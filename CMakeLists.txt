@@ -49,6 +49,12 @@ if(ENABLE_LORA_TESTING)
     add_subdirectory(test)
 endif()
 
+# --- Benchmarks ---
+option(ENABLE_LORA_BENCHMARKS "Enable gr4-lora benchmarks" ON)
+if(ENABLE_LORA_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()
+
 # --- Hardware applications (require SoapySDR) ---
 option(ENABLE_LORA_APPS "Enable gr4-lora hardware applications" ON)
 if(ENABLE_LORA_APPS)
