@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: ISC
-/// Full TX pipeline and TX->RX loopback tests (algorithm-level only).
+/// TX->RX loopback test (algorithm-level only).
+/// Per-stage TX tests are in qa_lora_tx.cpp.
 
 #include <boost/ut.hpp>
 
-#include <cmath>
-#include <complex>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -22,38 +21,6 @@ const std::filesystem::path& testVectorDir() {
     return dir;
 }
 
-std::vector<uint8_t> load_u8(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
-std::vector<uint32_t> load_u32(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    std::vector<uint32_t> data;
-    uint32_t val;
-    while (f.read(reinterpret_cast<char*>(&val), sizeof(val))) {
-        data.push_back(val);
-    }
-    return data;
-}
-
-std::vector<std::complex<float>> load_cf32(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    std::vector<std::complex<float>> data;
-    float re, im;
-    while (f.read(reinterpret_cast<char*>(&re), sizeof(re)) &&
-           f.read(reinterpret_cast<char*>(&im), sizeof(im))) {
-        data.emplace_back(re, im);
-    }
-    return data;
-}
-
 std::string load_text(const std::string& filename) {
     auto path = testVectorDir() / filename;
     std::ifstream f(path);
@@ -65,129 +32,9 @@ std::string load_text(const std::string& filename) {
 constexpr uint8_t  SF           = 8;
 constexpr uint32_t N            = 1u << SF; // 256
 constexpr uint8_t  CR           = 4;
-constexpr uint32_t BW           = 62500;
-constexpr uint32_t SAMP_RATE    = 250000;  // 4 * BW
-constexpr uint8_t  OS_FACTOR    = 4;
-constexpr uint16_t SYNC_WORD    = 0x12;
-constexpr uint16_t PREAMBLE_LEN = 8;
 constexpr bool     HAS_CRC      = true;
-constexpr uint32_t SPS          = N * OS_FACTOR; // 1024 samples per symbol
 
 } // namespace
-
-// ============================================================================
-// TX Integration Test
-// ============================================================================
-
-const boost::ut::suite<"Full TX pipeline (algorithm-level)"> full_tx_pipeline_tests = [] {
-    using namespace boost::ut;
-    using namespace gr::lora;
-
-    "Full TX pipeline vs GR3 test vector"_test = [] {
-        auto payload_str = load_text("payload.txt");
-        std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
-
-        // Step 1: Whitening
-        auto whitened = whiten(payload);
-        auto expected_whitened = load_u8("tx_01_whitened_nibbles.u8");
-        expect(eq(whitened.size(), expected_whitened.size())) << "Whitened size";
-        for (std::size_t i = 0; i < whitened.size(); i++) {
-            expect(eq(whitened[i], expected_whitened[i])) << "Whitened[" << i << "]";
-        }
-
-        // Step 2: Header insert
-        auto with_header = insert_header(whitened, static_cast<uint8_t>(payload.size()), CR, HAS_CRC);
-        auto expected_header = load_u8("tx_02_with_header.u8");
-        expect(eq(with_header.size(), expected_header.size())) << "Header size";
-        for (std::size_t i = 0; i < with_header.size(); i++) {
-            expect(eq(with_header[i], expected_header[i])) << "Header[" << i << "]";
-        }
-
-        // Step 3: Add CRC
-        auto with_crc = add_crc(with_header, payload, HAS_CRC);
-        auto expected_crc = load_u8("tx_03_with_crc.u8");
-        expect(eq(with_crc.size(), expected_crc.size())) << "CRC size";
-        for (std::size_t i = 0; i < with_crc.size(); i++) {
-            expect(eq(with_crc[i], expected_crc[i])) << "CRC[" << i << "]";
-        }
-
-        // Step 4: Hamming encode
-        auto encoded = hamming_enc_frame(with_crc, SF, CR);
-        auto expected_encoded = load_u8("tx_04_encoded.u8");
-        expect(eq(encoded.size(), expected_encoded.size())) << "Encoded size";
-        for (std::size_t i = 0; i < encoded.size(); i++) {
-            expect(eq(encoded[i], expected_encoded[i])) << "Encoded[" << i << "]";
-        }
-
-        // Step 5: Interleave
-        auto interleaved = interleave_frame(encoded, SF, CR);
-        auto expected_interleaved = load_u32("tx_05_interleaved.u32");
-        expect(eq(interleaved.size(), expected_interleaved.size())) << "Interleaved size";
-        for (std::size_t i = 0; i < interleaved.size(); i++) {
-            expect(eq(interleaved[i], expected_interleaved[i])) << "Interleaved[" << i << "]";
-        }
-
-        // Step 6: Gray demap
-        auto gray_mapped = gray_demap(interleaved, SF);
-        auto expected_gray = load_u32("tx_06_gray_mapped.u32");
-        expect(eq(gray_mapped.size(), expected_gray.size())) << "Gray mapped size";
-        for (std::size_t i = 0; i < gray_mapped.size(); i++) {
-            expect(eq(gray_mapped[i], expected_gray[i])) << "GrayDemap[" << i << "]";
-        }
-
-        // Step 7: Modulate -> IQ (with same zero padding as GR3 test vector generator)
-        constexpr uint32_t ZERO_PAD = N * OS_FACTOR * 5; // 5 symbol durations of silence
-        auto iq = modulate_frame(gray_mapped, SF, OS_FACTOR,
-                                 SYNC_WORD, PREAMBLE_LEN, ZERO_PAD);
-        auto expected_iq = load_cf32("tx_07_iq_frame.cf32");
-
-        expect(eq(iq.size(), expected_iq.size()))
-            << "IQ frame size: got " << iq.size()
-            << " expected " << expected_iq.size();
-
-        // Compare IQ samples with tolerance (floating point)
-        // First check preamble+sync+SFD (symbol-by-symbol)
-        std::size_t preamble_end = static_cast<std::size_t>((PREAMBLE_LEN + 4.25) * SPS);
-        {
-            float max_err_pre = 0.f;
-            for (std::size_t i = 0; i < preamble_end && i < iq.size() && i < expected_iq.size(); i++) {
-                float err = std::max(std::abs(iq[i].real() - expected_iq[i].real()),
-                                     std::abs(iq[i].imag() - expected_iq[i].imag()));
-                if (err > max_err_pre) max_err_pre = err;
-            }
-            expect(lt(max_err_pre, 1e-4f))
-                << "Preamble+SFD max error: " << max_err_pre;
-        }
-
-        // Check each payload symbol individually
-        auto gray_expected = load_u32("tx_06_gray_mapped.u32");
-        std::size_t n_payload_syms = gray_expected.size();
-        std::size_t first_bad_sym = SIZE_MAX;
-        for (std::size_t s = 0; s < n_payload_syms; s++) {
-            std::size_t sym_start = preamble_end + s * SPS;
-            float sym_max_err = 0.f;
-            for (std::size_t j = 0; j < SPS && sym_start + j < iq.size() && sym_start + j < expected_iq.size(); j++) {
-                float err = std::max(
-                    std::abs(iq[sym_start + j].real() - expected_iq[sym_start + j].real()),
-                    std::abs(iq[sym_start + j].imag() - expected_iq[sym_start + j].imag()));
-                if (err > sym_max_err) sym_max_err = err;
-            }
-            if (sym_max_err > 1e-4f && first_bad_sym == SIZE_MAX) {
-                first_bad_sym = s;
-                // Print the first few samples of mismatching symbol
-                std::size_t sym_start2 = preamble_end + s * SPS;
-                std::printf("Symbol %zu (value=%u) max_err=%.6f\n",
-                    s, gray_mapped[s], sym_max_err);
-                std::printf("  GR4[0]: (%.6f, %.6f)  GR3[0]: (%.6f, %.6f)\n",
-                    iq[sym_start2].real(), iq[sym_start2].imag(),
-                    expected_iq[sym_start2].real(), expected_iq[sym_start2].imag());
-            }
-            expect(lt(sym_max_err, 1e-4f))
-                << "Payload symbol " << s << " (value=" << gray_mapped[s]
-                << ") max error: " << sym_max_err;
-        }
-    };
-};
 
 // ============================================================================
 // Full Loopback: GR4 TX -> GR4 RX (algorithm-level)

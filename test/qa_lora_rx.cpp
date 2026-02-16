@@ -255,26 +255,30 @@ const boost::ut::suite<"CRC Verify RX"> crc_verif_rx_tests = [] {
         }
     };
 
-    "CRC-16 computation on payload bytes (algorithm-level)"_test = [] {
+    "CRC-16 computation matches test vector nibbles (algorithm-level)"_test = [] {
         auto payload_str = load_text("payload.txt");
         std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
 
-        if (payload.size() >= 2) {
-            uint16_t crc = crc16(std::span<const uint8_t>(payload.data(), payload.size() - 2));
-            crc ^= static_cast<uint16_t>(payload[payload.size() - 1]);
-            crc ^= static_cast<uint16_t>(payload[payload.size() - 2]) << 8;
+        expect(ge(payload.size(), 2UZ)) << "payload must be >= 2 bytes for LoRa CRC";
 
-            auto with_crc = load_u8("tx_03_with_crc.u8");
-            std::size_t crc_start = with_crc.size() - 4;
+        // Compute LoRa CRC: crc16(payload[0..len-3]) ^ last_two_bytes
+        uint16_t crc = crc16(std::span<const uint8_t>(payload.data(), payload.size() - 2));
+        crc ^= static_cast<uint16_t>(payload[payload.size() - 1]);
+        crc ^= static_cast<uint16_t>(payload[payload.size() - 2]) << 8;
 
-            uint16_t crc_from_nibs = static_cast<uint16_t>(with_crc[crc_start])
-                                   | (static_cast<uint16_t>(with_crc[crc_start + 1]) << 4)
-                                   | (static_cast<uint16_t>(with_crc[crc_start + 2]) << 8)
-                                   | (static_cast<uint16_t>(with_crc[crc_start + 3]) << 12);
+        // Reconstruct CRC from the 4 nibbles at end of tx_03_with_crc.u8
+        auto with_crc = load_u8("tx_03_with_crc.u8");
+        expect(ge(with_crc.size(), 4UZ)) << "tx_03_with_crc.u8 too small";
+        std::size_t crc_start = with_crc.size() - 4;
 
-            expect(neq(crc, uint16_t{0}) or eq(crc, uint16_t{0}))
-                << "CRC computed: 0x" << std::format("{:04x}", crc);
-        }
+        uint16_t crc_from_nibs = static_cast<uint16_t>(with_crc[crc_start])
+                               | (static_cast<uint16_t>(with_crc[crc_start + 1]) << 4)
+                               | (static_cast<uint16_t>(with_crc[crc_start + 2]) << 8)
+                               | (static_cast<uint16_t>(with_crc[crc_start + 3]) << 12);
+
+        expect(eq(crc, crc_from_nibs))
+            << "CRC mismatch: computed=0x" << std::format("{:04x}", crc)
+            << " from_nibs=0x" << std::format("{:04x}", crc_from_nibs);
     };
 };
 

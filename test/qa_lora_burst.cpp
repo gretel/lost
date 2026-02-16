@@ -403,6 +403,139 @@ const boost::ut::suite<"Robustness tests"> robustness_tests = [] {
                 << "+500Hz decode: \"" << decoded << "\"";
         }
     };
+
+    "Decodes with -500 Hz CFO"_test = [] {
+        float sample_rate = static_cast<float>(BW * OS_FACTOR);
+        auto iq = make_frame_iq("Hello MeshCore");
+        apply_cfo(iq, -500.f, sample_rate);
+
+        auto result = run_decode(iq);
+
+        expect(ge(result.samples.size(), 14UZ))
+            << "Output size with -500Hz CFO: " << result.samples.size();
+        if (result.samples.size() >= 14) {
+            std::string decoded(result.samples.begin(), result.samples.begin() + 14);
+            expect(eq(decoded, std::string("Hello MeshCore")))
+                << "-500Hz decode: \"" << decoded << "\"";
+        }
+    };
+
+    "Decodes with +1000 Hz CFO"_test = [] {
+        float sample_rate = static_cast<float>(BW * OS_FACTOR);
+        auto iq = make_frame_iq("Hello MeshCore");
+        apply_cfo(iq, 1000.f, sample_rate);
+
+        auto result = run_decode(iq);
+
+        expect(ge(result.samples.size(), 14UZ))
+            << "Output size with +1000Hz CFO: " << result.samples.size();
+        if (result.samples.size() >= 14) {
+            std::string decoded(result.samples.begin(), result.samples.begin() + 14);
+            expect(eq(decoded, std::string("Hello MeshCore")))
+                << "+1000Hz decode: \"" << decoded << "\"";
+        }
+    };
+
+    "Decodes with -1000 Hz CFO"_test = [] {
+        float sample_rate = static_cast<float>(BW * OS_FACTOR);
+        auto iq = make_frame_iq("Hello MeshCore");
+        apply_cfo(iq, -1000.f, sample_rate);
+
+        auto result = run_decode(iq);
+
+        expect(ge(result.samples.size(), 14UZ))
+            << "Output size with -1000Hz CFO: " << result.samples.size();
+        if (result.samples.size() >= 14) {
+            std::string decoded(result.samples.begin(), result.samples.begin() + 14);
+            expect(eq(decoded, std::string("Hello MeshCore")))
+                << "-1000Hz decode: \"" << decoded << "\"";
+        }
+    };
+};
+
+// ============================================================================
+// Test 5: Error paths — wrong sync word, CRC failure, low SNR
+// ============================================================================
+
+const boost::ut::suite<"Error path tests"> error_path_tests = [] {
+    using namespace boost::ut;
+
+    "Wrong sync word is rejected"_test = [] {
+        // Generate frame with sync_word=0x34, but decoder expects 0x12
+        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o', ' ',
+                                        'M', 'e', 's', 'h', 'C', 'o', 'r', 'e'};
+        auto iq = gr::lora::generate_frame_iq(payload, SF, CR, OS_FACTOR,
+                                              0x34,  // wrong sync word
+                                              PREAMBLE_LEN, true, SPS * 5);
+
+        auto result = run_decode(iq);  // decoder uses SYNC_WORD=0x12
+
+        // BurstDetector should reject: no decoded output
+        expect(eq(result.samples.size(), 0UZ))
+            << "Wrong sync word should produce 0 bytes, got " << result.samples.size();
+
+        // No crc_valid tag should be present
+        bool found_crc = false;
+        for (const auto& t : result.tags) {
+            if (t.map.contains("crc_valid")) found_crc = true;
+        }
+        expect(!found_crc) << "Should have no crc_valid tag after sync word rejection";
+    };
+
+    "CRC failure is flagged (corrupted payload IQ)"_test = [] {
+        auto iq = make_frame_iq("Hello MeshCore");
+
+        // Corrupt a payload symbol by zeroing out one symbol's worth of IQ
+        // in the middle of the payload. The preamble is ~12.25 symbols.
+        std::size_t payload_start = static_cast<std::size_t>(12.25 * SPS);
+        std::size_t corrupt_sym = 5;  // corrupt the 6th payload symbol
+        std::size_t corrupt_start = payload_start + corrupt_sym * SPS;
+        for (std::size_t i = corrupt_start; i < corrupt_start + SPS && i < iq.size(); i++) {
+            iq[i] = std::complex<float>(0.f, 0.f);
+        }
+
+        auto result = run_decode(iq);
+
+        // SymbolDemodulator should still output bytes, but crc_valid=false
+        // (it always outputs payload on header success, regardless of CRC)
+        if (!result.samples.empty()) {
+            bool found_crc = false;
+            bool crc_valid = true;
+            for (const auto& t : result.tags) {
+                if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                    crc_valid = pmtv::cast<bool>(it->second);
+                    found_crc = true;
+                }
+            }
+            // If we got output, CRC should be flagged invalid
+            if (found_crc) {
+                expect(!crc_valid) << "CRC should be invalid for corrupted frame";
+            }
+        }
+        // Either no output (detection failed) or output with crc_valid=false.
+        // Both are acceptable — the key is no false positive.
+    };
+
+    "Low SNR (-15 dB) does not produce false positive"_test = [] {
+        auto iq = make_frame_iq("Hello MeshCore");
+        add_awgn(iq, -15.0f);
+
+        auto result = run_decode(iq);
+
+        // At -15 dB, preamble detection may fail entirely (0 bytes)
+        // or decoder may produce garbage with CRC invalid.
+        // The key assertion: no valid CRC output.
+        bool false_positive = false;
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                if (pmtv::cast<bool>(it->second)) {
+                    false_positive = true;
+                }
+            }
+        }
+        expect(!false_positive)
+            << "Should not produce crc_valid=true at -15 dB SNR";
+    };
 };
 
 int main() { /* boost::ut auto-runs all suites */ }

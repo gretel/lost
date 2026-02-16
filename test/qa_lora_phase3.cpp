@@ -55,23 +55,11 @@ std::vector<std::complex<float>> load_cf32(const std::string& filename) {
     return data;
 }
 
-std::string load_text(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
 // MeshCore test configuration (must match test_vectors/config.json)
 constexpr uint8_t  SF           = 8;
 constexpr uint32_t N            = 1u << SF; // 256
-constexpr uint8_t  CR           = 4;
-constexpr uint32_t BW           = 62500;
-constexpr uint32_t SAMP_RATE    = 250000;  // 4 * BW
 constexpr uint8_t  OS_FACTOR    = 4;
-constexpr uint16_t SYNC_WORD    = 0x12;
 constexpr uint16_t PREAMBLE_LEN = 8;
-constexpr bool     HAS_CRC      = true;
 
 } // namespace
 
@@ -81,21 +69,7 @@ const boost::ut::suite<"Interleaver algorithm"> interleaver_algo_tests = [] {
     using namespace boost::ut;
     using namespace gr::lora;
 
-    "Interleave vs test vector (algorithm-level)"_test = [] {
-        auto encoded  = load_u8("tx_04_encoded.u8");
-        auto expected = load_u32("tx_05_interleaved.u32");
-
-        // Use the interleave_frame algorithm directly
-        auto result = interleave_frame(encoded, SF, CR);
-
-        expect(eq(result.size(), expected.size()))
-            << "Interleave output size mismatch: got " << result.size()
-            << " expected " << expected.size();
-        for (std::size_t i = 0; i < result.size() && i < expected.size(); i++) {
-            expect(eq(result[i], expected[i]))
-                << "Interleave mismatch at index " << i;
-        }
-    };
+    // NOTE: interleave vs test vector test is in qa_lora_algorithms.cpp
 
     "Interleave → Deinterleave roundtrip (algorithm-level)"_test = [] {
         auto encoded    = load_u8("tx_04_encoded.u8");

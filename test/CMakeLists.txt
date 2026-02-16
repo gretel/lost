@@ -19,6 +19,10 @@ add_ut_test(qa_lora_algorithms)
 target_compile_definitions(qa_lora_algorithms PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
 
+add_ut_test(qa_lora_tx)
+target_compile_definitions(qa_lora_tx PRIVATE
+    TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
+
 add_ut_test(qa_lora_phase3)
 target_compile_definitions(qa_lora_phase3 PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
