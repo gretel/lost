@@ -158,4 +158,143 @@ const boost::ut::suite<"Full loopback (algorithm-level)"> full_loopback_tests = 
     };
 };
 
+// ============================================================================
+// Multi-SF loopback: verify TX->RX roundtrip at SF7 and SF12 (boundary cases)
+// ============================================================================
+
+const boost::ut::suite<"Multi-SF loopback"> multi_sf_loopback_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    auto do_loopback = [](uint8_t test_sf, uint8_t test_cr,
+                          uint32_t test_bw, const std::string& payload_str) {
+        std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
+        uint8_t test_os = 4;
+
+        // === TX ===
+        auto whitened    = whiten(payload);
+        auto with_header = insert_header(whitened,
+                                         static_cast<uint8_t>(payload.size()),
+                                         test_cr, true);
+        auto with_crc    = add_crc(with_header, payload, true);
+        auto encoded     = hamming_enc_frame(with_crc, test_sf, test_cr);
+
+        bool ldro = needs_ldro(test_sf, test_bw);
+        auto interleaved = interleave_frame(encoded, test_sf, test_cr, ldro);
+        auto gray_mapped = gray_demap(interleaved, test_sf);
+
+        uint32_t N_test = 1u << test_sf;
+
+        // === RX (reverse the TX chain, no IQ) ===
+        // Stage 1: FFTDemod simulation (subtract 1)
+        std::vector<uint16_t> fft_output;
+        for (auto gm : gray_mapped) {
+            fft_output.push_back(static_cast<uint16_t>((gm + N_test - 1) % N_test));
+        }
+
+        // Stage 2: GrayMapping
+        std::vector<uint16_t> rx_interleaved;
+        for (auto sym : fft_output) {
+            rx_interleaved.push_back(static_cast<uint16_t>(sym ^ (sym >> 1)));
+        }
+
+        // Stage 3: Deinterleave
+        std::vector<uint8_t> all_codewords;
+        std::size_t sym_idx = 0;
+        bool is_first = true;
+        while (sym_idx < rx_interleaved.size()) {
+            bool reduced = is_first || ldro;
+            uint8_t sf_app = reduced ? static_cast<uint8_t>(test_sf - 2) : test_sf;
+            uint8_t cw_len = is_first ? uint8_t(8) : static_cast<uint8_t>(4 + test_cr);
+            if (sym_idx + cw_len > rx_interleaved.size()) break;
+
+            std::vector<uint16_t> block_syms;
+            for (int j = 0; j < cw_len; j++) {
+                uint16_t sym = rx_interleaved[sym_idx + j];
+                if (reduced) sym >>= (test_sf - sf_app);
+                block_syms.push_back(sym);
+            }
+            auto cw = deinterleave_block(block_syms, test_sf, cw_len, sf_app);
+            all_codewords.insert(all_codewords.end(), cw.begin(), cw.end());
+            sym_idx += cw_len;
+            is_first = false;
+        }
+
+        // Stage 4: Hamming decode
+        std::vector<uint8_t> nibbles;
+        for (std::size_t i = 0; i < all_codewords.size(); i++) {
+            uint8_t cr_app = (static_cast<int>(i) < test_sf - 2) ? uint8_t(4) : test_cr;
+            nibbles.push_back(hamming_decode_hard(all_codewords[i], cr_app));
+        }
+
+        // Stage 5: Header decode
+        expect(ge(nibbles.size(), std::size_t{5})) << "Not enough nibbles";
+        auto hdr = parse_explicit_header(nibbles[0], nibbles[1], nibbles[2],
+                                          nibbles[3], nibbles[4]);
+        expect(hdr.checksum_valid) << "Header checksum";
+        expect(eq(static_cast<int>(hdr.payload_len), static_cast<int>(payload.size())))
+            << "Header pay_len";
+
+        // Stage 6: Dewhitening
+        std::vector<uint8_t> decoded_bytes;
+        std::size_t data_start = 5;
+        uint32_t total_nibs = hdr.payload_len * 2 + (hdr.has_crc ? 4u : 0u);
+        for (uint32_t i = 0; i < total_nibs / 2; i++) {
+            std::size_t nib_idx = data_start + 2 * i;
+            if (nib_idx + 1 >= nibbles.size()) break;
+            uint8_t low_nib  = nibbles[nib_idx];
+            uint8_t high_nib = nibbles[nib_idx + 1];
+            if (i < hdr.payload_len) {
+                uint8_t ws = whitening_seq[i % whitening_seq.size()];
+                low_nib  ^= (ws & 0x0F);
+                high_nib ^= ((ws >> 4) & 0x0F);
+            }
+            decoded_bytes.push_back(static_cast<uint8_t>((high_nib << 4) | low_nib));
+        }
+
+        // Stage 7: CRC verify
+        if (hdr.has_crc && hdr.payload_len >= 2
+            && decoded_bytes.size() >= hdr.payload_len + 2u) {
+            bool crc_ok = lora_verify_crc(
+                std::span<const uint8_t>(decoded_bytes.data(), hdr.payload_len),
+                decoded_bytes[hdr.payload_len],
+                decoded_bytes[hdr.payload_len + 1]);
+            expect(crc_ok) << "CRC mismatch at SF=" << static_cast<int>(test_sf);
+        }
+
+        // Compare payload
+        std::string decoded_str(decoded_bytes.begin(),
+                                decoded_bytes.begin() +
+                                static_cast<int64_t>(hdr.payload_len));
+        expect(eq(decoded_str, payload_str))
+            << "SF=" << static_cast<int>(test_sf) << " payload mismatch";
+    };
+
+    "SF7 loopback"_test = [&do_loopback] {
+        do_loopback(7, 4, 125000, "Hello SF7");
+    };
+
+    "SF12 loopback"_test = [&do_loopback] {
+        do_loopback(12, 4, 125000, "Hello SF12");
+    };
+
+    "SF11 BW=62.5kHz LDRO loopback"_test = [&do_loopback] {
+        // SF11 @ 62.5kHz: symbol duration = 32.77ms > 16ms -> LDRO active
+        do_loopback(11, 4, 62500, "LDRO test");
+    };
+
+    "SF10 BW=62.5kHz LDRO boundary loopback"_test = [&do_loopback] {
+        // SF10 @ 62.5kHz: symbol duration = 16.38ms > 16ms -> LDRO just active
+        do_loopback(10, 4, 62500, "LDRO boundary");
+    };
+
+    "SF9 CR=2 loopback"_test = [&do_loopback] {
+        do_loopback(9, 2, 125000, "CR2 test");
+    };
+
+    "SF8 CR=1 loopback"_test = [&do_loopback] {
+        do_loopback(8, 1, 62500, "CR1 test");
+    };
+};
+
 int main() { /* boost::ut auto-runs all suites */ }

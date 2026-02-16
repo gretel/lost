@@ -43,21 +43,28 @@
 
 namespace {
 
-// MeshCore LoRa PHY parameters
-constexpr uint8_t  SF           = 8;
-constexpr uint32_t N            = 1u << SF;
-constexpr uint8_t  CR           = 4;
-constexpr uint32_t BW           = 62500;
-constexpr uint8_t  OS_FACTOR    = 4;
-constexpr uint16_t SYNC_WORD    = 0x12;
-constexpr uint16_t PREAMBLE_LEN = 8;
-constexpr uint32_t SPS          = N * OS_FACTOR;
-constexpr float    SAMPLE_RATE  = 250000.f;
-constexpr double   DEFAULT_FREQ = 869'525'000.0;
-constexpr double   TX_GAIN      = 30.0;
-constexpr double   RX_GAIN      = 40.0;
+// Default LoRa PHY parameters (MeshCore uk/narrow)
+constexpr uint8_t  kDefaultSF           = 8;
+constexpr uint8_t  kDefaultCR           = 4;
+constexpr uint32_t kDefaultBW           = 62500;
+constexpr uint16_t kDefaultSyncWord     = 0x12;
+constexpr uint16_t kDefaultPreambleLen  = 8;
+constexpr float    kDefaultSampleRate   = 250000.f;
+constexpr double   kDefaultFreq         = 869'525'000.0;
+constexpr double   kDefaultTxGain       = 30.0;
+constexpr double   kDefaultRxGain       = 40.0;
 
 // ---- RX decode (offline, using GR4 graph) ----
+
+struct LoraParams {
+    uint8_t  sf{kDefaultSF};
+    uint8_t  cr{kDefaultCR};
+    uint32_t bw{kDefaultBW};
+    uint16_t sync_word{kDefaultSyncWord};
+    uint16_t preamble_len{kDefaultPreambleLen};
+    float    sample_rate{kDefaultSampleRate};
+    double   freq{kDefaultFreq};
+};
 
 struct DecodeResult {
     std::vector<uint8_t> payload;
@@ -65,8 +72,11 @@ struct DecodeResult {
     bool                 decoded{false};
 };
 
-DecodeResult decode_iq(const std::vector<std::complex<float>>& iq) {
+DecodeResult decode_iq(const std::vector<std::complex<float>>& iq,
+                       const LoraParams& lp) {
     gr::Graph graph;
+
+    auto os_factor = static_cast<uint8_t>(lp.sample_rate / static_cast<float>(lp.bw));
 
     auto& src = graph.emplaceBlock<gr::testing::TagSource<std::complex<float>,
         gr::testing::ProcessFunction::USE_PROCESS_BULK>>({
@@ -76,16 +86,16 @@ DecodeResult decode_iq(const std::vector<std::complex<float>>& iq) {
     src.values = iq;
 
     auto& burst = graph.emplaceBlock<gr::lora::BurstDetector>();
-    burst.center_freq  = static_cast<uint32_t>(DEFAULT_FREQ);
-    burst.bandwidth    = BW;
-    burst.sf           = SF;
-    burst.sync_word    = SYNC_WORD;
-    burst.os_factor    = OS_FACTOR;
-    burst.preamble_len = PREAMBLE_LEN;
+    burst.center_freq  = static_cast<uint32_t>(lp.freq);
+    burst.bandwidth    = lp.bw;
+    burst.sf           = lp.sf;
+    burst.sync_word    = lp.sync_word;
+    burst.os_factor    = os_factor;
+    burst.preamble_len = lp.preamble_len;
 
     auto& demod = graph.emplaceBlock<gr::lora::SymbolDemodulator>();
-    demod.sf        = SF;
-    demod.bandwidth = BW;
+    demod.sf        = lp.sf;
+    demod.bandwidth = lp.bw;
 
     auto& sink = graph.emplaceBlock<gr::testing::TagSink<uint8_t,
         gr::testing::ProcessFunction::USE_PROCESS_BULK>>({
@@ -124,12 +134,15 @@ struct RoundResult {
 
 /// Build padded TX IQ with leading/trailing silence.
 std::vector<std::complex<float>> build_padded_iq(
-        const std::string& payload_str) {
+        const std::string& payload_str, const LoraParams& lp) {
+    auto os_factor = static_cast<uint8_t>(lp.sample_rate / static_cast<float>(lp.bw));
     std::vector<uint8_t> payload_bytes(payload_str.begin(),
                                         payload_str.end());
     auto frame_iq = gr::lora::generate_frame_iq(
-        payload_bytes, SF, CR, OS_FACTOR, SYNC_WORD, PREAMBLE_LEN, true, 0);
-    uint32_t pad = static_cast<uint32_t>(SAMPLE_RATE * 0.1f);  // 100ms
+        payload_bytes, lp.sf, lp.cr, os_factor,
+        lp.sync_word, lp.preamble_len, true, 0,
+        2, lp.bw);
+    uint32_t pad = static_cast<uint32_t>(lp.sample_rate * 0.1f);  // 100ms
     std::vector<std::complex<float>> iq;
     iq.resize(pad, std::complex<float>(0.f, 0.f));
     iq.insert(iq.end(), frame_iq.begin(), frame_iq.end());
@@ -141,7 +154,8 @@ std::vector<std::complex<float>> build_padded_iq(
 RoundResult do_round(const std::string& label,
                      const std::string& payload_str,
                      soapy_bridge_t* tx_bridge,
-                     soapy_bridge_t* rx_bridge) {
+                     soapy_bridge_t* rx_bridge,
+                     const LoraParams& lp) {
     RoundResult rr;
     rr.tx_string = payload_str;
 
@@ -149,11 +163,11 @@ RoundResult do_round(const std::string& label,
     std::fprintf(stderr, "  TX: \"%s\" (%zu bytes)\n",
                  payload_str.c_str(), payload_str.size());
 
-    auto tx_iq = build_padded_iq(payload_str);
+    auto tx_iq = build_padded_iq(payload_str, lp);
 
     // RX capture: frame + 500ms margin
     std::size_t rx_total = tx_iq.size() + static_cast<std::size_t>(
-        SAMPLE_RATE * 0.5f);
+        lp.sample_rate * 0.5f);
     std::vector<std::complex<float>> rx_buf(rx_total);
     std::atomic<std::size_t> rx_captured{0};
 
@@ -201,7 +215,7 @@ RoundResult do_round(const std::string& label,
 
     // Decode
     std::fprintf(stderr, "  Decoding...\n");
-    rr.decode = decode_iq(rx_buf);
+    rr.decode = decode_iq(rx_buf, lp);
 
     if (rr.decode.decoded) {
         // Trim to expected length
@@ -248,18 +262,32 @@ std::string random_hex_nonce(int n_bytes) {
 // ---- CLI ----
 
 struct LoopbackConfig {
-    double      freq{DEFAULT_FREQ};
-    double      tx_gain{TX_GAIN};
-    double      rx_gain{RX_GAIN};
+    double      freq{kDefaultFreq};
+    double      tx_gain{kDefaultTxGain};
+    double      rx_gain{kDefaultRxGain};
+    uint32_t    bw{kDefaultBW};
+    uint8_t     sf{kDefaultSF};
+    uint8_t     cr{kDefaultCR};
+    uint16_t    sync_word{kDefaultSyncWord};
+    uint16_t    preamble_len{kDefaultPreambleLen};
+    float       sample_rate{kDefaultSampleRate};
     std::string payload;  // empty = challenge-response mode
 };
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
-        "Usage: %s [--freq hz] [--tx-gain db] [--rx-gain db] "
-        "[--payload \"text\"]\n\n"
-        "Without --payload: runs challenge-response protocol (2 rounds).\n"
-        "With --payload:    single-round loopback with fixed payload.\n",
+        "Usage: %s [options]\n\n"
+        "Options:\n"
+        "  --freq <hz>       Frequency (default: 869525000)\n"
+        "  --tx-gain <db>    TX gain (default: 30)\n"
+        "  --rx-gain <db>    RX gain (default: 40)\n"
+        "  --bw <hz>         LoRa bandwidth (default: 62500)\n"
+        "  --sf <7-12>       Spreading factor (default: 8)\n"
+        "  --cr <1-4>        Coding rate (default: 4)\n"
+        "  --sync <hex>      Sync word (default: 0x12)\n"
+        "  --preamble <n>    Preamble length (default: 8)\n"
+        "  --payload \"text\"  Fixed payload (disables challenge-response)\n"
+        "\nWithout --payload: runs challenge-response protocol (2 rounds).\n",
         prog);
 }
 
@@ -275,6 +303,16 @@ bool parse_args(int argc, char** argv, LoopbackConfig& cfg) {
             cfg.tx_gain = std::stod(argv[++i]);
         } else if (arg == "--rx-gain" && i + 1 < argc) {
             cfg.rx_gain = std::stod(argv[++i]);
+        } else if (arg == "--bw" && i + 1 < argc) {
+            cfg.bw = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--sf" && i + 1 < argc) {
+            cfg.sf = static_cast<uint8_t>(std::stoul(argv[++i]));
+        } else if (arg == "--cr" && i + 1 < argc) {
+            cfg.cr = static_cast<uint8_t>(std::stoul(argv[++i]));
+        } else if (arg == "--sync" && i + 1 < argc) {
+            cfg.sync_word = static_cast<uint16_t>(std::stoul(argv[++i], nullptr, 0));
+        } else if (arg == "--preamble" && i + 1 < argc) {
+            cfg.preamble_len = static_cast<uint16_t>(std::stoul(argv[++i]));
         } else if (arg == "--payload" && i + 1 < argc) {
             cfg.payload = argv[++i];
         }
@@ -292,15 +330,25 @@ int main(int argc, char** argv) {
 
     bool challenge_mode = cfg.payload.empty();
 
+    // Build LoraParams from config
+    LoraParams lp;
+    lp.sf           = cfg.sf;
+    lp.cr           = cfg.cr;
+    lp.bw           = cfg.bw;
+    lp.sync_word    = cfg.sync_word;
+    lp.preamble_len = cfg.preamble_len;
+    lp.sample_rate  = cfg.sample_rate;
+    lp.freq         = cfg.freq;
+
     std::fprintf(stderr, "=== LoRa Hardware Loopback Test ===\n");
     std::fprintf(stderr, "  Mode:      %s\n",
                  challenge_mode ? "challenge-response (2 rounds)"
-                                : "fixed payload (1 round)");
+                                 : "fixed payload (1 round)");
     std::fprintf(stderr, "  Frequency: %.6f MHz\n", cfg.freq / 1e6);
     std::fprintf(stderr, "  TX gain:   %.0f dB  RX gain: %.0f dB\n",
                  cfg.tx_gain, cfg.rx_gain);
-    std::fprintf(stderr, "  SF=%u BW=%u CR=4/%u sync=0x%02X\n",
-                 SF, BW, 4 + CR, SYNC_WORD);
+    std::fprintf(stderr, "  SF=%u BW=%u CR=4/%u sync=0x%02X preamble=%u\n",
+                 cfg.sf, cfg.bw, 4 + cfg.cr, cfg.sync_word, cfg.preamble_len);
 
     // --- Probe device ---
     std::fprintf(stderr, "\nProbing for B210...\n");
@@ -315,7 +363,7 @@ int main(int argc, char** argv) {
     rx_cfg.driver       = "uhd";
     rx_cfg.clock_source = "external";
     rx_cfg.device_args  = nullptr;
-    rx_cfg.sample_rate  = static_cast<double>(SAMPLE_RATE);
+    rx_cfg.sample_rate  = static_cast<double>(cfg.sample_rate);
     rx_cfg.center_freq  = cfg.freq;
     rx_cfg.gain_db      = cfg.rx_gain;
     rx_cfg.bandwidth    = 0;
@@ -336,7 +384,7 @@ int main(int argc, char** argv) {
     tx_cfg.driver       = "uhd";
     tx_cfg.clock_source = "external";
     tx_cfg.device_args  = nullptr;
-    tx_cfg.sample_rate  = static_cast<double>(SAMPLE_RATE);
+    tx_cfg.sample_rate  = static_cast<double>(cfg.sample_rate);
     tx_cfg.center_freq  = cfg.freq;
     tx_cfg.gain_db      = cfg.tx_gain;
     tx_cfg.bandwidth    = 0;
@@ -361,7 +409,7 @@ int main(int argc, char** argv) {
 
         // Round 1: Challenge
         auto r1 = do_round("Round 1: Challenge", challenge,
-                           tx_bridge, rx_bridge);
+                           tx_bridge, rx_bridge, lp);
         if (!r1.decode.decoded || !r1.decode.crc_valid || !r1.match) {
             std::fprintf(stderr, "\nRound 1 FAILED.\n");
             exit_code = 1;
@@ -381,7 +429,7 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
             auto r2 = do_round("Round 2: Response", response,
-                               tx_bridge, rx_bridge);
+                               tx_bridge, rx_bridge, lp);
             if (!r2.decode.decoded || !r2.decode.crc_valid || !r2.match) {
                 std::fprintf(stderr, "\nRound 2 FAILED.\n");
                 exit_code = 1;
@@ -423,7 +471,7 @@ int main(int argc, char** argv) {
     } else {
         // ---- Single fixed-payload round ----
         auto r = do_round("Single Round", cfg.payload,
-                          tx_bridge, rx_bridge);
+                          tx_bridge, rx_bridge, lp);
 
         std::fprintf(stderr, "\n=== LOOPBACK RESULT ===\n");
         std::fprintf(stderr, "  TX: \"%s\"\n", r.tx_string.c_str());

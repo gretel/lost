@@ -66,14 +66,18 @@ namespace gr::lora {
 /// Interleave an entire frame of codewords (TX).
 /// Handles the header block (first sf-2 codewords with cw_len=8 and parity)
 /// and subsequent payload blocks (sf codewords with cw_len=cr+4).
+/// When ldro=true (Low Data Rate Optimization), payload blocks also use
+/// sf_app=sf-2 with parity, matching the header block's reduced rate.
 [[nodiscard]] inline std::vector<uint32_t> interleave_frame(
-        const std::vector<uint8_t>& codewords, uint8_t sf, uint8_t cr) {
+        const std::vector<uint8_t>& codewords, uint8_t sf, uint8_t cr,
+        bool ldro = false) {
     std::vector<uint32_t> all_symbols;
     std::size_t idx = 0;
     bool is_first = true;
 
     while (idx < codewords.size()) {
-        uint8_t sf_app = is_first ? static_cast<uint8_t>(sf - 2) : sf;
+        bool reduced_rate = is_first || ldro;
+        uint8_t sf_app = reduced_rate ? static_cast<uint8_t>(sf - 2) : sf;
         uint8_t cw_len = is_first ? uint8_t(8) : static_cast<uint8_t>(4 + cr);
 
         // Gather sf_app codewords for this block
@@ -86,7 +90,7 @@ namespace gr::lora {
             block.push_back(0);
         }
 
-        auto syms = interleave_block(block, sf, cw_len, sf_app, is_first);
+        auto syms = interleave_block(block, sf, cw_len, sf_app, reduced_rate);
         all_symbols.insert(all_symbols.end(), syms.begin(), syms.end());
         is_first = false;
     }

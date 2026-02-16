@@ -39,22 +39,17 @@
 
 namespace {
 
-// MeshCore LoRa PHY parameters
-constexpr uint8_t  SF           = 8;
-constexpr uint32_t N            = 1u << SF;  // 256
-constexpr uint8_t  CR           = 4;
-constexpr uint32_t BW           = 62500;
-constexpr uint8_t  OS_FACTOR    = 4;
-constexpr uint16_t SYNC_WORD    = 0x12;
-constexpr uint16_t PREAMBLE_LEN = 8;
-constexpr uint32_t SPS          = N * OS_FACTOR;  // 1024 samples per symbol
-
 // ---- CLI argument parsing ----
 
 struct TxConfig {
     double      freq{869'525'000.0};
     double      gain{30.0};
     float       rate{250'000.f};
+    uint32_t    bw{62500};
+    uint8_t     sf{8};
+    uint8_t     cr{4};
+    uint16_t    sync_word{0x12};
+    uint16_t    preamble_len{8};
     int         repeat{1};
     int         gap_ms{1000};
     bool        dry_run{false};
@@ -64,15 +59,18 @@ struct TxConfig {
 void print_usage(const char* prog) {
     std::fprintf(stderr, "Usage: %s [options] <payload_string>\n", prog);
     std::fprintf(stderr, "\nOptions:\n");
-    std::fprintf(stderr, "  --freq <hz>    TX frequency (default: 869525000)\n");
-    std::fprintf(stderr, "  --gain <db>    TX gain (default: 30)\n");
-    std::fprintf(stderr, "  --rate <sps>   Sample rate (default: 250000)\n");
-    std::fprintf(stderr, "  --repeat <n>   Transmit count (default: 1)\n");
-    std::fprintf(stderr, "  --gap <ms>     Gap between repeats (default: 1000)\n");
-    std::fprintf(stderr, "  --dry-run      Generate IQ without transmitting\n");
-    std::fprintf(stderr, "  -h, --help     Show this help\n");
-    std::fprintf(stderr, "\nLoRa: SF=%u BW=%u CR=4/%u sync=0x%02X\n",
-                 SF, BW, 4 + CR, SYNC_WORD);
+    std::fprintf(stderr, "  --freq <hz>       TX frequency (default: 869525000)\n");
+    std::fprintf(stderr, "  --gain <db>       TX gain (default: 30)\n");
+    std::fprintf(stderr, "  --rate <sps>      Sample rate (default: 250000)\n");
+    std::fprintf(stderr, "  --bw <hz>         LoRa bandwidth (default: 62500)\n");
+    std::fprintf(stderr, "  --sf <7-12>       Spreading factor (default: 8)\n");
+    std::fprintf(stderr, "  --cr <1-4>        Coding rate (default: 4)\n");
+    std::fprintf(stderr, "  --sync <hex>      Sync word, e.g. 0x12 (default: 0x12)\n");
+    std::fprintf(stderr, "  --preamble <n>    Preamble length (default: 8)\n");
+    std::fprintf(stderr, "  --repeat <n>      Transmit count (default: 1)\n");
+    std::fprintf(stderr, "  --gap <ms>        Gap between repeats (default: 1000)\n");
+    std::fprintf(stderr, "  --dry-run         Generate IQ without transmitting\n");
+    std::fprintf(stderr, "  -h, --help        Show this help\n");
     std::fprintf(stderr, "\n*** Ensure you have authorization to transmit! ***\n");
 }
 
@@ -88,6 +86,16 @@ bool parse_args(int argc, char** argv, TxConfig& cfg) {
             cfg.gain = std::stod(argv[++i]);
         } else if (arg == "--rate" && i + 1 < argc) {
             cfg.rate = std::stof(argv[++i]);
+        } else if (arg == "--bw" && i + 1 < argc) {
+            cfg.bw = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--sf" && i + 1 < argc) {
+            cfg.sf = static_cast<uint8_t>(std::stoul(argv[++i]));
+        } else if (arg == "--cr" && i + 1 < argc) {
+            cfg.cr = static_cast<uint8_t>(std::stoul(argv[++i]));
+        } else if (arg == "--sync" && i + 1 < argc) {
+            cfg.sync_word = static_cast<uint16_t>(std::stoul(argv[++i], nullptr, 0));
+        } else if (arg == "--preamble" && i + 1 < argc) {
+            cfg.preamble_len = static_cast<uint16_t>(std::stoul(argv[++i]));
         } else if (arg == "--repeat" && i + 1 < argc) {
             cfg.repeat = std::stoi(argv[++i]);
         } else if (arg == "--gap" && i + 1 < argc) {
@@ -132,10 +140,13 @@ int main(int argc, char** argv) {
     }
 
     // --- Generate IQ ---
+    const auto os_factor = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
+    const uint32_t sps = (1u << cfg.sf) * os_factor;
     std::vector<uint8_t> payload_bytes(cfg.payload.begin(), cfg.payload.end());
-    auto iq = gr::lora::generate_frame_iq(payload_bytes, SF, CR, OS_FACTOR,
-                                          SYNC_WORD, PREAMBLE_LEN,
-                                          true, SPS * 2);
+    auto iq = gr::lora::generate_frame_iq(payload_bytes, cfg.sf, cfg.cr,
+                                          os_factor, cfg.sync_word,
+                                          cfg.preamble_len, true, sps * 2,
+                                          2, cfg.bw);
 
     double airtime_sec = static_cast<double>(iq.size()) /
                          static_cast<double>(cfg.rate);
@@ -147,8 +158,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "  Gain:        %.0f dB\n", cfg.gain);
     std::fprintf(stderr, "  Sample rate: %.0f S/s\n",
                  static_cast<double>(cfg.rate));
-    std::fprintf(stderr, "  SF=%u  BW=%u  CR=4/%u  sync=0x%02X\n",
-                 SF, BW, 4 + CR, SYNC_WORD);
+    std::fprintf(stderr, "  SF=%u  BW=%u  CR=4/%u  sync=0x%02X  preamble=%u\n",
+                 cfg.sf, cfg.bw, 4 + cfg.cr, cfg.sync_word, cfg.preamble_len);
     std::fprintf(stderr, "  IQ samples:  %zu (%.3f ms airtime)\n",
                  iq.size(), airtime_sec * 1000.0);
     std::fprintf(stderr, "  Repeat:      %d  gap=%d ms\n",

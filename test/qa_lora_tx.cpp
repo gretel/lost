@@ -253,6 +253,41 @@ const boost::ut::suite<"TX interleave_frame"> tx_interleave_tests = [] {
             expect(eq(result[i], expected[i])) << "interleaved[" << i << "]";
         }
     };
+
+    "interleave_frame() LDRO produces more symbols"_test = [] {
+        // When LDRO is active, payload blocks use sf_app=sf-2, requiring
+        // more blocks to encode the same data (lower spectral efficiency).
+        auto encoded = load_u8("tx_04_encoded.u8");
+        auto normal = interleave_frame(encoded, SF, CR, false);
+        auto ldro   = interleave_frame(encoded, SF, CR, true);
+
+        expect(ge(ldro.size(), normal.size()))
+            << "LDRO should produce >= symbols: ldro=" << ldro.size()
+            << " normal=" << normal.size();
+    };
+
+    "interleave_frame() LDRO roundtrip at SF11 BW125kHz"_test = [] {
+        // SF11 @ BW=125kHz: symbol_duration = 2048*1000/125000 = 16.384ms > 16ms -> LDRO
+        constexpr uint8_t sf11 = 11;
+        // Create some test nibbles: 5 header + payload nibbles
+        std::vector<uint8_t> codewords;
+        for (int i = 0; i < 30; i++) codewords.push_back(static_cast<uint8_t>(i & 0xFF));
+
+        auto symbols = interleave_frame(codewords, sf11, CR, true);
+
+        // Header block: cw_len=8, sf_app=sf-2=9 -> 8 symbols consuming 9 codewords
+        // Payload blocks: cw_len=4+CR=8, sf_app=sf-2=9 -> 8 symbols consuming 9 codewords each
+        // Total codewords: 30, header consumes 9, remaining 21 -> ceil(21/9)=3 payload blocks
+        // Total symbols: 8 (header) + 3*8 (payload) = 32
+        expect(eq(symbols.size(), 32UZ))
+            << "SF11 LDRO: expected 32 symbols, got " << symbols.size();
+
+        // Verify all symbols are in range [0, 2^sf)
+        uint32_t n11 = 1u << sf11;
+        for (std::size_t i = 0; i < symbols.size(); i++) {
+            expect(lt(symbols[i], n11)) << "symbol[" << i << "] out of range";
+        }
+    };
 };
 
 const boost::ut::suite<"TX gray_demap"> tx_gray_demap_tests = [] {

@@ -155,24 +155,40 @@ namespace gr::lora {
     return iq;
 }
 
+/// Determine whether LDRO (Low Data Rate Optimization) should be active
+/// for the given SF and bandwidth.
+[[nodiscard]] inline bool needs_ldro(uint8_t sf, uint32_t bandwidth) {
+    return (static_cast<float>(1u << sf) * 1e3f
+            / static_cast<float>(bandwidth)) > LDRO_MAX_DURATION_MS;
+}
+
 /// Full TX chain: payload bytes -> baseband IQ samples.
 ///
 /// Ties together the complete LoRa TX pipeline:
 ///   whiten -> insert_header -> add_crc -> hamming_encode -> interleave
 ///   -> gray_demap -> modulate
+///
+/// The ldro_mode parameter controls Low Data Rate Optimization:
+///   0 = off, 1 = on, 2 = auto (enabled when symbol duration > 16ms).
+/// Auto mode requires bandwidth to be set; when ldro_mode != 2, bandwidth
+/// is unused.
 [[nodiscard]] inline std::vector<std::complex<float>> generate_frame_iq(
         std::span<const uint8_t> payload,
         uint8_t sf, uint8_t cr, uint8_t os_factor,
         uint16_t sync_word, uint16_t preamble_len,
         bool has_crc = true,
-        uint32_t zero_pad = 0) {
+        uint32_t zero_pad = 0,
+        uint8_t ldro_mode = 2,
+        uint32_t bandwidth = 62500) {
+    bool ldro = (ldro_mode == 2) ? needs_ldro(sf, bandwidth) : (ldro_mode != 0);
+
     auto whitened    = whiten(payload);
     auto with_header = insert_header(whitened,
                                      static_cast<uint8_t>(payload.size()),
                                      cr, has_crc);
     auto with_crc    = add_crc(with_header, payload, has_crc);
     auto encoded     = hamming_enc_frame(with_crc, sf, cr);
-    auto interleaved = interleave_frame(encoded, sf, cr);
+    auto interleaved = interleave_frame(encoded, sf, cr, ldro);
     auto gray_mapped = gray_demap(interleaved, sf);
     return modulate_frame(gray_mapped, sf, os_factor,
                           sync_word, preamble_len, zero_pad);

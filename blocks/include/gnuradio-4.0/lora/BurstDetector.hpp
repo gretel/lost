@@ -17,6 +17,12 @@
 
 namespace gr::lora {
 
+/// Detection thresholds — fixed by LoRa PHY signal processing requirements.
+/// Not runtime-configurable, but named for readability and tuning experiments.
+static constexpr int kPreambleBinTolerance = 1;  ///< max FFT bin drift between consecutive upchirps
+static constexpr int kSyncWordBinTolerance = 2;  ///< max bin error for sync word (net ID) verification
+static constexpr uint8_t kMaxAdditionalUpchirps = 3;  ///< extra preamble symbols before rollover
+
 namespace detail {
 
 /// Find the most frequent value in a vector.
@@ -356,9 +362,9 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
                 break;
             }
 
-            // Look for consecutive reference upchirps (within +/-1 bin tolerance)
-            if (std::abs(mod(std::abs(_bin_idx_new - _bin_idx) + 1, static_cast<int64_t>(_N)) - 1) <= 1
-                && _bin_idx_new != -1) {
+            // Look for consecutive reference upchirps (within +/-kPreambleBinTolerance)
+            if (std::abs(mod(std::abs(_bin_idx_new - _bin_idx) + 1, static_cast<int64_t>(_N)) - 1)
+                    <= kPreambleBinTolerance && _bin_idx_new != -1) {
                 if (_symbol_cnt == 1 && _bin_idx != -1) {
                     _preamb_up_vals[0] = _bin_idx;
                 }
@@ -456,7 +462,7 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
                             _net_id_samp[i] = in_span[idx];
                     }
 
-                    if (_additional_upchirps >= 3) {
+                    if (_additional_upchirps >= kMaxAdditionalUpchirps) {
                         std::rotate(_preamble_raw_up.begin(),
                                     _preamble_raw_up.begin() + static_cast<std::ptrdiff_t>(_sps),
                                     _preamble_raw_up.end());
@@ -629,7 +635,7 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
                 if (_sw0 == 0) {
                     sync_ok = true;
                     _items_to_consume = 0;
-                } else if (std::abs(netid1 - static_cast<int>(_sw0)) > 2) {
+                } else if (std::abs(netid1 - static_cast<int>(_sw0)) > kSyncWordBinTolerance) {
                     // Wrong net ID 1
                 } else {
                     net_id_off = netid1 - static_cast<int>(_sw0);

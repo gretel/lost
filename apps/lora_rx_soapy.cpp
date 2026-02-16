@@ -2,9 +2,8 @@
 //
 // lora_rx_soapy: Hardware LoRa receiver using SoapySDR + B210.
 //
-// Usage: lora_rx_soapy [--cbor] [freq_hz] [gain_db] [sample_rate]
-//
-// Defaults: 869.525 MHz, 30 dB gain, 250 kS/s (= 4 * BW for os_factor=4)
+// All LoRa PHY parameters (SF, BW, CR, sync word, preamble length) are
+// configurable via CLI options. Defaults match MeshCore uk/narrow config.
 //
 // Graph: SoapySource -> BurstDetector -> SymbolDemodulator -> ConsoleSink
 
@@ -28,6 +27,69 @@
 
 namespace {
 volatile std::sig_atomic_t g_running = 1;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+struct RxConfig {
+    double   freq{869'525'000.0};
+    double   gain{30.0};
+    float    rate{250'000.f};
+    uint32_t bw{62500};
+    uint8_t  sf{8};
+    uint16_t sync{0x12};
+    uint16_t preamble{8};
+    bool     cbor{false};
+};
+
+void print_usage(const char* prog) {
+    std::fprintf(stderr,
+        "Usage: %s [options]\n\n"
+        "Options:\n"
+        "  --freq <hz>       RX center frequency (default: 869525000)\n"
+        "  --gain <db>       RX gain in dB (default: 30)\n"
+        "  --rate <sps>      Sample rate in S/s (default: 250000)\n"
+        "  --bw <hz>         LoRa bandwidth (default: 62500)\n"
+        "  --sf <7-12>       Spreading factor (default: 8)\n"
+        "  --sync <hex>      Sync word, e.g. 0x12 (default: 0x12)\n"
+        "  --preamble <n>    Preamble length in symbols (default: 8)\n"
+        "  --cbor            Output decoded frames as CBOR\n"
+        "  -h, --help        Show this help\n\n"
+        "Example:\n"
+        "  %s --sf 12 --bw 125000 --rate 500000\n"
+        "  %s --cbor | python3 -c \\\n"
+        "    'import cbor2,sys; [print(cbor2.load(sys.stdin.buffer)) for _ in iter(int,1)]'\n",
+        prog, prog, prog);
+}
+
+bool parse_args(int argc, char** argv, RxConfig& cfg) {
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return false;
+        } else if (arg == "--freq" && i + 1 < argc) {
+            cfg.freq = std::stod(argv[++i]);
+        } else if (arg == "--gain" && i + 1 < argc) {
+            cfg.gain = std::stod(argv[++i]);
+        } else if (arg == "--rate" && i + 1 < argc) {
+            cfg.rate = std::stof(argv[++i]);
+        } else if (arg == "--bw" && i + 1 < argc) {
+            cfg.bw = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--sf" && i + 1 < argc) {
+            cfg.sf = static_cast<uint8_t>(std::stoul(argv[++i]));
+        } else if (arg == "--sync" && i + 1 < argc) {
+            cfg.sync = static_cast<uint16_t>(std::stoul(argv[++i], nullptr, 0));
+        } else if (arg == "--preamble" && i + 1 < argc) {
+            cfg.preamble = static_cast<uint16_t>(std::stoul(argv[++i]));
+        } else if (arg == "--cbor") {
+            cfg.cbor = true;
+        } else {
+            std::fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 void signal_handler(int /*sig*/) {
@@ -35,61 +97,24 @@ void signal_handler(int /*sig*/) {
 }
 
 int main(int argc, char** argv) {
-    // --- Parse CLI arguments ---
-    constexpr double   kDefaultFreq   = 869'525'000.0;  // MeshCore uk/narrow: 869.525 MHz
-    constexpr double   kDefaultGain   = 30.0;
-    constexpr float    kDefaultRate   = 250'000.f;       // 4 * 62500 BW
-    constexpr uint32_t kDefaultBW     = 62500;
-    constexpr uint8_t  kDefaultSF     = 8;
-    constexpr uint16_t kDefaultSync   = 0x12;
-
-    // Check for flags
-    bool cbor_mode = false;
-    for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "--cbor") == 0) {
-            cbor_mode = true;
-            // Shift remaining args down
-            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
-            argc--;
-            i--;
-        }
+    RxConfig cfg;
+    if (!parse_args(argc, argv, cfg)) {
+        return 1;
     }
 
-    if (argc > 1 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
-        std::printf("Usage: %s [--cbor] [freq_hz] [gain_db] [sample_rate]\n", argv[0]);
-        std::printf("\n");
-        std::printf("  --cbor       Output decoded frames as CBOR (for Python: cbor2)\n");
-        std::printf("  freq_hz      RX center frequency (default: %.0f)\n", kDefaultFreq);
-        std::printf("  gain_db      RX gain in dB (default: %.0f)\n", kDefaultGain);
-        std::printf("  sample_rate  Sample rate in S/s (default: %.0f)\n",
-                    static_cast<double>(kDefaultRate));
-        std::printf("\n");
-        std::printf("LoRa config: SF=%u BW=%u CR=4/8 sync=0x%02X (MeshCore defaults)\n",
-                    kDefaultSF, kDefaultBW, kDefaultSync);
-        std::printf("\n");
-        std::printf("Example:\n");
-        std::printf("  %s 869525000 40\n", argv[0]);
-        std::printf("  %s --cbor | python3 -c \\\n", argv[0]);
-        std::printf("    'import cbor2,sys; [print(cbor2.load(sys.stdin.buffer)) for _ in iter(int,1)]'\n");
-        return 0;
-    }
-
-    const double freq       = argc >= 2 ? std::stod(argv[1]) : kDefaultFreq;
-    const double gain       = argc >= 3 ? std::stod(argv[2]) : kDefaultGain;
-    const float  samp_rate  = argc >= 4 ? std::stof(argv[3]) : kDefaultRate;
-    const auto   os_factor  = static_cast<uint8_t>(samp_rate / kDefaultBW);
+    const auto os_factor = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
     // Print banner to stderr so it doesn't interfere with CBOR output
-    auto* banner_fp = cbor_mode ? stderr : stdout;
+    auto* banner_fp = cfg.cbor ? stderr : stdout;
     std::fprintf(banner_fp, "=== LoRa RX (SoapySDR via C bridge) ===\n");
-    std::fprintf(banner_fp, "  Frequency:   %.6f MHz\n", freq / 1e6);
-    std::fprintf(banner_fp, "  Gain:        %.0f dB\n", gain);
-    std::fprintf(banner_fp, "  Sample rate: %.0f S/s\n", static_cast<double>(samp_rate));
+    std::fprintf(banner_fp, "  Frequency:   %.6f MHz\n", cfg.freq / 1e6);
+    std::fprintf(banner_fp, "  Gain:        %.0f dB\n", cfg.gain);
+    std::fprintf(banner_fp, "  Sample rate: %.0f S/s\n", static_cast<double>(cfg.rate));
     std::fprintf(banner_fp, "  OS factor:   %u\n", os_factor);
-    std::fprintf(banner_fp, "  SF=%u  BW=%u  CR=4/8  sync=0x%02X\n",
-                 kDefaultSF, kDefaultBW, kDefaultSync);
+    std::fprintf(banner_fp, "  SF=%u  BW=%u  sync=0x%02X  preamble=%u\n",
+                 cfg.sf, cfg.bw, cfg.sync, cfg.preamble);
     std::fprintf(banner_fp, "  Device:      uhd (B210), clock_source=external\n");
-    std::fprintf(banner_fp, "  Output:      %s\n", cbor_mode ? "CBOR" : "text");
+    std::fprintf(banner_fp, "  Output:      %s\n", cfg.cbor ? "CBOR" : "text");
     std::fprintf(banner_fp, "\n");
 
     // --- Install signal handler for clean shutdown ---
@@ -103,27 +128,27 @@ int main(int argc, char** argv) {
         {"device", std::string("uhd")},
         {"clock_source", std::string("external")},
         {"device_args", std::string("recv_frame_size=16360")},
-        {"sample_rate", samp_rate},
-        {"center_freq", freq},
-        {"gain", gain},
+        {"sample_rate", cfg.rate},
+        {"center_freq", cfg.freq},
+        {"gain", cfg.gain},
     });
 
     auto& detector = graph.emplaceBlock<gr::lora::BurstDetector>({
-        {"center_freq", static_cast<uint32_t>(freq)},
-        {"bandwidth", kDefaultBW},
-        {"sf", static_cast<uint8_t>(kDefaultSF)},
-        {"sync_word", kDefaultSync},
+        {"center_freq", static_cast<uint32_t>(cfg.freq)},
+        {"bandwidth", cfg.bw},
+        {"sf", cfg.sf},
+        {"sync_word", cfg.sync},
         {"os_factor", os_factor},
-        {"preamble_len", static_cast<uint16_t>(8)},
+        {"preamble_len", cfg.preamble},
     });
 
     auto& demod = graph.emplaceBlock<gr::lora::SymbolDemodulator>({
-        {"sf", static_cast<uint8_t>(kDefaultSF)},
-        {"bandwidth", kDefaultBW},
+        {"sf", cfg.sf},
+        {"bandwidth", cfg.bw},
     });
 
     auto& sink = graph.emplaceBlock<gr::lora::ConsoleSink>({
-        {"output_mode", std::string(cbor_mode ? "cbor" : "text")},
+        {"output_mode", std::string(cfg.cbor ? "cbor" : "text")},
     });
 
     // Connect: source -> detector -> demod -> sink
