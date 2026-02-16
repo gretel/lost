@@ -38,3 +38,7 @@ target_compile_definitions(qa_lora_loopback PRIVATE
 add_ut_test(qa_lora_burst)
 target_compile_definitions(qa_lora_burst PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
+
+add_ut_test(qa_lora_channelizer)
+target_compile_definitions(qa_lora_channelizer PRIVATE
+    TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
