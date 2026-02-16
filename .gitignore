@@ -1,0 +1,26 @@
+# Build output
+build/
+build_*/
+cmake-build-*/
+out/
+compile_commands.json
+
+# CMake generated
+**/CMakeFiles/
+**/CMakeCache.txt
+**cmake_install.cmake
+**/CTestTestfile.cmake
+Makefile
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vs/
+.vscode/
+.idea/
+.cache/
+*.swp
+*~
+CMakeLists.txt.user
