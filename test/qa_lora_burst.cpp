@@ -454,7 +454,107 @@ const boost::ut::suite<"Robustness tests"> robustness_tests = [] {
 };
 
 // ============================================================================
-// Test 5: Error paths — wrong sync word, CRC failure, low SNR
+// Test 5: Downchirp (inverted IQ) frame handling
+//
+// Design: downchirp detection uses input conjugation (conj(downchirp) = upchirp).
+// The RX conjugates the IQ stream, making downchirp frames appear as normal
+// upchirp frames to BurstDetector + SymbolDemodulator. This is the standard
+// SDR approach (two parallel chains: normal + conjugated).
+//
+// These tests verify: (a) inverted_iq TX produces conjugated output,
+// (b) conjugating the input before the RX chain decodes downchirp frames.
+// ============================================================================
+
+const boost::ut::suite<"Downchirp detection"> downchirp_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "Downchirp frame decoded via input conjugation"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o', ' ',
+                                        'M', 'e', 's', 'h', 'C', 'o', 'r', 'e'};
+        auto iq = generate_frame_iq(payload, SF, CR, OS_FACTOR,
+                                    SYNC_WORD, PREAMBLE_LEN,
+                                    true, SPS * 5,
+                                    2,       // ldro_mode auto
+                                    BW,
+                                    true);   // inverted_iq
+
+        // Conjugate the IQ to convert downchirp frame → upchirp frame
+        for (auto& s : iq) s = std::conj(s);
+
+        auto result = run_decode(iq);
+
+        std::printf("Downchirp (conj): %zu bytes output (expected 14)\n",
+                    result.samples.size());
+
+        expect(ge(result.samples.size(), 14UZ))
+            << "Downchirp output size: " << result.samples.size();
+        if (result.samples.size() >= 14) {
+            std::string decoded(result.samples.begin(), result.samples.begin() + 14);
+            expect(eq(decoded, std::string("Hello MeshCore")))
+                << "Downchirp decode: \"" << decoded << "\"";
+        }
+
+        // Verify CRC valid
+        bool found_crc = false;
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                expect(pmtv::cast<bool>(it->second)) << "CRC should be valid";
+                found_crc = true;
+            }
+        }
+        expect(found_crc) << "Should have crc_valid tag";
+    };
+
+    "Downchirp frame with CFO decoded via input conjugation"_test = [] {
+        float sample_rate = static_cast<float>(BW * OS_FACTOR);
+        std::vector<uint8_t> payload = {'T', 'e', 's', 't', '!'};
+        auto iq = generate_frame_iq(payload, SF, CR, OS_FACTOR,
+                                    SYNC_WORD, PREAMBLE_LEN,
+                                    true, SPS * 5,
+                                    2, BW, true);  // inverted_iq
+        apply_cfo(iq, 500.f, sample_rate);
+
+        // Conjugate to convert downchirp → upchirp
+        for (auto& s : iq) s = std::conj(s);
+
+        auto result = run_decode(iq);
+
+        expect(ge(result.samples.size(), 5UZ))
+            << "Downchirp+CFO output size: " << result.samples.size();
+        if (result.samples.size() >= 5) {
+            std::string decoded(result.samples.begin(), result.samples.begin() + 5);
+            expect(eq(decoded, std::string("Test!")))
+                << "Downchirp+CFO decode: \"" << decoded << "\"";
+        }
+    };
+
+    "Inverted IQ is exact conjugate of normal IQ"_test = [] {
+        // Verify the mathematical identity: inverted_iq output = conj(normal output)
+        std::vector<uint8_t> payload = {'H', 'i'};
+        auto iq_normal   = generate_frame_iq(payload, SF, CR, OS_FACTOR,
+                                             SYNC_WORD, PREAMBLE_LEN,
+                                             true, 0, 2, BW, false);
+        auto iq_inverted = generate_frame_iq(payload, SF, CR, OS_FACTOR,
+                                             SYNC_WORD, PREAMBLE_LEN,
+                                             true, 0, 2, BW, true);
+
+        expect(eq(iq_normal.size(), iq_inverted.size()));
+
+        float max_err = 0.f;
+        for (std::size_t i = 0; i < iq_normal.size(); i++) {
+            auto conj_normal = std::conj(iq_normal[i]);
+            float err = std::max(std::abs(conj_normal.real() - iq_inverted[i].real()),
+                                 std::abs(conj_normal.imag() - iq_inverted[i].imag()));
+            if (err > max_err) max_err = err;
+        }
+        expect(lt(max_err, 1e-5f))
+            << "conj(normal) should equal inverted: max err " << max_err;
+    };
+};
+
+// ============================================================================
+// Test 6: Error paths — wrong sync word, CRC failure, low SNR
 // ============================================================================
 
 const boost::ut::suite<"Error path tests"> error_path_tests = [] {

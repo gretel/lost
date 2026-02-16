@@ -103,47 +103,68 @@ namespace gr::lora {
 
 /// Modulate symbols into baseband IQ chirps with preamble, sync word,
 /// and SFD.
+///
+/// When inverted_iq is true, the chirp roles are swapped: preamble uses
+/// downchirps, SFD uses upchirps, and payload uses downchirps. This
+/// produces a "downchirp frame" (inverted IQ) as used by some LoRa
+/// devices and network configurations.
 [[nodiscard]] inline std::vector<std::complex<float>> modulate_frame(
         std::span<const uint32_t> symbols,
         uint8_t sf, uint8_t os_factor,
         uint16_t sync_word, uint16_t preamble_len,
-        uint32_t zero_pad = 0) {
+        uint32_t zero_pad = 0,
+        bool inverted_iq = false) {
     const uint32_t sps = (1u << sf) * os_factor;
     std::vector<std::complex<float>> iq;
 
     std::vector<std::complex<float>> upchirp(sps), downchirp(sps);
     build_ref_chirps(upchirp.data(), downchirp.data(), sf, os_factor);
 
+    // For inverted IQ: swap chirp roles. Preamble/payload use downchirps,
+    // SFD uses upchirps. Equivalently, conjugate the entire output.
+    // We implement by swapping the reference chirps used for each role.
+    auto& preamble_chirp = inverted_iq ? downchirp : upchirp;
+    auto& sfd_chirp      = inverted_iq ? upchirp   : downchirp;
+
     auto sw0 = static_cast<uint16_t>(((sync_word & 0xF0) >> 4) << 3);
     auto sw1 = static_cast<uint16_t>((sync_word & 0x0F) << 3);
 
     // Preamble
     for (uint16_t i = 0; i < preamble_len; i++) {
-        iq.insert(iq.end(), upchirp.begin(), upchirp.end());
+        iq.insert(iq.end(), preamble_chirp.begin(), preamble_chirp.end());
     }
 
-    // 2 sync word upchirps
+    // 2 sync word chirps (same direction as preamble, with symbol offset)
     {
         std::vector<std::complex<float>> sw_chirp(sps);
         build_upchirp(sw_chirp.data(), sw0, sf, os_factor);
+        if (inverted_iq) {
+            for (auto& s : sw_chirp) s = std::conj(s);
+        }
         iq.insert(iq.end(), sw_chirp.begin(), sw_chirp.end());
     }
     {
         std::vector<std::complex<float>> sw_chirp(sps);
         build_upchirp(sw_chirp.data(), sw1, sf, os_factor);
+        if (inverted_iq) {
+            for (auto& s : sw_chirp) s = std::conj(s);
+        }
         iq.insert(iq.end(), sw_chirp.begin(), sw_chirp.end());
     }
 
-    // SFD: 2 full downchirps + quarter downchirp
-    iq.insert(iq.end(), downchirp.begin(), downchirp.end());
-    iq.insert(iq.end(), downchirp.begin(), downchirp.end());
-    iq.insert(iq.end(), downchirp.begin(),
-              downchirp.begin() + static_cast<std::ptrdiff_t>(sps / 4));
+    // SFD: 2 full chirps + quarter chirp (opposite direction from preamble)
+    iq.insert(iq.end(), sfd_chirp.begin(), sfd_chirp.end());
+    iq.insert(iq.end(), sfd_chirp.begin(), sfd_chirp.end());
+    iq.insert(iq.end(), sfd_chirp.begin(),
+              sfd_chirp.begin() + static_cast<std::ptrdiff_t>(sps / 4));
 
-    // Payload chirps
+    // Payload chirps (same direction as preamble)
     for (auto sym : symbols) {
         std::vector<std::complex<float>> chirp(sps);
         build_upchirp(chirp.data(), sym, sf, os_factor);
+        if (inverted_iq) {
+            for (auto& s : chirp) s = std::conj(s);
+        }
         iq.insert(iq.end(), chirp.begin(), chirp.end());
     }
 
@@ -172,6 +193,9 @@ namespace gr::lora {
 ///   0 = off, 1 = on, 2 = auto (enabled when symbol duration > 16ms).
 /// Auto mode requires bandwidth to be set; when ldro_mode != 2, bandwidth
 /// is unused.
+///
+/// When inverted_iq is true, the frame uses downchirp preamble (inverted
+/// IQ). The RX side detects this by correlating with conjugated input.
 [[nodiscard]] inline std::vector<std::complex<float>> generate_frame_iq(
         std::span<const uint8_t> payload,
         uint8_t sf, uint8_t cr, uint8_t os_factor,
@@ -179,7 +203,8 @@ namespace gr::lora {
         bool has_crc = true,
         uint32_t zero_pad = 0,
         uint8_t ldro_mode = 2,
-        uint32_t bandwidth = 62500) {
+        uint32_t bandwidth = 62500,
+        bool inverted_iq = false) {
     bool ldro = (ldro_mode == 2) ? needs_ldro(sf, bandwidth) : (ldro_mode != 0);
 
     auto whitened    = whiten(payload);
@@ -191,7 +216,7 @@ namespace gr::lora {
     auto interleaved = interleave_frame(encoded, sf, cr, ldro);
     auto gray_mapped = gray_demap(interleaved, sf);
     return modulate_frame(gray_mapped, sf, os_factor,
-                          sync_word, preamble_len, zero_pad);
+                          sync_word, preamble_len, zero_pad, inverted_iq);
 }
 
 }  // namespace gr::lora

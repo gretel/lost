@@ -473,4 +473,58 @@ const boost::ut::suite<"TX generate_frame_iq"> tx_generate_tests = [] {
     };
 };
 
+// ============================================================================
+// Inverted IQ (downchirp) TX tests
+// ============================================================================
+
+const boost::ut::suite<"TX inverted IQ"> tx_inverted_iq_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "inverted IQ is conjugate of normal IQ"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'i'};
+        auto iq_normal   = generate_frame_iq(payload, SF, CR, OS_FACTOR,
+                                             SYNC_WORD, PREAMBLE_LEN,
+                                             HAS_CRC, 0, 2, 62500, false);
+        auto iq_inverted = generate_frame_iq(payload, SF, CR, OS_FACTOR,
+                                             SYNC_WORD, PREAMBLE_LEN,
+                                             HAS_CRC, 0, 2, 62500, true);
+
+        expect(eq(iq_normal.size(), iq_inverted.size()))
+            << "Normal and inverted IQ should be same size";
+
+        // Inverted IQ should be the conjugate of normal IQ
+        float max_err = 0.f;
+        for (std::size_t i = 0; i < iq_normal.size(); i++) {
+            auto conj_normal = std::conj(iq_normal[i]);
+            float err = std::max(std::abs(conj_normal.real() - iq_inverted[i].real()),
+                                 std::abs(conj_normal.imag() - iq_inverted[i].imag()));
+            if (err > max_err) max_err = err;
+        }
+        expect(lt(max_err, 1e-5f))
+            << "Inverted IQ should equal conj(normal): max err " << max_err;
+    };
+
+    "inverted IQ preamble starts with downchirps"_test = [] {
+        std::vector<uint8_t> payload = {'X'};
+        auto iq = generate_frame_iq(payload, SF, CR, OS_FACTOR,
+                                    SYNC_WORD, PREAMBLE_LEN,
+                                    HAS_CRC, 0, 2, 62500, true);
+
+        // Build reference downchirp
+        std::vector<std::complex<float>> upchirp(SPS), downchirp(SPS);
+        build_ref_chirps(upchirp.data(), downchirp.data(), SF, OS_FACTOR);
+
+        // First SPS samples should be a downchirp (first preamble symbol)
+        float max_err = 0.f;
+        for (std::size_t i = 0; i < SPS && i < iq.size(); i++) {
+            float err = std::max(std::abs(iq[i].real() - downchirp[i].real()),
+                                 std::abs(iq[i].imag() - downchirp[i].imag()));
+            if (err > max_err) max_err = err;
+        }
+        expect(lt(max_err, 1e-5f))
+            << "Inverted preamble should start with downchirps: max err " << max_err;
+    };
+};
+
 int main() { /* boost::ut auto-runs all suites */ }
