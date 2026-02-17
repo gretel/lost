@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: ISC
-#include <boost/ut.hpp>
+#include "test_helpers.hpp"
 
 #include <array>
-#include <cstdint>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <string>
-#include <vector>
 
 #include <gnuradio-4.0/lora/algorithm/tables.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
@@ -15,61 +10,7 @@
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
 
-// ---- Test vector loading helpers ----
-
-namespace {
-
-const std::filesystem::path& testVectorDir() {
-    static const std::filesystem::path dir = TEST_VECTORS_DIR;
-    return dir;
-}
-
-std::vector<uint8_t> load_u8(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
-std::vector<uint32_t> load_u32(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    std::vector<uint32_t> data;
-    uint32_t val;
-    while (f.read(reinterpret_cast<char*>(&val), sizeof(val))) {
-        data.push_back(val);
-    }
-    return data;
-}
-
-std::string load_text(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
-/// Compare two vectors element-by-element using boost::ut assertions.
-template<typename T>
-void expect_vectors_equal(const std::vector<T>& actual, const std::vector<T>& expected,
-                          const std::string& label) {
-    using namespace boost::ut;
-    expect(eq(actual.size(), expected.size())) << label << " size mismatch";
-    for (std::size_t i = 0; i < actual.size() && i < expected.size(); i++) {
-        expect(eq(actual[i], expected[i])) << label << " mismatch at index " << i;
-    }
-}
-
-// Default LoRa test configuration (SF8/BW62.5k/CR4/8, must match test_vectors/config.json)
-constexpr uint8_t  SF          = 8;
-[[maybe_unused]] constexpr uint32_t BW          = 62500;
-constexpr uint8_t  CR          = 4;
-constexpr bool     HAS_CRC     = true;
-[[maybe_unused]] constexpr uint8_t  SYNC_WORD   = 0x12;
-[[maybe_unused]] constexpr uint8_t  PREAMBLE    = 8;
-
-} // namespace
+using namespace gr::lora::test;
 
 // ---- Tests ----
 

@@ -22,6 +22,7 @@ import cbor2
 
 sys.path.insert(0, os.path.dirname(__file__))
 import cbor_stream
+import lora_common
 import lora_mon
 import lora_decode_lorawan
 
@@ -270,6 +271,33 @@ class TestLoRaWANParser(unittest.TestCase):
         eui = 0x0807060504030201
         result = lora_decode_lorawan.format_eui(eui)
         self.assertEqual(result, "08:07:06:05:04:03:02:01")
+
+
+# ---- lora_common shared module ----
+
+
+class TestLoraCommon(unittest.TestCase):
+    def test_format_hex_basic(self):
+        self.assertEqual(lora_common.format_hex(b"\xab\xcd"), "AB CD")
+
+    def test_format_hex_truncation(self):
+        result = lora_common.format_hex(b"\x01\x02\x03", max_bytes=2)
+        self.assertIn("...(3B)", result)
+
+    def test_format_hex_sep(self):
+        self.assertEqual(lora_common.format_hex(b"\xab\xcd", sep=""), "ABCD")
+
+    def test_format_ascii_basic(self):
+        self.assertEqual(lora_common.format_ascii(b"Hi\x00"), "Hi.")
+
+    def test_sync_word_name(self):
+        self.assertEqual(lora_common.sync_word_name(0x12), "MeshCore/Reticulum")
+        self.assertEqual(lora_common.sync_word_name(0x2B), "Meshtastic")
+        self.assertEqual(lora_common.sync_word_name(0xFF), "0xFF")
+
+    def test_constants(self):
+        self.assertEqual(len(lora_common.ROUTE_NAMES), 4)
+        self.assertEqual(len(lora_common.PAYLOAD_NAMES), 16)
 
 
 # ---- CBOR Sequence stream reader ----

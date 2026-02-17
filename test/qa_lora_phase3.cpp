@@ -1,67 +1,14 @@
 // SPDX-License-Identifier: ISC
-#include <boost/ut.hpp>
+#include "test_helpers.hpp"
 
 #include <cmath>
-#include <complex>
-#include <cstdint>
-#include <filesystem>
-#include <fstream>
-#include <string>
-#include <vector>
 
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
 
-// ---- Test vector loading helpers ----
-
-namespace {
-
-const std::filesystem::path& testVectorDir() {
-    static const std::filesystem::path dir = TEST_VECTORS_DIR;
-    return dir;
-}
-
-std::vector<uint8_t> load_u8(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
-std::vector<uint32_t> load_u32(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    std::vector<uint32_t> data;
-    uint32_t val;
-    while (f.read(reinterpret_cast<char*>(&val), sizeof(val))) {
-        data.push_back(val);
-    }
-    return data;
-}
-
-std::vector<std::complex<float>> load_cf32(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    std::vector<std::complex<float>> data;
-    float re, im;
-    while (f.read(reinterpret_cast<char*>(&re), sizeof(re)) &&
-           f.read(reinterpret_cast<char*>(&im), sizeof(im))) {
-        data.emplace_back(re, im);
-    }
-    return data;
-}
-
-// Default LoRa test configuration (SF8/BW62.5k/CR4/8, must match test_vectors/config.json)
-constexpr uint8_t  SF           = 8;
-constexpr uint32_t N            = 1u << SF; // 256
-constexpr uint8_t  OS_FACTOR    = 4;
-constexpr uint16_t PREAMBLE_LEN = 8;
-
-} // namespace
+using namespace gr::lora::test;
 
 // ---- Interleaver Algorithm Tests (no scheduler) ----
 

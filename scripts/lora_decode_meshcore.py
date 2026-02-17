@@ -23,35 +23,11 @@ import argparse
 import json
 import struct
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-import cbor2
-
 from cbor_stream import read_cbor_seq
-
-# ---- MeshCore v1 constants ----
-
-ROUTE_NAMES = ["T_FLOOD", "FLOOD", "DIRECT", "T_DIRECT"]
-
-PAYLOAD_NAMES = [
-    "REQ",
-    "RESP",
-    "TXT",
-    "ACK",
-    "ADVERT",
-    "GRP_TXT",
-    "GRP_DATA",
-    "ANON_REQ",
-    "PATH",
-    "TRACE",
-    "MULTI",
-    "CTRL",
-    "rsv12",
-    "rsv13",
-    "rsv14",
-    "RAW_CUSTOM",
-]
+from lora_common import PAYLOAD_NAMES, ROUTE_NAMES, format_hex
 
 NODE_TYPE_NAMES = {
     0x01: "chat",
@@ -166,10 +142,6 @@ def _parse_advert(pkt: MeshCorePacket) -> None:
 
     if (pkt.advert_flags & 0x80) and off < len(appdata):
         pkt.advert_name = appdata[off:].decode("utf-8", errors="replace")
-
-
-def format_hex(data: bytes, sep: str = " ") -> str:
-    return sep.join(f"{b:02X}" for b in data)
 
 
 def format_path(path: bytes) -> str:

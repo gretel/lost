@@ -7,17 +7,11 @@
 ///   3. Multi-frame: two back-to-back frames
 ///   4. Robustness: AWGN + CFO
 
-#include <boost/ut.hpp>
+#include "test_helpers.hpp"
 
 #include <cmath>
-#include <complex>
-#include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <numbers>
 #include <random>
-#include <string>
-#include <vector>
 
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
@@ -27,46 +21,9 @@
 #include <gnuradio-4.0/lora/SymbolDemodulator.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
-// ---- Test vector loading helpers ----
+using namespace gr::lora::test;
 
 namespace {
-
-const std::filesystem::path& testVectorDir() {
-    static const std::filesystem::path dir = TEST_VECTORS_DIR;
-    return dir;
-}
-
-std::vector<std::complex<float>> load_cf32(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    std::vector<std::complex<float>> data;
-    float re, im;
-    while (f.read(reinterpret_cast<char*>(&re), sizeof(re)) &&
-           f.read(reinterpret_cast<char*>(&im), sizeof(im))) {
-        data.emplace_back(re, im);
-    }
-    return data;
-}
-
-std::string load_text(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
-// Default LoRa test configuration (SF8/BW62.5k/CR4/8)
-constexpr uint8_t  SF           = 8;
-constexpr uint32_t N            = 1u << SF;  // 256
-constexpr uint8_t  CR           = 4;
-constexpr uint32_t BW           = 62500;
-constexpr uint8_t  OS_FACTOR    = 4;
-constexpr uint16_t SYNC_WORD    = 0x12;
-constexpr uint16_t PREAMBLE_LEN = 8;
-constexpr uint32_t CENTER_FREQ  = 866000000;
-[[maybe_unused]] constexpr bool HAS_CRC = true;
-constexpr uint32_t SPS          = N * OS_FACTOR;  // 1024
 
 // --- Test frame generation using shared TX chain ---
 

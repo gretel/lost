@@ -31,19 +31,10 @@ import json
 import sys
 from typing import Any
 
-import cbor2
-
 from cbor_stream import read_cbor_seq
+from lora_common import format_ascii, format_hex
 
 MESHTASTIC_SYNC_WORD = 0x2B
-
-
-def format_hex(data: bytes, sep: str = " ") -> str:
-    return sep.join(f"{b:02X}" for b in data)
-
-
-def format_ascii(data: bytes) -> str:
-    return "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in data)
 
 
 def print_text(msg: dict[str, Any]) -> None:

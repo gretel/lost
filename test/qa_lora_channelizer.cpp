@@ -6,16 +6,12 @@
 ///   2. FreqXlatingDecimator: frequency shift, decimation, FIR filtering
 ///   3. Integration: wideband LoRa frame → channelizer → BurstDetector → SymbolDemodulator
 
-#include <boost/ut.hpp>
+#include "test_helpers.hpp"
 
 #include <cmath>
-#include <complex>
-#include <cstdint>
 #include <numbers>
 #include <numeric>
 #include <random>
-#include <string>
-#include <vector>
 
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
@@ -27,18 +23,9 @@
 #include <gnuradio-4.0/lora/algorithm/firdes.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
-namespace {
+using namespace gr::lora::test;
 
-// Default LoRa test configuration (SF8/BW62.5k/CR4/8)
-constexpr uint8_t  SF           = 8;
-constexpr uint32_t N            = 1u << SF;  // 256
-constexpr uint8_t  CR           = 4;
-constexpr uint32_t BW           = 62500;
-constexpr uint8_t  OS_FACTOR    = 4;
-constexpr uint16_t SYNC_WORD    = 0x12;
-constexpr uint16_t PREAMBLE_LEN = 8;
-constexpr uint32_t CENTER_FREQ  = 866000000;
-constexpr uint32_t SPS          = N * OS_FACTOR;  // 1024
+namespace {
 
 /// Compute the frequency response magnitude of a real FIR filter at a given
 /// normalized frequency (0 = DC, 0.5 = Nyquist).

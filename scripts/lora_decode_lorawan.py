@@ -40,9 +40,8 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-import cbor2
-
 from cbor_stream import read_cbor_seq
+from lora_common import format_hex
 
 LORAWAN_SYNC_WORD = 0x34
 
@@ -207,10 +206,6 @@ def parse_lorawan(data: bytes) -> LoRaWANFrame | None:
 
 
 # ---- Output formatters ----
-
-
-def format_hex(data: bytes, sep: str = " ") -> str:
-    return sep.join(f"{b:02X}" for b in data)
 
 
 def format_dev_addr(addr: int) -> str:

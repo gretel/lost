@@ -21,26 +21,8 @@ import json
 import sys
 from typing import Any
 
-import cbor2
-
 from cbor_stream import read_cbor_seq
-
-
-def format_hex(data: bytes, sep: str = " ") -> str:
-    """Format bytes as uppercase hex."""
-    return sep.join(f"{b:02X}" for b in data)
-
-
-def format_ascii(data: bytes) -> str:
-    """Format bytes as printable ASCII (replace non-printable with '.')."""
-    return "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in data)
-
-
-def sync_word_name(sw: int) -> str:
-    """Map sync word to a human-readable protocol name."""
-    return {0x12: "MeshCore/Reticulum", 0x2B: "Meshtastic", 0x34: "LoRaWAN"}.get(
-        sw, f"0x{sw:02X}"
-    )
+from lora_common import format_ascii, format_hex, sync_word_name
 
 
 def decode_frame(msg: dict[str, Any]) -> dict[str, Any]:

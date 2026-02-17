@@ -3,13 +3,7 @@
 /// each RX stage (GrayMapping, Deinterleave, HammingDec, Header, Dewhitening,
 /// CRC) and a full RX pipeline.
 
-#include <boost/ut.hpp>
-
-#include <cstdint>
-#include <filesystem>
-#include <fstream>
-#include <string>
-#include <vector>
+#include "test_helpers.hpp"
 
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
@@ -17,48 +11,7 @@
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
 #include <gnuradio-4.0/lora/algorithm/tables.hpp>
 
-// ---- Test vector loading helpers ----
-
-namespace {
-
-const std::filesystem::path& testVectorDir() {
-    static const std::filesystem::path dir = TEST_VECTORS_DIR;
-    return dir;
-}
-
-std::vector<uint8_t> load_u8(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
-std::vector<uint32_t> load_u32(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    std::vector<uint32_t> data;
-    uint32_t val;
-    while (f.read(reinterpret_cast<char*>(&val), sizeof(val))) {
-        data.push_back(val);
-    }
-    return data;
-}
-
-std::string load_text(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
-// Default LoRa test configuration (SF8/BW62.5k/CR4/8, must match test_vectors/config.json)
-constexpr uint8_t  SF           = 8;
-constexpr uint32_t N            = 1u << SF; // 256
-constexpr uint8_t  CR           = 4;
-constexpr bool     HAS_CRC      = true;
-
-} // namespace
+using namespace gr::lora::test;
 
 // ---- RX Algorithm-Level Tests ----
 // Walk backwards through the TX test vectors to verify RX algorithms.

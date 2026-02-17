@@ -2,41 +2,14 @@
 /// TX->RX loopback test (algorithm-level only).
 /// Per-stage TX tests are in qa_lora_tx.cpp.
 
-#include <boost/ut.hpp>
+#include "test_helpers.hpp"
 
 #include <chrono>
-#include <cstdint>
 #include <cstdio>
-#include <filesystem>
-#include <fstream>
-#include <string>
-#include <vector>
 
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
-// ---- Test vector loading helpers ----
-
-namespace {
-
-const std::filesystem::path& testVectorDir() {
-    static const std::filesystem::path dir = TEST_VECTORS_DIR;
-    return dir;
-}
-
-std::string load_text(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
-// Default LoRa test configuration (SF8/BW62.5k/CR4/8, must match test_vectors/config.json)
-constexpr uint8_t  SF           = 8;
-constexpr uint32_t N            = 1u << SF; // 256
-constexpr uint8_t  CR           = 4;
-constexpr bool     HAS_CRC      = true;
-
-} // namespace
+using namespace gr::lora::test;
 
 // ============================================================================
 // Full Loopback: GR4 TX -> GR4 RX (algorithm-level)

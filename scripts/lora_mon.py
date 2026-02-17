@@ -32,29 +32,14 @@ from typing import Any, TextIO
 import cbor2
 
 from cbor_stream import read_cbor_seq
-
-# ---- Protocol constants ----
-
-ROUTE_NAMES = ["T_FLOOD", "FLOOD", "DIRECT", "T_DIRECT"]
-PAYLOAD_NAMES = [
-    "REQ",
-    "RESP",
-    "TXT",
-    "ACK",
-    "ADVERT",
-    "GRP_TXT",
-    "GRP_DATA",
-    "ANON_REQ",
-    "PATH",
-    "TRACE",
-    "MULTI",
-    "CTRL",
-    "rsv12",
-    "rsv13",
-    "rsv14",
-    "RAW_CUSTOM",
-]
-SYNC_NAMES = {0x12: "MeshCore", 0x2B: "Meshtastic", 0x34: "LoRaWAN"}
+from lora_common import (
+    PAYLOAD_NAMES,
+    ROUTE_NAMES,
+    SYNC_NAMES,
+    format_ascii,
+    format_hex,
+    sync_word_name,
+)
 
 DEFAULT_PORT = 5556
 
@@ -106,23 +91,6 @@ def parse_meshcore_summary(data: bytes) -> str:
                     advert_info = f' "{name}"'
 
     return f"v{version} {route_name}/{ptype_name}{transport_str} path={path_len}{advert_info}"
-
-
-# ---- Formatting helpers ----
-
-
-def format_hex(data: bytes, max_bytes: int = 24) -> str:
-    preview = " ".join(f"{b:02X}" for b in data[:max_bytes])
-    if len(data) > max_bytes:
-        preview += f" ...({len(data)}B)"
-    return preview
-
-
-def format_ascii(data: bytes, max_bytes: int = 40) -> str:
-    s = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in data[:max_bytes])
-    if len(data) > max_bytes:
-        s += "..."
-    return s
 
 
 # ---- Stats ----
@@ -191,12 +159,12 @@ def format_frame(msg: dict[str, Any], *, compact: bool = False) -> str:
         if mc:
             lines.append(f"     {mc}")
 
-    hex_line = format_hex(payload)
+    hex_line = format_hex(payload, max_bytes=24)
     if hex_line:
         lines.append(f"     {hex_line}")
 
     if any(0x20 <= b < 0x7F for b in payload[:40]):
-        lines.append(f"     {format_ascii(payload)}")
+        lines.append(f"     {format_ascii(payload, max_bytes=40)}")
 
     if compact:
         return lines[0]
@@ -211,7 +179,7 @@ def format_frame_json(msg: dict[str, Any]) -> str:
         "seq": msg.get("seq", 0),
         "ts": msg.get("ts", ""),
         "payload_len": len(payload),
-        "payload_hex": "".join(f"{b:02X}" for b in payload),
+        "payload_hex": format_hex(payload, sep=""),
         "crc_valid": msg.get("crc_valid", False),
         "sf": phy.get("sf", 0),
         "bw": phy.get("bw", 0),

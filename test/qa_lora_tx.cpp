@@ -2,78 +2,14 @@
 /// TX chain unit tests: each tx_chain.hpp function tested in isolation
 /// against GR3 test vectors, plus generate_frame_iq() integration tests.
 
-#include <boost/ut.hpp>
+#include "test_helpers.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <complex>
-#include <cstdint>
-#include <filesystem>
-#include <fstream>
-#include <string>
-#include <vector>
 
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
-// ---- Test vector loading helpers ----
-
-namespace {
-
-const std::filesystem::path& testVectorDir() {
-    static const std::filesystem::path dir = TEST_VECTORS_DIR;
-    return dir;
-}
-
-std::vector<uint8_t> load_u8(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
-std::vector<uint32_t> load_u32(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    std::vector<uint32_t> data;
-    uint32_t val;
-    while (f.read(reinterpret_cast<char*>(&val), sizeof(val))) {
-        data.push_back(val);
-    }
-    return data;
-}
-
-std::vector<std::complex<float>> load_cf32(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    std::vector<std::complex<float>> data;
-    float re, im;
-    while (f.read(reinterpret_cast<char*>(&re), sizeof(re)) &&
-           f.read(reinterpret_cast<char*>(&im), sizeof(im))) {
-        data.emplace_back(re, im);
-    }
-    return data;
-}
-
-std::string load_text(const std::string& filename) {
-    auto path = testVectorDir() / filename;
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("Cannot open test vector: " + path.string());
-    return {std::istreambuf_iterator<char>(f), {}};
-}
-
-// Default LoRa test configuration (SF8/BW62.5k/CR4/8, must match test_vectors/config.json)
-constexpr uint8_t  SF           = 8;
-constexpr uint32_t N            = 1u << SF;  // 256
-constexpr uint8_t  CR           = 4;
-constexpr uint8_t  OS_FACTOR    = 4;
-constexpr uint16_t SYNC_WORD    = 0x12;
-constexpr uint16_t PREAMBLE_LEN = 8;
-constexpr bool     HAS_CRC      = true;
-constexpr uint32_t SPS          = N * OS_FACTOR;  // 1024
-
-}  // namespace
+using namespace gr::lora::test;
 
 // ============================================================================
 // Per-stage TX tests vs GR3 test vectors
