@@ -2,6 +2,7 @@
 #ifndef GNURADIO_LORA_CRC_HPP
 #define GNURADIO_LORA_CRC_HPP
 
+#include <array>
 #include <cstdint>
 #include <span>
 

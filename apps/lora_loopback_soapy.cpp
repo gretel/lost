@@ -315,6 +315,10 @@ bool parse_args(int argc, char** argv, LoopbackConfig& cfg) {
             cfg.preamble_len = static_cast<uint16_t>(std::stoul(argv[++i]));
         } else if (arg == "--payload" && i + 1 < argc) {
             cfg.payload = argv[++i];
+        } else {
+            std::fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return false;
         }
     }
     return true;

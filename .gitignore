@@ -17,6 +17,9 @@ Makefile
 __pycache__/
 *.pyc
 
+# Scratch
+tmp/
+
 # macOS
 .DS_Store
 ._*

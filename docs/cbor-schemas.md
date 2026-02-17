@@ -89,16 +89,15 @@ Emitted by `lora_tx_soapy --stdin` after processing each request.
 ## Python Examples
 
 ```python
-import cbor2
-
 # Read concatenated CBOR from stdin (pipe mode)
+# Uses cbor_stream.read_cbor_seq() which handles pipe streaming correctly.
+# Do NOT use cbor2.CBORDecoder(stream).decode() — it blocks on pipes.
 import sys
-decoder = cbor2.CBORDecoder(sys.stdin.buffer)
-while True:
-    try:
-        frame = decoder.decode()
-    except cbor2.CBORDecodeEOF:
-        break
+from cbor_stream import read_cbor_seq
+
+for frame in read_cbor_seq(sys.stdin.buffer):
+    if not isinstance(frame, dict) or frame.get("type") != "lora_frame":
+        continue
     print(f"#{frame['seq']} {frame['payload_len']}B CRC={'OK' if frame['crc_valid'] else 'FAIL'}")
 ```
 
