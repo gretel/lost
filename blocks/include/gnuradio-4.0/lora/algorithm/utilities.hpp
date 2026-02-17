@@ -13,9 +13,7 @@
 
 namespace gr::lora {
 
-inline constexpr uint8_t MIN_SF = 5;
-inline constexpr uint8_t MAX_SF = 12;
-inline constexpr int     LDRO_MAX_DURATION_MS = 16;
+inline constexpr int LDRO_MAX_DURATION_MS = 16;
 
 using LLR = double;  ///< Log-Likelihood Ratio type
 

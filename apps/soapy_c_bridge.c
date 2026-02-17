@@ -10,7 +10,6 @@
 #include <SoapySDR/Errors.h>
 #include <SoapySDR/Formats.h>
 #include <SoapySDR/Types.h>
-#include <SoapySDR/Version.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>

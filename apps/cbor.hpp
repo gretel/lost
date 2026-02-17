@@ -9,7 +9,6 @@
 #define GR4_LORA_CBOR_HPP
 
 #include <cstdint>
-#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -218,35 +217,11 @@ inline Map decode_map(std::span<const uint8_t> data) {
 
 // Typed accessors — return the value or throw if missing/wrong type.
 
-inline uint64_t get_uint(const Map& m, const std::string& key) {
-    auto it = m.find(key);
-    if (it == m.end()) throw DecodeError("missing key: " + key);
-    auto* v = std::get_if<uint64_t>(&it->second);
-    if (!v) throw DecodeError("key '" + key + "' is not uint");
-    return *v;
-}
-
-inline std::string get_text(const Map& m, const std::string& key) {
-    auto it = m.find(key);
-    if (it == m.end()) throw DecodeError("missing key: " + key);
-    auto* v = std::get_if<std::string>(&it->second);
-    if (!v) throw DecodeError("key '" + key + "' is not text");
-    return *v;
-}
-
 inline std::vector<uint8_t> get_bytes(const Map& m, const std::string& key) {
     auto it = m.find(key);
     if (it == m.end()) throw DecodeError("missing key: " + key);
     auto* v = std::get_if<std::vector<uint8_t>>(&it->second);
     if (!v) throw DecodeError("key '" + key + "' is not bytes");
-    return *v;
-}
-
-inline bool get_bool(const Map& m, const std::string& key) {
-    auto it = m.find(key);
-    if (it == m.end()) throw DecodeError("missing key: " + key);
-    auto* v = std::get_if<bool>(&it->second);
-    if (!v) throw DecodeError("key '" + key + "' is not bool");
     return *v;
 }
 

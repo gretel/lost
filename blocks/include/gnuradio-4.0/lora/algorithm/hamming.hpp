@@ -6,7 +6,6 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <numeric>
 #include <span>
 #include <vector>
 
@@ -85,9 +84,7 @@ namespace gr::lora {
         break;
     }
     case 2: {
-        // Detect-only (no correction): syndrome bits computed but not used for correction
-        // bool s0 = cw[0] ^ cw[1] ^ cw[2] ^ cw[4];
-        // bool s1 = cw[1] ^ cw[2] ^ cw[3] ^ cw[5];
+        // Detect-only (no correction)
         break;
     }
     case 1: {

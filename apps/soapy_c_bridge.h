@@ -43,14 +43,9 @@ typedef struct {
 } soapy_bridge_config_t;
 
 // Error codes returned by read/write (match SoapySDR error codes)
-#define SOAPY_BRIDGE_OK          0
 #define SOAPY_BRIDGE_ERR_TIMEOUT (-1)
-#define SOAPY_BRIDGE_ERR_STREAM  (-2)
-#define SOAPY_BRIDGE_ERR_CORRUPT (-3)
 #define SOAPY_BRIDGE_ERR_OVERFLOW (-4)
-#define SOAPY_BRIDGE_ERR_UNDERFLOW (-7)
 #define SOAPY_BRIDGE_ERR_NULL    (-100)
-#define SOAPY_BRIDGE_ERR_MAKE    (-101)
 
 // Probe for available devices. Returns 1 if a device matching the driver
 // is found, 0 otherwise. Useful for checking USB connection before create().

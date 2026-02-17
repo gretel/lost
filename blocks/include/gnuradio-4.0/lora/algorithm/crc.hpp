@@ -115,9 +115,8 @@ struct HeaderInfo {
     uint8_t cr          = n2 >> 1;
     bool    has_crc     = n2 & 1;
 
-    uint8_t received_chk = static_cast<uint8_t>((n3 << 4) | n4);  // n3 is just c4 (1 bit)
     // n3 contains only c4 as the low bit: header_chk = ((in[3] & 1) << 4) + in[4]
-    received_chk = static_cast<uint8_t>(((n3 & 1) << 4) | n4);
+    uint8_t received_chk = static_cast<uint8_t>(((n3 & 1) << 4) | n4);
     uint8_t computed_chk = header_checksum(n0, n1, n2);
 
     return {payload_len, cr, has_crc, received_chk == computed_chk};
