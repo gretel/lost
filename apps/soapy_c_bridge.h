@@ -42,18 +42,15 @@ typedef struct {
     int         direction;       // SOAPY_BRIDGE_RX or SOAPY_BRIDGE_TX
 } soapy_bridge_config_t;
 
-// Error codes
-#define SOAPY_BRIDGE_OK         0
-#define SOAPY_BRIDGE_ERR_MAKE  -1
-#define SOAPY_BRIDGE_ERR_RATE  -2
-#define SOAPY_BRIDGE_ERR_FREQ  -3
-#define SOAPY_BRIDGE_ERR_GAIN  -4
-#define SOAPY_BRIDGE_ERR_STREAM -5
-#define SOAPY_BRIDGE_ERR_ACTIVATE -6
-#define SOAPY_BRIDGE_ERR_NULL  -7
-#define SOAPY_BRIDGE_ERR_CLOCK -8
-#define SOAPY_BRIDGE_ERR_BW    -9
-#define SOAPY_BRIDGE_ERR_WRITE -10
+// Error codes returned by read/write (match SoapySDR error codes)
+#define SOAPY_BRIDGE_OK          0
+#define SOAPY_BRIDGE_ERR_TIMEOUT (-1)
+#define SOAPY_BRIDGE_ERR_STREAM  (-2)
+#define SOAPY_BRIDGE_ERR_CORRUPT (-3)
+#define SOAPY_BRIDGE_ERR_OVERFLOW (-4)
+#define SOAPY_BRIDGE_ERR_UNDERFLOW (-7)
+#define SOAPY_BRIDGE_ERR_NULL    (-100)
+#define SOAPY_BRIDGE_ERR_MAKE    (-101)
 
 // Probe for available devices. Returns 1 if a device matching the driver
 // is found, 0 otherwise. Useful for checking USB connection before create().
@@ -70,6 +67,8 @@ const char* soapy_bridge_last_error(void);
 // Read IQ samples (RX). buf = interleaved complex float (IQIQIQ...).
 // buf must hold at least num_samples * 2 * sizeof(float) bytes.
 // Returns number of samples read (>= 0) or negative error code.
+// SOAPY_BRIDGE_ERR_TIMEOUT (-1) is returned on timeout (not an error).
+// SOAPY_BRIDGE_ERR_OVERFLOW (-4) indicates dropped samples (logged).
 int soapy_bridge_read(soapy_bridge_t* bridge, float* buf,
                       size_t num_samples, long timeout_us);
 
@@ -86,6 +85,12 @@ double soapy_bridge_get_center_freq(const soapy_bridge_t* bridge);
 double soapy_bridge_get_gain(const soapy_bridge_t* bridge);
 
 // Deactivate stream and destroy device. Safe to call with NULL.
+// If skip_unmake is nonzero, only deactivate/close the stream but do NOT
+// call SoapySDRDevice_unmake(). Use this at process exit to avoid the
+// known UHD segfault in device teardown on macOS.
+void soapy_bridge_destroy_ex(soapy_bridge_t* bridge, int skip_unmake);
+
+// Convenience: full destroy (deactivate + unmake + free).
 void soapy_bridge_destroy(soapy_bridge_t* bridge);
 
 #ifdef __cplusplus

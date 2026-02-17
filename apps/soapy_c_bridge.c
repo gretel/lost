@@ -7,6 +7,7 @@
 #include "soapy_c_bridge.h"
 
 #include <SoapySDR/Device.h>
+#include <SoapySDR/Errors.h>
 #include <SoapySDR/Formats.h>
 #include <SoapySDR/Types.h>
 #include <SoapySDR/Version.h>
@@ -26,6 +27,11 @@ struct soapy_bridge {
     double          sample_rate;
     double          center_freq;
     double          gain_db;
+    // Runtime stats
+    uint64_t        overflow_count;
+    uint64_t        underflow_count;
+    uint64_t        read_count;
+    uint64_t        write_count;
 };
 
 // Thread-local error message buffer
@@ -112,7 +118,9 @@ soapy_bridge_t* soapy_bridge_create(const soapy_bridge_config_t* config) {
     // Set clock source
     if (config->clock_source && config->clock_source[0]) {
         fprintf(stderr, "[soapy_bridge] Setting clock_source=%s\n", config->clock_source);
-        SoapySDRDevice_setClockSource(dev, config->clock_source);
+        if (SoapySDRDevice_setClockSource(dev, config->clock_source) != 0) {
+            fprintf(stderr, "[soapy_bridge] WARNING: setClockSource failed (non-fatal)\n");
+        }
     }
 
     // Set sample rate
@@ -120,7 +128,7 @@ soapy_bridge_t* soapy_bridge_create(const soapy_bridge_config_t* config) {
         fprintf(stderr, "[soapy_bridge] Setting sample_rate=%.0f\n", config->sample_rate);
         if (SoapySDRDevice_setSampleRate(dev, soapy_dir, config->channel,
                                           config->sample_rate) != 0) {
-            set_error("setSampleRate failed");
+            set_error("setSampleRate failed: %s", SoapySDRDevice_lastError());
             SoapySDRDevice_unmake(dev);
             return NULL;
         }
@@ -133,7 +141,7 @@ soapy_bridge_t* soapy_bridge_create(const soapy_bridge_config_t* config) {
         fprintf(stderr, "[soapy_bridge] Setting center_freq=%.0f\n", config->center_freq);
         if (SoapySDRDevice_setFrequency(dev, soapy_dir, config->channel,
                                           config->center_freq, &tuneArgs) != 0) {
-            set_error("setFrequency failed");
+            set_error("setFrequency failed: %s", SoapySDRDevice_lastError());
             SoapySDRDevice_unmake(dev);
             return NULL;
         }
@@ -144,7 +152,7 @@ soapy_bridge_t* soapy_bridge_create(const soapy_bridge_config_t* config) {
         fprintf(stderr, "[soapy_bridge] Setting gain=%.1f dB\n", config->gain_db);
         if (SoapySDRDevice_setGain(dev, soapy_dir, config->channel,
                                     config->gain_db) != 0) {
-            set_error("setGain failed");
+            set_error("setGain failed: %s", SoapySDRDevice_lastError());
             SoapySDRDevice_unmake(dev);
             return NULL;
         }
@@ -155,7 +163,7 @@ soapy_bridge_t* soapy_bridge_create(const soapy_bridge_config_t* config) {
         fprintf(stderr, "[soapy_bridge] Setting bandwidth=%.0f\n", config->bandwidth);
         if (SoapySDRDevice_setBandwidth(dev, soapy_dir, config->channel,
                                          config->bandwidth) != 0) {
-            set_error("setBandwidth failed");
+            set_error("setBandwidth failed: %s", SoapySDRDevice_lastError());
             SoapySDRDevice_unmake(dev);
             return NULL;
         }
@@ -166,7 +174,7 @@ soapy_bridge_t* soapy_bridge_create(const soapy_bridge_config_t* config) {
         fprintf(stderr, "[soapy_bridge] Setting antenna=%s\n", config->antenna);
         if (SoapySDRDevice_setAntenna(dev, soapy_dir, config->channel,
                                        config->antenna) != 0) {
-            set_error("setAntenna failed");
+            set_error("setAntenna failed: %s", SoapySDRDevice_lastError());
             SoapySDRDevice_unmake(dev);
             return NULL;
         }
@@ -186,7 +194,7 @@ soapy_bridge_t* soapy_bridge_create(const soapy_bridge_config_t* config) {
 
     // Activate stream
     if (SoapySDRDevice_activateStream(dev, stream, 0, 0, 0) != 0) {
-        set_error("activateStream failed");
+        set_error("activateStream failed: %s", SoapySDRDevice_lastError());
         SoapySDRDevice_closeStream(dev, stream);
         SoapySDRDevice_unmake(dev);
         return NULL;
@@ -235,9 +243,23 @@ int soapy_bridge_read(soapy_bridge_t* bridge, float* buf,
     int flags = 0;
     long long time_ns = 0;
 
-    return SoapySDRDevice_readStream(bridge->device, bridge->stream,
-                                      buffs, num_samples,
-                                      &flags, &time_ns, timeout_us);
+    int ret = SoapySDRDevice_readStream(bridge->device, bridge->stream,
+                                        buffs, num_samples,
+                                        &flags, &time_ns, timeout_us);
+
+    if (ret == SOAPY_SDR_OVERFLOW) {
+        bridge->overflow_count++;
+        // Log first occurrence and then every 100th
+        if (bridge->overflow_count == 1 ||
+            bridge->overflow_count % 100 == 0) {
+            fprintf(stderr, "[soapy_bridge] RX overflow #%llu (samples dropped)\n",
+                    (unsigned long long)bridge->overflow_count);
+        }
+    } else if (ret > 0) {
+        bridge->read_count += (uint64_t)ret;
+    }
+
+    return ret;
 }
 
 int soapy_bridge_write(soapy_bridge_t* bridge, const float* buf,
@@ -251,9 +273,22 @@ int soapy_bridge_write(soapy_bridge_t* bridge, const float* buf,
     int flags = end_burst ? SOAPY_SDR_END_BURST : 0;
     long long time_ns = 0;
 
-    return SoapySDRDevice_writeStream(bridge->device, bridge->stream,
-                                       buffs, num_samples,
-                                       &flags, time_ns, timeout_us);
+    int ret = SoapySDRDevice_writeStream(bridge->device, bridge->stream,
+                                         buffs, num_samples,
+                                         &flags, time_ns, timeout_us);
+
+    if (ret == SOAPY_SDR_UNDERFLOW) {
+        bridge->underflow_count++;
+        if (bridge->underflow_count == 1 ||
+            bridge->underflow_count % 100 == 0) {
+            fprintf(stderr, "[soapy_bridge] TX underflow #%llu\n",
+                    (unsigned long long)bridge->underflow_count);
+        }
+    } else if (ret > 0) {
+        bridge->write_count += (uint64_t)ret;
+    }
+
+    return ret;
 }
 
 double soapy_bridge_get_sample_rate(const soapy_bridge_t* bridge) {
@@ -268,18 +303,37 @@ double soapy_bridge_get_gain(const soapy_bridge_t* bridge) {
     return bridge ? bridge->gain_db : 0.0;
 }
 
-void soapy_bridge_destroy(soapy_bridge_t* bridge) {
+void soapy_bridge_destroy_ex(soapy_bridge_t* bridge, int skip_unmake) {
     if (!bridge) return;
+
+    // Log stats
+    if (bridge->overflow_count > 0) {
+        fprintf(stderr, "[soapy_bridge] Total RX overflows: %llu\n",
+                (unsigned long long)bridge->overflow_count);
+    }
+    if (bridge->underflow_count > 0) {
+        fprintf(stderr, "[soapy_bridge] Total TX underflows: %llu\n",
+                (unsigned long long)bridge->underflow_count);
+    }
 
     if (bridge->stream && bridge->device) {
         fprintf(stderr, "[soapy_bridge] Deactivating stream...\n");
         SoapySDRDevice_deactivateStream(bridge->device, bridge->stream, 0, 0);
         SoapySDRDevice_closeStream(bridge->device, bridge->stream);
+        bridge->stream = NULL;
     }
-    if (bridge->device) {
+    if (!skip_unmake && bridge->device) {
         fprintf(stderr, "[soapy_bridge] Unmaking device...\n");
         SoapySDRDevice_unmake(bridge->device);
+        bridge->device = NULL;
+        fprintf(stderr, "[soapy_bridge] Destroyed\n");
+    } else if (bridge->device) {
+        fprintf(stderr, "[soapy_bridge] Skipping device unmake (process exit)\n");
+        bridge->device = NULL;
     }
     free(bridge);
-    fprintf(stderr, "[soapy_bridge] Destroyed\n");
+}
+
+void soapy_bridge_destroy(soapy_bridge_t* bridge) {
+    soapy_bridge_destroy_ex(bridge, 0);
 }

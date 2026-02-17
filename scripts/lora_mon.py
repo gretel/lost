@@ -3,13 +3,14 @@
 """
 lora_mon.py -- LoRa streaming monitor.
 
-Reads concatenated CBOR objects from lora_rx_soapy --cbor on stdin
-and prints a formatted line per frame with running statistics to stderr.
+Listens for CBOR-encoded LoRa frames on a UDP socket and prints formatted
+text with running statistics.
 
 Usage:
-    build/apps/lora_rx_soapy --cbor | python3 scripts/lora_mon.py
-    build/apps/lora_rx_soapy --cbor | python3 scripts/lora_mon.py --json
-    build/apps/lora_rx_soapy --cbor | python3 scripts/lora_mon.py --stats-every 10
+    build/apps/lora_rx_soapy --udp 127.0.0.1:5556 &
+    python3 scripts/lora_mon.py
+    python3 scripts/lora_mon.py --port 5556 --json
+    python3 scripts/lora_mon.py --compact --stats
 
 Dependencies: cbor2
 """
@@ -17,11 +18,10 @@ Dependencies: cbor2
 from __future__ import annotations
 
 import argparse
-import io
 import json
+import socket
 import struct
 import sys
-import time
 from dataclasses import dataclass, field
 from typing import Any, TextIO
 
@@ -49,6 +49,8 @@ PAYLOAD_NAMES = [
     "RAW_CUSTOM",
 ]
 SYNC_NAMES = {0x12: "MeshCore", 0x2B: "Meshtastic", 0x34: "LoRaWAN"}
+
+DEFAULT_PORT = 5556
 
 
 # ---- MeshCore v1 one-line summary ----
@@ -220,52 +222,72 @@ def format_frame_json(msg: dict[str, Any]) -> str:
     return json.dumps(out)
 
 
-# ---- Main loop ----
+# ---- UDP receiver ----
 
 
-def process_stream(
-    inp: io.RawIOBase,
+def receive_udp(
+    port: int,
     out: TextIO,
     *,
     use_json: bool = False,
     compact: bool = False,
     stats_every: int = 0,
+    bind_addr: str = "0.0.0.0",
 ) -> Stats:
-    """Read CBOR from inp, write formatted frames to out. Return stats."""
-    decoder = cbor2.CBORDecoder(inp)
+    """Listen on UDP port, decode CBOR datagrams, write text to out."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((bind_addr, port))
+    print(f"Listening on UDP {bind_addr}:{port} ...", file=sys.stderr)
+    sys.stderr.flush()
+
     stats = Stats()
+    try:
+        while True:
+            data, _addr = sock.recvfrom(65536)
+            try:
+                msg = cbor2.loads(data)
+            except Exception:
+                continue
 
-    while True:
-        try:
-            msg = decoder.decode()
-        except cbor2.CBORDecodeEOF:
-            break
-        except Exception as exc:
-            print(f"Warning: CBOR decode error: {exc}", file=sys.stderr)
-            break
+            if not isinstance(msg, dict) or msg.get("type") != "lora_frame":
+                continue
 
-        if not isinstance(msg, dict) or msg.get("type") != "lora_frame":
-            continue
+            stats.update(msg)
 
-        stats.update(msg)
+            if use_json:
+                out.write(format_frame_json(msg))
+            else:
+                out.write(format_frame(msg, compact=compact))
+            out.write("\n")
+            out.flush()
 
-        if use_json:
-            out.write(format_frame_json(msg))
-        else:
-            out.write(format_frame(msg, compact=compact))
-        out.write("\n")
-        out.flush()
+            if stats_every > 0 and stats.total % stats_every == 0:
+                print(f"--- {stats.summary()}", file=sys.stderr)
+                sys.stderr.flush()
 
-        if stats_every > 0 and stats.total % stats_every == 0:
-            print(f"--- {stats.summary()}", file=sys.stderr)
-            sys.stderr.flush()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.close()
 
     return stats
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="LoRa streaming monitor — reads CBOR frames, prints text"
+        description="LoRa streaming monitor -- listens for CBOR frames on UDP"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"UDP port to listen on (default: {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--bind",
+        default="0.0.0.0",
+        help="bind address (default: 0.0.0.0)",
     )
     parser.add_argument(
         "--json",
@@ -291,18 +313,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    try:
-        stats = process_stream(
-            sys.stdin.buffer,
-            sys.stdout,
-            use_json=args.json,
-            compact=args.compact,
-            stats_every=args.stats_every,
-        )
-    except KeyboardInterrupt:
-        stats = Stats()  # partial stats lost, that's fine
-    except BrokenPipeError:
-        stats = Stats()
+    stats = receive_udp(
+        args.port,
+        sys.stdout,
+        use_json=args.json,
+        compact=args.compact,
+        stats_every=args.stats_every,
+        bind_addr=args.bind,
+    )
 
     if args.stats and stats.total > 0:
         print(f"--- {stats.summary()}", file=sys.stderr)

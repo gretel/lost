@@ -1,14 +1,14 @@
 # CBOR Schemas
 
 All inter-process communication uses [CBOR (RFC 8949)](https://cbor.io/) —
-a compact binary encoding of JSON-like data. Messages are concatenated
-(self-delimiting); a reader decodes one top-level map at a time.
+a compact binary encoding of JSON-like data.
 
-Python: `pip install cbor2`, then `cbor2.CBORDecoder(stream)`.
+Python: `pip install cbor2`, then `cbor2.loads(datagram)`.
 
-## RX Output (`lora_rx_soapy --output cbor`)
+## RX Output (`lora_rx_soapy --udp host:port`)
 
-Emitted by `FrameSink` after each decoded frame.
+Each decoded frame is sent as a single CBOR-encoded UDP datagram by
+`FrameSink`. Text output goes to stdout simultaneously.
 
 ```
 {
@@ -69,23 +69,14 @@ Emitted by `lora_tx_soapy --stdin` after processing each request.
 ## Python Example
 
 ```python
-import sys
+import socket
 import cbor2
 
-# Send a TX request
-req = {
-    "type": "lora_tx",
-    "payload": b"Hello MeshCore",
-    "freq": 869525000,
-    "sf": 8,
-    "bw": 62500,
-    "cr": 4,
-}
-sys.stdout.buffer.write(cbor2.dumps(req))
-sys.stdout.buffer.flush()
-
-# Read the ack
-ack = cbor2.CBORDecoder(sys.stdin.buffer).decode()
-assert ack["type"] == "lora_tx_ack"
-assert ack["ok"] is True
+# Receive frames via UDP
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("0.0.0.0", 5556))
+while True:
+    data, addr = sock.recvfrom(65536)
+    frame = cbor2.loads(data)
+    print(f"#{frame['seq']} {frame['payload_len']}B CRC={'OK' if frame['crc_valid'] else 'FAIL'}")
 ```

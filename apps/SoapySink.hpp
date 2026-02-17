@@ -40,16 +40,12 @@ device (e.g. USRP B210) for transmission.
     gr::Annotated<double, "bandwidth", gr::Unit<"Hz">, gr::Visible> bandwidth{0.0};
     gr::Annotated<uint32_t, "max chunk size"> max_chunk_size{8192U};
 
-    // If true, send SOAPY_SDR_END_BURST on the last write before stop().
-    // This tells the hardware to stop transmitting after the burst.
-    gr::Annotated<bool, "end burst on stop"> end_burst_on_stop{true};
-
     GR_MAKE_REFLECTABLE(SoapySink, in, device, clock_source, device_args,
                         sample_rate, center_freq, gain, bandwidth,
-                        max_chunk_size, end_burst_on_stop);
+                        max_chunk_size);
 
     soapy_bridge_t* _bridge{nullptr};
-    bool            _burst_ended{false};
+    bool _skip_unmake{false};  ///< Set true before stop() to skip SoapySDRDevice_unmake
 
     void start() {
         soapy_bridge_config_t config{};
@@ -72,7 +68,6 @@ device (e.g. USRP B210) for transmission.
                 std::format("SoapySink: failed to create device: {}",
                             soapy_bridge_last_error()));
         }
-        _burst_ended = false;
 
         std::fprintf(stderr, "[SoapySink] Device ready: rate=%.0f freq=%.0f gain=%.1f\n",
                      soapy_bridge_get_sample_rate(_bridge),
@@ -82,12 +77,12 @@ device (e.g. USRP B210) for transmission.
 
     void stop() {
         if (_bridge) {
-            soapy_bridge_destroy(_bridge);
+            soapy_bridge_destroy_ex(_bridge, _skip_unmake ? 1 : 0);
             _bridge = nullptr;
         }
     }
 
-    [[nodiscard]] constexpr work::Status processBulk(InputSpanLike auto& input) {
+    [[nodiscard]] work::Status processBulk(InputSpanLike auto& input) {
         if (!_bridge) {
             if (!input.consume(input.size())) {
                 throw gr::exception("SoapySink: could not consume input");
@@ -99,7 +94,8 @@ device (e.g. USRP B210) for transmission.
             static_cast<std::size_t>(max_chunk_size.value), input.size());
 
         if (nSamples == 0) {
-            return work::Status::DONE;
+            // No data available — keep running, don't signal DONE.
+            return work::Status::OK;
         }
 
         auto* buf = reinterpret_cast<const float*>(input.data());
@@ -114,7 +110,8 @@ device (e.g. USRP B210) for transmission.
             return work::Status::OK;
         }
 
-        // Write error or timeout — consume nothing, keep trying
+        // Timeout or underflow: consume nothing, retry on next work() call.
+        // Underflow is logged by the bridge.
         return work::Status::OK;
     }
 };

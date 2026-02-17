@@ -6,26 +6,32 @@
 // the {pay_len, cr, crc_valid} tag that marks the start of each frame.
 // Accumulates pay_len bytes, then outputs the frame.
 //
-// Two output modes:
-//   "text"  — human-readable hex dump + ASCII (default)
-//   "cbor"  — concatenated CBOR objects on stdout (for Python: cbor2.CBORDecoder)
+// Output:
+//   - Text (hex dump + ASCII) always goes to stdout.
+//   - When udp_dest is set ("host:port"), each frame is also sent as a
+//     CBOR-encoded UDP datagram for machine consumers (lora_mon.py, etc).
 //
 // Protocol-agnostic: the CBOR schema contains only PHY-layer metadata.
 // A "protocol" hint is derived from the sync word:
-//   0x12 → "meshcore_or_reticulum"
-//   0x2B → "meshtastic"
-//   0x34 → "lorawan"
-//   else → "unknown"
+//   0x12 -> "meshcore_or_reticulum"
+//   0x2B -> "meshtastic"
+//   0x34 -> "lorawan"
+//   else -> "unknown"
 
 #ifndef GR4_LORA_FRAME_SINK_HPP
 #define GR4_LORA_FRAME_SINK_HPP
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <format>
 #include <span>
 #include <string>
@@ -51,12 +57,12 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     gr::PortIn<uint8_t> in;
 
     // Configuration
-    std::string output_mode{"text"};   ///< "text" or "cbor"
+    std::string udp_dest{};            ///< "host:port" for UDP CBOR output (empty=off)
     uint16_t    sync_word{0x12};       ///< for protocol hint in output
     uint8_t     phy_sf{8};             ///< SF for metadata
     uint32_t    phy_bw{62500};         ///< BW for metadata
 
-    GR_MAKE_REFLECTABLE(FrameSink, in, output_mode, sync_word, phy_sf, phy_bw);
+    GR_MAKE_REFLECTABLE(FrameSink, in, udp_dest, sync_word, phy_sf, phy_bw);
 
     // Frame accumulation state
     uint32_t             _pay_len{0};
@@ -67,11 +73,52 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     std::vector<uint8_t> _frame;
     uint32_t             _frame_count{0};
 
+    // UDP socket state
+    int                  _udp_fd{-1};
+    struct sockaddr_in   _udp_addr{};
+
+    void start() {
+        if (udp_dest.empty()) return;
+
+        auto colon = udp_dest.rfind(':');
+        if (colon == std::string::npos || colon == 0) {
+            std::fprintf(stderr, "ERROR: invalid udp_dest '%s' (expected host:port)\n",
+                         udp_dest.c_str());
+            return;
+        }
+        auto host = udp_dest.substr(0, colon);
+        auto port = static_cast<uint16_t>(
+            std::stoul(udp_dest.substr(colon + 1)));
+
+        _udp_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (_udp_fd < 0) {
+            std::fprintf(stderr, "ERROR: socket(): %s\n", std::strerror(errno));
+            return;
+        }
+        std::memset(&_udp_addr, 0, sizeof(_udp_addr));
+        _udp_addr.sin_family = AF_INET;
+        _udp_addr.sin_port   = htons(port);
+        if (::inet_pton(AF_INET, host.c_str(), &_udp_addr.sin_addr) != 1) {
+            std::fprintf(stderr, "ERROR: invalid UDP host '%s'\n", host.c_str());
+            ::close(_udp_fd);
+            _udp_fd = -1;
+            return;
+        }
+        std::fprintf(stderr, "  UDP output: %s:%u\n", host.c_str(), port);
+    }
+
+    void stop() {
+        if (_udp_fd >= 0) {
+            ::close(_udp_fd);
+            _udp_fd = -1;
+        }
+    }
+
     [[nodiscard]] static std::string timestamp_now() {
-        auto now   = std::chrono::system_clock::now();
-        auto t     = std::chrono::system_clock::to_time_t(now);
-        auto ms    = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         now.time_since_epoch()) % 1000;
+        auto now = std::chrono::system_clock::now();
+        auto t   = std::chrono::system_clock::to_time_t(now);
+        auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       now.time_since_epoch()) % 1000;
         std::tm tm{};
         localtime_r(&t, &tm);
         return std::format("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}.{:03d}Z",
@@ -100,7 +147,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     }
 
     void printFrameText() {
-        _frame_count++;
         auto ts = timestamp_now();
         auto frame_span = std::span<const uint8_t>(_frame.data(), _pay_len);
 
@@ -119,22 +165,20 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         std::fflush(stdout);
     }
 
-    void emitFrameCbor() {
-        _frame_count++;
+    void sendFrameUdp() {
+        if (_udp_fd < 0) return;
+
         auto ts = timestamp_now();
         auto protocol = guess_protocol(sync_word);
-
-        uint64_t n_pairs = 10;  // type,ts,seq,phy,payload,payload_len,crc_valid,cr,protocol,is_downchirp
 
         std::vector<uint8_t> buf;
         buf.reserve(128 + _pay_len);
 
-        cbor::encode_map_begin(buf, n_pairs);
+        cbor::encode_map_begin(buf, 10);
         cbor::kv_text(buf, "type", "lora_frame");
         cbor::kv_text(buf, "ts", ts);
         cbor::kv_uint(buf, "seq", _frame_count);
 
-        // PHY sub-map
         cbor::encode_text(buf, "phy");
         cbor::encode_map_begin(buf, 5);
         cbor::kv_uint(buf, "sf", phy_sf);
@@ -152,16 +196,15 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         cbor::kv_text(buf, "protocol", protocol);
         cbor::kv_bool(buf, "is_downchirp", _is_downchirp);
 
-        // Atomic write
-        ::write(STDOUT_FILENO, buf.data(), buf.size());
+        ::sendto(_udp_fd, buf.data(), buf.size(), 0,
+                 reinterpret_cast<const struct sockaddr*>(&_udp_addr),
+                 sizeof(_udp_addr));
     }
 
     void emitFrame() {
-        if (output_mode == "cbor") {
-            emitFrameCbor();
-        } else {
-            printFrameText();
-        }
+        _frame_count++;
+        printFrameText();
+        sendFrameUdp();
     }
 
     void processOne(uint8_t byte) noexcept {

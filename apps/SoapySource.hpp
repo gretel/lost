@@ -43,6 +43,7 @@ Produces complex float IQ samples from a SoapySDR-compatible device (e.g. USRP B
                         sample_rate, center_freq, gain, bandwidth, max_chunk_size);
 
     soapy_bridge_t* _bridge{nullptr};
+    bool _skip_unmake{false};  ///< Set true before stop() to skip SoapySDRDevice_unmake
 
     void start() {
         soapy_bridge_config_t config{};
@@ -55,6 +56,7 @@ Produces complex float IQ samples from a SoapySDR-compatible device (e.g. USRP B
         config.bandwidth    = bandwidth.value;
         config.channel      = 0;
         config.antenna      = nullptr;
+        config.direction    = SOAPY_BRIDGE_RX;
 
         _bridge = soapy_bridge_create(&config);
         if (!_bridge) {
@@ -72,12 +74,12 @@ Produces complex float IQ samples from a SoapySDR-compatible device (e.g. USRP B
 
     void stop() {
         if (_bridge) {
-            soapy_bridge_destroy(_bridge);
+            soapy_bridge_destroy_ex(_bridge, _skip_unmake ? 1 : 0);
             _bridge = nullptr;
         }
     }
 
-    constexpr work::Status processBulk(OutputSpanLike auto& output) {
+    work::Status processBulk(OutputSpanLike auto& output) {
         if (!_bridge) {
             output.publish(0UZ);
             return work::Status::ERROR;
@@ -96,7 +98,9 @@ Produces complex float IQ samples from a SoapySDR-compatible device (e.g. USRP B
             return work::Status::OK;
         }
 
-        // Timeout or error — publish nothing, keep running
+        // Timeout (-1) or overflow (-4): publish nothing, keep running.
+        // Overflow is logged by the bridge. Other errors are also non-fatal
+        // for a streaming source — we just retry on the next work() call.
         output.publish(0UZ);
         return work::Status::OK;
     }
