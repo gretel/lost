@@ -32,7 +32,7 @@ typedef struct {
     const char* driver;          // e.g. "uhd"
     const char* clock_source;    // e.g. "external" or NULL for default
     double      sample_rate;     // e.g. 250000.0
-    double      center_freq;     // e.g. 869525000.0
+    double      center_freq;     // e.g. 869618000.0
     double      gain_db;         // e.g. 40.0
     double      bandwidth;       // 0 = auto
     size_t      channel;         // channel index (usually 0)

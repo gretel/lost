@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: ISC
 """
-Tests for lora_mon.py.
+Tests for lora_mon.py and lora_decode_lorawan.py.
 
 Run:  python3 -m unittest scripts/test_lora_mon.py -v
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import socket
@@ -20,7 +21,9 @@ from typing import Any
 import cbor2
 
 sys.path.insert(0, os.path.dirname(__file__))
+import cbor_stream
 import lora_mon
+import lora_decode_lorawan
 
 
 # ---- Helpers ----
@@ -136,6 +139,270 @@ class TestUdpReceive(unittest.TestCase):
         t.join(timeout=3)
         self.assertEqual(len(results), 1)
         self.assertIn("#7", results[0])
+
+
+# ---- LoRaWAN decoder ----
+
+
+class TestLoRaWANParser(unittest.TestCase):
+    """Unit tests for lora_decode_lorawan.parse_lorawan()."""
+
+    def _make_data_frame(
+        self,
+        mtype: int = 2,
+        dev_addr: int = 0x26011234,
+        fctrl: int = 0x80,
+        fcnt: int = 42,
+        fport: int | None = 1,
+        frm_payload: bytes = b"\xab\xcd\xef",
+        mic: int = 0xDEADBEEF,
+    ) -> bytes:
+        """Build a raw LoRaWAN data frame for testing."""
+        import struct
+
+        mhdr = (mtype << 5) | 0x00  # RFU=0, Major=0
+        buf = bytearray([mhdr])
+        buf += struct.pack("<I", dev_addr)
+        buf += bytes([fctrl])
+        buf += struct.pack("<H", fcnt)
+        fopts_len = fctrl & 0x0F
+        buf += b"\x00" * fopts_len
+        if fport is not None:
+            buf += bytes([fport])
+            buf += frm_payload
+        buf += struct.pack("<I", mic)
+        return bytes(buf)
+
+    def test_unconf_data_up(self):
+        raw = self._make_data_frame(mtype=2, dev_addr=0x26011234, fcnt=42, fport=1)
+        frame = lora_decode_lorawan.parse_lorawan(raw)
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame.mtype, 2)
+        self.assertEqual(frame.mtype_name, "UnconfDataUp")
+        self.assertTrue(frame.is_uplink)
+        self.assertTrue(frame.is_data)
+        self.assertEqual(frame.dev_addr, 0x26011234)
+        self.assertEqual(frame.fcnt, 42)
+        self.assertEqual(frame.fport, 1)
+        self.assertEqual(frame.frm_payload, b"\xab\xcd\xef")
+        self.assertEqual(frame.mic, 0xDEADBEEF)
+        self.assertTrue(frame.adr)  # fctrl=0x80 -> ADR set
+
+    def test_conf_data_down(self):
+        raw = self._make_data_frame(mtype=5, fctrl=0x30)  # ACK + FPending
+        frame = lora_decode_lorawan.parse_lorawan(raw)
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame.mtype_name, "ConfDataDown")
+        self.assertFalse(frame.is_uplink)
+        self.assertTrue(frame.ack)
+        self.assertTrue(frame.fpending)
+        self.assertFalse(frame.adr)
+
+    def test_fctrl_fopts(self):
+        # FOptsLen=3, so FOpts is 3 bytes
+        raw = self._make_data_frame(fctrl=0x03, fport=None, frm_payload=b"")
+        frame = lora_decode_lorawan.parse_lorawan(raw)
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame.fopts_len, 3)
+        self.assertEqual(len(frame.fopts), 3)
+        # No FPort when no FRMPayload
+        self.assertIsNone(frame.fport)
+
+    def test_join_request(self):
+        import struct
+
+        mhdr = 0 << 5  # JoinRequest
+        join_eui = 0x0102030405060708
+        dev_eui = 0x1112131415161718
+        dev_nonce = 0xABCD
+        mic = 0x12345678
+        raw = bytes([mhdr])
+        raw += struct.pack("<Q", join_eui)
+        raw += struct.pack("<Q", dev_eui)
+        raw += struct.pack("<H", dev_nonce)
+        raw += struct.pack("<I", mic)
+
+        frame = lora_decode_lorawan.parse_lorawan(raw)
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame.mtype, 0)
+        self.assertEqual(frame.mtype_name, "JoinRequest")
+        self.assertTrue(frame.is_join)
+        self.assertTrue(frame.is_uplink)
+        self.assertEqual(frame.join_eui, join_eui)
+        self.assertEqual(frame.dev_eui, dev_eui)
+        self.assertEqual(frame.dev_nonce, dev_nonce)
+        self.assertEqual(frame.mic, mic)
+
+    def test_join_accept(self):
+        import struct
+
+        mhdr = 1 << 5  # JoinAccept
+        # JoinAccept body is encrypted, just some opaque bytes + MIC
+        raw = bytes([mhdr]) + b"\x00" * 12 + struct.pack("<I", 0xCAFEBABE)
+        frame = lora_decode_lorawan.parse_lorawan(raw)
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame.mtype, 1)
+        self.assertTrue(frame.is_join)
+        self.assertEqual(frame.mic, 0xCAFEBABE)
+        # Encrypted payload preserved
+        self.assertEqual(len(frame.frm_payload), 12)
+
+    def test_too_short(self):
+        self.assertIsNone(lora_decode_lorawan.parse_lorawan(b""))
+        self.assertIsNone(lora_decode_lorawan.parse_lorawan(b"\x40\x00\x00"))
+
+    def test_major_version(self):
+        raw = self._make_data_frame()
+        frame = lora_decode_lorawan.parse_lorawan(raw)
+        self.assertEqual(frame.major, 0)
+        self.assertEqual(frame.major_name, "LoRaWAN R1")
+
+    def test_fport_zero_is_mac(self):
+        raw = self._make_data_frame(fport=0, frm_payload=b"\x02\x01")
+        frame = lora_decode_lorawan.parse_lorawan(raw)
+        self.assertEqual(frame.fport, 0)
+
+    def test_format_dev_addr(self):
+        self.assertEqual(lora_decode_lorawan.format_dev_addr(0x26011234), "26011234")
+
+    def test_format_eui(self):
+        # EUI stored as LE uint64; display should be big-endian colon-separated
+        eui = 0x0807060504030201
+        result = lora_decode_lorawan.format_eui(eui)
+        self.assertEqual(result, "08:07:06:05:04:03:02:01")
+
+
+# ---- CBOR Sequence stream reader ----
+
+
+class TestCborStream(unittest.TestCase):
+    """Tests for cbor_stream.read_cbor_seq() -- RFC 8742 CBOR Sequence reader."""
+
+    def test_single_item(self):
+        """Read a single CBOR item from a BytesIO."""
+        data = cbor2.dumps({"hello": "world"})
+        items = list(cbor_stream.read_cbor_seq(io.BytesIO(data)))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0], {"hello": "world"})
+
+    def test_multiple_items(self):
+        """Read multiple concatenated CBOR items."""
+        frames = [{"seq": i, "data": f"frame_{i}"} for i in range(5)]
+        data = b"".join(cbor2.dumps(f) for f in frames)
+        items = list(cbor_stream.read_cbor_seq(io.BytesIO(data)))
+        self.assertEqual(len(items), 5)
+        for i, item in enumerate(items):
+            self.assertEqual(item["seq"], i)
+
+    def test_empty_stream(self):
+        """Empty stream yields no items."""
+        items = list(cbor_stream.read_cbor_seq(io.BytesIO(b"")))
+        self.assertEqual(items, [])
+
+    def test_mixed_types(self):
+        """CBOR Sequence can contain mixed types (dict, list, int, string)."""
+        values = [{"a": 1}, [1, 2, 3], 42, "hello"]
+        data = b"".join(cbor2.dumps(v) for v in values)
+        items = list(cbor_stream.read_cbor_seq(io.BytesIO(data)))
+        self.assertEqual(items, values)
+
+    def test_large_item(self):
+        """Items larger than chunk_size are reassembled correctly."""
+        big = {"payload": b"\xab" * 20000}
+        data = cbor2.dumps(big)
+        items = list(cbor_stream.read_cbor_seq(io.BytesIO(data), chunk_size=256))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(len(items[0]["payload"]), 20000)
+
+    def test_truncated_item_discarded(self):
+        """A truncated CBOR item at end of stream is silently discarded."""
+        good = cbor2.dumps({"ok": True})
+        truncated = cbor2.dumps({"will": "be truncated"})[:3]
+        data = good + truncated
+        items = list(cbor_stream.read_cbor_seq(io.BytesIO(data)))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0], {"ok": True})
+
+    def test_pipe_no_hang(self):
+        """CBOR items written to a pipe are readable without waiting for EOF.
+
+        This is the critical test that proves the fix: write one complete CBOR
+        item to a pipe (without closing the write end), and verify that
+        read_cbor_seq yields it within a bounded time.
+        """
+        r_fd, w_fd = os.pipe()
+        r_file = os.fdopen(r_fd, "rb")
+        w_file = os.fdopen(w_fd, "wb")
+
+        frame = {"type": "lora_frame", "seq": 1, "payload": b"\x01\x02\x03"}
+        result = []
+        error = []
+
+        def reader():
+            try:
+                for item in cbor_stream.read_cbor_seq(r_file):
+                    result.append(item)
+                    break  # Stop after first item
+            except Exception as e:
+                error.append(e)
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+
+        # Write one complete CBOR item, flush, but do NOT close.
+        w_file.write(cbor2.dumps(frame))
+        w_file.flush()
+
+        # Reader should yield within 2 seconds (not block until EOF).
+        t.join(timeout=2.0)
+        w_file.close()
+        r_file.close()
+
+        self.assertFalse(t.is_alive(), "read_cbor_seq blocked on pipe (hung)")
+        self.assertEqual(len(error), 0, f"reader raised: {error}")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["seq"], 1)
+
+    def test_pipe_multiple_writes(self):
+        """Multiple CBOR items written incrementally to a pipe are all decoded."""
+        r_fd, w_fd = os.pipe()
+        r_file = os.fdopen(r_fd, "rb")
+        w_file = os.fdopen(w_fd, "wb")
+
+        result = []
+        n_frames = 3
+
+        def reader():
+            for item in cbor_stream.read_cbor_seq(r_file):
+                result.append(item)
+                if len(result) >= n_frames:
+                    break
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+
+        for i in range(n_frames):
+            w_file.write(cbor2.dumps({"seq": i}))
+            w_file.flush()
+            time.sleep(0.01)  # Small delay to simulate real-time writes
+
+        t.join(timeout=5.0)
+        w_file.close()
+        r_file.close()
+
+        self.assertFalse(t.is_alive(), "read_cbor_seq blocked on pipe")
+        self.assertEqual(len(result), n_frames)
+        for i in range(n_frames):
+            self.assertEqual(result[i]["seq"], i)
+
+    def test_lora_frame_roundtrip(self):
+        """Full roundtrip: CBOR encode lora_frame, decode via read_cbor_seq."""
+        frame = make_frame(seq=99, payload=b"test roundtrip")
+        data = cbor2.dumps(frame)
+        items = list(cbor_stream.read_cbor_seq(io.BytesIO(data)))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["seq"], 99)
+        self.assertEqual(items[0]["type"], "lora_frame")
 
 
 if __name__ == "__main__":

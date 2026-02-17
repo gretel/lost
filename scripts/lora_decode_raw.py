@@ -23,6 +23,8 @@ from typing import Any
 
 import cbor2
 
+from cbor_stream import read_cbor_seq
+
 
 def format_hex(data: bytes, sep: str = " ") -> str:
     """Format bytes as uppercase hex."""
@@ -93,15 +95,9 @@ def main() -> None:
     args = parser.parse_args()
 
     printer = print_json if args.json else print_text
-    decoder = cbor2.CBORDecoder(sys.stdin.buffer)
 
     try:
-        while True:
-            try:
-                msg = decoder.decode()
-            except cbor2.CBORDecodeEOF:
-                break
-
+        for msg in read_cbor_seq(sys.stdin.buffer):
             if not isinstance(msg, dict):
                 print(
                     f"Warning: skipping non-map CBOR item: {type(msg)}", file=sys.stderr

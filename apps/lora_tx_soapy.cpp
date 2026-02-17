@@ -12,7 +12,7 @@
 //               Reads concatenated CBOR TX request objects from stdin.
 //               See docs/cbor-schemas.md for the schema.
 //
-//   --freq <hz>       TX center frequency (default: 869525000)
+//   --freq <hz>       TX center frequency (default: 869618000)
 //   --gain <db>       TX gain in dB (default: 30)
 //   --rate <sps>      Sample rate in S/s (default: 250000)
 //   --repeat <n>      Number of times to transmit (default: 1)
@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,7 +52,7 @@ namespace {
 // ---- CLI argument parsing ----
 
 struct TxConfig {
-    double      freq{869'525'000.0};
+    double      freq{869'618'000.0};
     double      gain{30.0};
     float       rate{250'000.f};
     uint32_t    bw{62500};
@@ -69,7 +70,7 @@ struct TxConfig {
 void print_usage(const char* prog) {
     std::fprintf(stderr, "Usage: %s [options] <payload_string>\n", prog);
     std::fprintf(stderr, "\nOptions:\n");
-    std::fprintf(stderr, "  --freq <hz>       TX frequency (default: 869525000)\n");
+    std::fprintf(stderr, "  --freq <hz>       TX frequency (default: 869618000)\n");
     std::fprintf(stderr, "  --gain <db>       TX gain (default: 30)\n");
     std::fprintf(stderr, "  --rate <sps>      Sample rate (default: 250000)\n");
     std::fprintf(stderr, "  --bw <hz>         LoRa bandwidth (default: 62500)\n");
@@ -178,10 +179,35 @@ int transmit_iq(soapy_bridge_t* bridge,
     return 0;
 }
 
+/// Probe for the B210 with a timeout. Returns true if found.
+/// UHD enumeration can hang indefinitely on macOS if the device is in a
+/// bad USB state, so we run the probe on a detached thread and give up
+/// after timeout_sec seconds.
+bool probe_device_with_timeout(const char* driver, int timeout_sec) {
+    std::fprintf(stderr, "Probing for %s device (timeout %ds)...\n",
+                 driver, timeout_sec);
+
+    auto future = std::async(std::launch::async, [driver]() {
+        return soapy_bridge_probe(driver);
+    });
+
+    auto status = future.wait_for(std::chrono::seconds(timeout_sec));
+    if (status == std::future_status::timeout) {
+        std::fprintf(stderr,
+            "ERROR: Device probe timed out after %ds.\n"
+            "       The device may be in a bad USB state. Try:\n"
+            "         1. Unplug and replug the B210\n"
+            "         2. uhd_find_devices --args=\"type=b200\"\n",
+            timeout_sec);
+        return false;
+    }
+
+    return future.get() != 0;
+}
+
 /// Open the TX hardware device. Returns nullptr on failure.
 soapy_bridge_t* open_tx_device(const TxConfig& cfg) {
-    std::fprintf(stderr, "Probing for device...\n");
-    if (!soapy_bridge_probe("uhd")) {
+    if (!probe_device_with_timeout("uhd", 10)) {
         std::fprintf(stderr, "Error: No UHD device found. Is the B210 connected?\n");
         return nullptr;
     }

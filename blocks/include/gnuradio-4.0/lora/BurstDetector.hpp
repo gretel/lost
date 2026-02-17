@@ -72,7 +72,7 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
     gr::PortOut<std::complex<float>> out;
 
     // Configuration parameters
-    uint32_t center_freq  = 866000000;
+    uint32_t center_freq  = 869618000;
     uint32_t bandwidth    = 62500;
     uint8_t  sf           = 8;
     uint16_t sync_word    = 0x12;

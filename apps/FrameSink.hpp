@@ -6,10 +6,12 @@
 // the {pay_len, cr, crc_valid} tag that marks the start of each frame.
 // Accumulates pay_len bytes, then outputs the frame.
 //
-// Output:
-//   - Text (hex dump + ASCII) always goes to stdout.
-//   - When udp_dest is set ("host:port"), each frame is also sent as a
-//     CBOR-encoded UDP datagram for machine consumers (lora_mon.py, etc).
+// Output modes:
+//   - Default: text (hex dump + ASCII) goes to stdout.
+//   - --cbor:  concatenated CBOR maps go to stdout (machine-readable).
+//              Self-delimiting — each CBOR map knows its own length.
+//   - --udp:   each frame is also sent as a CBOR-encoded UDP datagram.
+//   - --cbor and --udp can be combined.
 //
 // Protocol-agnostic: the CBOR schema contains only PHY-layer metadata.
 // A "protocol" hint is derived from the sync word:
@@ -58,11 +60,12 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
     // Configuration
     std::string udp_dest{};            ///< "host:port" for UDP CBOR output (empty=off)
+    bool        cbor_stdout{false};    ///< write CBOR to stdout instead of text
     uint16_t    sync_word{0x12};       ///< for protocol hint in output
     uint8_t     phy_sf{8};             ///< SF for metadata
     uint32_t    phy_bw{62500};         ///< BW for metadata
 
-    GR_MAKE_REFLECTABLE(FrameSink, in, udp_dest, sync_word, phy_sf, phy_bw);
+    GR_MAKE_REFLECTABLE(FrameSink, in, udp_dest, cbor_stdout, sync_word, phy_sf, phy_bw);
 
     // Frame accumulation state
     uint32_t             _pay_len{0};
@@ -146,8 +149,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         return result;
     }
 
-    void printFrameText() {
-        auto ts = timestamp_now();
+    void printFrameText(const std::string& ts) {
         auto frame_span = std::span<const uint8_t>(_frame.data(), _pay_len);
 
         const char* crc_str = _crc_valid ? "CRC_OK" : "CRC_FAIL";
@@ -165,10 +167,8 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         std::fflush(stdout);
     }
 
-    void sendFrameUdp() {
-        if (_udp_fd < 0) return;
-
-        auto ts = timestamp_now();
+    /// Build the CBOR datagram for one frame. Shared by UDP and stdout paths.
+    [[nodiscard]] std::vector<uint8_t> buildFrameCbor(const std::string& ts) {
         auto protocol = guess_protocol(sync_word);
 
         std::vector<uint8_t> buf;
@@ -196,15 +196,38 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         cbor::kv_text(buf, "protocol", protocol);
         cbor::kv_bool(buf, "is_downchirp", _is_downchirp);
 
+        return buf;
+    }
+
+    void sendFrameUdp(const std::vector<uint8_t>& buf) {
+        if (_udp_fd < 0) return;
         ::sendto(_udp_fd, buf.data(), buf.size(), 0,
                  reinterpret_cast<const struct sockaddr*>(&_udp_addr),
                  sizeof(_udp_addr));
     }
 
+    static void sendFrameStdout(const std::vector<uint8_t>& buf) {
+        // Write raw CBOR to stdout as a CBOR Sequence (RFC 8742):
+        // concatenated self-delimiting CBOR items, no framing.
+        std::fwrite(buf.data(), 1, buf.size(), stdout);
+        std::fflush(stdout);
+    }
+
     void emitFrame() {
         _frame_count++;
-        printFrameText();
-        sendFrameUdp();
+        auto ts = timestamp_now();
+
+        if (cbor_stdout || _udp_fd >= 0) {
+            auto buf = buildFrameCbor(ts);
+            if (cbor_stdout) {
+                sendFrameStdout(buf);
+            }
+            sendFrameUdp(buf);
+        }
+
+        if (!cbor_stdout) {
+            printFrameText(ts);
+        }
     }
 
     void processOne(uint8_t byte) noexcept {

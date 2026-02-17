@@ -3,14 +3,18 @@
 """
 lora_mon.py -- LoRa streaming monitor.
 
-Listens for CBOR-encoded LoRa frames on a UDP socket and prints formatted
-text with running statistics.
+Listens for CBOR-encoded LoRa frames on a UDP socket or reads concatenated
+CBOR from stdin, and prints formatted text with running statistics.
 
 Usage:
-    build/apps/lora_rx_soapy --udp 127.0.0.1:5556 &
+    # UDP mode (default):
+    lora_rx_soapy --udp 127.0.0.1:5556 &
     python3 scripts/lora_mon.py
     python3 scripts/lora_mon.py --port 5556 --json
     python3 scripts/lora_mon.py --compact --stats
+
+    # Pipe mode:
+    lora_rx_soapy --cbor | python3 scripts/lora_mon.py --stdin
 
 Dependencies: cbor2
 """
@@ -26,6 +30,8 @@ from dataclasses import dataclass, field
 from typing import Any, TextIO
 
 import cbor2
+
+from cbor_stream import read_cbor_seq
 
 # ---- Protocol constants ----
 
@@ -274,9 +280,44 @@ def receive_udp(
     return stats
 
 
+def receive_stdin(
+    out: TextIO,
+    *,
+    use_json: bool = False,
+    compact: bool = False,
+    stats_every: int = 0,
+) -> Stats:
+    """Read CBOR Sequence (RFC 8742) from stdin, decode, write text to out."""
+    stats = Stats()
+    try:
+        for msg in read_cbor_seq(sys.stdin.buffer):
+            if not isinstance(msg, dict) or msg.get("type") != "lora_frame":
+                continue
+
+            stats.update(msg)
+
+            if use_json:
+                out.write(format_frame_json(msg))
+            else:
+                out.write(format_frame(msg, compact=compact))
+            out.write("\n")
+            out.flush()
+
+            if stats_every > 0 and stats.total % stats_every == 0:
+                print(f"--- {stats.summary()}", file=sys.stderr)
+                sys.stderr.flush()
+
+    except KeyboardInterrupt:
+        pass
+    except BrokenPipeError:
+        pass
+
+    return stats
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="LoRa streaming monitor -- listens for CBOR frames on UDP"
+        description="LoRa streaming monitor -- listens for CBOR frames on UDP or stdin"
     )
     parser.add_argument(
         "--port",
@@ -311,16 +352,29 @@ def main() -> None:
         action="store_true",
         help="print final stats summary to stderr on exit",
     )
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read CBOR Sequence (RFC 8742) from stdin instead of UDP",
+    )
     args = parser.parse_args()
 
-    stats = receive_udp(
-        args.port,
-        sys.stdout,
-        use_json=args.json,
-        compact=args.compact,
-        stats_every=args.stats_every,
-        bind_addr=args.bind,
-    )
+    if args.stdin:
+        stats = receive_stdin(
+            sys.stdout,
+            use_json=args.json,
+            compact=args.compact,
+            stats_every=args.stats_every,
+        )
+    else:
+        stats = receive_udp(
+            args.port,
+            sys.stdout,
+            use_json=args.json,
+            compact=args.compact,
+            stats_every=args.stats_every,
+            bind_addr=args.bind,
+        )
 
     if args.stats and stats.total > 0:
         print(f"--- {stats.summary()}", file=sys.stderr)

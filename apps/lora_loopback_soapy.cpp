@@ -50,7 +50,7 @@ constexpr uint32_t kDefaultBW           = 62500;
 constexpr uint16_t kDefaultSyncWord     = 0x12;
 constexpr uint16_t kDefaultPreambleLen  = 8;
 constexpr float    kDefaultSampleRate   = 250000.f;
-constexpr double   kDefaultFreq         = 869'525'000.0;
+constexpr double   kDefaultFreq         = 869'618'000.0;
 constexpr double   kDefaultTxGain       = 30.0;
 constexpr double   kDefaultRxGain       = 40.0;
 
@@ -278,7 +278,7 @@ void print_usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s [options]\n\n"
         "Options:\n"
-        "  --freq <hz>       Frequency (default: 869525000)\n"
+        "  --freq <hz>       Frequency (default: 869618000)\n"
         "  --tx-gain <db>    TX gain (default: 30)\n"
         "  --rx-gain <db>    RX gain (default: 40)\n"
         "  --bw <hz>         LoRa bandwidth (default: 62500)\n"

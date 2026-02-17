@@ -33,6 +33,8 @@ from typing import Any
 
 import cbor2
 
+from cbor_stream import read_cbor_seq
+
 MESHTASTIC_SYNC_WORD = 0x2B
 
 
@@ -88,15 +90,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    decoder = cbor2.CBORDecoder(sys.stdin.buffer)
-
     try:
-        while True:
-            try:
-                msg = decoder.decode()
-            except cbor2.CBORDecodeEOF:
-                break
-
+        for msg in read_cbor_seq(sys.stdin.buffer):
             if not isinstance(msg, dict) or msg.get("type") != "lora_frame":
                 continue
 

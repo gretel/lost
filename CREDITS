@@ -31,8 +31,32 @@ GNU Radio 4
 -----------
   FAIR/GSI Helmholtzzentrum für Schwerionenforschung
   https://github.com/fair-acc/gnuradio4
-  License: LGPL-3.0
+  License: MIT
 
 gr4-packet-modem (GR4 block development patterns)
   Daniel Estevez
   https://github.com/daniestevez/gr4-packet-modem
+
+CBOR
+----
+  RFC 8949 -- Concise Binary Object Representation (CBOR)
+  C. Bormann and P. Hoffman, December 2020
+  https://www.rfc-editor.org/rfc/rfc8949
+
+  RFC 8742 -- Concise Binary Object Representation (CBOR) Sequences
+  C. Bormann, October 2020
+  https://www.rfc-editor.org/rfc/rfc8742
+
+  cbor2 (Python CBOR codec, used for decoding)
+  https://github.com/agronholm/cbor2
+  License: MIT
+
+  microcbor (streaming CBOR Sequence decoder pattern, TypeScript)
+  Joel Gustafson
+  https://github.com/joeltg/microcbor
+  License: MIT
+
+  cbor (header-only C++ CBOR encoder/decoder for embedded systems)
+  Vladimir Gamalyan
+  https://github.com/vladimirgamalyan/cbor
+  License: MIT

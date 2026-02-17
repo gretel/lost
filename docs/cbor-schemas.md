@@ -5,10 +5,30 @@ a compact binary encoding of JSON-like data.
 
 Python: `pip install cbor2`, then `cbor2.loads(datagram)`.
 
-## RX Output (`lora_rx_soapy --udp host:port`)
+## RX Output
 
-Each decoded frame is sent as a single CBOR-encoded UDP datagram by
-`FrameSink`. Text output goes to stdout simultaneously.
+Two CBOR output modes, combinable:
+
+- **`--udp host:port`** — each frame sent as a CBOR-encoded UDP datagram.
+- **`--cbor`** — concatenated CBOR maps written to stdout (replaces text).
+
+When neither flag is set, stdout gets human-readable text (hex dump + ASCII).
+When `--cbor` is set, stdout gets raw CBOR instead. Each CBOR map is
+self-delimiting, so consumers can decode a concatenated stream directly:
+
+```bash
+# Pipe to offline decoder (direnv adds build/apps to PATH)
+lora_rx_soapy --cbor | python3 scripts/lora_decode_meshcore.py
+
+# Pipe to streaming monitor
+lora_rx_soapy --cbor | python3 scripts/lora_mon.py --stdin
+
+# Save for later
+lora_rx_soapy --cbor > captured.cbor
+
+# Both UDP and stdout CBOR simultaneously
+lora_rx_soapy --cbor --udp 127.0.0.1:5556
+```
 
 ```
 {
@@ -41,7 +61,7 @@ apply for any omitted field.
 {
   "type":         "lora_tx",          // text, required, must be "lora_tx"
   "payload":      h'48656C6C6F',      // bytes, required, 1–255 bytes
-  "freq":         869525000,          // uint, optional, TX frequency in Hz
+  "freq":         869618000,          // uint, optional, TX frequency in Hz
   "gain":         30,                 // uint, optional, TX gain in dB
   "sf":           8,                  // uint, optional, spreading factor (7–12)
   "bw":           62500,              // uint, optional, bandwidth in Hz
@@ -66,7 +86,21 @@ Emitted by `lora_tx_soapy --stdin` after processing each request.
 }
 ```
 
-## Python Example
+## Python Examples
+
+```python
+import cbor2
+
+# Read concatenated CBOR from stdin (pipe mode)
+import sys
+decoder = cbor2.CBORDecoder(sys.stdin.buffer)
+while True:
+    try:
+        frame = decoder.decode()
+    except cbor2.CBORDecodeEOF:
+        break
+    print(f"#{frame['seq']} {frame['payload_len']}B CRC={'OK' if frame['crc_valid'] else 'FAIL'}")
+```
 
 ```python
 import socket

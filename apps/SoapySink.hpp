@@ -35,7 +35,7 @@ device (e.g. USRP B210) for transmission.
     gr::Annotated<std::string, "clock source", gr::Visible>    clock_source{"external"};
     gr::Annotated<std::string, "extra device args", gr::Visible> device_args{""};
     gr::Annotated<float, "sample rate", gr::Unit<"Hz">, gr::Visible> sample_rate{250000.f};
-    gr::Annotated<double, "center frequency", gr::Unit<"Hz">, gr::Visible> center_freq{869525000.0};
+    gr::Annotated<double, "center frequency", gr::Unit<"Hz">, gr::Visible> center_freq{869618000.0};
     gr::Annotated<double, "gain", gr::Unit<"dB">, gr::Visible> gain{30.0};
     gr::Annotated<double, "bandwidth", gr::Unit<"Hz">, gr::Visible> bandwidth{0.0};
     gr::Annotated<uint32_t, "max chunk size"> max_chunk_size{8192U};

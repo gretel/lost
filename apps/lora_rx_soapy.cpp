@@ -41,7 +41,7 @@ namespace {
 volatile std::sig_atomic_t g_running = 1;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 struct RxConfig {
-    double   freq{869'525'000.0};
+    double   freq{869'618'000.0};
     double   gain{30.0};
     float    rate{250'000.f};
     uint32_t bw{62500};
@@ -49,13 +49,14 @@ struct RxConfig {
     uint16_t sync{0x12};
     uint16_t preamble{8};
     std::string udp{};               ///< "host:port" for UDP CBOR output
+    bool     cbor{false};            ///< write CBOR to stdout instead of text
 };
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s [options]\n\n"
         "Options:\n"
-        "  --freq <hz>       RX center frequency (default: 869525000)\n"
+        "  --freq <hz>       RX center frequency (default: 869618000)\n"
         "  --gain <db>       RX gain in dB (default: 30)\n"
         "  --rate <sps>      Sample rate in S/s (default: 250000)\n"
         "  --bw <hz>         LoRa bandwidth (default: 62500)\n"
@@ -63,11 +64,13 @@ void print_usage(const char* prog) {
         "  --sync <hex>      Sync word, e.g. 0x12 (default: 0x12)\n"
         "  --preamble <n>    Preamble length in symbols (default: 8)\n"
         "  --udp <host:port> Send CBOR frames via UDP (e.g. 127.0.0.1:5556)\n"
+        "  --cbor            Write CBOR to stdout instead of text\n"
         "  -h, --help        Show this help\n\n"
         "Example:\n"
         "  %s --sf 12 --bw 125000 --rate 500000\n"
-        "  %s --udp 127.0.0.1:5556\n",
-        prog, prog, prog);
+        "  %s --udp 127.0.0.1:5556\n"
+        "  %s --cbor | python3 scripts/lora_decode_meshcore.py\n",
+        prog, prog, prog, prog);
 }
 
 bool parse_args(int argc, char** argv, RxConfig& cfg) {
@@ -92,6 +95,8 @@ bool parse_args(int argc, char** argv, RxConfig& cfg) {
             cfg.preamble = static_cast<uint16_t>(std::stoul(argv[++i]));
         } else if (arg == "--udp" && i + 1 < argc) {
             cfg.udp = argv[++i];
+        } else if (arg == "--cbor") {
+            cfg.cbor = true;
         } else {
             std::fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -156,6 +161,9 @@ int main(int argc, char** argv) {
     if (!cfg.udp.empty()) {
         std::fprintf(stderr, "  UDP CBOR:    %s\n", cfg.udp.c_str());
     }
+    if (cfg.cbor) {
+        std::fprintf(stderr, "  Output:      CBOR on stdout\n");
+    }
     std::fprintf(stderr, "\n");
 
     // --- Install signal handlers ---
@@ -202,6 +210,7 @@ int main(int argc, char** argv) {
         {"phy_sf", cfg.sf},
         {"phy_bw", cfg.bw},
     });
+    sink.cbor_stdout = cfg.cbor;
 
     // Connect: source -> detector -> demod -> sink
     if (graph.connect<"out">(source).to<"in">(detector) != gr::ConnectionResult::SUCCESS) {

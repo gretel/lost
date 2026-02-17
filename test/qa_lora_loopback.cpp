@@ -4,7 +4,9 @@
 
 #include <boost/ut.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -295,6 +297,153 @@ const boost::ut::suite<"Multi-SF loopback"> multi_sf_loopback_tests = [] {
 
     "SF8 CR=1 loopback"_test = [&do_loopback] {
         do_loopback(8, 1, 62500, "CR1 test");
+    };
+};
+
+// ============================================================================
+// Performance timing: measure TX→RX algorithm throughput
+// ============================================================================
+
+const boost::ut::suite<"Loopback timing"> timing_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "TX algorithm chain throughput"_test = [] {
+        auto payload_str = load_text("payload.txt");
+        std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
+
+        constexpr int REPS = 500;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < REPS; i++) {
+            auto iq = generate_frame_iq(payload, SF, CR, 1, 0x12, 8, true, N * 2, 2);
+            expect(gt(iq.size(), std::size_t{0})) << "IQ generation failed";
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+        double fps = static_cast<double>(REPS) / elapsed_s;
+
+        std::fprintf(stderr, "\n--- TX chain timing ---\n");
+        std::fprintf(stderr, "  %d iterations in %.3f s = %.0f frames/s\n",
+                     REPS, elapsed_s, fps);
+
+        // Sanity: TX chain should be fast (>100 frames/s at os_factor=1)
+        expect(gt(fps, 50.0)) << "TX chain too slow: " << fps << " fps";
+    };
+
+    "Full algorithm loopback throughput"_test = [] {
+        auto payload_str = load_text("payload.txt");
+        std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
+
+        // Pre-generate the IQ frame once (os_factor=1 for fastest decode)
+        auto iq = generate_frame_iq(payload, SF, CR, 1, 0x12, 8, true, N * 2, 2);
+
+        // The RX algorithm pipeline: gray_map → deinterleave → hamming → header → dewhiten → CRC
+        // We simulate the FFT demod step (dechirp + argmax) inline.
+        // Generate reference chirp for dechirp
+        std::vector<std::complex<float>> ref_downchirp(N);
+        for (uint32_t n = 0; n < N; n++) {
+            float phase = -static_cast<float>(M_PI) * static_cast<float>(n * n) / static_cast<float>(N);
+            ref_downchirp[n] = {std::cos(phase), std::sin(phase)};
+        }
+
+        constexpr int REPS = 200;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int rep = 0; rep < REPS; rep++) {
+            // Extract payload symbols from the IQ (skip preamble + SFD)
+            // Preamble: 8 upchirps + 2 sync + 2.25 downchirps = 12.25 symbols
+            // Start at sample offset 12.25 * N
+            std::size_t payload_start = static_cast<std::size_t>(12.25 * N);
+
+            // Count symbols: for "Hello MeshCore" (14 bytes) at SF8/CR4:
+            //   header: 8 symbols, payload: ceil((14+2)*2 * (4+4) / 8) = 32 codewords
+            //   -> 32 / 8 = 4 payload blocks -> 4*8 = 32 symbols
+            //   total payload symbols = 8 (header) + 32 = 40... but let's just demod all
+            std::size_t n_symbols = (iq.size() - payload_start) / N;
+
+            // Dechirp + FFT + argmax for each symbol
+            std::vector<uint16_t> demod_symbols;
+            demod_symbols.reserve(n_symbols);
+            for (std::size_t s = 0; s < n_symbols; s++) {
+                std::size_t offset = payload_start + s * N;
+                // Dechirp
+                std::vector<std::complex<float>> dechirped(N);
+                for (uint32_t n = 0; n < N; n++) {
+                    dechirped[n] = iq[offset + n] * ref_downchirp[n];
+                }
+                // FFT (simple DFT for N=256 — adequate for timing test)
+                float max_mag = 0;
+                uint32_t max_bin = 0;
+                for (uint32_t k = 0; k < N; k++) {
+                    std::complex<float> sum{0, 0};
+                    for (uint32_t n = 0; n < N; n++) {
+                        float angle = -2.0f * static_cast<float>(M_PI)
+                                      * static_cast<float>(k * n) / static_cast<float>(N);
+                        sum += dechirped[n] * std::complex<float>{std::cos(angle), std::sin(angle)};
+                    }
+                    float mag = std::abs(sum);
+                    if (mag > max_mag) { max_mag = mag; max_bin = k; }
+                }
+                demod_symbols.push_back(static_cast<uint16_t>((max_bin + N - 1) % N));
+            }
+
+            // Gray map
+            for (auto& sym : demod_symbols) {
+                sym = static_cast<uint16_t>(sym ^ (sym >> 1));
+            }
+
+            // Deinterleave + Hamming decode + header parse + dewhiten
+            std::vector<uint8_t> all_codewords;
+            std::size_t sym_idx = 0;
+            bool is_first = true;
+            while (sym_idx < demod_symbols.size()) {
+                uint8_t sf_app = is_first ? static_cast<uint8_t>(SF - 2) : SF;
+                uint8_t cw_len = is_first ? uint8_t(8) : static_cast<uint8_t>(4 + CR);
+                if (sym_idx + cw_len > demod_symbols.size()) break;
+
+                std::vector<uint16_t> block_syms;
+                for (std::size_t j = 0; j < cw_len; j++) {
+                    uint16_t sym = demod_symbols[sym_idx + j];
+                    if (is_first) sym >>= (SF - sf_app);
+                    block_syms.push_back(sym);
+                }
+                auto cw = deinterleave_block(block_syms, SF, cw_len, sf_app);
+                all_codewords.insert(all_codewords.end(), cw.begin(), cw.end());
+                sym_idx += cw_len;
+                is_first = false;
+            }
+
+            std::vector<uint8_t> nibbles;
+            for (std::size_t i = 0; i < all_codewords.size(); i++) {
+                uint8_t cr_app = (static_cast<int>(i) < SF - 2) ? uint8_t(4) : CR;
+                nibbles.push_back(hamming_decode_hard(all_codewords[i], cr_app));
+            }
+
+            if (nibbles.size() >= 5) {
+                auto hdr = parse_explicit_header(nibbles[0], nibbles[1], nibbles[2],
+                                                  nibbles[3], nibbles[4]);
+                // Just touch the result to prevent dead-code elimination
+                if (!hdr.checksum_valid) { expect(false) << "Header checksum failed in timing loop"; }
+            }
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+        double fps = static_cast<double>(REPS) / elapsed_s;
+
+        // LoRa airtime: (8 preamble + 2 SFD + 2.25 downchirp + ~40 payload) * 4.096ms
+        double t_sym_s = static_cast<double>(N) / 62500.0;
+        double airtime_s = 52.25 * t_sym_s;
+        double realtime_fps = 1.0 / airtime_s;
+        double margin = fps / realtime_fps;
+
+        std::fprintf(stderr, "\n--- Full loopback timing ---\n");
+        std::fprintf(stderr, "  %d iterations in %.3f s = %.1f frames/s\n",
+                     REPS, elapsed_s, fps);
+        std::fprintf(stderr, "  Frame airtime: %.1f ms\n", airtime_s * 1e3);
+        std::fprintf(stderr, "  Real-time margin: %.1fx\n", margin);
+
+        // Must be at least 1x real-time (decode faster than airtime)
+        expect(gt(margin, 1.0))
+            << "Decode slower than real-time: " << margin << "x";
     };
 };
 
