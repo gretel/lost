@@ -63,7 +63,7 @@ namespace gr::lora {
 /// payload_with_crc contains payload_len bytes of data followed by 2 CRC bytes (reassembled).
 /// Returns true if CRC matches.
 [[nodiscard]] inline bool lora_verify_crc(std::span<const uint8_t> payload, uint8_t crc_lo, uint8_t crc_hi) {
-    uint16_t received_crc = static_cast<uint16_t>(crc_lo) | (static_cast<uint16_t>(crc_hi) << 8);
+    uint16_t received_crc = static_cast<uint16_t>(static_cast<unsigned>(crc_lo) | (static_cast<unsigned>(crc_hi) << 8));
     uint16_t computed     = lora_payload_crc(payload);
     return received_crc == computed;
 }

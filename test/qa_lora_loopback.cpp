@@ -28,7 +28,7 @@ std::string load_text(const std::string& filename) {
     return {std::istreambuf_iterator<char>(f), {}};
 }
 
-// MeshCore test configuration (must match test_vectors/config.json)
+// Default LoRa test configuration (SF8/BW62.5k/CR4/8, must match test_vectors/config.json)
 constexpr uint8_t  SF           = 8;
 constexpr uint32_t N            = 1u << SF; // 256
 constexpr uint8_t  CR           = 4;
@@ -52,7 +52,7 @@ const boost::ut::suite<"Full loopback (algorithm-level)"> full_loopback_tests = 
         auto whitened    = whiten(payload);
         auto with_header = insert_header(whitened, static_cast<uint8_t>(payload.size()), CR, HAS_CRC);
         auto with_crc    = add_crc(with_header, payload, HAS_CRC);
-        auto encoded     = hamming_enc_frame(with_crc, SF, CR);
+        auto encoded     = hamming_encode_frame(with_crc, SF, CR);
         auto interleaved = interleave_frame(encoded, SF, CR);
         auto gray_mapped = gray_demap(interleaved, SF);
 
@@ -89,7 +89,7 @@ const boost::ut::suite<"Full loopback (algorithm-level)"> full_loopback_tests = 
             if (sym_idx + cw_len > rx_interleaved.size()) break;
 
             std::vector<uint16_t> block_syms;
-            for (int j = 0; j < cw_len; j++) {
+            for (std::size_t j = 0; j < cw_len; j++) {
                 uint16_t sym = rx_interleaved[sym_idx + j];
                 if (is_first) sym >>= (SF - sf_app);
                 block_syms.push_back(sym);
@@ -141,9 +141,10 @@ const boost::ut::suite<"Full loopback (algorithm-level)"> full_loopback_tests = 
             uint16_t computed_crc = crc16(std::span<const uint8_t>(
                 decoded_bytes.data(), hdr.payload_len - 2));
             computed_crc ^= static_cast<uint16_t>(decoded_bytes[hdr.payload_len - 1]);
-            computed_crc ^= static_cast<uint16_t>(decoded_bytes[hdr.payload_len - 2]) << 8;
-            uint16_t received_crc = static_cast<uint16_t>(decoded_bytes[hdr.payload_len])
-                                  | (static_cast<uint16_t>(decoded_bytes[hdr.payload_len + 1]) << 8);
+            computed_crc ^= static_cast<uint16_t>(static_cast<unsigned>(decoded_bytes[hdr.payload_len - 2]) << 8);
+            uint16_t received_crc = static_cast<uint16_t>(
+                                      static_cast<unsigned>(decoded_bytes[hdr.payload_len])
+                                    | (static_cast<unsigned>(decoded_bytes[hdr.payload_len + 1]) << 8));
             expect(eq(computed_crc, received_crc))
                 << "CRC mismatch: computed=0x" << std::format("{:04x}", computed_crc)
                 << " received=0x" << std::format("{:04x}", received_crc);
@@ -169,7 +170,7 @@ const boost::ut::suite<"Multi-SF loopback"> multi_sf_loopback_tests = [] {
     auto do_loopback = [](uint8_t test_sf, uint8_t test_cr,
                           uint32_t test_bw, const std::string& payload_str) {
         std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
-        uint8_t test_os = 4;
+        // os_factor=4 is implied by generate_frame() default
 
         // === TX ===
         auto whitened    = whiten(payload);
@@ -177,7 +178,7 @@ const boost::ut::suite<"Multi-SF loopback"> multi_sf_loopback_tests = [] {
                                          static_cast<uint8_t>(payload.size()),
                                          test_cr, true);
         auto with_crc    = add_crc(with_header, payload, true);
-        auto encoded     = hamming_enc_frame(with_crc, test_sf, test_cr);
+        auto encoded     = hamming_encode_frame(with_crc, test_sf, test_cr);
 
         bool ldro = needs_ldro(test_sf, test_bw);
         auto interleaved = interleave_frame(encoded, test_sf, test_cr, ldro);
@@ -209,7 +210,7 @@ const boost::ut::suite<"Multi-SF loopback"> multi_sf_loopback_tests = [] {
             if (sym_idx + cw_len > rx_interleaved.size()) break;
 
             std::vector<uint16_t> block_syms;
-            for (int j = 0; j < cw_len; j++) {
+            for (std::size_t j = 0; j < cw_len; j++) {
                 uint16_t sym = rx_interleaved[sym_idx + j];
                 if (reduced) sym >>= (test_sf - sf_app);
                 block_syms.push_back(sym);

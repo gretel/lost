@@ -16,6 +16,9 @@ Makefile
 .DS_Store
 ._*
 
+# Agent
+CLAUDE.md
+
 # IDE
 .vs/
 .vscode/

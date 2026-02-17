@@ -20,7 +20,7 @@ endif()
 # Clang / GCC colour output + libc++
 if(CMAKE_CXX_COMPILER_ID MATCHES ".*Clang")
     add_compile_options(-stdlib=libc++ -fcolor-diagnostics)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -stdlib=libc++ -lc++")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -stdlib=libc++")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_compile_options(-fdiagnostics-color=always)
 endif()

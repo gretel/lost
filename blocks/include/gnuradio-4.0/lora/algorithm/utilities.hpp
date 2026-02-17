@@ -9,6 +9,8 @@
 #include <numbers>
 #include <vector>
 
+#include <gnuradio-4.0/algorithm/fourier/fft.hpp>
+
 namespace gr::lora {
 
 inline constexpr uint8_t MIN_SF = 5;
@@ -22,15 +24,10 @@ using LLR = double;  ///< Log-Likelihood Ratio type
     return (a % b + b) % b;
 }
 
-/// Positive modulus for doubles.
-[[nodiscard]] inline double double_mod(double a, int64_t b) noexcept {
-    return std::fmod(std::fmod(a, static_cast<double>(b)) + static_cast<double>(b), static_cast<double>(b));
-}
-
 /// Convert an integer to a MSB-first vector of bool with n_bits bits.
 [[nodiscard]] inline std::vector<bool> int2bool(uint32_t integer, uint8_t n_bits) {
     std::vector<bool> vec(n_bits, false);
-    for (int i = 0; i < n_bits; i++) {
+    for (std::size_t i = 0; i < n_bits; i++) {
         vec[n_bits - 1 - i] = (integer >> i) & 1;
     }
     return vec;
@@ -76,6 +73,32 @@ inline void build_ref_chirps(std::complex<float>* upchirp, std::complex<float>* 
     for (int n = 0; n < len; n++) {
         downchirp[n] = std::conj(upchirp[n]);
     }
+}
+
+/// Dechirp + FFT + argmax: element-wise multiply samples with ref_chirp,
+/// FFT, return bin index with maximum magnitude-squared.
+/// scratch must point to N writable elements.
+[[nodiscard]] inline uint32_t dechirp_argmax(
+        const std::complex<float>* samples,
+        const std::complex<float>* ref_chirp,
+        std::complex<float>* scratch, uint32_t N,
+        gr::algorithm::FFT<std::complex<float>>& fft) {
+    for (uint32_t i = 0; i < N; i++) {
+        scratch[i] = samples[i] * ref_chirp[i];
+    }
+    auto fft_out = fft.compute(std::span<const std::complex<float>>(scratch, N));
+
+    float max_val = 0.f;
+    uint32_t max_idx = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        float mag_sq = fft_out[i].real() * fft_out[i].real()
+                     + fft_out[i].imag() * fft_out[i].imag();
+        if (mag_sq > max_val) {
+            max_val = mag_sq;
+            max_idx = i;
+        }
+    }
+    return max_idx;
 }
 
 }  // namespace gr::lora

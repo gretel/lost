@@ -43,7 +43,7 @@
 
 namespace {
 
-// Default LoRa PHY parameters (MeshCore uk/narrow)
+// Default LoRa PHY parameters (SF8/BW62.5k/CR4/8)
 constexpr uint8_t  kDefaultSF           = 8;
 constexpr uint8_t  kDefaultCR           = 4;
 constexpr uint32_t kDefaultBW           = 62500;
@@ -102,12 +102,12 @@ DecodeResult decode_iq(const std::vector<std::complex<float>>& iq,
         {"log_samples", true}, {"log_tags", true}
     });
 
-    graph.connect<"out">(src).to<"in">(burst);
-    graph.connect<"out">(burst).to<"in">(demod);
-    graph.connect<"out">(demod).to<"in">(sink);
+    (void)graph.connect<"out">(src).to<"in">(burst);
+    (void)graph.connect<"out">(burst).to<"in">(demod);
+    (void)graph.connect<"out">(demod).to<"in">(sink);
 
     gr::scheduler::Simple sched;
-    sched.exchange(std::move(graph));
+    (void)sched.exchange(std::move(graph));
     sched.runAndWait();
 
     DecodeResult result;

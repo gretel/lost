@@ -24,19 +24,19 @@ if(TARGET SoapySDR)
   # Uses SoapySource.hpp which calls only C functions from soapy_c_bridge.
   # Does NOT include any SoapySDR C++ headers.
   add_executable(lora_rx_soapy lora_rx_soapy.cpp)
-  target_link_libraries(lora_rx_soapy PRIVATE gnuradio-core gnuradio-blocklib-core gr-lora soapy_c_bridge)
+  target_link_libraries(lora_rx_soapy PRIVATE gnuradio-blocklib-core gr-lora soapy_c_bridge)
 
   # --- lora_tx_soapy: compiled with LLVM 19 (GR4 toolchain) ---
   # Uses algorithm headers directly (no GR4 graph needed for batch TX).
   # Calls soapy_c_bridge for hardware access.
   add_executable(lora_tx_soapy lora_tx_soapy.cpp)
-  target_link_libraries(lora_tx_soapy PRIVATE gnuradio-core gr-lora soapy_c_bridge)
+  target_link_libraries(lora_tx_soapy PRIVATE gr-lora soapy_c_bridge)
 
   # --- lora_loopback_soapy: TX+RX hardware loopback test ---
   # Opens both TX and RX on same B210, transmits a LoRa frame, captures IQ,
   # then decodes offline to verify the round-trip.
   add_executable(lora_loopback_soapy lora_loopback_soapy.cpp)
-  target_link_libraries(lora_loopback_soapy PRIVATE gnuradio-core gnuradio-blocklib-core gr-lora gr-testing soapy_c_bridge)
+  target_link_libraries(lora_loopback_soapy PRIVATE gnuradio-blocklib-core gr-lora gr-testing soapy_c_bridge)
 else()
   message(STATUS "SoapySDR not found -- skipping lora hardware apps")
 endif()

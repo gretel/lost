@@ -3,9 +3,9 @@
 // lora_rx_soapy: Hardware LoRa receiver using SoapySDR + B210.
 //
 // All LoRa PHY parameters (SF, BW, CR, sync word, preamble length) are
-// configurable via CLI options. Defaults match MeshCore uk/narrow config.
+// configurable via CLI options. Defaults: SF8/BW62.5k/CR4/8/sync=0x12.
 //
-// Graph: SoapySource -> BurstDetector -> SymbolDemodulator -> ConsoleSink
+// Graph: SoapySource -> BurstDetector -> SymbolDemodulator -> FrameSink
 
 #include <complex>
 #include <csignal>
@@ -22,7 +22,7 @@
 #include <gnuradio-4.0/lora/BurstDetector.hpp>
 #include <gnuradio-4.0/lora/SymbolDemodulator.hpp>
 
-#include "ConsoleSink.hpp"
+#include "FrameSink.hpp"
 #include "SoapySource.hpp"
 
 namespace {
@@ -147,8 +147,11 @@ int main(int argc, char** argv) {
         {"bandwidth", cfg.bw},
     });
 
-    auto& sink = graph.emplaceBlock<gr::lora::ConsoleSink>({
+    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
         {"output_mode", std::string(cfg.cbor ? "cbor" : "text")},
+        {"sync_word", cfg.sync},
+        {"phy_sf", cfg.sf},
+        {"phy_bw", cfg.bw},
     });
 
     // Connect: source -> detector -> demod -> sink

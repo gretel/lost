@@ -17,7 +17,7 @@
 //   -h, --help        Show usage
 //
 // LoRa config: SF=8, BW=62500, CR=4/8, sync=0x12, explicit header, CRC on
-// (MeshCore uk/narrow defaults)
+// (defaults match common mesh network configurations)
 //
 // *** SAFETY: This program transmits on radio frequencies. ***
 // *** Ensure you have authorization to transmit on the configured frequency. ***

@@ -52,7 +52,7 @@ std::string load_text(const std::string& filename) {
     return {std::istreambuf_iterator<char>(f), {}};
 }
 
-// MeshCore test configuration (must match test_vectors/config.json)
+// Default LoRa test configuration (SF8/BW62.5k/CR4/8, must match test_vectors/config.json)
 constexpr uint8_t  SF           = 8;
 constexpr uint32_t N            = 1u << SF; // 256
 constexpr uint8_t  CR           = 4;
@@ -107,7 +107,7 @@ const boost::ut::suite<"Deinterleaver RX"> deinterleaver_rx_tests = [] {
             if (sym_idx + cw_len > interleaved.size()) break;
 
             std::vector<uint16_t> block_syms;
-            for (int j = 0; j < cw_len; j++) {
+            for (std::size_t j = 0; j < cw_len; j++) {
                 uint32_t sym = interleaved[sym_idx + j];
                 // For header block: FFT demod divides by 2^(SF-sf_app) to strip parity
                 if (is_first) {
@@ -271,10 +271,11 @@ const boost::ut::suite<"CRC Verify RX"> crc_verif_rx_tests = [] {
         expect(ge(with_crc.size(), 4UZ)) << "tx_03_with_crc.u8 too small";
         std::size_t crc_start = with_crc.size() - 4;
 
-        uint16_t crc_from_nibs = static_cast<uint16_t>(with_crc[crc_start])
-                               | (static_cast<uint16_t>(with_crc[crc_start + 1]) << 4)
-                               | (static_cast<uint16_t>(with_crc[crc_start + 2]) << 8)
-                               | (static_cast<uint16_t>(with_crc[crc_start + 3]) << 12);
+        uint16_t crc_from_nibs = static_cast<uint16_t>(
+                                  static_cast<unsigned>(with_crc[crc_start])
+                                | (static_cast<unsigned>(with_crc[crc_start + 1]) << 4)
+                                | (static_cast<unsigned>(with_crc[crc_start + 2]) << 8)
+                                | (static_cast<unsigned>(with_crc[crc_start + 3]) << 12));
 
         expect(eq(crc, crc_from_nibs))
             << "CRC mismatch: computed=0x" << std::format("{:04x}", crc)
@@ -315,7 +316,7 @@ const boost::ut::suite<"Full RX pipeline (algorithm-level)"> full_rx_pipeline_te
             if (sym_idx + cw_len > interleaved.size()) break;
 
             std::vector<uint16_t> block_syms;
-            for (int j = 0; j < cw_len; j++) {
+            for (std::size_t j = 0; j < cw_len; j++) {
                 uint16_t sym = interleaved[sym_idx + j];
                 if (is_first) {
                     sym >>= (SF - sf_app); // strip parity/zero for header
@@ -379,10 +380,11 @@ const boost::ut::suite<"Full RX pipeline (algorithm-level)"> full_rx_pipeline_te
             uint16_t computed_crc = crc16(std::span<const uint8_t>(
                 decoded_bytes.data(), hdr.payload_len - 2));
             computed_crc ^= static_cast<uint16_t>(decoded_bytes[hdr.payload_len - 1]);
-            computed_crc ^= static_cast<uint16_t>(decoded_bytes[hdr.payload_len - 2]) << 8;
+            computed_crc ^= static_cast<uint16_t>(static_cast<unsigned>(decoded_bytes[hdr.payload_len - 2]) << 8);
 
-            uint16_t received_crc = static_cast<uint16_t>(decoded_bytes[hdr.payload_len])
-                                  | (static_cast<uint16_t>(decoded_bytes[hdr.payload_len + 1]) << 8);
+            uint16_t received_crc = static_cast<uint16_t>(
+                                      static_cast<unsigned>(decoded_bytes[hdr.payload_len])
+                                    | (static_cast<unsigned>(decoded_bytes[hdr.payload_len + 1]) << 8));
 
             expect(eq(computed_crc, received_crc))
                 << "CRC mismatch: computed=0x" << std::format("{:04x}", computed_crc)

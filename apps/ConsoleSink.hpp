@@ -1,22 +1,13 @@
 // SPDX-License-Identifier: ISC
 //
-// ConsoleSink: prints decoded LoRa frames to stdout.
+// ConsoleSink: LoRa frame output with MeshCore protocol parsing.
 //
-// Consumes uint8_t payload bytes from SymbolDemodulator and watches for
-// the {pay_len, cr, crc_valid} tag that marks the start of each frame.
-// Accumulates pay_len bytes, then prints the frame.
+// Thin wrapper around FrameSink that adds MeshCore v1 protocol decoding
+// for the text output mode. CBOR mode outputs protocol-agnostic PHY data
+// plus a MeshCore-specific sub-map when sync_word matches.
 //
-// Two output modes:
-//   "text"  — human-readable console output (default)
-//   "cbor"  — concatenated CBOR objects on stdout (for Python: cbor2.CBORDecoder)
-//
-// MeshCore v1 packet structure (from protocol spec):
-//   [header(1)][transport_codes(4, optional)][path_length(1)][path(N)][payload]
-//
-//   Header byte: 0bVVPPPPRR
-//     RR   (bits 0-1): Route Type
-//     PPPP (bits 2-5): Payload Type
-//     VV   (bits 6-7): Payload Version
+// For protocol-agnostic output without MeshCore parsing, use FrameSink
+// directly.
 
 #ifndef GR4_LORA_CONSOLE_SINK_HPP
 #define GR4_LORA_CONSOLE_SINK_HPP
@@ -34,220 +25,10 @@
 
 #include <gnuradio-4.0/Block.hpp>
 
+#include "cbor.hpp"
+#include "protocol/meshcore.hpp"
+
 namespace gr::lora {
-
-// ---- Minimal CBOR encoder (RFC 8949, subset) ----
-// Supports: unsigned int, text string, byte string, bool, map.
-// Encodes to a std::vector<uint8_t> buffer, then write(STDOUT) atomically.
-namespace cbor {
-
-inline void encode_head(std::vector<uint8_t>& buf,
-                        uint8_t major, uint64_t val) {
-    uint8_t mt = static_cast<uint8_t>(major << 5);
-    if (val < 24) {
-        buf.push_back(static_cast<uint8_t>(mt | val));
-    } else if (val <= 0xFF) {
-        buf.push_back(mt | 24);
-        buf.push_back(static_cast<uint8_t>(val));
-    } else if (val <= 0xFFFF) {
-        buf.push_back(mt | 25);
-        buf.push_back(static_cast<uint8_t>(val >> 8));
-        buf.push_back(static_cast<uint8_t>(val));
-    } else if (val <= 0xFFFFFFFF) {
-        buf.push_back(mt | 26);
-        buf.push_back(static_cast<uint8_t>(val >> 24));
-        buf.push_back(static_cast<uint8_t>(val >> 16));
-        buf.push_back(static_cast<uint8_t>(val >> 8));
-        buf.push_back(static_cast<uint8_t>(val));
-    } else {
-        buf.push_back(mt | 27);
-        for (int i = 7; i >= 0; i--) {
-            buf.push_back(static_cast<uint8_t>(val >> (8 * i)));
-        }
-    }
-}
-
-inline void encode_uint(std::vector<uint8_t>& buf, uint64_t val) {
-    encode_head(buf, 0, val);
-}
-
-inline void encode_text(std::vector<uint8_t>& buf, const std::string& s) {
-    encode_head(buf, 3, s.size());
-    buf.insert(buf.end(), s.begin(), s.end());
-}
-
-inline void encode_bytes(std::vector<uint8_t>& buf,
-                         const uint8_t* data, std::size_t len) {
-    encode_head(buf, 2, len);
-    buf.insert(buf.end(), data, data + len);
-}
-
-inline void encode_bool(std::vector<uint8_t>& buf, bool val) {
-    buf.push_back(val ? 0xF5 : 0xF4);  // true=0xF5, false=0xF4
-}
-
-inline void encode_map_begin(std::vector<uint8_t>& buf, uint64_t n_pairs) {
-    encode_head(buf, 5, n_pairs);
-}
-
-// Convenience: encode a key-value pair where key is text
-inline void kv_uint(std::vector<uint8_t>& buf,
-                    const std::string& key, uint64_t val) {
-    encode_text(buf, key);
-    encode_uint(buf, val);
-}
-
-inline void kv_text(std::vector<uint8_t>& buf,
-                    const std::string& key, const std::string& val) {
-    encode_text(buf, key);
-    encode_text(buf, val);
-}
-
-inline void kv_bool(std::vector<uint8_t>& buf,
-                    const std::string& key, bool val) {
-    encode_text(buf, key);
-    encode_bool(buf, val);
-}
-
-inline void kv_bytes(std::vector<uint8_t>& buf,
-                     const std::string& key,
-                     const uint8_t* data, std::size_t len) {
-    encode_text(buf, key);
-    encode_bytes(buf, data, len);
-}
-
-}  // namespace cbor
-
-// ---- MeshCore protocol constants ----
-namespace meshcore {
-
-static constexpr std::array<const char*, 4> kRouteNames = {
-    "T_FLOOD", "FLOOD", "DIRECT", "T_DIRECT"
-};
-
-static constexpr std::array<const char*, 16> kPayloadNames = {
-    "REQ", "RESP", "TXT", "ACK", "ADVERT", "GRP_TXT",
-    "GRP_DATA", "ANON_REQ", "PATH", "TRACE", "MULTI", "CTRL",
-    "rsv12", "rsv13", "rsv14", "RAW_CUSTOM"
-};
-
-/// Parsed MeshCore packet header + framing.
-struct PacketInfo {
-    uint8_t     route_type{0};
-    uint8_t     payload_type{0};
-    uint8_t     version{0};
-    bool        has_transport{false};  // T_FLOOD or T_DIRECT
-    uint16_t    transport_code1{0};
-    uint16_t    transport_code2{0};
-    uint8_t     path_length{0};
-    std::size_t path_offset{0};       // offset of path[] in frame
-    std::size_t payload_offset{0};    // offset of MeshCore payload in frame
-    std::size_t payload_size{0};
-};
-
-/// Read a little-endian uint16.
-inline uint16_t read_le16(const uint8_t* p) {
-    return static_cast<uint16_t>(
-        static_cast<uint16_t>(p[0]) | static_cast<uint16_t>(p[1] << 8));
-}
-
-/// Read a little-endian uint32.
-inline uint32_t read_le32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0])
-         | (static_cast<uint32_t>(p[1]) << 8)
-         | (static_cast<uint32_t>(p[2]) << 16)
-         | (static_cast<uint32_t>(p[3]) << 24);
-}
-
-/// Parse the MeshCore packet framing from a raw LoRa payload.
-[[nodiscard]] inline PacketInfo parse_packet(
-        std::span<const uint8_t> frame) {
-    PacketInfo info{};
-    if (frame.empty()) return info;
-
-    uint8_t hdr = frame[0];
-    info.route_type   = hdr & 0x03;
-    info.payload_type = (hdr >> 2) & 0x0F;
-    info.version      = (hdr >> 6) & 0x03;
-    info.has_transport = (info.route_type == 0 || info.route_type == 3);
-
-    std::size_t offset = 1;
-
-    // Transport codes (4 bytes) for T_FLOOD and T_DIRECT
-    if (info.has_transport) {
-        if (offset + 4 > frame.size()) return info;
-        info.transport_code1 = read_le16(&frame[offset]);
-        info.transport_code2 = read_le16(&frame[offset + 2]);
-        offset += 4;
-    }
-
-    // Path length + path
-    if (offset >= frame.size()) return info;
-    info.path_length = frame[offset];
-    offset += 1;
-    info.path_offset = offset;
-    if (info.path_length > 64 || offset + info.path_length > frame.size()) {
-        // Invalid path length — treat rest as payload
-        info.payload_offset = offset;
-        info.payload_size = frame.size() - offset;
-        return info;
-    }
-    offset += info.path_length;
-
-    info.payload_offset = offset;
-    info.payload_size = frame.size() > offset ? frame.size() - offset : 0;
-    return info;
-}
-
-/// Parse ADVERT appdata to extract the node name.
-/// ADVERT payload: [pubkey(32)][timestamp(4)][signature(64)][appdata...]
-/// Appdata: [flags(1)][lat(4)?][lon(4)?][feat1(2)?][feat2(2)?][name...]
-[[nodiscard]] inline std::string parse_advert_name(
-        std::span<const uint8_t> payload) {
-    constexpr std::size_t kMinAdvert = 32 + 4 + 64;  // pubkey+ts+sig
-    if (payload.size() <= kMinAdvert) return "";
-
-    std::span<const uint8_t> appdata = payload.subspan(kMinAdvert);
-    if (appdata.empty()) return "";
-
-    uint8_t flags = appdata[0];
-    std::size_t off = 1;
-
-    if (flags & 0x10) off += 8;   // lat(4) + lon(4)
-    if (flags & 0x20) off += 2;   // feature 1
-    if (flags & 0x40) off += 2;   // feature 2
-
-    if ((flags & 0x80) && off < appdata.size()) {
-        // Name is the rest of appdata
-        return std::string(
-            reinterpret_cast<const char*>(&appdata[off]),
-            appdata.size() - off);
-    }
-    return "";
-}
-
-/// Describe ADVERT appdata flags.
-[[nodiscard]] inline std::string describe_advert_flags(uint8_t flags) {
-    std::string result;
-    // Node type (lower nibble values)
-    uint8_t node_type = flags & 0x0F;
-    if (node_type == 0x01) result = "chat";
-    else if (node_type == 0x02) result = "repeater";
-    else if (node_type == 0x03) result = "room";
-    else if (node_type == 0x04) result = "sensor";
-    // Optional fields
-    if (flags & 0x10) {
-        if (!result.empty()) result += ",";
-        result += "loc";
-    }
-    if (flags & 0x80) {
-        if (!result.empty()) result += ",";
-        result += "name";
-    }
-    return result;
-}
-
-}  // namespace meshcore
 
 struct ConsoleSink : gr::Block<ConsoleSink, gr::NoDefaultTagForwarding> {
     gr::PortIn<uint8_t> in;
@@ -340,38 +121,35 @@ struct ConsoleSink : gr::Block<ConsoleSink, gr::NoDefaultTagForwarding> {
                 pkt.payload_offset, pkt.payload_size);
 
             if (pkt.payload_type == 4 && mc_payload.size() > 100) {
-                // ADVERT: pubkey(32) + timestamp(4) + signature(64) + appdata
+                // ADVERT
                 auto name = meshcore::parse_advert_name(mc_payload);
+                uint32_t adv_ts = meshcore::read_le32(&mc_payload[32]);
+                std::printf("  ADVERT: ts=%u", adv_ts);
                 if (mc_payload.size() > 100) {
-                    uint32_t adv_ts = meshcore::read_le32(
-                        &mc_payload[32]);
-                    std::printf("  ADVERT: ts=%u", adv_ts);
-                    if (mc_payload.size() > 100) {
-                        uint8_t flags = mc_payload[100];
-                        auto flag_desc = meshcore::describe_advert_flags(flags);
-                        if (!flag_desc.empty()) {
-                            std::printf("  flags=[%s]", flag_desc.c_str());
-                        }
+                    uint8_t flags = mc_payload[100];
+                    auto flag_desc = meshcore::describe_advert_flags(flags);
+                    if (!flag_desc.empty()) {
+                        std::printf("  flags=[%s]", flag_desc.c_str());
                     }
-                    if (!name.empty()) {
-                        std::printf("  name=\"%s\"", name.c_str());
-                    }
-                    std::printf("\n");
                 }
+                if (!name.empty()) {
+                    std::printf("  name=\"%s\"", name.c_str());
+                }
+                std::printf("\n");
             } else if ((pkt.payload_type == 0 || pkt.payload_type == 1
                         || pkt.payload_type == 2 || pkt.payload_type == 8)
                        && mc_payload.size() >= 4) {
-                // REQ/RESP/TXT/PATH: dst_hash(1) + src_hash(1) + MAC(2) + cipher
+                // REQ/RESP/TXT/PATH
                 std::printf("  dst=%02X src=%02X mac=%04X cipher=%zu bytes\n",
                             mc_payload[0], mc_payload[1],
                             meshcore::read_le16(&mc_payload[2]),
                             mc_payload.size() - 4);
             } else if (pkt.payload_type == 3 && mc_payload.size() >= 4) {
-                // ACK: checksum(4)
+                // ACK
                 uint32_t cksum = meshcore::read_le32(mc_payload.data());
                 std::printf("  ACK checksum=%08X\n", cksum);
             } else if (pkt.payload_type == 11 && !mc_payload.empty()) {
-                // CTRL: flags(1) + data
+                // CTRL
                 uint8_t ctrl_flags = mc_payload[0];
                 uint8_t sub_type = (ctrl_flags >> 4) & 0x0F;
                 std::printf("  CTRL sub_type=%u data=%zu bytes\n",
@@ -455,7 +233,7 @@ struct ConsoleSink : gr::Block<ConsoleSink, gr::NoDefaultTagForwarding> {
         if (this->inputTagsPresent()) {
             const auto& tag = this->mergedInputTag();
             if (auto it = tag.map.find("pay_len"); it != tag.map.end()) {
-                // New frame starting — flush any incomplete previous frame
+                // New frame starting -- flush any incomplete previous frame
                 if (_collecting && !_frame.empty()) {
                     _pay_len = static_cast<uint32_t>(_frame.size());
                     emitFrame();

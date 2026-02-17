@@ -56,7 +56,7 @@ std::string load_text(const std::string& filename) {
     return {std::istreambuf_iterator<char>(f), {}};
 }
 
-// MeshCore test configuration
+// Default LoRa test configuration (SF8/BW62.5k/CR4/8)
 constexpr uint8_t  SF           = 8;
 constexpr uint32_t N            = 1u << SF;  // 256
 constexpr uint8_t  CR           = 4;
@@ -310,7 +310,7 @@ const boost::ut::suite<"Multi-frame decoding"> multi_frame_tests = [] {
     using namespace boost::ut;
 
     "Two back-to-back frames decoded correctly"_test = [] {
-        auto iq1 = make_frame_iq("Hello MeshCore", SPS * 3);
+        auto iq1 = make_frame_iq("LoRa PHY test!", SPS * 3);
         auto iq2 = make_frame_iq("Second Frame!!", SPS * 5);
 
         std::vector<std::complex<float>> iq;
@@ -339,7 +339,7 @@ const boost::ut::suite<"Multi-frame decoding"> multi_frame_tests = [] {
         if (result.samples.size() >= 14) {
             std::string frame1(result.samples.begin(), result.samples.begin() + 14);
             std::printf("  Frame 1: \"%s\"\n", frame1.c_str());
-            expect(eq(frame1, std::string("Hello MeshCore")))
+            expect(eq(frame1, std::string("LoRa PHY test!")))
                 << "Frame 1";
         }
         if (result.samples.size() >= 28) {
@@ -359,7 +359,7 @@ const boost::ut::suite<"Robustness tests"> robustness_tests = [] {
     using namespace boost::ut;
 
     "Decodes at +10 dB SNR"_test = [] {
-        auto iq = make_frame_iq("Hello MeshCore");
+        auto iq = make_frame_iq("LoRa PHY test!");
         add_awgn(iq, 10.0f);
 
         auto result = run_decode(iq);
@@ -368,13 +368,13 @@ const boost::ut::suite<"Robustness tests"> robustness_tests = [] {
             << "Output size at 10dB: " << result.samples.size();
         if (result.samples.size() >= 14) {
             std::string decoded(result.samples.begin(), result.samples.begin() + 14);
-            expect(eq(decoded, std::string("Hello MeshCore")))
+            expect(eq(decoded, std::string("LoRa PHY test!")))
                 << "10dB decode: \"" << decoded << "\"";
         }
     };
 
     "Decodes at 0 dB SNR"_test = [] {
-        auto iq = make_frame_iq("Hello MeshCore");
+        auto iq = make_frame_iq("LoRa PHY test!");
         add_awgn(iq, 0.0f);
 
         auto result = run_decode(iq);
@@ -383,14 +383,14 @@ const boost::ut::suite<"Robustness tests"> robustness_tests = [] {
             << "Output size at 0dB: " << result.samples.size();
         if (result.samples.size() >= 14) {
             std::string decoded(result.samples.begin(), result.samples.begin() + 14);
-            expect(eq(decoded, std::string("Hello MeshCore")))
+            expect(eq(decoded, std::string("LoRa PHY test!")))
                 << "0dB decode: \"" << decoded << "\"";
         }
     };
 
     "Decodes with +500 Hz CFO"_test = [] {
         float sample_rate = static_cast<float>(BW * OS_FACTOR);  // 250 kHz
-        auto iq = make_frame_iq("Hello MeshCore");
+        auto iq = make_frame_iq("LoRa PHY test!");
         apply_cfo(iq, 500.f, sample_rate);
 
         auto result = run_decode(iq);
@@ -399,14 +399,14 @@ const boost::ut::suite<"Robustness tests"> robustness_tests = [] {
             << "Output size with +500Hz CFO: " << result.samples.size();
         if (result.samples.size() >= 14) {
             std::string decoded(result.samples.begin(), result.samples.begin() + 14);
-            expect(eq(decoded, std::string("Hello MeshCore")))
+            expect(eq(decoded, std::string("LoRa PHY test!")))
                 << "+500Hz decode: \"" << decoded << "\"";
         }
     };
 
     "Decodes with -500 Hz CFO"_test = [] {
         float sample_rate = static_cast<float>(BW * OS_FACTOR);
-        auto iq = make_frame_iq("Hello MeshCore");
+        auto iq = make_frame_iq("LoRa PHY test!");
         apply_cfo(iq, -500.f, sample_rate);
 
         auto result = run_decode(iq);
@@ -415,14 +415,14 @@ const boost::ut::suite<"Robustness tests"> robustness_tests = [] {
             << "Output size with -500Hz CFO: " << result.samples.size();
         if (result.samples.size() >= 14) {
             std::string decoded(result.samples.begin(), result.samples.begin() + 14);
-            expect(eq(decoded, std::string("Hello MeshCore")))
+            expect(eq(decoded, std::string("LoRa PHY test!")))
                 << "-500Hz decode: \"" << decoded << "\"";
         }
     };
 
     "Decodes with +1000 Hz CFO"_test = [] {
         float sample_rate = static_cast<float>(BW * OS_FACTOR);
-        auto iq = make_frame_iq("Hello MeshCore");
+        auto iq = make_frame_iq("LoRa PHY test!");
         apply_cfo(iq, 1000.f, sample_rate);
 
         auto result = run_decode(iq);
@@ -431,14 +431,14 @@ const boost::ut::suite<"Robustness tests"> robustness_tests = [] {
             << "Output size with +1000Hz CFO: " << result.samples.size();
         if (result.samples.size() >= 14) {
             std::string decoded(result.samples.begin(), result.samples.begin() + 14);
-            expect(eq(decoded, std::string("Hello MeshCore")))
+            expect(eq(decoded, std::string("LoRa PHY test!")))
                 << "+1000Hz decode: \"" << decoded << "\"";
         }
     };
 
     "Decodes with -1000 Hz CFO"_test = [] {
         float sample_rate = static_cast<float>(BW * OS_FACTOR);
-        auto iq = make_frame_iq("Hello MeshCore");
+        auto iq = make_frame_iq("LoRa PHY test!");
         apply_cfo(iq, -1000.f, sample_rate);
 
         auto result = run_decode(iq);
@@ -447,7 +447,7 @@ const boost::ut::suite<"Robustness tests"> robustness_tests = [] {
             << "Output size with -1000Hz CFO: " << result.samples.size();
         if (result.samples.size() >= 14) {
             std::string decoded(result.samples.begin(), result.samples.begin() + 14);
-            expect(eq(decoded, std::string("Hello MeshCore")))
+            expect(eq(decoded, std::string("LoRa PHY test!")))
                 << "-1000Hz decode: \"" << decoded << "\"";
         }
     };
@@ -470,8 +470,8 @@ const boost::ut::suite<"Downchirp detection"> downchirp_tests = [] {
     using namespace gr::lora;
 
     "Downchirp frame decoded via input conjugation"_test = [] {
-        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o', ' ',
-                                        'M', 'e', 's', 'h', 'C', 'o', 'r', 'e'};
+        std::vector<uint8_t> payload = {'L', 'o', 'R', 'a', ' ', 'P',
+                                        'H', 'Y', ' ', 't', 'e', 's', 't', '!'};
         auto iq = generate_frame_iq(payload, SF, CR, OS_FACTOR,
                                     SYNC_WORD, PREAMBLE_LEN,
                                     true, SPS * 5,
@@ -491,7 +491,7 @@ const boost::ut::suite<"Downchirp detection"> downchirp_tests = [] {
             << "Downchirp output size: " << result.samples.size();
         if (result.samples.size() >= 14) {
             std::string decoded(result.samples.begin(), result.samples.begin() + 14);
-            expect(eq(decoded, std::string("Hello MeshCore")))
+            expect(eq(decoded, std::string("LoRa PHY test!")))
                 << "Downchirp decode: \"" << decoded << "\"";
         }
 
@@ -562,8 +562,8 @@ const boost::ut::suite<"Error path tests"> error_path_tests = [] {
 
     "Wrong sync word is rejected"_test = [] {
         // Generate frame with sync_word=0x34, but decoder expects 0x12
-        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o', ' ',
-                                        'M', 'e', 's', 'h', 'C', 'o', 'r', 'e'};
+        std::vector<uint8_t> payload = {'L', 'o', 'R', 'a', ' ', 'P',
+                                        'H', 'Y', ' ', 't', 'e', 's', 't', '!'};
         auto iq = gr::lora::generate_frame_iq(payload, SF, CR, OS_FACTOR,
                                               0x34,  // wrong sync word
                                               PREAMBLE_LEN, true, SPS * 5);
@@ -583,7 +583,7 @@ const boost::ut::suite<"Error path tests"> error_path_tests = [] {
     };
 
     "CRC failure is flagged (corrupted payload IQ)"_test = [] {
-        auto iq = make_frame_iq("Hello MeshCore");
+        auto iq = make_frame_iq("LoRa PHY test!");
 
         // Corrupt a payload symbol by zeroing out one symbol's worth of IQ
         // in the middle of the payload. The preamble is ~12.25 symbols.
@@ -617,7 +617,7 @@ const boost::ut::suite<"Error path tests"> error_path_tests = [] {
     };
 
     "Low SNR (-15 dB) does not produce false positive"_test = [] {
-        auto iq = make_frame_iq("Hello MeshCore");
+        auto iq = make_frame_iq("LoRa PHY test!");
         add_awgn(iq, -15.0f);
 
         auto result = run_decode(iq);

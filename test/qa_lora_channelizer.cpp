@@ -29,7 +29,7 @@
 
 namespace {
 
-// MeshCore test configuration
+// Default LoRa test configuration (SF8/BW62.5k/CR4/8)
 constexpr uint8_t  SF           = 8;
 constexpr uint32_t N            = 1u << SF;  // 256
 constexpr uint8_t  CR           = 4;

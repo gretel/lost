@@ -137,6 +137,13 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
     uint32_t _output_symb_cnt = 0;
     bool     _burst_tag_published = false;
 
+    // Pre-allocated scratch buffers (avoid per-call heap allocation)
+    std::vector<std::complex<float>> _scratch_N;      ///< N-element scratch for dechirp
+    std::vector<std::complex<float>> _scratch_2N;     ///< 2N-element scratch
+    std::vector<float>               _scratch_2N_f;   ///< 2N-element float scratch
+    std::vector<std::complex<float>> _corr_vec;       ///< preamble-length correction vector
+    std::vector<std::complex<float>> _fft_val_buf;    ///< CFO estimation FFT values
+
     // FFT engine
     gr::algorithm::FFT<std::complex<float>> _fft;
 
@@ -173,6 +180,13 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
 
         _CFO_frac_correc.resize(_N);
         _symb_corr.resize(_N);
+        _scratch_N.resize(_N);
+        _scratch_2N.resize(2 * _N);
+        _scratch_2N_f.resize(2 * _N);
+        auto max_corr = static_cast<std::size_t>(
+            _n_up_req + kMaxAdditionalUpchirps) * _N;
+        _corr_vec.resize(max_corr);
+        _fft_val_buf.resize(static_cast<std::size_t>(_up_symb_to_use) * _N);
 
         resetToDetect();
 
@@ -194,110 +208,97 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
         _sync_phase  = NET_ID1;
     }
 
-    /// Dechirp + FFT -> argmax.
+    /// Dechirp + FFT -> argmax (uses pre-allocated _scratch_N).
     [[nodiscard]] uint32_t get_symbol_val(const std::complex<float>* samples,
                                           const std::complex<float>* ref_chirp) {
-        std::vector<std::complex<float>> dechirped(_N);
-        detail::complex_multiply(dechirped.data(), samples, ref_chirp, _N);
-        auto fft_out = _fft.compute(dechirped);
-
-        float max_val = 0.f;
-        uint32_t max_idx = 0;
-        for (uint32_t i = 0; i < _N; i++) {
-            float mag_sq = fft_out[i].real() * fft_out[i].real()
-                         + fft_out[i].imag() * fft_out[i].imag();
-            if (mag_sq > max_val) {
-                max_val = mag_sq;
-                max_idx = i;
-            }
-        }
-        return max_val > 0.f ? max_idx : static_cast<uint32_t>(-1);
+        return dechirp_argmax(samples, ref_chirp, _scratch_N.data(), _N, _fft);
     }
 
     /// CFO fractional estimation using Bernier's algorithm.
+    /// Uses pre-allocated _scratch_N, _fft_val_buf, _corr_vec.
     float estimate_CFO_frac_Bernier(const std::complex<float>* samples) {
         const auto n_syms = _up_symb_to_use;
-        std::vector<int> k0(n_syms);
-        std::vector<float> k0_mag(n_syms);
-        std::vector<std::complex<float>> fft_val(n_syms * _N);
-        std::vector<std::complex<float>> dechirped(_N);
 
-        gr::algorithm::FFT<std::complex<float>> fft_cfo{};
+        // Per-symbol peak index and magnitude (small, stack-friendly)
+        float k0_best_mag = 0.f;
+        uint32_t idx_max = 0;
 
         for (uint32_t i = 0; i < n_syms; i++) {
-            detail::complex_multiply(dechirped.data(), &samples[_N * i], _downchirp.data(), _N);
-            auto fft_out = fft_cfo.compute(dechirped);
+            detail::complex_multiply(_scratch_N.data(), &samples[_N * i], _downchirp.data(), _N);
+            auto fft_out = _fft.compute(
+                std::span<const std::complex<float>>(_scratch_N.data(), _N));
 
             float best = 0.f;
             int best_idx = 0;
             for (uint32_t j = 0; j < _N; j++) {
                 float mag_sq = fft_out[j].real() * fft_out[j].real()
                              + fft_out[j].imag() * fft_out[j].imag();
-                fft_val[j + i * _N] = fft_out[j];
+                _fft_val_buf[j + i * _N] = fft_out[j];
                 if (mag_sq > best) {
                     best = mag_sq;
                     best_idx = static_cast<int>(j);
                 }
             }
-            k0[i] = best_idx;
-            k0_mag[i] = best;
+            if (best > k0_best_mag) {
+                k0_best_mag = best;
+                idx_max = static_cast<uint32_t>(best_idx);
+            }
         }
-
-        auto max_it = std::max_element(k0_mag.begin(), k0_mag.end());
-        auto idx_max = static_cast<uint32_t>(
-            k0[static_cast<std::size_t>(std::distance(k0_mag.begin(), max_it))]);
 
         std::complex<float> four_cum(0.f, 0.f);
         for (uint32_t i = 0; i + 1 < n_syms; i++) {
-            four_cum += fft_val[idx_max + _N * i]
-                      * std::conj(fft_val[idx_max + _N * (i + 1)]);
+            four_cum += _fft_val_buf[idx_max + _N * i]
+                      * std::conj(_fft_val_buf[idx_max + _N * (i + 1)]);
         }
         float cfo_frac = -std::arg(four_cum) / (2.f * static_cast<float>(std::numbers::pi));
 
-        // Correct CFO in preamble
-        std::vector<std::complex<float>> CFO_frac_correc_aug(n_syms * _N);
+        // Correct CFO in preamble using _corr_vec
         for (uint32_t n = 0; n < n_syms * _N; n++) {
             float phase = -2.f * static_cast<float>(std::numbers::pi) * cfo_frac
                         / static_cast<float>(_N) * static_cast<float>(n);
-            CFO_frac_correc_aug[n] = std::complex<float>(std::cos(phase), std::sin(phase));
+            _corr_vec[n] = std::complex<float>(std::cos(phase), std::sin(phase));
         }
-        detail::complex_multiply(_preamble_upchirps.data(), samples, CFO_frac_correc_aug.data(),
+        detail::complex_multiply(_preamble_upchirps.data(), samples, _corr_vec.data(),
                                  n_syms * _N);
 
         return cfo_frac;
     }
 
     /// STO fractional estimation using zero-padded FFT with RCTSL interpolation.
+    /// Uses pre-allocated _scratch_N (dechirp), _scratch_2N (FFT input), _scratch_2N_f (mag accum).
     float estimate_STO_frac() {
         const auto n_syms = _up_symb_to_use;
-        std::vector<std::complex<float>> dechirped(_N);
-        std::vector<std::complex<float>> fft_in(2 * _N, {0.f, 0.f});
-        std::vector<float> fft_mag_sq(2 * _N, 0.f);
 
-        gr::algorithm::FFT<std::complex<float>> fft_sto{};
+        // Zero the accumulator
+        std::fill(_scratch_2N_f.begin(), _scratch_2N_f.end(), 0.f);
 
         for (uint32_t i = 0; i < n_syms; i++) {
-            detail::complex_multiply(dechirped.data(), &_preamble_upchirps[_N * i],
+            detail::complex_multiply(_scratch_N.data(), &_preamble_upchirps[_N * i],
                                      _downchirp.data(), _N);
 
-            std::copy_n(dechirped.begin(), _N, fft_in.begin());
-            std::fill(fft_in.begin() + _N, fft_in.end(), std::complex<float>(0.f, 0.f));
+            std::copy_n(_scratch_N.begin(), _N, _scratch_2N.begin());
+            std::fill(_scratch_2N.begin() + _N, _scratch_2N.end(),
+                      std::complex<float>(0.f, 0.f));
 
-            auto fft_out = fft_sto.compute(fft_in);
+            auto fft_out = _fft.compute(
+                std::span<const std::complex<float>>(_scratch_2N.data(), 2 * _N));
 
             for (uint32_t j = 0; j < 2 * _N; j++) {
-                fft_mag_sq[j] += fft_out[j].real() * fft_out[j].real()
-                               + fft_out[j].imag() * fft_out[j].imag();
+                _scratch_2N_f[j] += fft_out[j].real() * fft_out[j].real()
+                                  + fft_out[j].imag() * fft_out[j].imag();
             }
         }
 
-        auto max_it = std::max_element(fft_mag_sq.begin(), fft_mag_sq.end());
-        auto k0 = static_cast<uint32_t>(std::distance(fft_mag_sq.begin(), max_it));
+        auto max_it = std::max_element(_scratch_2N_f.begin(), _scratch_2N_f.end());
+        auto k0 = static_cast<uint32_t>(std::distance(_scratch_2N_f.begin(), max_it));
 
         // RCTSL interpolation
-        double Y_1 = static_cast<double>(fft_mag_sq[mod(static_cast<int64_t>(k0) - 1, 2LL * static_cast<int64_t>(_N))]);
-        double Y0  = static_cast<double>(fft_mag_sq[k0]);
-        double Y1  = static_cast<double>(fft_mag_sq[mod(static_cast<int64_t>(k0) + 1, 2LL * static_cast<int64_t>(_N))]);
+        auto wrap = [N2 = 2LL * static_cast<int64_t>(_N)](int64_t i) -> std::size_t {
+            return static_cast<std::size_t>(mod(i, N2));
+        };
+        double Y_1 = static_cast<double>(_scratch_2N_f[wrap(static_cast<int64_t>(k0) - 1)]);
+        double Y0  = static_cast<double>(_scratch_2N_f[k0]);
+        double Y1  = static_cast<double>(_scratch_2N_f[wrap(static_cast<int64_t>(k0) + 1)]);
 
         double u = 64.0 * _N / 406.5506497;
         double v = u * 2.4674;
@@ -540,15 +541,14 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
 
                 uint32_t n_corr_syms = _n_up_req + _additional_upchirps;
                 std::size_t corr_len = static_cast<std::size_t>(n_corr_syms) * _N;
-                std::vector<std::complex<float>> CFO_int_correc(corr_len);
                 for (std::size_t n = 0; n < corr_len; n++) {
                     float phase = -2.f * static_cast<float>(std::numbers::pi)
                                 * static_cast<float>(_cfo_int)
                                 / static_cast<float>(_N) * static_cast<float>(n);
-                    CFO_int_correc[n] = std::complex<float>(std::cos(phase), std::sin(phase));
+                    _corr_vec[n] = std::complex<float>(std::cos(phase), std::sin(phase));
                 }
                 detail::complex_multiply(_preamble_upchirps.data(), _preamble_upchirps.data(),
-                                         CFO_int_correc.data(), _up_symb_to_use * _N);
+                                         _corr_vec.data(), _up_symb_to_use * _N);
 
                 // SFO estimation
                 _sfo_hat = (static_cast<float>(_cfo_int) + _cfo_frac)
@@ -561,7 +561,6 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
                 double fs_p = static_cast<double>(bandwidth) * (1.0 - clk_off);
                 int N_int = static_cast<int>(_N);
 
-                std::vector<std::complex<float>> sfo_corr_vect(corr_len, {0.f, 0.f});
                 for (std::size_t n = 0; n < corr_len; n++) {
                     double n_mod = static_cast<double>(
                         mod(static_cast<int64_t>(n), static_cast<int64_t>(N_int)));
@@ -573,12 +572,12 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
                         + (floor_n_N * (bandwidth / fs_p * bandwidth / fs_p
                                        - bandwidth / fs_p)
                            + bandwidth / 2.0 * (1.0 / fs - 1.0 / fs_p)) * n_mod);
-                    sfo_corr_vect[n] = std::complex<float>(
+                    _corr_vec[n] = std::complex<float>(
                         static_cast<float>(std::cos(phase)),
                         static_cast<float>(std::sin(phase)));
                 }
                 detail::complex_multiply(_preamble_upchirps.data(), _preamble_upchirps.data(),
-                                         sfo_corr_vect.data(), _up_symb_to_use * _N);
+                                         _corr_vec.data(), _up_symb_to_use * _N);
 
                 // Re-estimate STO frac after SFO correction
                 float tmp_sto_frac = estimate_STO_frac();
@@ -596,38 +595,39 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
                 }
 
                 // Decimate and correct net_id samples for sync word verification
-                std::vector<std::complex<float>> net_ids_samp_dec(2 * _N, {0.f, 0.f});
+                // Reuse _scratch_2N for decimated net ID samples
+                std::fill(_scratch_2N.begin(), _scratch_2N.end(),
+                          std::complex<float>(0.f, 0.f));
                 int start_off = os / 2
                               - detail::my_roundf(_sto_frac * static_cast<float>(os_factor))
                               + os * (static_cast<int>(_N / 4) + _cfo_int);
                 for (uint32_t i = 0; i < _N * 2; i++) {
                     int idx = start_off + static_cast<int>(i) * os;
                     if (idx >= 0 && static_cast<std::size_t>(idx) < _net_id_samp.size()) {
-                        net_ids_samp_dec[i] = _net_id_samp[static_cast<std::size_t>(idx)];
+                        _scratch_2N[i] = _net_id_samp[static_cast<std::size_t>(idx)];
                     }
                 }
 
-                // Apply CFO_int correction
-                std::vector<std::complex<float>> cfo_int_corr_2N(2 * _N);
+                // Apply CFO_int correction (reuse _corr_vec for phasor)
                 for (uint32_t n = 0; n < 2 * _N; n++) {
                     float phase = -2.f * static_cast<float>(std::numbers::pi)
                                 * static_cast<float>(_cfo_int)
                                 / static_cast<float>(_N) * static_cast<float>(n);
-                    cfo_int_corr_2N[n] = std::complex<float>(std::cos(phase), std::sin(phase));
+                    _corr_vec[n] = std::complex<float>(std::cos(phase), std::sin(phase));
                 }
-                detail::complex_multiply(net_ids_samp_dec.data(), net_ids_samp_dec.data(),
-                                         cfo_int_corr_2N.data(), 2 * _N);
+                detail::complex_multiply(_scratch_2N.data(), _scratch_2N.data(),
+                                         _corr_vec.data(), 2 * _N);
 
                 // Apply CFO_frac correction
-                detail::complex_multiply(net_ids_samp_dec.data(), net_ids_samp_dec.data(),
+                detail::complex_multiply(_scratch_2N.data(), _scratch_2N.data(),
                                          _CFO_frac_correc.data(), _N);
-                detail::complex_multiply(&net_ids_samp_dec[_N], &net_ids_samp_dec[_N],
+                detail::complex_multiply(&_scratch_2N[_N], &_scratch_2N[_N],
                                          _CFO_frac_correc.data(), _N);
 
                 int netid1 = static_cast<int>(
-                    get_symbol_val(net_ids_samp_dec.data(), _downchirp.data()));
+                    get_symbol_val(_scratch_2N.data(), _downchirp.data()));
                 int netid2 = static_cast<int>(
-                    get_symbol_val(&net_ids_samp_dec[_N], _downchirp.data()));
+                    get_symbol_val(&_scratch_2N[_N], _downchirp.data()));
 
                 // Sync word verification
                 bool sync_ok = false;

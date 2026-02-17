@@ -42,6 +42,28 @@ namespace gr::lora {
     return nibbles;
 }
 
+/// Dewhitening: reassemble nibble pairs into bytes, XOR payload bytes with LFSR.
+/// Processes data_nibble_count/2 nibble pairs starting at nibbles[0].
+/// The first pay_len bytes are dewhitened; remaining bytes (CRC) are not.
+[[nodiscard]] inline std::vector<uint8_t> dewhiten(
+        std::span<const uint8_t> nibbles,
+        uint32_t pay_len) {
+    std::vector<uint8_t> bytes;
+    bytes.reserve(nibbles.size() / 2);
+    for (std::size_t i = 0; i + 1 < nibbles.size(); i += 2) {
+        uint8_t low_nib  = nibbles[i];
+        uint8_t high_nib = nibbles[i + 1];
+        auto byte_idx = i / 2;
+        if (byte_idx < pay_len) {
+            uint8_t ws = whitening_seq[byte_idx % whitening_seq.size()];
+            low_nib  ^= (ws & 0x0F);
+            high_nib ^= ((ws >> 4) & 0x0F);
+        }
+        bytes.push_back(static_cast<uint8_t>((high_nib << 4) | low_nib));
+    }
+    return bytes;
+}
+
 /// Insert explicit header (5 nibbles) before whitened payload nibbles.
 [[nodiscard]] inline std::vector<uint8_t> insert_header(
         std::span<const uint8_t> whitened_nibbles,
@@ -62,28 +84,10 @@ namespace gr::lora {
         std::span<const uint8_t> payload, bool has_crc) {
     std::vector<uint8_t> result(with_header.begin(), with_header.end());
     if (has_crc && payload.size() >= 2) {
-        uint16_t crc = crc16(payload.subspan(0, payload.size() - 2));
-        crc ^= static_cast<uint16_t>(payload[payload.size() - 1]);
-        crc ^= static_cast<uint16_t>(payload[payload.size() - 2]) << 8;
-        result.push_back(static_cast<uint8_t>(crc & 0x0F));
-        result.push_back(static_cast<uint8_t>((crc >> 4) & 0x0F));
-        result.push_back(static_cast<uint8_t>((crc >> 8) & 0x0F));
-        result.push_back(static_cast<uint8_t>((crc >> 12) & 0x0F));
+        auto nibs = crc_to_nibbles(lora_payload_crc(payload));
+        result.insert(result.end(), nibs.begin(), nibs.end());
     }
     return result;
-}
-
-/// Hamming-encode a full frame of nibbles. The first (sf - 2) nibbles
-/// (header region) always use cr=4; the rest use the given CR.
-[[nodiscard]] inline std::vector<uint8_t> hamming_enc_frame(
-        std::span<const uint8_t> nibbles, uint8_t sf, uint8_t cr) {
-    std::vector<uint8_t> encoded;
-    encoded.reserve(nibbles.size());
-    for (std::size_t i = 0; i < nibbles.size(); i++) {
-        uint8_t cr_app = (static_cast<int>(i) < sf - 2) ? uint8_t(4) : cr;
-        encoded.push_back(hamming_encode(nibbles[i], cr_app));
-    }
-    return encoded;
 }
 
 /// Gray de-mapping: binary -> Gray code + 1 cyclic offset.
@@ -212,7 +216,7 @@ namespace gr::lora {
                                      static_cast<uint8_t>(payload.size()),
                                      cr, has_crc);
     auto with_crc    = add_crc(with_header, payload, has_crc);
-    auto encoded     = hamming_enc_frame(with_crc, sf, cr);
+    auto encoded     = hamming_encode_frame(with_crc, sf, cr);
     auto interleaved = interleave_frame(encoded, sf, cr, ldro);
     auto gray_mapped = gray_demap(interleaved, sf);
     return modulate_frame(gray_mapped, sf, os_factor,

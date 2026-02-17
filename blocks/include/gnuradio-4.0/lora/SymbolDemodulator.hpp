@@ -16,7 +16,7 @@
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
-#include <gnuradio-4.0/lora/algorithm/tables.hpp>
+#include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
 
 namespace gr::lora {
@@ -122,23 +122,8 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
     /// Dechirp one symbol -> raw symbol value (argmax - 1).
     /// Gray mapping and header division happen in processBlock().
     [[nodiscard]] uint16_t demodSymbol(const std::complex<float>* samples) {
-        for (uint32_t i = 0; i < _N; i++) {
-            _dechirped[i] = samples[i] * _downchirp[i];
-        }
-
-        auto fft_out = _fft.compute(_dechirped);
-
-        float max_val = 0.f;
-        uint32_t max_idx = 0;
-        for (uint32_t i = 0; i < _N; i++) {
-            float mag_sq = fft_out[i].real() * fft_out[i].real()
-                         + fft_out[i].imag() * fft_out[i].imag();
-            if (mag_sq > max_val) {
-                max_val = mag_sq;
-                max_idx = i;
-            }
-        }
-
+        auto max_idx = dechirp_argmax(samples, _downchirp.data(),
+                                      _dechirped.data(), _N, _fft);
         // Subtract 1 (cancel TX +1 offset)
         return static_cast<uint16_t>(
             mod(static_cast<int64_t>(max_idx) - 1, static_cast<int64_t>(_N)));
@@ -210,23 +195,14 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
         }
 
         // --- Dewhitening ---
-        std::vector<uint8_t> decoded_bytes;
         uint32_t total_data_nibs = _pay_len * 2 + (_has_crc ? 4 : 0);
-
-        for (uint32_t i = 0; i < total_data_nibs / 2; i++) {
-            std::size_t nib_idx = data_start + 2 * i;
-            if (nib_idx + 1 >= _nibbles.size()) break;
-
-            uint8_t low_nib  = _nibbles[nib_idx];
-            uint8_t high_nib = _nibbles[nib_idx + 1];
-
-            if (i < _pay_len) {
-                uint8_t ws = whitening_seq[i % whitening_seq.size()];
-                low_nib  ^= (ws & 0x0F);
-                high_nib ^= ((ws >> 4) & 0x0F);
-            }
-            decoded_bytes.push_back(static_cast<uint8_t>((high_nib << 4) | low_nib));
-        }
+        std::size_t avail_nibs = (_nibbles.size() > data_start)
+                               ? _nibbles.size() - data_start : 0;
+        std::size_t use_nibs = std::min(static_cast<std::size_t>(total_data_nibs), avail_nibs);
+        // Round down to even (need pairs)
+        use_nibs &= ~std::size_t{1};
+        auto decoded_bytes = dewhiten(
+            std::span<const uint8_t>(&_nibbles[data_start], use_nibs), _pay_len);
 
         // --- CRC verification ---
         bool crc_valid = true;

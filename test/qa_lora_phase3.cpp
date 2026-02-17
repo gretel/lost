@@ -55,7 +55,7 @@ std::vector<std::complex<float>> load_cf32(const std::string& filename) {
     return data;
 }
 
-// MeshCore test configuration (must match test_vectors/config.json)
+// Default LoRa test configuration (SF8/BW62.5k/CR4/8, must match test_vectors/config.json)
 constexpr uint8_t  SF           = 8;
 constexpr uint32_t N            = 1u << SF; // 256
 constexpr uint8_t  OS_FACTOR    = 4;

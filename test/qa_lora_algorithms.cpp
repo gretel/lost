@@ -61,13 +61,13 @@ void expect_vectors_equal(const std::vector<T>& actual, const std::vector<T>& ex
     }
 }
 
-// MeshCore test configuration (must match test_vectors/config.json)
+// Default LoRa test configuration (SF8/BW62.5k/CR4/8, must match test_vectors/config.json)
 constexpr uint8_t  SF          = 8;
-constexpr uint32_t BW          = 62500;
+[[maybe_unused]] constexpr uint32_t BW          = 62500;
 constexpr uint8_t  CR          = 4;
 constexpr bool     HAS_CRC     = true;
-constexpr uint8_t  SYNC_WORD   = 0x12;
-constexpr uint8_t  PREAMBLE    = 8;
+[[maybe_unused]] constexpr uint8_t  SYNC_WORD   = 0x12;
+[[maybe_unused]] constexpr uint8_t  PREAMBLE    = 8;
 
 } // namespace
 
@@ -260,7 +260,7 @@ const boost::ut::suite<"LoRa Hamming decoding"> hamming_dec_tests = [] {
             uint8_t cw = hamming_encode(nib, 4);
             // Flip each bit and verify correction
             for (int bit = 0; bit < 8; bit++) {
-                uint8_t corrupted = cw ^ (1 << bit);
+                auto corrupted = static_cast<uint8_t>(cw ^ (1 << bit));
                 uint8_t decoded = hamming_decode_hard(corrupted, 4);
                 expect(eq(decoded, nib)) << "single-bit correction failed for nib="
                     << static_cast<int>(nib) << " bit=" << bit;
@@ -273,7 +273,7 @@ const boost::ut::suite<"LoRa Hamming decoding"> hamming_dec_tests = [] {
             uint8_t cw = hamming_encode(nib, 3);
             // Flip each bit in the 7-bit codeword
             for (int bit = 0; bit < 7; bit++) {
-                uint8_t corrupted = cw ^ (1 << bit);
+                auto corrupted = static_cast<uint8_t>(cw ^ (1 << bit));
                 uint8_t decoded = hamming_decode_hard(corrupted, 3);
                 expect(eq(decoded, nib)) << "cr=3 correction failed for nib="
                     << static_cast<int>(nib) << " bit=" << bit;
@@ -289,7 +289,7 @@ const boost::ut::suite<"LoRa Hamming decoding"> hamming_dec_tests = [] {
 
         // Create LLRs: +10 for bit 1, -10 for bit 0
         std::array<double, 8> llrs;
-        for (int i = 0; i < 8; i++) {
+        for (std::size_t i = 0; i < 8; i++) {
             llrs[i] = bits[i] ? 10.0 : -10.0;
         }
 
@@ -336,7 +336,7 @@ const boost::ut::suite<"LoRa interleaving"> interleaving_tests = [] {
         auto decoded_cw = deinterleave_block(syms16, SF, cw_len, sf_app);
         expect(eq(decoded_cw.size(), static_cast<std::size_t>(sf_app)));
 
-        for (int i = 0; i < sf_app; i++) {
+        for (std::size_t i = 0; i < sf_app; i++) {
             expect(eq(decoded_cw[i], codewords[i]))
                 << "header roundtrip failed at " << i;
         }
@@ -357,7 +357,7 @@ const boost::ut::suite<"LoRa interleaving"> interleaving_tests = [] {
         auto decoded_cw = deinterleave_block(syms16, SF, cw_len, SF);
         expect(eq(decoded_cw.size(), static_cast<std::size_t>(SF)));
 
-        for (int i = 0; i < SF; i++) {
+        for (std::size_t i = 0; i < SF; i++) {
             expect(eq(decoded_cw[i], codewords[i]))
                 << "payload roundtrip failed at " << i;
         }

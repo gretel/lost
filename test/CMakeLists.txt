@@ -3,7 +3,7 @@
 # --- Local test helpers (independent of GR4 core test infrastructure) ---
 function(setup_test TEST_NAME)
     target_link_libraries(${TEST_NAME} PRIVATE
-        gr-lora gnuradio-options gnuradio-core gnuradio-blocklib-core gr-testing ut)
+        gr-lora gnuradio-options gnuradio-blocklib-core gr-testing ut)
     add_test(NAME ${TEST_NAME}
              COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/${TEST_NAME})
     set_tests_properties(${TEST_NAME} PROPERTIES TIMEOUT 30)

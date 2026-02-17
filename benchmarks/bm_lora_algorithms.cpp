@@ -117,7 +117,7 @@ const boost::ut::suite rx_benchmarks = [] {
                                                     static_cast<uint8_t>(PAYLOAD.size()),
                                                     CR, true);
         auto with_crc    = gr::lora::add_crc(with_header, PAYLOAD, true);
-        auto encoded     = gr::lora::hamming_enc_frame(with_crc, SF, CR);
+        auto encoded     = gr::lora::hamming_encode_frame(with_crc, SF, CR);
         auto interleaved = gr::lora::interleave_frame(encoded, SF, CR);
 
         // Take first 8 symbols (header block)
@@ -226,7 +226,7 @@ const boost::ut::suite rx_benchmarks = [] {
                                                     static_cast<uint8_t>(PAYLOAD.size()),
                                                     CR, true);
         auto with_crc    = gr::lora::add_crc(with_header, PAYLOAD, true);
-        auto encoded     = gr::lora::hamming_enc_frame(with_crc, SF, CR);
+        auto encoded     = gr::lora::hamming_encode_frame(with_crc, SF, CR);
 
         constexpr int REPS = 5'000;
         ::benchmark::benchmark<REPS>(std::string_view("interleave_frame (37 cw)"), encoded.size()) =

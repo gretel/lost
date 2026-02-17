@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <numeric>
+#include <span>
 #include <vector>
 
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
@@ -44,7 +45,7 @@ namespace gr::lora {
 /// Hamming-encode a full frame of nibbles.
 /// The first (sf - 2) nibbles always use cr_app=4 regardless of the nominal CR.
 [[nodiscard]] inline std::vector<uint8_t> hamming_encode_frame(
-        const std::vector<uint8_t>& nibbles, uint8_t sf, uint8_t cr) {
+        std::span<const uint8_t> nibbles, uint8_t sf, uint8_t cr) {
     std::vector<uint8_t> encoded;
     encoded.reserve(nibbles.size());
     for (std::size_t i = 0; i < nibbles.size(); i++) {
@@ -118,8 +119,8 @@ inline constexpr std::array<uint8_t, 16> hamming_cw_LUT_cr5 = {
 
     std::array<LLR, cw_nbr> cw_proba{};
 
-    for (int n = 0; n < cw_nbr; n++) {
-        for (int j = 0; j < cw_len; j++) {
+    for (std::size_t n = 0; n < cw_nbr; n++) {
+        for (std::size_t j = 0; j < cw_len; j++) {
             uint8_t lut_entry = (cr_app != 1) ? hamming_cw_LUT[n] : hamming_cw_LUT_cr5[n];
             bool bit = (lut_entry >> (8 - cw_len)) & (1u << (cw_len - 1 - j));
             if ((bit && codeword_LLR[j] > 0) || (!bit && codeword_LLR[j] < 0)) {
@@ -132,7 +133,7 @@ inline constexpr std::array<uint8_t, 16> hamming_cw_LUT_cr5 = {
 
     // Select codeword with maximum probability
     auto   it        = std::max_element(cw_proba.begin(), cw_proba.end());
-    int    idx_max   = static_cast<int>(it - cw_proba.begin());
+    auto   idx_max   = static_cast<std::size_t>(it - cw_proba.begin());
     uint8_t data_soft = hamming_cw_LUT[idx_max] >> 4;
 
     // Reverse bit order (MSB<=>LSB within 4 bits) per LoRa convention

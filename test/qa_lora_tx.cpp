@@ -63,7 +63,7 @@ std::string load_text(const std::string& filename) {
     return {std::istreambuf_iterator<char>(f), {}};
 }
 
-// MeshCore test configuration (must match test_vectors/config.json)
+// Default LoRa test configuration (SF8/BW62.5k/CR4/8, must match test_vectors/config.json)
 constexpr uint8_t  SF           = 8;
 constexpr uint32_t N            = 1u << SF;  // 256
 constexpr uint8_t  CR           = 4;
@@ -203,13 +203,13 @@ const boost::ut::suite<"TX add_crc"> tx_add_crc_tests = [] {
     };
 };
 
-const boost::ut::suite<"TX hamming_enc_frame"> tx_hamming_enc_tests = [] {
+const boost::ut::suite<"TX hamming_encode_frame"> tx_hamming_enc_tests = [] {
     using namespace boost::ut;
     using namespace gr::lora;
 
-    "hamming_enc_frame() vs test vector"_test = [] {
+    "hamming_encode_frame() vs test vector"_test = [] {
         auto with_crc = load_u8("tx_03_with_crc.u8");
-        auto encoded  = hamming_enc_frame(with_crc, SF, CR);
+        auto encoded  = hamming_encode_frame(with_crc, SF, CR);
         auto expected = load_u8("tx_04_encoded.u8");
 
         expect(eq(encoded.size(), expected.size())) << "encoded size";
@@ -218,12 +218,12 @@ const boost::ut::suite<"TX hamming_enc_frame"> tx_hamming_enc_tests = [] {
         }
     };
 
-    "hamming_enc_frame() first sf-2 nibbles use cr=4"_test = [] {
+    "hamming_encode_frame() first sf-2 nibbles use cr=4"_test = [] {
         // Verify that the first sf-2 codewords match cr=4 encoding
         // regardless of the frame CR setting (even if CR=1)
         std::vector<uint8_t> nibbles = {0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0x1, 0x2};
-        auto encoded_cr1 = hamming_enc_frame(nibbles, SF, 1);
-        auto encoded_cr4 = hamming_enc_frame(nibbles, SF, 4);
+        auto encoded_cr1 = hamming_encode_frame(nibbles, SF, 1);
+        auto encoded_cr4 = hamming_encode_frame(nibbles, SF, 4);
 
         // First sf-2=6 codewords should be identical (both use cr=4)
         for (int i = 0; i < SF - 2; i++) {
