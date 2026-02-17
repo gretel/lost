@@ -3,12 +3,12 @@
 """
 lora_decode_raw.py -- Raw LoRa frame decoder.
 
-Reads concatenated CBOR frames from lora_rx_soapy (--output cbor) on stdin
+Reads concatenated CBOR frames from lora_rx_soapy --cbor on stdin
 and prints a human-readable summary of each frame.
 
 Usage:
-    lora_rx_soapy --output cbor | python3 scripts/lora_decode_raw.py
-    lora_rx_soapy --output cbor | python3 scripts/lora_decode_raw.py --json
+    build/apps/lora_rx_soapy --cbor | python3 scripts/lora_decode_raw.py
+    build/apps/lora_rx_soapy --cbor | python3 scripts/lora_decode_raw.py --json
 """
 
 from __future__ import annotations

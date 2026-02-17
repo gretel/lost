@@ -3,7 +3,7 @@
 """
 lora_decode_meshtastic.py -- Meshtastic protocol decoder (stub).
 
-Reads concatenated CBOR frames from lora_rx_soapy (--output cbor) on stdin.
+Reads concatenated CBOR frames from lora_rx_soapy --cbor on stdin.
 Filters for frames with sync_word=0x2B (Meshtastic) and prints raw info.
 
 Meshtastic uses Protobuf-encoded payloads (meshtastic.mesh_pb2). Full
@@ -18,7 +18,7 @@ To add full decoding:
     pkt.ParseFromString(payload)
 
 Usage:
-    lora_rx_soapy --output cbor --sync 0x2B | python3 scripts/lora_decode_meshtastic.py
+    build/apps/lora_rx_soapy --cbor --sync 0x2B | python3 scripts/lora_decode_meshtastic.py
 """
 
 from __future__ import annotations

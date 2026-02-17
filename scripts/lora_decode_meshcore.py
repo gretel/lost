@@ -3,15 +3,15 @@
 """
 lora_decode_meshcore.py -- MeshCore v1 protocol decoder.
 
-Reads concatenated CBOR frames from lora_rx_soapy (--output cbor) on stdin,
+Reads concatenated CBOR frames from lora_rx_soapy --cbor on stdin,
 parses the MeshCore v1 packet framing, and prints decoded information.
 
 Only processes frames where protocol == "meshcore_or_reticulum".
 Frames with other protocols are passed through with minimal annotation.
 
 Usage:
-    lora_rx_soapy --output cbor | python3 scripts/lora_decode_meshcore.py
-    lora_rx_soapy --output cbor | python3 scripts/lora_decode_meshcore.py --json
+    build/apps/lora_rx_soapy --cbor | python3 scripts/lora_decode_meshcore.py
+    build/apps/lora_rx_soapy --cbor | python3 scripts/lora_decode_meshcore.py --json
 """
 
 from __future__ import annotations
