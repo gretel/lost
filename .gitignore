@@ -12,6 +12,10 @@ compile_commands.json
 **/CTestTestfile.cmake
 Makefile
 
+# Python
+__pycache__/
+*.pyc
+
 # macOS
 .DS_Store
 ._*
