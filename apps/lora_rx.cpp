@@ -416,17 +416,38 @@ int run_overflow_test(RxConfig& cfg) {
 /// Dual-channel overflow test: mirrors scanner mode's USB/driver path.
 /// Uses radio_bridge_multi (2 RX channels on one USRP) at wideband_rate.
 /// This is the configuration where overflows are most likely — two channels
-/// at 5 MS/s each sharing one USB 3.0 pipe.
+/// at 5 MS/s each sharing one USB 3.0 pipe (10 MS/s aggregate = 40 MB/s).
 ///
-/// B210 MIMO startup overflow: The B210's FPGA has a 2048-sample framing
-/// FIFO (new_rx_framer, SAMPLE_FIFO_SIZE=11) and no source flow control
-/// (SOURCE_FLOW_CONTROL=0). At 5 MS/s this is only 0.4 ms of buffering.
-/// When the timed stream start triggers both radio cores, the FPGA-to-USB
-/// pipeline needs time to prime. The framing FIFO may overflow once before
-/// data starts flowing through USB. UHD's handle_overflow() detects this,
-/// stops/flushes/restarts the stream (b200_io_impl.cpp MIMO path), and
-/// streaming proceeds cleanly. This single startup overflow is inherent to
-/// B210 MIMO and independent of num_recv_frames. We report it separately.
+/// B210 RX buffer chain (7 stages, FPGA to host, sc16 wire format):
+///
+///   Per-radio stages (x2 independent):
+///     1. new_rx_framer sample FIFO   2^11=2048 entries  16 KB  0.82 ms/ch
+///     2. rx_fifo clock-crossing      2^11=2048 entries  16 KB  0.82 ms/ch
+///     3. axi_packet_gate             2^11=2048 entries  16 KB  0.82 ms/ch
+///     Per-radio subtotal: ~49 KB, ~2.46 ms
+///
+///   axi_mux4 merges both radios (round-robin, BUFFER=1)
+///
+///   Shared stages (both channels interleaved):
+///     4. extra_rx_buff               2^12=4096 entries  32 KB  0.82 ms
+///     5. GPIF2 path (cross-clk+gate) ~4608 entries      18 KB  0.46 ms
+///     6. FX3 USB DMA buffers         2 x 16 KB          32 KB  0.82 ms
+///     7. Host libusb buffer pool     16 x 8176 bytes   131 KB  3.27 ms
+///     Shared subtotal: ~213 KB, ~5.37 ms
+///
+///   Grand total at defaults: ~264 KB, ~7.83 ms end-to-end.
+///   (Source: ettus-uhd FPGA Verilog + host C++. See uhd skill for details.)
+///
+/// SOURCE_FLOW_CONTROL=0 — no backpressure from USB to FPGA. When per-radio
+/// FIFOs fill (stages 1-3), new_rx_control transitions to IBS_OVERRUN and
+/// emits error code 0x8. UHD's handle_overflow() (b200_io_impl.cpp) detects
+/// MIMO mode, stops/flushes/restarts the stream with time_spec=now+0.01.
+/// This is self-correcting but costs one overflow event per restart.
+///
+/// Only stage 7 (host USB pool) is tunable via num_recv_frames device arg.
+/// At 128 frames: 128 x 8176 = ~1 MB = ~26 ms — enough to absorb macOS
+/// scheduling jitter that exceeds the default ~7.83 ms chain depth.
+/// The LibreSDR B220 doubles stage 5 (DATA_RX_FIFO_SIZE=14 vs B210's 13).
 int run_overflow_test_dual(RxConfig& cfg) {
     cfg.args = apply_recv_frames(cfg.args, cfg.recv_frames);
     const int duration = cfg.test_duration;
@@ -485,8 +506,8 @@ int run_overflow_test_dual(RxConfig& cfg) {
 
     // Stream loop — read both channels simultaneously.
     // Track startup vs steady-state overflows separately.
-    // The B210 MIMO startup overflow (FPGA framing FIFO) typically fires
-    // once during the first few seconds and is self-correcting.
+    // The B210 MIMO startup overflow (per-radio FPGA FIFO chain, ~2.46 ms)
+    // typically fires once during the first few seconds and is self-correcting.
     constexpr std::size_t chunk_size = 65536;  // match DualRadioSource
     constexpr double startup_window = 5.0;     // seconds
     std::vector<float> buf0(chunk_size * 2);   // ch0 interleaved I/Q
@@ -577,9 +598,9 @@ int run_overflow_test_dual(RxConfig& cfg) {
         loss_pct > 0.0 ? loss_pct : 0.0);
 
     // Recommendations — steady-state overflows are the real concern.
-    // Startup overflows are a known B210 MIMO artifact (FPGA framing FIFO
-    // overflow before USB pipeline primes, self-correcting via UHD's
-    // handle_overflow stop/flush/restart).
+    // Startup overflows are a known B210 MIMO artifact (per-radio FPGA FIFO
+    // chain overflows before USB pipeline primes, self-correcting via UHD's
+    // handle_overflow stop/flush/restart in b200_io_impl.cpp).
     std::fprintf(stderr, "\n=== Assessment ===\n");
     if (steady_overflows == 0 && startup_overflows == 0) {
         std::fprintf(stderr, "  PASS: No overflows at %.0f S/s dual-RX with %d USB frames.\n",
