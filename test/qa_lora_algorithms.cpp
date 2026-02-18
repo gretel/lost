@@ -315,7 +315,6 @@ const boost::ut::suite<"LoRa Gray mapping"> gray_tests = [] {
 
         // Gray demap: binary→Gray + shift by 1 (TX side)
         // out = gray(in) + 1, where gray(x) = x ^ (x>>1) ^ (x>>2) ^ ... ^ (x>>(sf-1))
-        const uint32_t N = 1u << SF;
         std::vector<uint32_t> gray_mapped;
         gray_mapped.reserve(interleaved.size());
         for (auto s : interleaved) {
@@ -339,7 +338,6 @@ const boost::ut::suite<"LoRa Gray mapping"> gray_tests = [] {
         //
         // So the effective roundtrip (excluding the +1/-1 cancellation) is:
         //   binary_to_gray(gray_to_binary(s)) == s
-        const uint32_t N = 1u << SF;
         for (uint32_t sym = 0; sym < N; sym++) {
             // TX gray_demap (without +1): gray_to_binary(sym)
             uint32_t g2b = sym;
@@ -396,7 +394,6 @@ const boost::ut::suite<"LoRa full TX pipeline"> pipeline_tests = [] {
         expect_vectors_equal(interleaved, load_u32("tx_05_interleaved.u32"), "stage 5 interleave");
 
         // Stage 6: Gray demap
-        const uint32_t N = 1u << SF;
         std::vector<uint32_t> gray_mapped;
         for (auto s : interleaved) {
             uint32_t g = s;

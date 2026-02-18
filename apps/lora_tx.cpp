@@ -22,7 +22,7 @@
 //     lora_tx --loopback [--payload "text"]
 //     Opens both TX and RX on the same device (shared via the bridge's
 //     reference counting). Runs a three-round test protocol:
-//       Round 1 (Greeting):  TX "Hello From gnuradio-4.0 (<rev>)!"
+//       Round 1 (Greeting):  TX "Hello from GNU Radio 4 (<gr4-rev>) + gr4-lora (<lora-rev>)!"
 //       Round 2 (Challenge): TX a random nonce "CHAL:<hex8>", RX and decode.
 //       Round 3 (Response):  TX "RESP:<decoded_nonce>", RX and decode.
 //     All rounds must decode with CRC valid and matching payloads.
@@ -687,12 +687,13 @@ std::string random_hex_nonce(int n_bytes) {
     return hex;
 }
 
-/// Build the default loopback payload: "Hello From gnuradio-4.0 (<rev>)!"
 std::string default_loopback_payload() {
-#ifdef GR4_GIT_REV
-    return std::string("Hello From gnuradio-4.0 (") + GR4_GIT_REV + ")!";
+#if defined(GR4_GIT_REV) && defined(GR4_LORA_GIT_REV)
+    return std::string("Hello from GNU Radio 4 (") + GR4_GIT_REV + ") + gr4-lora (" + GR4_LORA_GIT_REV + ")!";
+#elif defined(GR4_GIT_REV)
+    return std::string("Hello from GNU Radio 4 (") + GR4_GIT_REV + ")!";
 #else
-    return "Hello From gnuradio-4.0!";
+    return "Hello from GNU Radio 4!";
 #endif
 }
 
