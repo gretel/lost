@@ -631,13 +631,6 @@ radio_bridge_multi_t* radio_bridge_multi_create(
     uhd_rx_streamer_max_num_samps(rx_streamer, &max_samps);
     fprintf(stderr, "[uhd_multi] RX max_samps_per_packet=%zu\n", max_samps);
 
-    // Verify frequencies are still correct after get_rx_stream
-    for (size_t ch = 0; ch < 2; ch++) {
-        double actual = 0;
-        uhd_usrp_get_rx_freq(usrp, ch, &actual);
-        fprintf(stderr, "[uhd_multi] ch%zu: post-stream freq=%.0f\n", ch, actual);
-    }
-
     // Create metadata
     uhd_rx_metadata_handle rx_md = NULL;
     uhd_rx_metadata_make(&rx_md);
@@ -645,6 +638,10 @@ radio_bridge_multi_t* radio_bridge_multi_create(
     // Start streaming with timed command for multi-channel alignment.
     // For multi-channel, stream_now=false with a time spec is required
     // by UHD's super_recv_packet_handler for time alignment.
+    // We start the stream BEFORE re-tuning because get_rx_stream() may
+    // change the master clock rate (e.g. 40->20 MHz on B210), which
+    // resets DSP frequencies. Retuning after stream start ensures the
+    // frequencies stick.
     int64_t now_full = 0;
     double now_frac = 0;
     uhd_usrp_get_time_now(usrp, 0, &now_full, &now_frac);
@@ -654,11 +651,11 @@ radio_bridge_multi_t* radio_bridge_multi_create(
         .num_samps           = 0,
         .stream_now          = false,
         .time_spec_full_secs = now_full,
-        .time_spec_frac_secs = now_frac + 0.1,  // +100ms
+        .time_spec_frac_secs = now_frac + 0.2,  // +200ms (retune needs time)
     };
 
-    fprintf(stderr, "[uhd_multi] Starting stream at t=%lld + %.3f (+100ms)\n",
-            (long long)now_full, now_frac + 0.1);
+    fprintf(stderr, "[uhd_multi] Starting stream at t=%lld + %.3f (+200ms)\n",
+            (long long)now_full, now_frac + 0.2);
 
     if (uhd_rx_streamer_issue_stream_cmd(rx_streamer, &stream_cmd)
             != UHD_ERROR_NONE) {
@@ -688,11 +685,26 @@ radio_bridge_multi_t* radio_bridge_multi_create(
     bridge->rx_md        = rx_md;
     bridge->max_samps    = max_samps;
 
-    // Read back actual values
+    // Re-apply per-channel frequencies AFTER stream creation.
+    // On B210, creating a multi-channel streamer changes the master clock
+    // rate (e.g. 40->20 MHz), which resets DSP frequencies. We retune here
+    // and store the configured values directly — uhd_usrp_get_rx_freq()
+    // returns wrong values for multi-channel configs on B210.
     uhd_usrp_get_rx_rate(usrp, 0, &bridge->sample_rate);
     for (size_t ch = 0; ch < 2; ch++) {
-        uhd_usrp_get_rx_freq(usrp, ch, &bridge->center_freq[ch]);
+        uhd_tune_request_t tune_req = {
+            .target_freq     = ch_cfg[ch].freq,
+            .rf_freq_policy  = UHD_TUNE_REQUEST_POLICY_AUTO,
+            .dsp_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO,
+        };
+        uhd_tune_result_t tune_result;
+        uhd_usrp_set_rx_freq(usrp, &tune_req, ch, &tune_result);
+        // Store configured frequency directly — get_rx_freq is unreliable
+        // on B210 multi-channel configs.
+        bridge->center_freq[ch] = ch_cfg[ch].freq;
         uhd_usrp_get_rx_gain(usrp, ch, "", &bridge->gain_db[ch]);
+        fprintf(stderr, "[uhd_multi] ch%zu: tuned freq=%.0f gain=%.1f\n",
+                ch, bridge->center_freq[ch], bridge->gain_db[ch]);
     }
 
     fprintf(stderr, "[uhd_multi] Actual: rate=%.0f ch0_freq=%.0f ch1_freq=%.0f\n",

@@ -7,25 +7,25 @@
 // the shared algorithm functions (no GR4 graph needed for batch TX), then
 // writes the IQ to the device via the pure-C bridge.
 //
-// Two modes:
-//   CLI mode:   lora_tx [options] <payload_string>
-//   Stdin mode: lora_tx --stdin [--dry-run]
-//               Reads concatenated CBOR TX request objects from stdin.
-//               See docs/cbor-schemas.md for the schema.
+// Three modes:
 //
-//   --args <str>      Device args (default: auto-discover)
-//   --clock <src>     Clock source (default: device default)
-//   --freq <hz>       TX center frequency (default: 869618000)
-//   --gain <db>       TX gain in dB (default: 30)
-//   --rate <sps>      Sample rate in S/s (default: 250000)
-//   --repeat <n>      Number of times to transmit (default: 1)
-//   --gap <ms>        Gap between repeats in milliseconds (default: 1000)
-//   --dry-run         Generate IQ but do not transmit (dump stats to stderr)
-//   --stdin           Read CBOR TX requests from stdin (streaming)
-//   -h, --help        Show usage
+//   CLI mode (default):
+//     lora_tx [options] <payload_string>
+//     Transmits one or more copies of the payload.
 //
-// LoRa config: SF=8, BW=62500, CR=4/8, sync=0x12, explicit header, CRC on
-// (defaults match common mesh network configurations)
+//   Stdin mode (--stdin):
+//     lora_tx --stdin [--dry-run]
+//     Reads concatenated CBOR TX request objects from stdin.
+//     See docs/cbor-schemas.md for the schema.
+//
+//   Loopback mode (--loopback):
+//     lora_tx --loopback [--payload "text"]
+//     Opens both TX and RX on the same device (shared via the bridge's
+//     reference counting). Runs a two-round challenge-response protocol:
+//       Round 1 (Challenge): TX a random nonce "CHAL:<hex8>", RX and decode.
+//       Round 2 (Response):  TX "RESP:<decoded_nonce>", RX and decode.
+//     Both rounds must decode with CRC valid and matching payloads.
+//     Use --payload for single-round fixed-payload mode.
 //
 // *** SAFETY: This program transmits on radio frequencies. ***
 // *** Ensure you have authorization to transmit on the configured frequency. ***
@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <complex>
@@ -41,10 +42,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include <gnuradio-4.0/Graph.hpp>
+#include <gnuradio-4.0/Scheduler.hpp>
+#include <gnuradio-4.0/testing/TagMonitors.hpp>
+
+#include <gnuradio-4.0/lora/BurstDetector.hpp>
+#include <gnuradio-4.0/lora/SymbolDemodulator.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
 #include "cbor.hpp"
@@ -55,7 +64,7 @@ namespace {
 // ---- CLI argument parsing ----
 
 struct TxConfig {
-    std::string args{};              ///< device args (empty = auto-discover)
+    std::string args{"type=b200"};   ///< device args (default: B200/B210)
     std::string clock{};             ///< clock source (empty = device default)
     double      freq{869'618'000.0};
     double      gain{30.0};
@@ -69,6 +78,8 @@ struct TxConfig {
     int         gap_ms{1000};
     bool        dry_run{false};
     bool        stdin_mode{false};
+    bool        loopback{false};
+    double      rx_gain{40.0};       ///< RX gain for loopback mode
     std::string payload;
 };
 
@@ -76,7 +87,7 @@ void print_usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s [options] <payload_string>\n\n"
         "Device options:\n"
-        "  --args <str>      Device args (default: auto-discover)\n"
+        "  --args <str>      Device args (default: type=b200)\n"
         "                    Examples: type=b200, addr=192.168.10.2\n"
         "  --clock <src>     Clock source (default: device default)\n"
         "                    Examples: internal, external, gpsdo\n"
@@ -93,14 +104,21 @@ void print_usage(const char* prog) {
         "  --repeat <n>      Transmit count (default: 1)\n"
         "  --gap <ms>        Gap between repeats (default: 1000)\n"
         "  --dry-run         Generate IQ without transmitting\n"
-        "  --stdin           Read CBOR TX requests from stdin\n"
+        "  --stdin           Read CBOR TX requests from stdin\n\n"
+        "Loopback mode:\n"
+        "  --loopback        TX->RX challenge-response test on same device\n"
+        "  --rx-gain <db>    RX gain for loopback (default: 40)\n"
+        "  --payload <text>  Fixed payload (disables challenge-response)\n\n"
+        "Other:\n"
         "  -h, --help        Show this help\n\n"
         "Examples:\n"
         "  %s \"Hello World\"\n"
         "  %s --args type=b200 --clock external \"Hello World\"\n"
-        "  %s --sf 12 --bw 125000 --rate 500000 \"Hello World\"\n\n"
+        "  %s --sf 12 --bw 125000 --rate 500000 \"Hello World\"\n"
+        "  %s --loopback --clock external\n"
+        "  %s --loopback --payload \"Test 123\"\n\n"
         "*** Ensure you have authorization to transmit! ***\n",
-        prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 bool parse_args(int argc, char** argv, TxConfig& cfg) {
@@ -137,6 +155,12 @@ bool parse_args(int argc, char** argv, TxConfig& cfg) {
             cfg.dry_run = true;
         } else if (arg == "--stdin") {
             cfg.stdin_mode = true;
+        } else if (arg == "--loopback") {
+            cfg.loopback = true;
+        } else if (arg == "--rx-gain" && i + 1 < argc) {
+            cfg.rx_gain = std::stod(argv[++i]);
+        } else if (arg == "--payload" && i + 1 < argc) {
+            cfg.payload = argv[++i];
         } else if (arg[0] == '-') {
             std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
             print_usage(argv[0]);
@@ -267,12 +291,8 @@ bool read_exact(int fd, uint8_t* buf, std::size_t n) {
     return true;
 }
 
-/// Peek at the first byte of a CBOR item to determine total map size.
-/// Returns the number of bytes needed (0 on error/EOF).
-/// CBOR maps are self-delimiting: we read the head, determine N pairs,
-/// then read each item. To simplify, we buffer up to 64 KB and decode.
+/// Read a complete CBOR map object from fd. Returns empty on EOF/error.
 std::vector<uint8_t> read_cbor_object(int fd) {
-    // Read into an accumulation buffer. Start with the head byte.
     std::vector<uint8_t> buf;
     buf.resize(1);
     if (!read_exact(fd, buf.data(), 1)) return {};
@@ -284,31 +304,23 @@ std::vector<uint8_t> read_cbor_object(int fd) {
         return {};
     }
 
-    // We need to read the complete CBOR map. Strategy: accumulate bytes
-    // and attempt to decode. Since our messages are small (< 4 KB),
-    // read in chunks until decode succeeds.
     buf.reserve(512);
 
-    // Read additional argument bytes for the map count
     uint8_t info = static_cast<uint8_t>(head & 0x1F);
     std::size_t extra = 0;
     if (info >= 24 && info <= 27) {
-        extra = std::size_t{1} << (info - 24);  // 1, 2, 4, 8
+        extra = std::size_t{1} << (info - 24);
         buf.resize(1 + extra);
         if (!read_exact(fd, buf.data() + 1, extra)) return {};
     }
 
-    // Now we know the pair count; read items incrementally.
-    // Each item starts with a head byte; we can compute its length.
-    // For simplicity, read byte-by-byte attempting decode after each chunk.
-    // Since max payload is 255 + overhead < 1 KB, this is fast.
     constexpr std::size_t kMaxSize = 65536;
     constexpr std::size_t kChunkSize = 256;
 
     while (buf.size() < kMaxSize) {
         try {
             gr::lora::cbor::decode_map(std::span<const uint8_t>(buf));
-            return buf;  // success
+            return buf;
         } catch (const gr::lora::cbor::DecodeError&) {
             // Need more data
         }
@@ -370,7 +382,7 @@ int run_stdin_mode(TxConfig& cfg) {
     uint64_t seq = 0;
     while (true) {
         auto raw = read_cbor_object(STDIN_FILENO);
-        if (raw.empty()) break;  // EOF or error
+        if (raw.empty()) break;
 
         seq++;
         try {
@@ -393,8 +405,7 @@ int run_stdin_mode(TxConfig& cfg) {
                 continue;
             }
 
-            // Apply per-request overrides
-            TxConfig req_cfg = cfg;  // start from CLI defaults
+            TxConfig req_cfg = cfg;
             apply_cbor_request(req_cfg, msg);
 
             auto iq = generate_iq(payload, req_cfg);
@@ -431,6 +442,367 @@ int run_stdin_mode(TxConfig& cfg) {
     return 0;
 }
 
+// ---- Loopback mode ----
+
+struct LoraParams {
+    uint8_t  sf;
+    uint8_t  cr;
+    uint32_t bw;
+    uint16_t sync_word;
+    uint16_t preamble_len;
+    float    sample_rate;
+    double   freq;
+};
+
+struct DecodeResult {
+    std::vector<uint8_t> payload;
+    bool                 crc_valid{false};
+    bool                 decoded{false};
+};
+
+/// Decode IQ samples offline using a GR4 graph.
+DecodeResult decode_iq(const std::vector<std::complex<float>>& iq,
+                       const LoraParams& lp) {
+    gr::Graph graph;
+
+    auto os_factor = static_cast<uint8_t>(lp.sample_rate / static_cast<float>(lp.bw));
+
+    auto& src = graph.emplaceBlock<gr::testing::TagSource<std::complex<float>,
+        gr::testing::ProcessFunction::USE_PROCESS_BULK>>({
+        {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
+        {"repeat_tags", false}, {"mark_tag", false}
+    });
+    src.values = iq;
+
+    auto& burst = graph.emplaceBlock<gr::lora::BurstDetector>();
+    burst.center_freq  = static_cast<uint32_t>(lp.freq);
+    burst.bandwidth    = lp.bw;
+    burst.sf           = lp.sf;
+    burst.sync_word    = lp.sync_word;
+    burst.os_factor    = os_factor;
+    burst.preamble_len = lp.preamble_len;
+
+    auto& demod = graph.emplaceBlock<gr::lora::SymbolDemodulator>();
+    demod.sf        = lp.sf;
+    demod.bandwidth = lp.bw;
+
+    auto& sink = graph.emplaceBlock<gr::testing::TagSink<uint8_t,
+        gr::testing::ProcessFunction::USE_PROCESS_BULK>>({
+        {"log_samples", true}, {"log_tags", true}
+    });
+
+    (void)graph.connect<"out">(src).to<"in">(burst);
+    (void)graph.connect<"out">(burst).to<"in">(demod);
+    (void)graph.connect<"out">(demod).to<"in">(sink);
+
+    gr::scheduler::Simple sched;
+    (void)sched.exchange(std::move(graph));
+    sched.runAndWait();
+
+    DecodeResult result;
+    result.payload = sink._samples;
+
+    for (const auto& tag : sink._tags) {
+        if (auto it = tag.map.find("crc_valid"); it != tag.map.end()) {
+            result.crc_valid = pmtv::cast<bool>(it->second);
+            result.decoded = true;
+        }
+    }
+
+    return result;
+}
+
+struct RoundResult {
+    DecodeResult         decode;
+    std::string          tx_string;
+    std::string          rx_string;
+    bool                 match{false};
+};
+
+/// Build padded TX IQ with leading/trailing silence.
+std::vector<std::complex<float>> build_padded_iq(
+        const std::string& payload_str, const LoraParams& lp) {
+    auto os_factor = static_cast<uint8_t>(lp.sample_rate / static_cast<float>(lp.bw));
+    std::vector<uint8_t> payload_bytes(payload_str.begin(),
+                                        payload_str.end());
+    auto frame_iq = gr::lora::generate_frame_iq(
+        payload_bytes, lp.sf, lp.cr, os_factor,
+        lp.sync_word, lp.preamble_len, true, 0,
+        2, lp.bw);
+    uint32_t pad = static_cast<uint32_t>(lp.sample_rate * 0.1f);
+    std::vector<std::complex<float>> iq;
+    iq.resize(pad, std::complex<float>(0.f, 0.f));
+    iq.insert(iq.end(), frame_iq.begin(), frame_iq.end());
+    iq.resize(iq.size() + pad, std::complex<float>(0.f, 0.f));
+    return iq;
+}
+
+/// Execute one TX->RX round: transmit payload, capture IQ, decode offline.
+RoundResult do_round(const std::string& label,
+                     const std::string& payload_str,
+                     radio_bridge_t* tx_bridge,
+                     radio_bridge_t* rx_bridge,
+                     const LoraParams& lp) {
+    RoundResult rr;
+    rr.tx_string = payload_str;
+
+    std::fprintf(stderr, "\n--- %s ---\n", label.c_str());
+    std::fprintf(stderr, "  TX: \"%s\" (%zu bytes)\n",
+                 payload_str.c_str(), payload_str.size());
+
+    auto tx_iq = build_padded_iq(payload_str, lp);
+
+    std::size_t rx_total = tx_iq.size() + static_cast<std::size_t>(
+        lp.sample_rate * 0.5f);
+    std::vector<std::complex<float>> rx_buf(rx_total);
+    std::atomic<std::size_t> rx_captured{0};
+
+    std::thread rx_thread([&]() {
+        std::size_t offset = 0;
+        while (offset < rx_total) {
+            std::size_t chunk = std::min(rx_total - offset,
+                                         std::size_t{4096});
+            auto* buf = reinterpret_cast<float*>(&rx_buf[offset]);
+            int ret = radio_bridge_read(rx_bridge, buf, chunk, 0.1);
+            if (ret > 0) {
+                offset += static_cast<std::size_t>(ret);
+                rx_captured.store(offset, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    std::fprintf(stderr, "  Transmitting %zu samples...\n", tx_iq.size());
+    const auto* tx_buf = reinterpret_cast<const float*>(tx_iq.data());
+    std::size_t tx_offset = 0;
+    while (tx_offset < tx_iq.size()) {
+        std::size_t chunk = std::min(tx_iq.size() - tx_offset,
+                                     std::size_t{4096});
+        int is_last = (tx_offset + chunk >= tx_iq.size()) ? 1 : 0;
+        int ret = radio_bridge_write(tx_bridge,
+                                      tx_buf + tx_offset * 2,
+                                      chunk, 0.1, is_last);
+        if (ret < 0) {
+            std::fprintf(stderr, "  TX write error: %d\n", ret);
+            break;
+        }
+        tx_offset += static_cast<std::size_t>(ret);
+    }
+    std::fprintf(stderr, "  TX complete.\n");
+
+    rx_thread.join();
+    std::fprintf(stderr, "  RX captured %zu samples.\n",
+                 rx_captured.load());
+
+    std::fprintf(stderr, "  Decoding...\n");
+    rr.decode = decode_iq(rx_buf, lp);
+
+    if (rr.decode.decoded) {
+        std::size_t expected = payload_str.size();
+        if (rr.decode.payload.size() >= expected) {
+            rr.rx_string = std::string(
+                rr.decode.payload.begin(),
+                rr.decode.payload.begin() +
+                static_cast<int64_t>(expected));
+        } else {
+            rr.rx_string = std::string(
+                rr.decode.payload.begin(),
+                rr.decode.payload.end());
+        }
+        rr.match = (rr.rx_string == rr.tx_string);
+        std::fprintf(stderr, "  RX: \"%s\" CRC=%s match=%s\n",
+                     rr.rx_string.c_str(),
+                     rr.decode.crc_valid ? "OK" : "FAIL",
+                     rr.match ? "YES" : "NO");
+    } else {
+        std::fprintf(stderr, "  RX: no frame detected!\n");
+    }
+
+    return rr;
+}
+
+/// Generate a random hex nonce for challenge-response.
+std::string random_hex_nonce(int n_bytes) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dist(0, 255);
+    std::string hex;
+    hex.reserve(static_cast<std::size_t>(n_bytes) * 2);
+    for (int i = 0; i < n_bytes; i++) {
+        char buf[3];
+        std::snprintf(buf, sizeof(buf), "%02x",
+                      static_cast<unsigned>(dist(gen)));
+        hex += buf;
+    }
+    return hex;
+}
+
+int run_loopback(const TxConfig& cfg) {
+    bool challenge_mode = cfg.payload.empty();
+
+    LoraParams lp;
+    lp.sf           = cfg.sf;
+    lp.cr           = cfg.cr;
+    lp.bw           = cfg.bw;
+    lp.sync_word    = cfg.sync_word;
+    lp.preamble_len = cfg.preamble_len;
+    lp.sample_rate  = cfg.rate;
+    lp.freq         = cfg.freq;
+
+    std::fprintf(stderr, "=== LoRa Hardware Loopback Test ===\n");
+    std::fprintf(stderr, "  Device args: %s\n",
+                 cfg.args.empty() ? "(auto)" : cfg.args.c_str());
+    std::fprintf(stderr, "  Clock:       %s\n",
+                 cfg.clock.empty() ? "(default)" : cfg.clock.c_str());
+    std::fprintf(stderr, "  Mode:        %s\n",
+                 challenge_mode ? "challenge-response (2 rounds)"
+                                 : "fixed payload (1 round)");
+    std::fprintf(stderr, "  Frequency:   %.6f MHz\n", cfg.freq / 1e6);
+    std::fprintf(stderr, "  TX gain:     %.0f dB  RX gain: %.0f dB\n",
+                 cfg.gain, cfg.rx_gain);
+    std::fprintf(stderr, "  SF=%u BW=%u CR=4/%u sync=0x%02X preamble=%u\n",
+                 cfg.sf, cfg.bw, 4 + cfg.cr, cfg.sync_word, cfg.preamble_len);
+
+    // --- Probe device ---
+    std::fprintf(stderr, "\nProbing for device...\n");
+    const char* probe_args = cfg.args.empty() ? nullptr : cfg.args.c_str();
+    if (!radio_bridge_probe(probe_args)) {
+        std::fprintf(stderr, "ERROR: No device found.\n");
+        return 1;
+    }
+
+    // --- Open RX stream ---
+    std::fprintf(stderr, "Opening RX stream...\n");
+    radio_bridge_config_t rx_cfg{};
+    rx_cfg.device_args  = cfg.args.empty() ? nullptr : cfg.args.c_str();
+    rx_cfg.clock_source = cfg.clock.empty() ? nullptr : cfg.clock.c_str();
+    rx_cfg.sample_rate  = static_cast<double>(cfg.rate);
+    rx_cfg.center_freq  = cfg.freq;
+    rx_cfg.gain_db      = cfg.rx_gain;
+    rx_cfg.bandwidth    = 0;
+    rx_cfg.channel      = 0;
+    rx_cfg.antenna      = nullptr;
+    rx_cfg.direction    = RADIO_BRIDGE_RX;
+
+    radio_bridge_t* rx_bridge = radio_bridge_create(&rx_cfg);
+    if (!rx_bridge) {
+        std::fprintf(stderr, "ERROR: RX create failed: %s\n",
+                     radio_bridge_last_error());
+        return 1;
+    }
+
+    // --- Open TX stream ---
+    std::fprintf(stderr, "Opening TX stream...\n");
+    radio_bridge_config_t tx_cfg{};
+    tx_cfg.device_args  = cfg.args.empty() ? nullptr : cfg.args.c_str();
+    tx_cfg.clock_source = cfg.clock.empty() ? nullptr : cfg.clock.c_str();
+    tx_cfg.sample_rate  = static_cast<double>(cfg.rate);
+    tx_cfg.center_freq  = cfg.freq;
+    tx_cfg.gain_db      = cfg.gain;
+    tx_cfg.bandwidth    = 0;
+    tx_cfg.channel      = 0;
+    tx_cfg.antenna      = nullptr;
+    tx_cfg.direction    = RADIO_BRIDGE_TX;
+
+    radio_bridge_t* tx_bridge = radio_bridge_create(&tx_cfg);
+    if (!tx_bridge) {
+        std::fprintf(stderr, "ERROR: TX create failed: %s\n",
+                     radio_bridge_last_error());
+        radio_bridge_destroy_ex(rx_bridge, 1);
+        _exit(1);
+    }
+
+    int exit_code = 0;
+
+    if (challenge_mode) {
+        std::string nonce = random_hex_nonce(4);
+        std::string challenge = "CHAL:" + nonce;
+
+        auto r1 = do_round("Round 1: Challenge", challenge,
+                           tx_bridge, rx_bridge, lp);
+        if (!r1.decode.decoded || !r1.decode.crc_valid || !r1.match) {
+            std::fprintf(stderr, "\nRound 1 FAILED.\n");
+            exit_code = 1;
+        } else {
+            std::string decoded_nonce;
+            if (r1.rx_string.size() > 5 &&
+                r1.rx_string.substr(0, 5) == "CHAL:") {
+                decoded_nonce = r1.rx_string.substr(5);
+            } else {
+                decoded_nonce = r1.rx_string;
+            }
+            std::string response = "RESP:" + decoded_nonce;
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+            auto r2 = do_round("Round 2: Response", response,
+                               tx_bridge, rx_bridge, lp);
+            if (!r2.decode.decoded || !r2.decode.crc_valid || !r2.match) {
+                std::fprintf(stderr, "\nRound 2 FAILED.\n");
+                exit_code = 1;
+            }
+
+            bool nonce_in_response = (r2.rx_string.find(nonce) !=
+                                      std::string::npos);
+
+            std::fprintf(stderr, "\n=============================\n");
+            std::fprintf(stderr, "  CHALLENGE-RESPONSE RESULT\n");
+            std::fprintf(stderr, "=============================\n");
+            std::fprintf(stderr, "  Nonce:       %s\n", nonce.c_str());
+            std::fprintf(stderr, "  R1 TX:       \"%s\"\n",
+                         r1.tx_string.c_str());
+            std::fprintf(stderr, "  R1 RX:       \"%s\"  CRC=%s\n",
+                         r1.rx_string.c_str(),
+                         r1.decode.crc_valid ? "OK" : "FAIL");
+            std::fprintf(stderr, "  R2 TX:       \"%s\"\n",
+                         r2.tx_string.c_str());
+            std::fprintf(stderr, "  R2 RX:       \"%s\"  CRC=%s\n",
+                         r2.rx_string.c_str(),
+                         r2.decode.crc_valid ? "OK" : "FAIL");
+            std::fprintf(stderr, "  Nonce echo:  %s\n",
+                         nonce_in_response ? "YES" : "NO");
+
+            if (r1.match && r1.decode.crc_valid &&
+                r2.match && r2.decode.crc_valid &&
+                nonce_in_response) {
+                std::fprintf(stderr,
+                    "\n  *** CHALLENGE-RESPONSE PASSED ***\n\n");
+                exit_code = 0;
+            } else {
+                std::fprintf(stderr,
+                    "\n  *** CHALLENGE-RESPONSE FAILED ***\n\n");
+                exit_code = 1;
+            }
+        }
+    } else {
+        auto r = do_round("Single Round", cfg.payload,
+                          tx_bridge, rx_bridge, lp);
+
+        std::fprintf(stderr, "\n=== LOOPBACK RESULT ===\n");
+        std::fprintf(stderr, "  TX: \"%s\"\n", r.tx_string.c_str());
+        std::fprintf(stderr, "  RX: \"%s\"\n", r.rx_string.c_str());
+        std::fprintf(stderr, "  CRC:   %s\n",
+                     r.decode.crc_valid ? "VALID" : "FAIL");
+        std::fprintf(stderr, "  Match: %s\n",
+                     r.match ? "YES" : "NO");
+
+        if (r.match && r.decode.crc_valid) {
+            std::fprintf(stderr,
+                "\n  *** LOOPBACK TEST PASSED ***\n\n");
+        } else {
+            std::fprintf(stderr,
+                "\n  *** LOOPBACK TEST FAILED ***\n\n");
+            exit_code = 1;
+        }
+    }
+
+    radio_bridge_destroy_ex(tx_bridge, 1);
+    radio_bridge_destroy_ex(rx_bridge, 1);
+
+    _exit(exit_code);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -442,6 +814,11 @@ int main(int argc, char** argv) {
     // ---- Stdin CBOR mode ----
     if (cfg.stdin_mode) {
         return run_stdin_mode(cfg);
+    }
+
+    // ---- Loopback mode ----
+    if (cfg.loopback) {
+        return run_loopback(cfg);
     }
 
     // ---- CLI mode ----
@@ -505,8 +882,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Stop stream and release streamer, but skip device deallocation —
-    // static teardown can crash under dual-libc++.
     radio_bridge_destroy_ex(bridge, 1);
     std::fprintf(stderr, "\nDone.\n");
     _exit(0);

@@ -2,6 +2,10 @@
 #
 # Hardware applications using the unified radio_bridge API.
 #
+# Two binaries:
+#   lora_rx  — single-channel receiver (default) or dual-RX scanner (--scan)
+#   lora_tx  — batch/CBOR-streaming transmitter or TX→RX loopback (--loopback)
+#
 # The radio_bridge API has two backends: UHD (preferred) and SoapySDR (fallback).
 # Both are compiled as pure C to isolate the dual-libc++ ABI boundary on macOS
 # (LLVM 19 for GR4 C++23 vs system libc++ for UHD/SoapySDR).
@@ -40,18 +44,10 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_definitions(radio_bridge PRIVATE _FORTIFY_SOURCE=2)
 endif()
 
-# --- lora_rx: single-channel LoRa receiver ---
+# --- lora_rx: single-channel RX (default) + dual-RX scanner (--scan) ---
 add_executable(lora_rx lora_rx.cpp)
 target_link_libraries(lora_rx PRIVATE gnuradio-blocklib-core gr-lora radio_bridge)
 
-# --- lora_tx: LoRa transmitter (batch + CBOR streaming) ---
+# --- lora_tx: batch TX / CBOR streaming / loopback (--loopback) ---
 add_executable(lora_tx lora_tx.cpp)
-target_link_libraries(lora_tx PRIVATE gr-lora radio_bridge)
-
-# --- lora_loopback: TX->RX hardware loopback test ---
-add_executable(lora_loopback lora_loopback.cpp)
-target_link_libraries(lora_loopback PRIVATE gnuradio-blocklib-core gr-lora gr-testing radio_bridge)
-
-# --- lora_scanner: dual-RX multi-channel LoRa scanner ---
-add_executable(lora_scanner lora_scanner.cpp)
-target_link_libraries(lora_scanner PRIVATE gnuradio-blocklib-core gr-lora radio_bridge)
+target_link_libraries(lora_tx PRIVATE gnuradio-blocklib-core gr-lora gr-testing radio_bridge)
