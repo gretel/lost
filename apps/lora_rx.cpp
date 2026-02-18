@@ -128,10 +128,10 @@ void print_usage(const char* prog) {
         "    RX0 (866 MHz): 865.125, 868.100 MHz\n"
         "    RX1 (869 MHz): 868.300, 869.525, 869.618 MHz\n\n"
         "Buffer tuning:\n"
-        "  --recv-frames <n> USB recv buffer count (default: UHD default = 16)\n"
-        "                    Increase to 32-64 to reduce overflows.\n"
-        "                    At 250 kS/s: 16 frames = ~131 ms buffer.\n"
-        "                    At 5 MS/s:   16 frames = ~6.5 ms buffer.\n\n"
+         "  --recv-frames <n> USB recv buffer count (default: 128 for --scan, 16 otherwise)\n"
+        "                    Scanner mode auto-sets 128 frames (~1 MB, ~26 ms buffer)\n"
+        "                    to absorb macOS scheduling jitter on dual-RX.\n"
+        "                    Single-channel: 16 frames is adequate at all rates.\n\n"
         "Diagnostics:\n"
         "  --overflow-test [sec]  Run overflow test for N seconds (default: 30)\n"
         "                    Streams RX without decode, counts overflows,\n"
@@ -937,6 +937,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::fprintf(stderr, "Device found.\n\n");
+
+    // Auto-set recv_frames for dual-RX modes (scanner, dual overflow test).
+    // The B210 RX buffer chain is only ~7.83 ms deep at default 16 frames.
+    // At 10 MS/s aggregate, macOS scheduling jitter causes steady-state
+    // overflows. 128 frames (~1 MB, ~26 ms) absorbs this reliably.
+    if (cfg.scan && cfg.recv_frames == 0) {
+        cfg.recv_frames = 128;
+        std::fprintf(stderr, "Scanner mode: auto-set --recv-frames %d "
+                     "(~1 MB USB buffer, ~26 ms)\n\n", cfg.recv_frames);
+    }
 
     if (cfg.overflow_test) {
         return cfg.scan ? run_overflow_test_dual(cfg) : run_overflow_test(cfg);
