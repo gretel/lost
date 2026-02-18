@@ -21,10 +21,11 @@
 //   Loopback mode (--loopback):
 //     lora_tx --loopback [--payload "text"]
 //     Opens both TX and RX on the same device (shared via the bridge's
-//     reference counting). Runs a two-round challenge-response protocol:
-//       Round 1 (Challenge): TX a random nonce "CHAL:<hex8>", RX and decode.
-//       Round 2 (Response):  TX "RESP:<decoded_nonce>", RX and decode.
-//     Both rounds must decode with CRC valid and matching payloads.
+//     reference counting). Runs a three-round test protocol:
+//       Round 1 (Greeting):  TX "Hello From gnuradio-4.0 (<rev>)!"
+//       Round 2 (Challenge): TX a random nonce "CHAL:<hex8>", RX and decode.
+//       Round 3 (Response):  TX "RESP:<decoded_nonce>", RX and decode.
+//     All rounds must decode with CRC valid and matching payloads.
 //     Use --payload for single-round fixed-payload mode.
 //
 // *** SAFETY: This program transmits on radio frequencies. ***
@@ -79,8 +80,10 @@ struct TxConfig {
     bool        dry_run{false};
     bool        stdin_mode{false};
     bool        loopback{false};
-    double      rx_gain{40.0};       ///< RX gain for loopback mode
+    bool        loopback_cbor{false};  ///< output CBOR frame on stdout in loopback
+    double      rx_gain{40.0};        ///< RX gain for loopback mode
     std::string payload;
+    bool        payload_is_hex{false};  ///< payload was set via --payload-hex
 };
 
 void print_usage(const char* prog) {
@@ -106,19 +109,22 @@ void print_usage(const char* prog) {
         "  --dry-run         Generate IQ without transmitting\n"
         "  --stdin           Read CBOR TX requests from stdin\n\n"
         "Loopback mode:\n"
-        "  --loopback        TX->RX challenge-response test on same device\n"
-        "  --rx-gain <db>    RX gain for loopback (default: 40)\n"
-        "  --payload <text>  Fixed payload (disables challenge-response)\n\n"
+        "  --loopback            TX->RX challenge-response test on same device\n"
+        "  --rx-gain <db>        RX gain for loopback (default: 40)\n"
+        "  --payload <text>      Fixed text payload (disables challenge-response)\n"
+        "  --payload-hex <hex>   Fixed binary payload as hex (e.g. MeshCore wire packet)\n"
+        "  --cbor                Output decoded frame as CBOR on stdout (loopback mode)\n\n"
         "Other:\n"
-        "  -h, --help        Show this help\n\n"
+        "  -h, --help            Show this help\n\n"
         "Examples:\n"
         "  %s \"Hello World\"\n"
         "  %s --args type=b200 --clock external \"Hello World\"\n"
         "  %s --sf 12 --bw 125000 --rate 500000 \"Hello World\"\n"
         "  %s --loopback --clock external\n"
-        "  %s --loopback --payload \"Test 123\"\n\n"
+        "  %s --loopback --payload \"Test 123\"\n"
+        "  %s --loopback --payload-hex 1100abcd... --cbor | python3 scripts/lora_decode_meshcore.py\n\n"
         "*** Ensure you have authorization to transmit! ***\n",
-        prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 bool parse_args(int argc, char** argv, TxConfig& cfg) {
@@ -161,6 +167,19 @@ bool parse_args(int argc, char** argv, TxConfig& cfg) {
             cfg.rx_gain = std::stod(argv[++i]);
         } else if (arg == "--payload" && i + 1 < argc) {
             cfg.payload = argv[++i];
+        } else if (arg == "--payload-hex" && i + 1 < argc) {
+            // Decode hex string into raw bytes stored in payload
+            std::string hex = argv[++i];
+            cfg.payload.clear();
+            cfg.payload.reserve(hex.size() / 2);
+            for (std::size_t j = 0; j + 1 < hex.size(); j += 2) {
+                auto byte = static_cast<char>(
+                    std::stoul(hex.substr(j, 2), nullptr, 16));
+                cfg.payload.push_back(byte);
+            }
+            cfg.payload_is_hex = true;
+        } else if (arg == "--cbor") {
+            cfg.loopback_cbor = true;  // only used with --loopback
         } else if (arg[0] == '-') {
             std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
             print_usage(argv[0]);
@@ -500,11 +519,11 @@ DecodeResult decode_iq(const std::vector<std::complex<float>>& iq,
     sched.runAndWait();
 
     DecodeResult result;
-    result.payload = sink._samples;
+    result.payload.assign(sink._samples.begin(), sink._samples.end());
 
     for (const auto& tag : sink._tags) {
         if (auto it = tag.map.find("crc_valid"); it != tag.map.end()) {
-            result.crc_valid = pmtv::cast<bool>(it->second);
+            result.crc_valid = it->second.value_or<bool>(false);
             result.decoded = true;
         }
     }
@@ -514,17 +533,31 @@ DecodeResult decode_iq(const std::vector<std::complex<float>>& iq,
 
 struct RoundResult {
     DecodeResult         decode;
-    std::string          tx_string;
-    std::string          rx_string;
+    std::vector<uint8_t> tx_bytes;
+    std::vector<uint8_t> rx_bytes;
     bool                 match{false};
 };
 
+/// Format bytes as hex string.
+std::string to_hex(const std::vector<uint8_t>& data, std::size_t max_bytes = 0) {
+    std::string hex;
+    std::size_t n = (max_bytes > 0) ? std::min(data.size(), max_bytes) : data.size();
+    hex.reserve(n * 3);
+    for (std::size_t i = 0; i < n; i++) {
+        char buf[4];
+        std::snprintf(buf, sizeof(buf), "%02X ", data[i]);
+        hex += buf;
+    }
+    if (max_bytes > 0 && data.size() > max_bytes) {
+        hex += "...";
+    }
+    return hex;
+}
+
 /// Build padded TX IQ with leading/trailing silence.
 std::vector<std::complex<float>> build_padded_iq(
-        const std::string& payload_str, const LoraParams& lp) {
+        const std::vector<uint8_t>& payload_bytes, const LoraParams& lp) {
     auto os_factor = static_cast<uint8_t>(lp.sample_rate / static_cast<float>(lp.bw));
-    std::vector<uint8_t> payload_bytes(payload_str.begin(),
-                                        payload_str.end());
     auto frame_iq = gr::lora::generate_frame_iq(
         payload_bytes, lp.sf, lp.cr, os_factor,
         lp.sync_word, lp.preamble_len, true, 0,
@@ -539,18 +572,26 @@ std::vector<std::complex<float>> build_padded_iq(
 
 /// Execute one TX->RX round: transmit payload, capture IQ, decode offline.
 RoundResult do_round(const std::string& label,
-                     const std::string& payload_str,
+                     const std::vector<uint8_t>& payload_bytes,
                      radio_bridge_t* tx_bridge,
                      radio_bridge_t* rx_bridge,
-                     const LoraParams& lp) {
+                     const LoraParams& lp,
+                     bool show_hex = false) {
     RoundResult rr;
-    rr.tx_string = payload_str;
+    rr.tx_bytes = payload_bytes;
 
     std::fprintf(stderr, "\n--- %s ---\n", label.c_str());
-    std::fprintf(stderr, "  TX: \"%s\" (%zu bytes)\n",
-                 payload_str.c_str(), payload_str.size());
+    if (show_hex) {
+        std::fprintf(stderr, "  TX: %zu bytes\n  Hex: %s\n",
+                     payload_bytes.size(),
+                     to_hex(payload_bytes, 48).c_str());
+    } else {
+        std::string tx_str(payload_bytes.begin(), payload_bytes.end());
+        std::fprintf(stderr, "  TX: \"%s\" (%zu bytes)\n",
+                     tx_str.c_str(), payload_bytes.size());
+    }
 
-    auto tx_iq = build_padded_iq(payload_str, lp);
+    auto tx_iq = build_padded_iq(payload_bytes, lp);
 
     std::size_t rx_total = tx_iq.size() + static_cast<std::size_t>(
         lp.sample_rate * 0.5f);
@@ -599,22 +640,30 @@ RoundResult do_round(const std::string& label,
     rr.decode = decode_iq(rx_buf, lp);
 
     if (rr.decode.decoded) {
-        std::size_t expected = payload_str.size();
+        std::size_t expected = payload_bytes.size();
         if (rr.decode.payload.size() >= expected) {
-            rr.rx_string = std::string(
+            rr.rx_bytes.assign(
                 rr.decode.payload.begin(),
                 rr.decode.payload.begin() +
                 static_cast<int64_t>(expected));
         } else {
-            rr.rx_string = std::string(
-                rr.decode.payload.begin(),
-                rr.decode.payload.end());
+            rr.rx_bytes = rr.decode.payload;
         }
-        rr.match = (rr.rx_string == rr.tx_string);
-        std::fprintf(stderr, "  RX: \"%s\" CRC=%s match=%s\n",
-                     rr.rx_string.c_str(),
-                     rr.decode.crc_valid ? "OK" : "FAIL",
-                     rr.match ? "YES" : "NO");
+        rr.match = (rr.rx_bytes == rr.tx_bytes);
+        if (show_hex) {
+            std::fprintf(stderr, "  RX: %zu bytes  CRC=%s  match=%s\n"
+                                 "  Hex: %s\n",
+                         rr.rx_bytes.size(),
+                         rr.decode.crc_valid ? "OK" : "FAIL",
+                         rr.match ? "YES" : "NO",
+                         to_hex(rr.rx_bytes, 48).c_str());
+        } else {
+            std::string rx_str(rr.rx_bytes.begin(), rr.rx_bytes.end());
+            std::fprintf(stderr, "  RX: \"%s\" CRC=%s match=%s\n",
+                         rx_str.c_str(),
+                         rr.decode.crc_valid ? "OK" : "FAIL",
+                         rr.match ? "YES" : "NO");
+        }
     } else {
         std::fprintf(stderr, "  RX: no frame detected!\n");
     }
@@ -638,6 +687,15 @@ std::string random_hex_nonce(int n_bytes) {
     return hex;
 }
 
+/// Build the default loopback payload: "Hello From gnuradio-4.0 (<rev>)!"
+std::string default_loopback_payload() {
+#ifdef GR4_GIT_REV
+    return std::string("Hello From gnuradio-4.0 (") + GR4_GIT_REV + ")!";
+#else
+    return "Hello From gnuradio-4.0!";
+#endif
+}
+
 int run_loopback(const TxConfig& cfg) {
     bool challenge_mode = cfg.payload.empty();
 
@@ -656,7 +714,7 @@ int run_loopback(const TxConfig& cfg) {
     std::fprintf(stderr, "  Clock:       %s\n",
                  cfg.clock.empty() ? "(default)" : cfg.clock.c_str());
     std::fprintf(stderr, "  Mode:        %s\n",
-                 challenge_mode ? "challenge-response (2 rounds)"
+                 challenge_mode ? "greeting + challenge-response (3 rounds)"
                                  : "fixed payload (1 round)");
     std::fprintf(stderr, "  Frequency:   %.6f MHz\n", cfg.freq / 1e6);
     std::fprintf(stderr, "  TX gain:     %.0f dB  RX gain: %.0f dB\n",
@@ -714,77 +772,107 @@ int run_loopback(const TxConfig& cfg) {
     }
 
     int exit_code = 0;
+    bool is_hex = cfg.payload_is_hex;
+
+    // Helper to convert string to byte vector.
+    auto to_bytes = [](const std::string& s) -> std::vector<uint8_t> {
+        return {s.begin(), s.end()};
+    };
+    // Helper to convert byte vector to string.
+    auto to_string = [](const std::vector<uint8_t>& v) -> std::string {
+        return {v.begin(), v.end()};
+    };
 
     if (challenge_mode) {
-        std::string nonce = random_hex_nonce(4);
-        std::string challenge = "CHAL:" + nonce;
-
-        auto r1 = do_round("Round 1: Challenge", challenge,
+        // Default loopback: version-stamped greeting + challenge-response
+        std::string greeting = default_loopback_payload();
+        auto r0 = do_round("Round 1: Greeting", to_bytes(greeting),
                            tx_bridge, rx_bridge, lp);
-        if (!r1.decode.decoded || !r1.decode.crc_valid || !r1.match) {
-            std::fprintf(stderr, "\nRound 1 FAILED.\n");
+
+        if (!r0.decode.decoded || !r0.decode.crc_valid || !r0.match) {
+            std::fprintf(stderr, "\nRound 1 (greeting) FAILED.\n");
             exit_code = 1;
         } else {
-            std::string decoded_nonce;
-            if (r1.rx_string.size() > 5 &&
-                r1.rx_string.substr(0, 5) == "CHAL:") {
-                decoded_nonce = r1.rx_string.substr(5);
-            } else {
-                decoded_nonce = r1.rx_string;
-            }
-            std::string response = "RESP:" + decoded_nonce;
-
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-            auto r2 = do_round("Round 2: Response", response,
+            std::string nonce = random_hex_nonce(4);
+            std::string challenge = "CHAL:" + nonce;
+
+            auto r1 = do_round("Round 2: Challenge", to_bytes(challenge),
                                tx_bridge, rx_bridge, lp);
-            if (!r2.decode.decoded || !r2.decode.crc_valid || !r2.match) {
-                std::fprintf(stderr, "\nRound 2 FAILED.\n");
+            if (!r1.decode.decoded || !r1.decode.crc_valid || !r1.match) {
+                std::fprintf(stderr, "\nRound 2 (challenge) FAILED.\n");
                 exit_code = 1;
-            }
-
-            bool nonce_in_response = (r2.rx_string.find(nonce) !=
-                                      std::string::npos);
-
-            std::fprintf(stderr, "\n=============================\n");
-            std::fprintf(stderr, "  CHALLENGE-RESPONSE RESULT\n");
-            std::fprintf(stderr, "=============================\n");
-            std::fprintf(stderr, "  Nonce:       %s\n", nonce.c_str());
-            std::fprintf(stderr, "  R1 TX:       \"%s\"\n",
-                         r1.tx_string.c_str());
-            std::fprintf(stderr, "  R1 RX:       \"%s\"  CRC=%s\n",
-                         r1.rx_string.c_str(),
-                         r1.decode.crc_valid ? "OK" : "FAIL");
-            std::fprintf(stderr, "  R2 TX:       \"%s\"\n",
-                         r2.tx_string.c_str());
-            std::fprintf(stderr, "  R2 RX:       \"%s\"  CRC=%s\n",
-                         r2.rx_string.c_str(),
-                         r2.decode.crc_valid ? "OK" : "FAIL");
-            std::fprintf(stderr, "  Nonce echo:  %s\n",
-                         nonce_in_response ? "YES" : "NO");
-
-            if (r1.match && r1.decode.crc_valid &&
-                r2.match && r2.decode.crc_valid &&
-                nonce_in_response) {
-                std::fprintf(stderr,
-                    "\n  *** CHALLENGE-RESPONSE PASSED ***\n\n");
-                exit_code = 0;
             } else {
-                std::fprintf(stderr,
-                    "\n  *** CHALLENGE-RESPONSE FAILED ***\n\n");
-                exit_code = 1;
+                std::string rx1_str = to_string(r1.rx_bytes);
+                std::string decoded_nonce;
+                if (rx1_str.size() > 5 && rx1_str.substr(0, 5) == "CHAL:") {
+                    decoded_nonce = rx1_str.substr(5);
+                } else {
+                    decoded_nonce = rx1_str;
+                }
+                std::string response = "RESP:" + decoded_nonce;
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+                auto r2 = do_round("Round 3: Response", to_bytes(response),
+                                   tx_bridge, rx_bridge, lp);
+                if (!r2.decode.decoded || !r2.decode.crc_valid || !r2.match) {
+                    std::fprintf(stderr, "\nRound 3 (response) FAILED.\n");
+                    exit_code = 1;
+                }
+
+                std::string r1_tx_str = to_string(r1.tx_bytes);
+                std::string r1_rx_str = to_string(r1.rx_bytes);
+                std::string r2_tx_str = to_string(r2.tx_bytes);
+                std::string r2_rx_str = to_string(r2.rx_bytes);
+                bool nonce_in_response = (r2_rx_str.find(nonce) !=
+                                          std::string::npos);
+
+                std::fprintf(stderr, "\n=============================\n");
+                std::fprintf(stderr, "  LOOPBACK TEST RESULT\n");
+                std::fprintf(stderr, "=============================\n");
+                std::fprintf(stderr, "  Greeting:    \"%s\"  CRC=%s\n",
+                             greeting.c_str(),
+                             r0.decode.crc_valid ? "OK" : "FAIL");
+                std::fprintf(stderr, "  Nonce:       %s\n", nonce.c_str());
+                std::fprintf(stderr, "  R2 TX:       \"%s\"\n", r1_tx_str.c_str());
+                std::fprintf(stderr, "  R2 RX:       \"%s\"  CRC=%s\n",
+                             r1_rx_str.c_str(),
+                             r1.decode.crc_valid ? "OK" : "FAIL");
+                std::fprintf(stderr, "  R3 TX:       \"%s\"\n", r2_tx_str.c_str());
+                std::fprintf(stderr, "  R3 RX:       \"%s\"  CRC=%s\n",
+                             r2_rx_str.c_str(),
+                             r2.decode.crc_valid ? "OK" : "FAIL");
+                std::fprintf(stderr, "  Nonce echo:  %s\n",
+                             nonce_in_response ? "YES" : "NO");
+
+                if (r0.match && r0.decode.crc_valid &&
+                    r1.match && r1.decode.crc_valid &&
+                    r2.match && r2.decode.crc_valid &&
+                    nonce_in_response) {
+                    std::fprintf(stderr,
+                        "\n  *** LOOPBACK TEST PASSED ***\n\n");
+                    exit_code = 0;
+                } else {
+                    std::fprintf(stderr,
+                        "\n  *** LOOPBACK TEST FAILED ***\n\n");
+                    exit_code = 1;
+                }
             }
         }
     } else {
-        auto r = do_round("Single Round", cfg.payload,
-                          tx_bridge, rx_bridge, lp);
+        std::vector<uint8_t> payload_bytes(cfg.payload.begin(),
+                                            cfg.payload.end());
+        auto r = do_round("Single Round", payload_bytes,
+                          tx_bridge, rx_bridge, lp, is_hex);
 
         std::fprintf(stderr, "\n=== LOOPBACK RESULT ===\n");
-        std::fprintf(stderr, "  TX: \"%s\"\n", r.tx_string.c_str());
-        std::fprintf(stderr, "  RX: \"%s\"\n", r.rx_string.c_str());
-        std::fprintf(stderr, "  CRC:   %s\n",
+        std::fprintf(stderr, "  Bytes:  %zu TX, %zu RX\n",
+                     r.tx_bytes.size(), r.rx_bytes.size());
+        std::fprintf(stderr, "  CRC:    %s\n",
                      r.decode.crc_valid ? "VALID" : "FAIL");
-        std::fprintf(stderr, "  Match: %s\n",
+        std::fprintf(stderr, "  Match:  %s\n",
                      r.match ? "YES" : "NO");
 
         if (r.match && r.decode.crc_valid) {
@@ -794,6 +882,28 @@ int run_loopback(const TxConfig& cfg) {
             std::fprintf(stderr,
                 "\n  *** LOOPBACK TEST FAILED ***\n\n");
             exit_code = 1;
+        }
+
+        // Output CBOR frame on stdout (like lora_rx --cbor) for piping
+        // to decoder scripts.
+        if (cfg.loopback_cbor && r.decode.decoded) {
+            std::vector<uint8_t> cbor_buf;
+            // 8 key-value pairs
+            gr::lora::cbor::encode_map_begin(cbor_buf, 8);
+            gr::lora::cbor::kv_text(cbor_buf, "type", "lora_frame");
+            gr::lora::cbor::kv_bytes(cbor_buf, "payload",
+                                      r.rx_bytes.data(), r.rx_bytes.size());
+            gr::lora::cbor::kv_uint(cbor_buf, "sf", cfg.sf);
+            gr::lora::cbor::kv_uint(cbor_buf, "cr", cfg.cr);
+            gr::lora::cbor::kv_bool(cbor_buf, "crc_valid",
+                                     r.decode.crc_valid);
+            gr::lora::cbor::kv_uint(cbor_buf, "sync_word", cfg.sync_word);
+            gr::lora::cbor::kv_text(cbor_buf, "protocol",
+                                     "meshcore_or_reticulum");
+            gr::lora::cbor::kv_uint(cbor_buf, "seq", 1);
+
+            std::fwrite(cbor_buf.data(), 1, cbor_buf.size(), stdout);
+            std::fflush(stdout);
         }
     }
 

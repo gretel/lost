@@ -522,7 +522,7 @@ const boost::ut::suite<"Channelizer integration"> integration_tests = [] {
         bool found_crc = false;
         for (const auto& t : sink._tags) {
             if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
-                expect(pmtv::cast<bool>(it->second)) << "CRC should be valid";
+                expect(it->second.value_or<bool>(false)) << "CRC should be valid";
                 found_crc = true;
             }
         }

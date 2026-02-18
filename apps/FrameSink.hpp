@@ -242,18 +242,18 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                 }
 
                 _pay_len = static_cast<uint32_t>(
-                    pmtv::cast<int64_t>(it->second));
+                    it->second.value_or<int64_t>(0));
                 if (auto it2 = tag.map.find("cr"); it2 != tag.map.end()) {
                     _cr = static_cast<uint8_t>(
-                        pmtv::cast<int64_t>(it2->second));
+                        it2->second.value_or<int64_t>(0));
                 }
                 if (auto it2 = tag.map.find("crc_valid");
                     it2 != tag.map.end()) {
-                    _crc_valid = pmtv::cast<bool>(it2->second);
+                    _crc_valid = it2->second.value_or<bool>(false);
                 }
                 if (auto it2 = tag.map.find("is_downchirp");
                     it2 != tag.map.end()) {
-                    _is_downchirp = pmtv::cast<bool>(it2->second);
+                    _is_downchirp = it2->second.value_or<bool>(false);
                 } else {
                     _is_downchirp = false;
                 }

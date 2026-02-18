@@ -425,7 +425,7 @@ class TestAnonReq(unittest.TestCase):
         dest_expanded = meshcore_expanded_key(seed2)
         dest_pub = bytes(sk2.verify_key)
 
-        message = b"Hello from SDR"
+        message = b"Hello from gr4-lora"
         pkt = build_anon_req(
             TEST_SEED_EXPANDED, TEST_SEED_PUB, dest_pub, message, timestamp=1700000000
         )

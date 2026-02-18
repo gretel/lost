@@ -11,7 +11,7 @@ Usage:
   meshcore_tx.py advert --name "MyNode"
 
   # Send anonymous encrypted message to a known peer:
-  meshcore_tx.py anon-req --dest <pubkey_hex> "Hello from SDR"
+  meshcore_tx.py anon-req --dest <pubkey_hex> "Hello from gr4-lora"
 
   # Pipe to lora_tx:
   meshcore_tx.py advert --name "MyNode" | lora_tx --stdin

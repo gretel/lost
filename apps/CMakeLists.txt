@@ -48,6 +48,23 @@ endif()
 add_executable(lora_rx lora_rx.cpp)
 target_link_libraries(lora_rx PRIVATE gnuradio-blocklib-core gr-lora radio_bridge)
 
+# --- Git revision strings (injected at configure time) ---
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    OUTPUT_VARIABLE GR4_LORA_GIT_REV
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/gnuradio4
+    OUTPUT_VARIABLE GR4_GIT_REV
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+
 # --- lora_tx: batch TX / CBOR streaming / loopback (--loopback) ---
 add_executable(lora_tx lora_tx.cpp)
 target_link_libraries(lora_tx PRIVATE gnuradio-blocklib-core gr-lora gr-testing radio_bridge)
+target_compile_definitions(lora_tx PRIVATE
+    GR4_LORA_GIT_REV="${GR4_LORA_GIT_REV}"
+    GR4_GIT_REV="${GR4_GIT_REV}")

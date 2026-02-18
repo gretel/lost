@@ -223,10 +223,10 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
 
         // --- Publish tag ---
         gr::property_map out_tag;
-        out_tag["pay_len"]       = pmtv::pmt(static_cast<int64_t>(_pay_len));
-        out_tag["cr"]            = pmtv::pmt(static_cast<int64_t>(_cr));
-        out_tag["crc_valid"]     = pmtv::pmt(crc_valid);
-        out_tag["is_downchirp"]  = pmtv::pmt(_is_downchirp);
+        out_tag["pay_len"]       = gr::pmt::Value(static_cast<int64_t>(_pay_len));
+        out_tag["cr"]            = gr::pmt::Value(static_cast<int64_t>(_cr));
+        out_tag["crc_valid"]     = gr::pmt::Value(crc_valid);
+        out_tag["is_downchirp"]  = gr::pmt::Value(_is_downchirp);
         this->publishTag(out_tag, 0UZ);
 
         // --- Publish message ---
@@ -235,9 +235,9 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
             payload_str.push_back(static_cast<char>(decoded_bytes[i]));
         }
         gr::property_map msg_data;
-        msg_data["payload"]       = pmtv::pmt(payload_str);
-        msg_data["crc_valid"]     = pmtv::pmt(crc_valid);
-        msg_data["is_downchirp"]  = pmtv::pmt(_is_downchirp);
+        msg_data["payload"]       = gr::pmt::Value(payload_str);
+        msg_data["crc_valid"]     = gr::pmt::Value(crc_valid);
+        msg_data["is_downchirp"]  = gr::pmt::Value(_is_downchirp);
         gr::sendMessage<gr::message::Command::Notify>(msg_out, "", "payload", msg_data);
     }
 
@@ -255,23 +255,23 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
         if (_state == IDLE && this->inputTagsPresent()) {
             const auto& tag = this->mergedInputTag();
             if (auto it = tag.map.find("burst_start"); it != tag.map.end()) {
-                if (pmtv::cast<bool>(it->second)) {
-                    // New burst — reset and start header accumulation
+                if (it->second.value_or<bool>(false)) {
+                    // new burst — reset and start header accumulation
                     if (auto sf_it = tag.map.find("sf"); sf_it != tag.map.end()) {
-                        auto new_sf = static_cast<uint8_t>(pmtv::cast<int64_t>(sf_it->second));
+                        auto new_sf = static_cast<uint8_t>(sf_it->second.value_or<int64_t>(sf));
                         if (new_sf != sf) {
                             sf = new_sf;
                             recalculate();
                         }
                     }
                     if (auto it2 = tag.map.find("cfo_int"); it2 != tag.map.end()) {
-                        _cfo_int = static_cast<int>(pmtv::cast<int64_t>(it2->second));
+                        _cfo_int = static_cast<int>(it2->second.value_or<int64_t>(0));
                     }
                     if (auto it2 = tag.map.find("cfo_frac"); it2 != tag.map.end()) {
-                        _cfo_frac = static_cast<float>(pmtv::cast<double>(it2->second));
+                        _cfo_frac = static_cast<float>(it2->second.value_or<double>(0.0));
                     }
                     if (auto it2 = tag.map.find("is_downchirp"); it2 != tag.map.end()) {
-                        _is_downchirp = pmtv::cast<bool>(it2->second);
+                        _is_downchirp = it2->second.value_or<bool>(false);
                     } else {
                         _is_downchirp = false;
                     }

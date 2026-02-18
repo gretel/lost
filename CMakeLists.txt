@@ -37,6 +37,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 
 # --- GR4 (provides gnuradio-core, gnuradio-algorithm, gr-testing, ut, …) ---
+set(GR_ENABLE_HTTP "OFF" CACHE STRING "" FORCE)
 add_subdirectory(gnuradio4)
 
 # --- LoRa block library ---

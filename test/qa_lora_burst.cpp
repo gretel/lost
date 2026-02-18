@@ -114,7 +114,7 @@ DecodeResult run_decode(const std::vector<std::complex<float>>& iq) {
     }
     sched.runAndWait();
 
-    return {sink._samples, sink._tags};
+    return {{sink._samples.begin(), sink._samples.end()}, sink._tags};
 }
 
 } // namespace
@@ -168,10 +168,10 @@ const boost::ut::suite<"SymbolDemodulator algorithm-level"> symdemod_algo_tests 
         });
         source.values = aligned_symbols;
         source._tags = {
-            Tag{0UZ, {{"burst_start", pmtv::pmt(true)},
-                      {"sf", pmtv::pmt(static_cast<int64_t>(SF))},
-                      {"cfo_int", pmtv::pmt(static_cast<int64_t>(0))},
-                      {"cfo_frac", pmtv::pmt(0.0)}}}
+            Tag{0UZ, {{"burst_start", gr::pmt::Value(true)},
+                      {"sf", gr::pmt::Value(static_cast<int64_t>(SF))},
+                      {"cfo_int", gr::pmt::Value(static_cast<int64_t>(0))},
+                      {"cfo_frac", gr::pmt::Value(0.0)}}}
         };
 
         auto& demod = graph.emplaceBlock<SymbolDemodulator>();
@@ -211,7 +211,7 @@ const boost::ut::suite<"SymbolDemodulator algorithm-level"> symdemod_algo_tests 
         bool found_crc_tag = false;
         for (const auto& t : sink._tags) {
             if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
-                expect(pmtv::cast<bool>(it->second)) << "CRC should be valid";
+                expect(it->second.value_or<bool>(false)) << "CRC should be valid";
                 found_crc_tag = true;
             }
         }
@@ -251,7 +251,7 @@ const boost::ut::suite<"Full 2-block RX graph"> full_graph_tests = [] {
         bool found_crc = false;
         for (const auto& t : result.tags) {
             if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
-                expect(pmtv::cast<bool>(it->second)) << "CRC should be valid";
+                expect(it->second.value_or<bool>(false)) << "CRC should be valid";
                 found_crc = true;
             }
         }
@@ -456,7 +456,7 @@ const boost::ut::suite<"Downchirp detection"> downchirp_tests = [] {
         bool found_crc = false;
         for (const auto& t : result.tags) {
             if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
-                expect(pmtv::cast<bool>(it->second)) << "CRC should be valid";
+                expect(it->second.value_or<bool>(false)) << "CRC should be valid";
                 found_crc = true;
             }
         }
@@ -560,7 +560,7 @@ const boost::ut::suite<"Error path tests"> error_path_tests = [] {
             bool crc_valid = true;
             for (const auto& t : result.tags) {
                 if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
-                    crc_valid = pmtv::cast<bool>(it->second);
+                    crc_valid = it->second.value_or<bool>(false);
                     found_crc = true;
                 }
             }
@@ -585,7 +585,7 @@ const boost::ut::suite<"Error path tests"> error_path_tests = [] {
         bool false_positive = false;
         for (const auto& t : result.tags) {
             if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
-                if (pmtv::cast<bool>(it->second)) {
+                if (it->second.value_or<bool>(false)) {
                     false_positive = true;
                 }
             }

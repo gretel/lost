@@ -688,11 +688,11 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
             // Publish burst_start tag on first symbol
             if (!_burst_tag_published) {
                 gr::property_map tag;
-                tag["burst_start"]  = pmtv::pmt(true);
-                tag["sf"]           = pmtv::pmt(static_cast<int64_t>(sf));
-                tag["cfo_int"]      = pmtv::pmt(static_cast<int64_t>(_cfo_int));
-                tag["cfo_frac"]     = pmtv::pmt(static_cast<double>(_cfo_frac));
-                tag["is_downchirp"] = pmtv::pmt(false);
+                tag["burst_start"]  = gr::pmt::Value(true);
+                tag["sf"]           = gr::pmt::Value(static_cast<int64_t>(sf));
+                tag["cfo_int"]      = gr::pmt::Value(static_cast<int64_t>(_cfo_int));
+                tag["cfo_frac"]     = gr::pmt::Value(static_cast<double>(_cfo_frac));
+                tag["is_downchirp"] = gr::pmt::Value(false);
                 this->publishTag(tag, 0UZ);
                 _burst_tag_published = true;
             }
