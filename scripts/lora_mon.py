@@ -3,15 +3,15 @@
 """
 lora_mon.py -- LoRa streaming monitor.
 
-Listens for CBOR-encoded LoRa frames on a UDP socket or reads concatenated
-CBOR from stdin, and prints formatted text with running statistics.
+Connects to a lora_rx UDP server and receives CBOR-encoded LoRa frames,
+or reads concatenated CBOR from stdin. Prints formatted text with running
+statistics.
 
 Usage:
-    # UDP mode (default):
-    lora_rx --udp 127.0.0.1:5556 &
-    python3 scripts/lora_mon.py
-    python3 scripts/lora_mon.py --port 5556 --json
-    python3 scripts/lora_mon.py --compact --stats
+    # UDP mode (default) -- connects to lora_rx UDP server:
+    lora_rx --udp 5556 &
+    python3 scripts/lora_mon.py --connect 127.0.0.1:5556
+    python3 scripts/lora_mon.py --port 5556   # legacy: binds locally
 
     # Pipe mode:
     lora_rx --cbor | python3 scripts/lora_mon.py --stdin
@@ -199,6 +199,67 @@ def format_frame_json(msg: dict[str, Any]) -> str:
 # ---- UDP receiver ----
 
 
+def connect_udp(
+    host: str,
+    port: int,
+    out: TextIO,
+    *,
+    use_json: bool = False,
+    compact: bool = False,
+    stats_every: int = 0,
+) -> Stats:
+    """Connect to a lora_rx UDP server and receive CBOR frames.
+
+    Sends a registration datagram, then receives frames from the server.
+    The server fans out frames to all registered consumers.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Bind an ephemeral port so the server can send back to us
+    sock.bind(("0.0.0.0", 0))
+    local_port = sock.getsockname()[1]
+
+    # Send registration datagram to the server
+    sock.sendto(b"sub", (host, port))
+    print(
+        f"Registered with UDP server {host}:{port} (listening on :{local_port}) ...",
+        file=sys.stderr,
+    )
+    sys.stderr.flush()
+
+    stats = Stats()
+    try:
+        while True:
+            data, _addr = sock.recvfrom(65536)
+            try:
+                msg = cbor2.loads(data)
+            except Exception:
+                continue
+
+            if not isinstance(msg, dict) or msg.get("type") != "lora_frame":
+                continue
+
+            stats.update(msg)
+
+            if use_json:
+                out.write(format_frame_json(msg))
+            else:
+                out.write(format_frame(msg, compact=compact))
+            out.write("\n")
+            out.flush()
+
+            if stats_every > 0 and stats.total % stats_every == 0:
+                print(f"--- {stats.summary()}", file=sys.stderr)
+                sys.stderr.flush()
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.close()
+
+    return stats
+
+
 def receive_udp(
     port: int,
     out: TextIO,
@@ -208,7 +269,7 @@ def receive_udp(
     stats_every: int = 0,
     bind_addr: str = "0.0.0.0",
 ) -> Stats:
-    """Listen on UDP port, decode CBOR datagrams, write text to out."""
+    """Legacy: bind a UDP port locally and receive CBOR datagrams."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((bind_addr, port))
@@ -285,18 +346,23 @@ def receive_stdin(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="LoRa streaming monitor -- listens for CBOR frames on UDP or stdin"
+        description="LoRa streaming monitor -- connects to lora_rx UDP server or reads stdin"
+    )
+    parser.add_argument(
+        "--connect",
+        metavar="HOST:PORT",
+        help="connect to lora_rx UDP server (e.g. 127.0.0.1:5556)",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=DEFAULT_PORT,
-        help=f"UDP port to listen on (default: {DEFAULT_PORT})",
+        help=f"legacy: bind a local UDP port (default: {DEFAULT_PORT})",
     )
     parser.add_argument(
         "--bind",
         default="0.0.0.0",
-        help="bind address (default: 0.0.0.0)",
+        help="legacy: bind address for --port mode (default: 0.0.0.0)",
     )
     parser.add_argument(
         "--json",
@@ -329,6 +395,21 @@ def main() -> None:
 
     if args.stdin:
         stats = receive_stdin(
+            sys.stdout,
+            use_json=args.json,
+            compact=args.compact,
+            stats_every=args.stats_every,
+        )
+    elif args.connect:
+        # Parse host:port
+        colon = args.connect.rfind(":")
+        if colon <= 0:
+            parser.error("--connect requires HOST:PORT (e.g. 127.0.0.1:5556)")
+        host = args.connect[:colon]
+        port = int(args.connect[colon + 1 :])
+        stats = connect_udp(
+            host,
+            port,
             sys.stdout,
             use_json=args.json,
             compact=args.compact,

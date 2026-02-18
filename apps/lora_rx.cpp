@@ -83,7 +83,7 @@ struct RxConfig {
     uint8_t  sf{8};
     uint16_t sync{0x12};
     uint16_t preamble{8};
-    std::string udp{};               ///< "host:port" for UDP CBOR output
+    std::string udp{};               ///< "[host:]port" for UDP CBOR server
     bool     cbor{false};            ///< write CBOR to stdout instead of text
 
     // Scanner mode fields
@@ -116,7 +116,8 @@ void print_usage(const char* prog) {
         "  --sync <hex>      Sync word, e.g. 0x12 (default: 0x12)\n"
         "  --preamble <n>    Preamble length in symbols (default: 8)\n\n"
         "Output options:\n"
-        "  --udp <host:port> Send CBOR frames via UDP (e.g. 127.0.0.1:5556)\n"
+        "  --udp [host:]port Bind UDP server for CBOR frames (e.g. 5556 or 0.0.0.0:5556)\n"
+        "                    Consumers register by sending any datagram to this port.\n"
         "  --cbor            Write CBOR to stdout instead of text\n\n"
         "Scanner mode (--scan):\n"
         "  --scan            Enable dual-RX multi-channel scanner\n"
@@ -143,7 +144,7 @@ void print_usage(const char* prog) {
         "  %s --sf 12 --bw 125000 --rate 500000\n"
         "  %s --cbor | python3 scripts/lora_decode_meshcore.py\n"
         "  %s --scan --clock external\n"
-        "  %s --scan --udp 127.0.0.1:5556\n"
+        "  %s --scan --udp 5556\n"
         "  %s --overflow-test 60 --recv-frames 32\n",
         prog, prog, prog, prog, prog, prog, prog, prog);
 }

@@ -10,7 +10,9 @@
 //   - Default: text (hex dump + ASCII) goes to stdout.
 //   - --cbor:  concatenated CBOR maps go to stdout (machine-readable).
 //              Self-delimiting — each CBOR map knows its own length.
-//   - --udp:   each frame is also sent as a CBOR-encoded UDP datagram.
+//   - --udp:   binds a UDP port and fans out CBOR frames to all registered
+//              consumers. A consumer registers by sending any datagram to
+//              the bound port. Multiple consumers are supported.
 //   - --cbor and --udp can be combined.
 //
 // Protocol-agnostic: the CBOR schema contains only PHY-layer metadata.
@@ -24,6 +26,7 @@
 #define GR4_LORA_FRAME_SINK_HPP
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -35,8 +38,10 @@
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
@@ -59,7 +64,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     gr::PortIn<uint8_t> in;
 
     // Configuration
-    std::string udp_dest{};            ///< "host:port" for UDP CBOR output (empty=off)
+    std::string udp_dest{};            ///< "[host:]port" for UDP server (empty=off)
     bool        cbor_stdout{false};    ///< write CBOR to stdout instead of text
     uint16_t    sync_word{0x12};       ///< for protocol hint in output
     uint8_t     phy_sf{8};             ///< SF for metadata
@@ -76,44 +81,130 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     std::vector<uint8_t> _frame;
     uint32_t             _frame_count{0};
 
-    // UDP socket state
-    int                  _udp_fd{-1};
-    struct sockaddr_in   _udp_addr{};
+    // UDP server state: bind a port, accept registrations, fan out frames.
+    int                              _udp_fd{-1};
+    std::vector<struct sockaddr_in>  _udp_clients;
+    std::mutex                       _udp_mutex;
+    std::thread                      _udp_listener;
+    bool                             _udp_running{false};
+
+    /// Parse "[host:]port" into bind address and port.
+    static bool parse_udp_dest(const std::string& spec,
+                               std::string& host, uint16_t& port) {
+        auto colon = spec.rfind(':');
+        if (colon != std::string::npos && colon > 0) {
+            host = spec.substr(0, colon);
+            port = static_cast<uint16_t>(std::stoul(spec.substr(colon + 1)));
+        } else {
+            // Port only — bind all interfaces
+            host = "0.0.0.0";
+            port = static_cast<uint16_t>(std::stoul(spec));
+        }
+        return port > 0;
+    }
+
+    /// Background thread: poll the bound socket for registration datagrams.
+    void udpListenerLoop() {
+        while (_udp_running) {
+            struct sockaddr_in sender{};
+            socklen_t slen = sizeof(sender);
+            char buf[64];
+            auto n = ::recvfrom(_udp_fd, buf, sizeof(buf), 0,
+                                reinterpret_cast<struct sockaddr*>(&sender),
+                                &slen);
+            if (n < 0) {
+                // EAGAIN/EWOULDBLOCK from non-blocking socket — just loop
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+                break;  // real error or fd closed
+            }
+            // Register this sender address if not already known
+            std::lock_guard<std::mutex> lock(_udp_mutex);
+            bool found = false;
+            for (const auto& c : _udp_clients) {
+                if (c.sin_addr.s_addr == sender.sin_addr.s_addr &&
+                    c.sin_port == sender.sin_port) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                _udp_clients.push_back(sender);
+                char addr_str[INET_ADDRSTRLEN];
+                ::inet_ntop(AF_INET, &sender.sin_addr,
+                            addr_str, sizeof(addr_str));
+                std::fprintf(stderr,
+                    "  UDP: registered consumer %s:%u (%zu total)\n",
+                    addr_str, ntohs(sender.sin_port),
+                    _udp_clients.size());
+            }
+        }
+    }
 
     void start() {
         if (udp_dest.empty()) return;
 
-        auto colon = udp_dest.rfind(':');
-        if (colon == std::string::npos || colon == 0) {
-            std::fprintf(stderr, "ERROR: invalid udp_dest '%s' (expected host:port)\n",
+        std::string host;
+        uint16_t port{0};
+        if (!parse_udp_dest(udp_dest, host, port)) {
+            std::fprintf(stderr, "ERROR: invalid udp_dest '%s'\n",
                          udp_dest.c_str());
             return;
         }
-        auto host = udp_dest.substr(0, colon);
-        auto port = static_cast<uint16_t>(
-            std::stoul(udp_dest.substr(colon + 1)));
 
         _udp_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (_udp_fd < 0) {
             std::fprintf(stderr, "ERROR: socket(): %s\n", std::strerror(errno));
             return;
         }
-        std::memset(&_udp_addr, 0, sizeof(_udp_addr));
-        _udp_addr.sin_family = AF_INET;
-        _udp_addr.sin_port   = htons(port);
-        if (::inet_pton(AF_INET, host.c_str(), &_udp_addr.sin_addr) != 1) {
-            std::fprintf(stderr, "ERROR: invalid UDP host '%s'\n", host.c_str());
+
+        int reuse = 1;
+        ::setsockopt(_udp_fd, SOL_SOCKET, SO_REUSEADDR,
+                     &reuse, sizeof(reuse));
+
+        struct sockaddr_in bind_addr{};
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_port   = htons(port);
+        if (::inet_pton(AF_INET, host.c_str(), &bind_addr.sin_addr) != 1) {
+            std::fprintf(stderr, "ERROR: invalid UDP bind address '%s'\n",
+                         host.c_str());
             ::close(_udp_fd);
             _udp_fd = -1;
             return;
         }
-        std::fprintf(stderr, "  UDP output: %s:%u\n", host.c_str(), port);
+
+        if (::bind(_udp_fd, reinterpret_cast<struct sockaddr*>(&bind_addr),
+                   sizeof(bind_addr)) < 0) {
+            std::fprintf(stderr, "ERROR: bind(%s:%u): %s\n",
+                         host.c_str(), port, std::strerror(errno));
+            ::close(_udp_fd);
+            _udp_fd = -1;
+            return;
+        }
+
+        // Set non-blocking for the listener thread
+        int flags = ::fcntl(_udp_fd, F_GETFL, 0);
+        ::fcntl(_udp_fd, F_SETFL, flags | O_NONBLOCK);
+
+        std::fprintf(stderr, "  UDP server: bound %s:%u "
+                     "(consumers register by sending any datagram)\n",
+                     host.c_str(), port);
+
+        // Start background listener for registration datagrams
+        _udp_running = true;
+        _udp_listener = std::thread([this] { udpListenerLoop(); });
     }
 
     void stop() {
+        _udp_running = false;
         if (_udp_fd >= 0) {
             ::close(_udp_fd);
             _udp_fd = -1;
+        }
+        if (_udp_listener.joinable()) {
+            _udp_listener.join();
         }
     }
 
@@ -201,9 +292,12 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
     void sendFrameUdp(const std::vector<uint8_t>& buf) {
         if (_udp_fd < 0) return;
-        ::sendto(_udp_fd, buf.data(), buf.size(), 0,
-                 reinterpret_cast<const struct sockaddr*>(&_udp_addr),
-                 sizeof(_udp_addr));
+        std::lock_guard<std::mutex> lock(_udp_mutex);
+        for (const auto& client : _udp_clients) {
+            ::sendto(_udp_fd, buf.data(), buf.size(), 0,
+                     reinterpret_cast<const struct sockaddr*>(&client),
+                     sizeof(client));
+        }
     }
 
     static void sendFrameStdout(const std::vector<uint8_t>& buf) {

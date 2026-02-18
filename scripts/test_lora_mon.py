@@ -142,6 +142,65 @@ class TestUdpReceive(unittest.TestCase):
         self.assertIn("#7", results[0])
 
 
+class TestConnectUdp(unittest.TestCase):
+    """Test the connect_udp() function (server-side registration model)."""
+
+    def test_connect_and_receive(self):
+        """Simulate a FrameSink server: bind, accept registration, send frame."""
+        port = find_free_port()
+        results = []
+
+        def fake_server():
+            """Mimics FrameSink: bind, wait for registration, send a frame back."""
+            srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.settimeout(2.0)
+            srv.bind(("127.0.0.1", port))
+            try:
+                # Wait for registration datagram
+                _data, client_addr = srv.recvfrom(64)
+                # Send a CBOR frame back to the registered client
+                frame = cbor2.dumps(make_frame(seq=42))
+                srv.sendto(frame, client_addr)
+            except socket.timeout:
+                pass
+            finally:
+                srv.close()
+
+        def client():
+            """Uses connect_udp to register and receive one frame."""
+            import io
+
+            buf = io.StringIO()
+            # connect_udp blocks until KeyboardInterrupt; we'll use a timeout
+            client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            client_sock.bind(("0.0.0.0", 0))
+            client_sock.settimeout(2.0)
+            # Send registration
+            client_sock.sendto(b"sub", ("127.0.0.1", port))
+            try:
+                data, _ = client_sock.recvfrom(65536)
+                msg = cbor2.loads(data)
+                results.append(lora_mon.format_frame(msg))
+            except socket.timeout:
+                pass
+            finally:
+                client_sock.close()
+
+        srv_thread = threading.Thread(target=fake_server, daemon=True)
+        srv_thread.start()
+        time.sleep(0.05)
+
+        cli_thread = threading.Thread(target=client, daemon=True)
+        cli_thread.start()
+
+        cli_thread.join(timeout=3)
+        srv_thread.join(timeout=3)
+        self.assertEqual(len(results), 1)
+        self.assertIn("#42", results[0])
+
+
 # ---- LoRaWAN decoder ----
 
 
