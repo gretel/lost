@@ -135,7 +135,8 @@ void print_usage(const char* prog) {
         "Diagnostics:\n"
         "  --overflow-test [sec]  Run overflow test for N seconds (default: 30)\n"
         "                    Streams RX without decode, counts overflows,\n"
-        "                    and prints buffer tuning recommendations.\n\n"
+        "                    and prints buffer tuning recommendations.\n"
+        "                    Combine with --scan for dual-RX stress test.\n\n"
         "Other:\n"
         "  -h, --help        Show this help\n\n"
         "Examples:\n"
@@ -145,8 +146,9 @@ void print_usage(const char* prog) {
         "  %s --cbor | python3 scripts/lora_decode_meshcore.py\n"
         "  %s --scan --clock external\n"
         "  %s --scan --udp 5556\n"
-        "  %s --overflow-test 60 --recv-frames 32\n",
-        prog, prog, prog, prog, prog, prog, prog, prog);
+        "  %s --overflow-test 60 --recv-frames 32\n"
+        "  %s --overflow-test 30 --scan --recv-frames 64\n",
+        prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 bool parse_args(int argc, char** argv, RxConfig& cfg) {
@@ -409,6 +411,209 @@ int run_overflow_test(RxConfig& cfg) {
 
     std::fprintf(stderr, "\n");
     _exit(overflow_count > 0 ? 1 : 0);
+}
+
+/// Dual-channel overflow test: mirrors scanner mode's USB/driver path.
+/// Uses radio_bridge_multi (2 RX channels on one USRP) at wideband_rate.
+/// This is the configuration where overflows are most likely — two channels
+/// at 5 MS/s each sharing one USB 3.0 pipe.
+///
+/// B210 MIMO startup overflow: The B210's FPGA has a 2048-sample framing
+/// FIFO (new_rx_framer, SAMPLE_FIFO_SIZE=11) and no source flow control
+/// (SOURCE_FLOW_CONTROL=0). At 5 MS/s this is only 0.4 ms of buffering.
+/// When the timed stream start triggers both radio cores, the FPGA-to-USB
+/// pipeline needs time to prime. The framing FIFO may overflow once before
+/// data starts flowing through USB. UHD's handle_overflow() detects this,
+/// stops/flushes/restarts the stream (b200_io_impl.cpp MIMO path), and
+/// streaming proceeds cleanly. This single startup overflow is inherent to
+/// B210 MIMO and independent of num_recv_frames. We report it separately.
+int run_overflow_test_dual(RxConfig& cfg) {
+    cfg.args = apply_recv_frames(cfg.args, cfg.recv_frames);
+    const int duration = cfg.test_duration;
+
+    std::fprintf(stderr, "=== Overflow Test (Dual-RX) ===\n");
+    std::fprintf(stderr, "  Device args: %s\n", cfg.args.c_str());
+    std::fprintf(stderr, "  Clock:       %s\n",
+                 cfg.clock.empty() ? "(default)" : cfg.clock.c_str());
+    std::fprintf(stderr, "  RX0 center:  %.6f MHz\n", cfg.rx0_freq / 1e6);
+    std::fprintf(stderr, "  RX1 center:  %.6f MHz\n", cfg.rx1_freq / 1e6);
+    std::fprintf(stderr, "  Gain:        %.0f dB\n", cfg.gain);
+    std::fprintf(stderr, "  Sample rate: %.0f S/s per RX (%.0f S/s aggregate)\n",
+                 static_cast<double>(cfg.wideband_rate),
+                 static_cast<double>(cfg.wideband_rate) * 2.0);
+    std::fprintf(stderr, "  Duration:    %d s\n", duration);
+    if (cfg.recv_frames > 0) {
+        std::fprintf(stderr, "  Recv frames: %d\n", cfg.recv_frames);
+    }
+    std::fprintf(stderr, "\n");
+
+    // Create dual-channel device
+    radio_bridge_multi_config_t config{};
+    config.device_args  = cfg.args.c_str();
+    config.clock_source = cfg.clock.empty() ? nullptr : cfg.clock.c_str();
+    config.sample_rate  = static_cast<double>(cfg.wideband_rate);
+    config.center_freq_0 = cfg.rx0_freq;
+    config.gain_db_0     = cfg.gain;
+    config.bandwidth_0   = 0.0;
+    config.antenna_0     = nullptr;
+    config.center_freq_1 = cfg.rx1_freq;
+    config.gain_db_1     = cfg.gain;
+    config.bandwidth_1   = 0.0;
+    config.antenna_1     = nullptr;
+
+    auto* bridge = radio_bridge_multi_create(&config);
+    if (!bridge) {
+        std::fprintf(stderr, "ERROR: %s\n", radio_bridge_last_error());
+        return 1;
+    }
+
+    // Compute buffer metrics
+    const double rate = radio_bridge_multi_get_sample_rate(bridge);
+    const int default_frames = 16;
+    // B210 multi-channel: sc16 on wire = 4 bytes/sample, 2 channels interleaved
+    // USB frame is 8176 bytes, shared between 2 channels.
+    // Each channel gets frame_bytes / (2 * 4) = 1022 samples per USB frame.
+    const int frame_bytes = 8176;
+    const int samples_per_frame = frame_bytes / (2 * 4);  // 2 channels, sc16
+    const int actual_frames = (cfg.recv_frames > 0) ? cfg.recv_frames : default_frames;
+    const double buffer_sec = static_cast<double>(actual_frames * samples_per_frame) / rate;
+
+    std::fprintf(stderr, "  Actual rate: %.0f S/s per RX\n", rate);
+    std::fprintf(stderr, "  USB buffer:  %d frames x %d samples/ch = %.1f ms\n",
+                 actual_frames, samples_per_frame, buffer_sec * 1000.0);
+    std::fprintf(stderr, "\nStreaming... (Ctrl+C to abort)\n\n");
+
+    // Stream loop — read both channels simultaneously.
+    // Track startup vs steady-state overflows separately.
+    // The B210 MIMO startup overflow (FPGA framing FIFO) typically fires
+    // once during the first few seconds and is self-correcting.
+    constexpr std::size_t chunk_size = 65536;  // match DualRadioSource
+    constexpr double startup_window = 5.0;     // seconds
+    std::vector<float> buf0(chunk_size * 2);   // ch0 interleaved I/Q
+    std::vector<float> buf1(chunk_size * 2);   // ch1 interleaved I/Q
+    uint64_t total_samples = 0;
+    uint64_t total_reads = 0;
+    uint64_t startup_overflows = 0;
+    uint64_t steady_overflows = 0;
+    uint64_t timeout_count = 0;
+    uint64_t error_count = 0;
+
+    auto start_time = std::chrono::steady_clock::now();
+    auto end_time = start_time + std::chrono::seconds(duration);
+    auto last_report = start_time;
+
+    while (g_running) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= end_time) break;
+
+        int ret = radio_bridge_multi_read(bridge, buf0.data(), buf1.data(),
+                                          chunk_size, 0.1);
+        total_reads++;
+        double age = std::chrono::duration<double>(now - start_time).count();
+
+        if (ret > 0) {
+            total_samples += static_cast<uint64_t>(ret);
+        } else if (ret == RADIO_BRIDGE_ERR_OVERFLOW) {
+            if (age < startup_window) {
+                startup_overflows++;
+            } else {
+                steady_overflows++;
+            }
+        } else if (ret == RADIO_BRIDGE_ERR_TIMEOUT) {
+            timeout_count++;
+        } else {
+            error_count++;
+        }
+
+        // Periodic status (every 5 seconds)
+        if (now - last_report >= std::chrono::seconds(5)) {
+            uint64_t total_ov = startup_overflows + steady_overflows;
+            std::fprintf(stderr,
+                "  [%.0fs] samples/ch=%" PRIu64 " overflows=%" PRIu64
+                " (startup=%" PRIu64 ") rate=%.0f S/s/ch\n",
+                age, total_samples, total_ov, startup_overflows,
+                static_cast<double>(total_samples) / age);
+            last_report = now;
+        }
+    }
+
+    auto actual_end = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(actual_end - start_time).count();
+
+    radio_bridge_multi_destroy_ex(bridge, 1);
+
+    // Print results
+    uint64_t total_overflows = startup_overflows + steady_overflows;
+    double expected_samples = rate * elapsed;
+    double overflow_pct = (total_overflows > 0)
+        ? 100.0 * static_cast<double>(total_overflows) / static_cast<double>(total_reads)
+        : 0.0;
+    double throughput = static_cast<double>(total_samples) / elapsed;
+    double loss_pct = 100.0 * (1.0 - static_cast<double>(total_samples) / expected_samples);
+
+    std::fprintf(stderr,
+        "\n=== Results (Dual-RX) ===\n"
+        "  Duration:       %.1f s\n"
+        "  Total reads:    %" PRIu64 "\n"
+        "  Samples per ch: %" PRIu64 " (expected ~%.0f)\n"
+        "  Per-ch rate:    %.0f S/s (%.1f%% of target)\n"
+        "  Aggregate:      %.0f S/s (2 channels)\n"
+        "  Overflows:      %" PRIu64 " total (%.2f%% of reads)\n"
+        "    Startup:      %" PRIu64 " (first %.0fs, B210 MIMO FPGA transient)\n"
+        "    Steady-state: %" PRIu64 "\n"
+        "  Timeouts:       %" PRIu64 "\n"
+        "  Errors:         %" PRIu64 "\n"
+        "  Sample loss:    %.2f%%\n",
+        elapsed,
+        total_reads,
+        total_samples, expected_samples,
+        throughput, 100.0 * throughput / rate,
+        throughput * 2.0,
+        total_overflows, overflow_pct,
+        startup_overflows, startup_window,
+        steady_overflows,
+        timeout_count,
+        error_count,
+        loss_pct > 0.0 ? loss_pct : 0.0);
+
+    // Recommendations — steady-state overflows are the real concern.
+    // Startup overflows are a known B210 MIMO artifact (FPGA framing FIFO
+    // overflow before USB pipeline primes, self-correcting via UHD's
+    // handle_overflow stop/flush/restart).
+    std::fprintf(stderr, "\n=== Assessment ===\n");
+    if (steady_overflows == 0 && startup_overflows == 0) {
+        std::fprintf(stderr, "  PASS: No overflows at %.0f S/s dual-RX with %d USB frames.\n",
+                     rate, actual_frames);
+    } else if (steady_overflows == 0) {
+        std::fprintf(stderr,
+            "  PASS: %" PRIu64 " startup overflow(s) only (B210 MIMO FPGA transient).\n"
+            "        No steady-state overflows. Buffer configuration is adequate.\n",
+            startup_overflows);
+    } else {
+        std::fprintf(stderr, "  FAIL: %" PRIu64 " steady-state overflow(s) at %.0f S/s dual-RX.\n",
+                     steady_overflows, rate);
+        if (cfg.recv_frames == 0) {
+            std::fprintf(stderr,
+                "  Try: --recv-frames 32  (doubles USB buffer to ~%.1f ms)\n",
+                buffer_sec * 2.0 * 1000.0);
+        } else if (cfg.recv_frames < 128) {
+            std::fprintf(stderr,
+                "  Try: --recv-frames %d  (increase USB buffer to ~%.1f ms)\n",
+                cfg.recv_frames * 2,
+                buffer_sec * 2.0 * 1000.0);
+        } else {
+            std::fprintf(stderr,
+                "  USB buffer at %d frames (%.1f ms). Consider:\n"
+                "    - Lowering --scan-rate (currently %.0f S/s)\n"
+                "    - Using an external USB 3.0 hub\n"
+                "    - Closing other USB 3.0 devices\n",
+                cfg.recv_frames, buffer_sec * 1000.0,
+                static_cast<double>(cfg.wideband_rate));
+        }
+    }
+
+    std::fprintf(stderr, "\n");
+    _exit(steady_overflows > 0 ? 1 : 0);
 }
 
 // ---- Single-channel RX mode ----
@@ -713,7 +918,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "Device found.\n\n");
 
     if (cfg.overflow_test) {
-        return run_overflow_test(cfg);
+        return cfg.scan ? run_overflow_test_dual(cfg) : run_overflow_test(cfg);
     }
     if (cfg.scan) {
         return run_scanner(cfg);
