@@ -46,6 +46,7 @@ import time
 from pathlib import Path
 
 import cbor2
+import segno
 from Crypto.Cipher import AES
 from nacl.signing import SigningKey, VerifyKey
 from nacl.bindings import (
@@ -248,6 +249,41 @@ def meshcore_mac_then_decrypt(shared_secret: bytes, data: bytes) -> bytes | None
     return cipher.decrypt(ciphertext)
 
 
+# ---- MeshCore contact URI + QR code ----
+
+# Node type names for the contact URI
+NODE_TYPE_NAMES = {
+    ADVERT_NODE_CHAT: "chat",
+    ADVERT_NODE_REPEATER: "repeater",
+    ADVERT_NODE_ROOM: "room",
+    ADVERT_NODE_SENSOR: "sensor",
+}
+
+
+def build_contact_uri(
+    pub_key: bytes, name: str, node_type: int = ADVERT_NODE_CHAT
+) -> str:
+    """Build a MeshCore contact URI for QR code sharing.
+
+    Format: meshcore://contact/add?name=<name>&public_key=<64hex>&type=<int>
+    """
+    from urllib.parse import quote
+
+    params = []
+    if name:
+        params.append(f"name={quote(name, safe='')}")
+    params.append(f"public_key={pub_key.hex()}")
+    params.append(f"type={node_type}")
+    return "meshcore://contact/add?" + "&".join(params)
+
+
+def print_qr_code(uri: str) -> None:
+    """Print a QR code to the terminal via segno."""
+    qr = segno.make(uri)
+    # segno terminal output uses Unicode block chars, compact=True for half-height
+    qr.terminal(compact=True)
+
+
 # ---- MeshCore packet construction ----
 
 
@@ -442,6 +478,17 @@ def main():
     parser.add_argument(
         "--show-key", action="store_true", help="Print public key and exit"
     )
+    parser.add_argument(
+        "--qr",
+        action="store_true",
+        help="Print MeshCore contact QR code to terminal and exit",
+    )
+    parser.add_argument(
+        "--qr-name",
+        type=str,
+        default="",
+        help="Node name for QR contact URI (default: empty)",
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -472,6 +519,17 @@ def main():
 
     if args.show_key:
         print(pub_key.hex())
+        return
+
+    if args.qr:
+        name = args.qr_name
+        uri = build_contact_uri(pub_key, name)
+        sys.stderr.write(f"Contact URI: {uri}\n")
+        sys.stderr.write(f"Public key:  {pub_key.hex()}\n")
+        if name:
+            sys.stderr.write(f"Name:        {name}\n")
+        sys.stderr.write("\n")
+        print_qr_code(uri)
         return
 
     if args.command is None:

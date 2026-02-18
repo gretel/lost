@@ -7,4 +7,5 @@ dependencies = [
     "cbor2",
     "pynacl",
     "pycryptodome",
+    "segno",
 ]

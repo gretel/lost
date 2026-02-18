@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -91,6 +92,11 @@ struct RxConfig {
     double   rx1_freq{869'000'000.0};
     float    wideband_rate{5'000'000.f};  ///< per-RX sample rate in scan mode
     std::vector<LoraChannel> channels;
+
+    // Overflow test mode
+    bool     overflow_test{false};   ///< run overflow diagnostics instead of RX
+    int      test_duration{30};      ///< overflow test duration in seconds
+    int      recv_frames{0};         ///< num_recv_frames override (0 = UHD default)
 };
 
 void print_usage(const char* prog) {
@@ -120,6 +126,15 @@ void print_usage(const char* prog) {
         "  Default channel plan (EU 868, MeshCore):\n"
         "    RX0 (866 MHz): 865.125, 868.100 MHz\n"
         "    RX1 (869 MHz): 868.300, 869.525, 869.618 MHz\n\n"
+        "Buffer tuning:\n"
+        "  --recv-frames <n> USB recv buffer count (default: UHD default = 16)\n"
+        "                    Increase to 32-64 to reduce overflows.\n"
+        "                    At 250 kS/s: 16 frames = ~131 ms buffer.\n"
+        "                    At 5 MS/s:   16 frames = ~6.5 ms buffer.\n\n"
+        "Diagnostics:\n"
+        "  --overflow-test [sec]  Run overflow test for N seconds (default: 30)\n"
+        "                    Streams RX without decode, counts overflows,\n"
+        "                    and prints buffer tuning recommendations.\n\n"
         "Other:\n"
         "  -h, --help        Show this help\n\n"
         "Examples:\n"
@@ -128,8 +143,9 @@ void print_usage(const char* prog) {
         "  %s --sf 12 --bw 125000 --rate 500000\n"
         "  %s --cbor | python3 scripts/lora_decode_meshcore.py\n"
         "  %s --scan --clock external\n"
-        "  %s --scan --udp 127.0.0.1:5556\n",
-        prog, prog, prog, prog, prog, prog, prog);
+        "  %s --scan --udp 127.0.0.1:5556\n"
+        "  %s --overflow-test 60 --recv-frames 32\n",
+        prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 bool parse_args(int argc, char** argv, RxConfig& cfg) {
@@ -168,6 +184,14 @@ bool parse_args(int argc, char** argv, RxConfig& cfg) {
             cfg.rx1_freq = std::stod(argv[++i]);
         } else if (arg == "--scan-rate" && i + 1 < argc) {
             cfg.wideband_rate = std::stof(argv[++i]);
+        } else if (arg == "--recv-frames" && i + 1 < argc) {
+            cfg.recv_frames = std::stoi(argv[++i]);
+        } else if (arg == "--overflow-test") {
+            cfg.overflow_test = true;
+            // Optional duration argument (next arg if it looks like a number)
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                cfg.test_duration = std::stoi(argv[++i]);
+            }
         } else {
             std::fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -222,9 +246,174 @@ bool probe_device_with_timeout(const std::string& device_args, int timeout_sec) 
     return future.get() != 0;
 }
 
+/// Inject num_recv_frames into device args string if --recv-frames was set.
+/// UHD B200/B210 default is 16 USB transfer buffers (8176 bytes each).
+/// At 250 kS/s this gives ~131 ms buffering. At 5 MS/s only ~6.5 ms.
+/// Increasing to 32-64 reduces overflow probability significantly.
+std::string apply_recv_frames(const std::string& args, int recv_frames) {
+    if (recv_frames <= 0) return args;
+    std::string extra = "num_recv_frames=" + std::to_string(recv_frames);
+    if (args.empty()) return extra;
+    return args + "," + extra;
+}
+
+// ---- Overflow test mode ----
+
+/// Stream RX samples in a tight loop for test_duration seconds.
+/// No GR4 graph — pure bridge reads. Measures overflow rate and prints
+/// buffer tuning recommendations.
+int run_overflow_test(RxConfig& cfg) {
+    cfg.args = apply_recv_frames(cfg.args, cfg.recv_frames);
+    const int duration = cfg.test_duration;
+
+    std::fprintf(stderr, "=== Overflow Test ===\n");
+    std::fprintf(stderr, "  Device args: %s\n", cfg.args.c_str());
+    std::fprintf(stderr, "  Clock:       %s\n", cfg.clock.empty() ? "(default)" : cfg.clock.c_str());
+    std::fprintf(stderr, "  Frequency:   %.6f MHz\n", cfg.freq / 1e6);
+    std::fprintf(stderr, "  Gain:        %.0f dB\n", cfg.gain);
+    std::fprintf(stderr, "  Sample rate: %.0f S/s\n", static_cast<double>(cfg.rate));
+    std::fprintf(stderr, "  Duration:    %d s\n", duration);
+    if (cfg.recv_frames > 0) {
+        std::fprintf(stderr, "  Recv frames: %d\n", cfg.recv_frames);
+    }
+    std::fprintf(stderr, "\n");
+
+    // Create device
+    radio_bridge_config_t config{};
+    config.device_args  = cfg.args.c_str();
+    config.clock_source = cfg.clock.empty() ? nullptr : cfg.clock.c_str();
+    config.sample_rate  = static_cast<double>(cfg.rate);
+    config.center_freq  = cfg.freq;
+    config.gain_db      = cfg.gain;
+    config.bandwidth    = 0.0;
+    config.channel      = 0;
+    config.antenna      = nullptr;
+    config.direction    = RADIO_BRIDGE_RX;
+
+    auto* bridge = radio_bridge_create(&config);
+    if (!bridge) {
+        std::fprintf(stderr, "ERROR: %s\n", radio_bridge_last_error());
+        return 1;
+    }
+
+    // Compute buffer metrics
+    const double rate = radio_bridge_get_sample_rate(bridge);
+    const int default_frames = 16;
+    const int frame_bytes = 8176;  // B200/B210 USB transfer size
+    const int samples_per_frame = frame_bytes / 8;  // fc32 = 8 bytes/sample
+    const int actual_frames = (cfg.recv_frames > 0) ? cfg.recv_frames : default_frames;
+    const double buffer_sec = static_cast<double>(actual_frames * samples_per_frame) / rate;
+
+    std::fprintf(stderr, "  Actual rate: %.0f S/s\n", rate);
+    std::fprintf(stderr, "  USB buffer:  %d frames x %d samples = %.1f ms\n",
+                 actual_frames, samples_per_frame, buffer_sec * 1000.0);
+    std::fprintf(stderr, "\nStreaming... (Ctrl+C to abort)\n\n");
+
+    // Stream loop
+    constexpr std::size_t chunk_size = 8192;
+    std::vector<float> buf(chunk_size * 2);  // interleaved I/Q
+    uint64_t total_samples = 0;
+    uint64_t total_reads = 0;
+    uint64_t overflow_count = 0;
+    uint64_t timeout_count = 0;
+    uint64_t error_count = 0;
+
+    auto start_time = std::chrono::steady_clock::now();
+    auto end_time = start_time + std::chrono::seconds(duration);
+    auto last_report = start_time;
+
+    while (g_running) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= end_time) break;
+
+        int ret = radio_bridge_read(bridge, buf.data(), chunk_size, 0.1);
+        total_reads++;
+
+        if (ret > 0) {
+            total_samples += static_cast<uint64_t>(ret);
+        } else if (ret == RADIO_BRIDGE_ERR_OVERFLOW) {
+            overflow_count++;
+        } else if (ret == RADIO_BRIDGE_ERR_TIMEOUT) {
+            timeout_count++;
+        } else {
+            error_count++;
+        }
+
+        // Periodic status (every 5 seconds)
+        if (now - last_report >= std::chrono::seconds(5)) {
+            auto elapsed = std::chrono::duration<double>(now - start_time).count();
+            std::fprintf(stderr, "  [%.0fs] samples=%" PRIu64 " overflows=%" PRIu64 " rate=%.0f S/s\n",
+                         elapsed, total_samples, overflow_count,
+                         static_cast<double>(total_samples) / elapsed);
+            last_report = now;
+        }
+    }
+
+    auto actual_end = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(actual_end - start_time).count();
+
+    radio_bridge_destroy_ex(bridge, 1);
+
+    // Print results
+    double expected_samples = rate * elapsed;
+    double overflow_pct = (overflow_count > 0)
+        ? 100.0 * static_cast<double>(overflow_count) / static_cast<double>(total_reads)
+        : 0.0;
+    double throughput = static_cast<double>(total_samples) / elapsed;
+    double loss_pct = 100.0 * (1.0 - static_cast<double>(total_samples) / expected_samples);
+
+    std::fprintf(stderr,
+        "\n=== Results ===\n"
+        "  Duration:     %.1f s\n"
+        "  Total reads:  %" PRIu64 "\n"
+        "  Total samples:%" PRIu64 " (expected ~%.0f)\n"
+        "  Throughput:   %.0f S/s (%.1f%% of target)\n"
+        "  Overflows:    %" PRIu64 " (%.2f%% of reads)\n"
+        "  Timeouts:     %" PRIu64 "\n"
+        "  Errors:       %" PRIu64 "\n"
+        "  Sample loss:  %.2f%%\n",
+        elapsed,
+        total_reads,
+        total_samples, expected_samples,
+        throughput, 100.0 * throughput / rate,
+        overflow_count, overflow_pct,
+        timeout_count,
+        error_count,
+        loss_pct > 0.0 ? loss_pct : 0.0);
+
+    // Recommendations
+    std::fprintf(stderr, "\n=== Recommendations ===\n");
+    if (overflow_count == 0) {
+        std::fprintf(stderr, "  PASS: No overflows detected. Buffer configuration is adequate.\n");
+    } else {
+        std::fprintf(stderr, "  FAIL: %" PRIu64 " overflows detected.\n",
+                     overflow_count);
+        if (cfg.recv_frames == 0) {
+            std::fprintf(stderr,
+                "  Try: --recv-frames 32  (doubles USB buffer to ~%.0f ms)\n",
+                buffer_sec * 2.0 * 1000.0);
+        } else if (cfg.recv_frames < 64) {
+            std::fprintf(stderr,
+                "  Try: --recv-frames %d  (increase USB buffer)\n",
+                cfg.recv_frames * 2);
+        } else {
+            std::fprintf(stderr,
+                "  USB buffer already at %d frames. Consider:\n"
+                "    - Lowering sample rate (currently %.0f S/s)\n"
+                "    - Closing other USB 3.0 devices\n"
+                "    - Using a powered USB 3.0 hub\n",
+                cfg.recv_frames, static_cast<double>(cfg.rate));
+        }
+    }
+
+    std::fprintf(stderr, "\n");
+    _exit(overflow_count > 0 ? 1 : 0);
+}
+
 // ---- Single-channel RX mode ----
 
-int run_single_rx(const RxConfig& cfg) {
+int run_single_rx(RxConfig& cfg) {
+    cfg.args = apply_recv_frames(cfg.args, cfg.recv_frames);
     const auto os_factor = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
     std::fprintf(stderr, "=== LoRa RX ===\n");
@@ -332,6 +521,8 @@ int run_single_rx(const RxConfig& cfg) {
 // ---- Scanner (dual-RX multi-channel) mode ----
 
 int run_scanner(RxConfig& cfg) {
+    cfg.args = apply_recv_frames(cfg.args, cfg.recv_frames);
+
     if (cfg.channels.empty()) {
         build_default_channels(cfg);
     }
@@ -509,14 +700,20 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    // --- Inject recv-frames into args for probe too ---
+    std::string probe_args = apply_recv_frames(cfg.args, cfg.recv_frames);
+
     // --- Probe device before building graph ---
-    if (!probe_device_with_timeout(cfg.args, 10)) {
+    if (!probe_device_with_timeout(probe_args, 10)) {
         std::fprintf(stderr,
             "ERROR: No device found. Is the device connected and powered?\n");
         return 1;
     }
     std::fprintf(stderr, "Device found.\n\n");
 
+    if (cfg.overflow_test) {
+        return run_overflow_test(cfg);
+    }
     if (cfg.scan) {
         return run_scanner(cfg);
     }

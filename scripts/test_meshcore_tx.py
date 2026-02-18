@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from meshcore_tx import (
     ADVERT_HAS_NAME,
     ADVERT_NODE_CHAT,
+    ADVERT_NODE_REPEATER,
     CIPHER_MAC_SIZE,
     PATH_HASH_SIZE,
     PAYLOAD_ADVERT,
@@ -27,6 +28,7 @@ from meshcore_tx import (
     SIGNATURE_SIZE,
     build_advert,
     build_anon_req,
+    build_contact_uri,
     build_wire_packet,
     load_or_create_identity,
     make_cbor_tx_request,
@@ -503,6 +505,53 @@ class TestCborTxRequest(unittest.TestCase):
         decoded = cbor2.loads(cbor_msg)
 
         self.assertTrue(decoded["dry_run"])
+
+
+class TestContactUri(unittest.TestCase):
+    """Tests for MeshCore contact URI and QR code generation."""
+
+    def test_contact_uri_basic(self):
+        """Contact URI with name and default type."""
+        pub = bytes(range(32))
+        uri = build_contact_uri(pub, "TestNode")
+        self.assertTrue(uri.startswith("meshcore://contact/add?"))
+        self.assertIn("name=TestNode", uri)
+        self.assertIn(f"public_key={pub.hex()}", uri)
+        self.assertIn("type=1", uri)
+
+    def test_contact_uri_no_name(self):
+        """Contact URI without a name."""
+        pub = bytes(range(32))
+        uri = build_contact_uri(pub, "")
+        self.assertNotIn("name=", uri)
+        self.assertIn(f"public_key={pub.hex()}", uri)
+
+    def test_contact_uri_special_chars(self):
+        """Contact URI with special characters in name."""
+        pub = bytes(range(32))
+        uri = build_contact_uri(pub, "My Node+1")
+        # Spaces and special chars should be percent-encoded
+        self.assertNotIn(" ", uri)
+        self.assertIn("My%20Node%2B1", uri)
+
+    def test_contact_uri_custom_type(self):
+        """Contact URI with repeater node type."""
+        pub = bytes(range(32))
+        uri = build_contact_uri(pub, "Relay", node_type=ADVERT_NODE_REPEATER)
+        self.assertIn("type=2", uri)
+
+    def test_qr_code_generation(self):
+        """QR code generates without error (output goes to terminal)."""
+        import io
+        import segno
+
+        pub = bytes(range(32))
+        uri = build_contact_uri(pub, "Test")
+        # Verify segno can encode the URI without error
+        qr = segno.make(uri)
+        buf = io.BytesIO()
+        qr.save(buf, kind="svg")
+        self.assertGreater(buf.tell(), 0)
 
 
 if __name__ == "__main__":
