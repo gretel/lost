@@ -9,7 +9,7 @@ framing, and prints decoded information.
 Only processes frames where protocol == "meshcore_or_reticulum".
 Frames with other protocols are passed through with minimal annotation.
 
-Note: for live monitoring, use lora_mon.py (reads UDP from lora_rx_soapy).
+Note: for live monitoring, use lora_mon.py (reads UDP from lora_rx).
 This script is for offline analysis of saved CBOR streams.
 
 Usage:

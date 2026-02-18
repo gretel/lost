@@ -6,7 +6,7 @@ lora_decode_raw.py -- Raw LoRa frame decoder.
 Reads concatenated CBOR frames on stdin and prints a human-readable
 summary of each frame.
 
-Note: for live monitoring, use lora_mon.py (reads UDP from lora_rx_soapy).
+Note: for live monitoring, use lora_mon.py (reads UDP from lora_rx).
 This script is for offline analysis of saved CBOR streams.
 
 Usage:

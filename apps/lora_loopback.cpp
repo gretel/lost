@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: ISC
 //
-// lora_loopback_soapy: Hardware TX->RX challenge-response loopback on B210.
+// lora_loopback: Hardware TX->RX challenge-response loopback test.
 //
-// Opens both TX and RX streams on the same B210 (SoapySDR shares the device
-// via reference counting). Runs a two-round challenge-response protocol:
+// Uses the unified radio_bridge API (UHD or SoapySDR backend, selected at
+// link time). Opens both TX and RX streams on the same device (the backend
+// shares the device via reference counting). Runs a two-round
+// challenge-response protocol:
 //
 //   Round 1 (Challenge): TX a random nonce "CHAL:<hex8>", RX and decode it.
 //   Round 2 (Response):  TX "RESP:<decoded_nonce>", RX and decode it.
@@ -16,8 +18,11 @@
 //
 // Default: TX on channel 0 (TX/RX port), RX on channel 0 (RX2 port).
 //
-// Usage: lora_loopback_soapy [--freq hz] [--tx-gain db] [--rx-gain db]
-//                            [--payload "text"]  (disables challenge-response)
+// Usage: lora_loopback [--args str] [--clock src] [--freq hz]
+//                      [--tx-gain db] [--rx-gain db]
+//                      [--payload "text"]  (disables challenge-response)
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -39,7 +44,7 @@
 #include <gnuradio-4.0/lora/SymbolDemodulator.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
-#include "soapy_c_bridge.h"
+#include "radio_bridge.h"
 
 namespace {
 
@@ -153,8 +158,8 @@ std::vector<std::complex<float>> build_padded_iq(
 /// Execute one TX->RX round: transmit payload, capture IQ, decode offline.
 RoundResult do_round(const std::string& label,
                      const std::string& payload_str,
-                     soapy_bridge_t* tx_bridge,
-                     soapy_bridge_t* rx_bridge,
+                     radio_bridge_t* tx_bridge,
+                     radio_bridge_t* rx_bridge,
                      const LoraParams& lp) {
     RoundResult rr;
     rr.tx_string = payload_str;
@@ -178,7 +183,7 @@ RoundResult do_round(const std::string& label,
             std::size_t chunk = std::min(rx_total - offset,
                                          std::size_t{4096});
             auto* buf = reinterpret_cast<float*>(&rx_buf[offset]);
-            int ret = soapy_bridge_read(rx_bridge, buf, chunk, 100000);
+            int ret = radio_bridge_read(rx_bridge, buf, chunk, 0.1);
             if (ret > 0) {
                 offset += static_cast<std::size_t>(ret);
                 rx_captured.store(offset, std::memory_order_relaxed);
@@ -197,9 +202,9 @@ RoundResult do_round(const std::string& label,
         std::size_t chunk = std::min(tx_iq.size() - tx_offset,
                                      std::size_t{4096});
         int is_last = (tx_offset + chunk >= tx_iq.size()) ? 1 : 0;
-        int ret = soapy_bridge_write(tx_bridge,
+        int ret = radio_bridge_write(tx_bridge,
                                       tx_buf + tx_offset * 2,
-                                      chunk, 100000, is_last);
+                                      chunk, 0.1, is_last);
         if (ret < 0) {
             std::fprintf(stderr, "  TX write error: %d\n", ret);
             break;
@@ -262,6 +267,8 @@ std::string random_hex_nonce(int n_bytes) {
 // ---- CLI ----
 
 struct LoopbackConfig {
+    std::string args{};              ///< device args (empty = auto-discover)
+    std::string clock{};             ///< clock source (empty = device default)
     double      freq{kDefaultFreq};
     double      tx_gain{kDefaultTxGain};
     double      rx_gain{kDefaultRxGain};
@@ -278,6 +285,8 @@ void print_usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s [options]\n\n"
         "Options:\n"
+        "  --args <str>      Device args (default: auto-discover)\n"
+        "  --clock <src>     Clock source (default: device default)\n"
         "  --freq <hz>       Frequency (default: 869618000)\n"
         "  --tx-gain <db>    TX gain (default: 30)\n"
         "  --rx-gain <db>    RX gain (default: 40)\n"
@@ -297,6 +306,10 @@ bool parse_args(int argc, char** argv, LoopbackConfig& cfg) {
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return false;
+        } else if (arg == "--args" && i + 1 < argc) {
+            cfg.args = argv[++i];
+        } else if (arg == "--clock" && i + 1 < argc) {
+            cfg.clock = argv[++i];
         } else if (arg == "--freq" && i + 1 < argc) {
             cfg.freq = std::stod(argv[++i]);
         } else if (arg == "--tx-gain" && i + 1 < argc) {
@@ -345,63 +358,66 @@ int main(int argc, char** argv) {
     lp.freq         = cfg.freq;
 
     std::fprintf(stderr, "=== LoRa Hardware Loopback Test ===\n");
-    std::fprintf(stderr, "  Mode:      %s\n",
+    std::fprintf(stderr, "  Device args: %s\n",
+                 cfg.args.empty() ? "(auto)" : cfg.args.c_str());
+    std::fprintf(stderr, "  Clock:       %s\n",
+                 cfg.clock.empty() ? "(default)" : cfg.clock.c_str());
+    std::fprintf(stderr, "  Mode:        %s\n",
                  challenge_mode ? "challenge-response (2 rounds)"
                                  : "fixed payload (1 round)");
-    std::fprintf(stderr, "  Frequency: %.6f MHz\n", cfg.freq / 1e6);
-    std::fprintf(stderr, "  TX gain:   %.0f dB  RX gain: %.0f dB\n",
+    std::fprintf(stderr, "  Frequency:   %.6f MHz\n", cfg.freq / 1e6);
+    std::fprintf(stderr, "  TX gain:     %.0f dB  RX gain: %.0f dB\n",
                  cfg.tx_gain, cfg.rx_gain);
     std::fprintf(stderr, "  SF=%u BW=%u CR=4/%u sync=0x%02X preamble=%u\n",
                  cfg.sf, cfg.bw, 4 + cfg.cr, cfg.sync_word, cfg.preamble_len);
 
     // --- Probe device ---
-    std::fprintf(stderr, "\nProbing for B210...\n");
-    if (!soapy_bridge_probe("uhd")) {
-        std::fprintf(stderr, "ERROR: No UHD device found.\n");
+    std::fprintf(stderr, "\nProbing for device...\n");
+    const char* probe_args = cfg.args.empty() ? nullptr : cfg.args.c_str();
+    if (!radio_bridge_probe(probe_args)) {
+        std::fprintf(stderr, "ERROR: No device found.\n");
         return 1;
     }
 
     // --- Open RX stream ---
     std::fprintf(stderr, "Opening RX stream...\n");
-    soapy_bridge_config_t rx_cfg{};
-    rx_cfg.driver       = "uhd";
-    rx_cfg.clock_source = "external";
-    rx_cfg.device_args  = nullptr;
+    radio_bridge_config_t rx_cfg{};
+    rx_cfg.device_args  = cfg.args.empty() ? nullptr : cfg.args.c_str();
+    rx_cfg.clock_source = cfg.clock.empty() ? nullptr : cfg.clock.c_str();
     rx_cfg.sample_rate  = static_cast<double>(cfg.sample_rate);
     rx_cfg.center_freq  = cfg.freq;
     rx_cfg.gain_db      = cfg.rx_gain;
     rx_cfg.bandwidth    = 0;
     rx_cfg.channel      = 0;
-    rx_cfg.antenna      = "RX2";
-    rx_cfg.direction    = SOAPY_BRIDGE_RX;
+    rx_cfg.antenna      = nullptr;  // device default
+    rx_cfg.direction    = RADIO_BRIDGE_RX;
 
-    soapy_bridge_t* rx_bridge = soapy_bridge_create(&rx_cfg);
+    radio_bridge_t* rx_bridge = radio_bridge_create(&rx_cfg);
     if (!rx_bridge) {
         std::fprintf(stderr, "ERROR: RX create failed: %s\n",
-                     soapy_bridge_last_error());
+                     radio_bridge_last_error());
         return 1;
     }
 
     // --- Open TX stream ---
     std::fprintf(stderr, "Opening TX stream...\n");
-    soapy_bridge_config_t tx_cfg{};
-    tx_cfg.driver       = "uhd";
-    tx_cfg.clock_source = "external";
-    tx_cfg.device_args  = nullptr;
+    radio_bridge_config_t tx_cfg{};
+    tx_cfg.device_args  = cfg.args.empty() ? nullptr : cfg.args.c_str();
+    tx_cfg.clock_source = cfg.clock.empty() ? nullptr : cfg.clock.c_str();
     tx_cfg.sample_rate  = static_cast<double>(cfg.sample_rate);
     tx_cfg.center_freq  = cfg.freq;
     tx_cfg.gain_db      = cfg.tx_gain;
     tx_cfg.bandwidth    = 0;
     tx_cfg.channel      = 0;
-    tx_cfg.antenna      = "TX/RX";
-    tx_cfg.direction    = SOAPY_BRIDGE_TX;
+    tx_cfg.antenna      = nullptr;  // device default
+    tx_cfg.direction    = RADIO_BRIDGE_TX;
 
-    soapy_bridge_t* tx_bridge = soapy_bridge_create(&tx_cfg);
+    radio_bridge_t* tx_bridge = radio_bridge_create(&tx_cfg);
     if (!tx_bridge) {
         std::fprintf(stderr, "ERROR: TX create failed: %s\n",
-                     soapy_bridge_last_error());
-        soapy_bridge_destroy(rx_bridge);
-        return 1;
+                     radio_bridge_last_error());
+        radio_bridge_destroy_ex(rx_bridge, 1);
+        _exit(1);
     }
 
     int exit_code = 0;
@@ -496,8 +512,10 @@ int main(int argc, char** argv) {
     }
 
     // --- Cleanup ---
-    soapy_bridge_destroy(tx_bridge);
-    soapy_bridge_destroy(rx_bridge);
+    // Stop streams and release streamers, but skip device deallocation —
+    // static teardown can crash under dual-libc++.
+    radio_bridge_destroy_ex(tx_bridge, 1);
+    radio_bridge_destroy_ex(rx_bridge, 1);
 
-    return exit_code;
+    _exit(exit_code);
 }

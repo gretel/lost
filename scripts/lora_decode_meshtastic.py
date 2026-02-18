@@ -17,7 +17,7 @@ To add full decoding:
     pkt = MeshPacket()
     pkt.ParseFromString(payload)
 
-Note: for live monitoring, use lora_mon.py (reads UDP from lora_rx_soapy).
+Note: for live monitoring, use lora_mon.py (reads UDP from lora_rx).
 This script is for offline analysis of saved CBOR streams.
 
 Usage:

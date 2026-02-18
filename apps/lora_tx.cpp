@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: ISC
 //
-// lora_tx_soapy: Hardware LoRa transmitter using SoapySDR + B210.
+// lora_tx: Hardware LoRa transmitter.
 //
-// Generates a complete LoRa frame from a payload string using the shared
-// algorithm functions (no GR4 graph needed for batch TX), then writes the
-// IQ to the B210 via the pure-C SoapySDR bridge.
+// Uses the unified radio_bridge API (UHD or SoapySDR backend, selected at
+// link time). Generates a complete LoRa frame from a payload string using
+// the shared algorithm functions (no GR4 graph needed for batch TX), then
+// writes the IQ to the device via the pure-C bridge.
 //
 // Two modes:
-//   CLI mode:   lora_tx_soapy [options] <payload_string>
-//   Stdin mode: lora_tx_soapy --stdin [--dry-run]
+//   CLI mode:   lora_tx [options] <payload_string>
+//   Stdin mode: lora_tx --stdin [--dry-run]
 //               Reads concatenated CBOR TX request objects from stdin.
 //               See docs/cbor-schemas.md for the schema.
 //
+//   --args <str>      Device args (default: auto-discover)
+//   --clock <src>     Clock source (default: device default)
 //   --freq <hz>       TX center frequency (default: 869618000)
 //   --gain <db>       TX gain in dB (default: 30)
 //   --rate <sps>      Sample rate in S/s (default: 250000)
@@ -45,13 +48,15 @@
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
 #include "cbor.hpp"
-#include "soapy_c_bridge.h"
+#include "radio_bridge.h"
 
 namespace {
 
 // ---- CLI argument parsing ----
 
 struct TxConfig {
+    std::string args{};              ///< device args (empty = auto-discover)
+    std::string clock{};             ///< clock source (empty = device default)
     double      freq{869'618'000.0};
     double      gain{30.0};
     float       rate{250'000.f};
@@ -68,22 +73,34 @@ struct TxConfig {
 };
 
 void print_usage(const char* prog) {
-    std::fprintf(stderr, "Usage: %s [options] <payload_string>\n", prog);
-    std::fprintf(stderr, "\nOptions:\n");
-    std::fprintf(stderr, "  --freq <hz>       TX frequency (default: 869618000)\n");
-    std::fprintf(stderr, "  --gain <db>       TX gain (default: 30)\n");
-    std::fprintf(stderr, "  --rate <sps>      Sample rate (default: 250000)\n");
-    std::fprintf(stderr, "  --bw <hz>         LoRa bandwidth (default: 62500)\n");
-    std::fprintf(stderr, "  --sf <7-12>       Spreading factor (default: 8)\n");
-    std::fprintf(stderr, "  --cr <1-4>        Coding rate (default: 4)\n");
-    std::fprintf(stderr, "  --sync <hex>      Sync word, e.g. 0x12 (default: 0x12)\n");
-    std::fprintf(stderr, "  --preamble <n>    Preamble length (default: 8)\n");
-    std::fprintf(stderr, "  --repeat <n>      Transmit count (default: 1)\n");
-    std::fprintf(stderr, "  --gap <ms>        Gap between repeats (default: 1000)\n");
-    std::fprintf(stderr, "  --dry-run         Generate IQ without transmitting\n");
-    std::fprintf(stderr, "  --stdin           Read CBOR TX requests from stdin\n");
-    std::fprintf(stderr, "  -h, --help        Show this help\n");
-    std::fprintf(stderr, "\n*** Ensure you have authorization to transmit! ***\n");
+    std::fprintf(stderr,
+        "Usage: %s [options] <payload_string>\n\n"
+        "Device options:\n"
+        "  --args <str>      Device args (default: auto-discover)\n"
+        "                    Examples: type=b200, addr=192.168.10.2\n"
+        "  --clock <src>     Clock source (default: device default)\n"
+        "                    Examples: internal, external, gpsdo\n"
+        "  --freq <hz>       TX frequency (default: 869618000)\n"
+        "  --gain <db>       TX gain (default: 30)\n"
+        "  --rate <sps>      Sample rate (default: 250000)\n\n"
+        "LoRa PHY options:\n"
+        "  --bw <hz>         LoRa bandwidth (default: 62500)\n"
+        "  --sf <7-12>       Spreading factor (default: 8)\n"
+        "  --cr <1-4>        Coding rate (default: 4)\n"
+        "  --sync <hex>      Sync word, e.g. 0x12 (default: 0x12)\n"
+        "  --preamble <n>    Preamble length (default: 8)\n\n"
+        "TX options:\n"
+        "  --repeat <n>      Transmit count (default: 1)\n"
+        "  --gap <ms>        Gap between repeats (default: 1000)\n"
+        "  --dry-run         Generate IQ without transmitting\n"
+        "  --stdin           Read CBOR TX requests from stdin\n"
+        "  -h, --help        Show this help\n\n"
+        "Examples:\n"
+        "  %s \"Hello World\"\n"
+        "  %s --args type=b200 --clock external \"Hello World\"\n"
+        "  %s --sf 12 --bw 125000 --rate 500000 \"Hello World\"\n\n"
+        "*** Ensure you have authorization to transmit! ***\n",
+        prog, prog, prog, prog);
 }
 
 bool parse_args(int argc, char** argv, TxConfig& cfg) {
@@ -92,6 +109,10 @@ bool parse_args(int argc, char** argv, TxConfig& cfg) {
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return false;
+        } else if (arg == "--args" && i + 1 < argc) {
+            cfg.args = argv[++i];
+        } else if (arg == "--clock" && i + 1 < argc) {
+            cfg.clock = argv[++i];
         } else if (arg == "--freq" && i + 1 < argc) {
             cfg.freq = std::stod(argv[++i]);
         } else if (arg == "--gain" && i + 1 < argc) {
@@ -159,8 +180,8 @@ void log_tx_info(const std::vector<uint8_t>& payload,
 
 // ---- Hardware TX ----
 
-/// Send IQ samples through the SoapySDR bridge. Returns 0 on success.
-int transmit_iq(soapy_bridge_t* bridge,
+/// Send IQ samples through the bridge. Returns 0 on success.
+int transmit_iq(radio_bridge_t* bridge,
                 const std::vector<std::complex<float>>& iq) {
     const auto* buf = reinterpret_cast<const float*>(iq.data());
     auto total = iq.size();
@@ -168,8 +189,8 @@ int transmit_iq(soapy_bridge_t* bridge,
     while (offset < total) {
         std::size_t chunk = std::min(total - offset, std::size_t{8192});
         int is_last = (offset + chunk >= total) ? 1 : 0;
-        int ret = soapy_bridge_write(bridge, buf + offset * 2,
-                                     chunk, 100000, is_last);
+        int ret = radio_bridge_write(bridge, buf + offset * 2,
+                                     chunk, 0.1, is_last);
         if (ret < 0) {
             std::fprintf(stderr, "Write error: %d\n", ret);
             return -1;
@@ -179,16 +200,13 @@ int transmit_iq(soapy_bridge_t* bridge,
     return 0;
 }
 
-/// Probe for the B210 with a timeout. Returns true if found.
-/// UHD enumeration can hang indefinitely on macOS if the device is in a
-/// bad USB state, so we run the probe on a detached thread and give up
-/// after timeout_sec seconds.
-bool probe_device_with_timeout(const char* driver, int timeout_sec) {
-    std::fprintf(stderr, "Probing for %s device (timeout %ds)...\n",
-                 driver, timeout_sec);
+/// Probe for a device with a timeout. Returns true if found.
+bool probe_device_with_timeout(const std::string& device_args, int timeout_sec) {
+    std::fprintf(stderr, "Probing for device (args=\"%s\", timeout %ds)...\n",
+                 device_args.c_str(), timeout_sec);
 
-    auto future = std::async(std::launch::async, [driver]() {
-        return soapy_bridge_probe(driver);
+    auto future = std::async(std::launch::async, [&device_args]() {
+        return radio_bridge_probe(device_args.empty() ? nullptr : device_args.c_str());
     });
 
     auto status = future.wait_for(std::chrono::seconds(timeout_sec));
@@ -196,8 +214,8 @@ bool probe_device_with_timeout(const char* driver, int timeout_sec) {
         std::fprintf(stderr,
             "ERROR: Device probe timed out after %ds.\n"
             "       The device may be in a bad USB state. Try:\n"
-            "         1. Unplug and replug the B210\n"
-            "         2. uhd_find_devices --args=\"type=b200\"\n",
+            "         1. Unplug and replug the device\n"
+            "         2. uhd_find_devices\n",
             timeout_sec);
         return false;
     }
@@ -206,34 +224,33 @@ bool probe_device_with_timeout(const char* driver, int timeout_sec) {
 }
 
 /// Open the TX hardware device. Returns nullptr on failure.
-soapy_bridge_t* open_tx_device(const TxConfig& cfg) {
-    if (!probe_device_with_timeout("uhd", 10)) {
-        std::fprintf(stderr, "Error: No UHD device found. Is the B210 connected?\n");
+radio_bridge_t* open_tx_device(const TxConfig& cfg) {
+    if (!probe_device_with_timeout(cfg.args, 10)) {
+        std::fprintf(stderr, "Error: No device found. Is the device connected and powered?\n");
         return nullptr;
     }
 
-    soapy_bridge_config_t bridge_cfg{};
-    bridge_cfg.driver       = "uhd";
-    bridge_cfg.clock_source = "external";
-    bridge_cfg.device_args  = nullptr;
+    radio_bridge_config_t bridge_cfg{};
+    bridge_cfg.device_args  = cfg.args.empty() ? nullptr : cfg.args.c_str();
+    bridge_cfg.clock_source = cfg.clock.empty() ? nullptr : cfg.clock.c_str();
     bridge_cfg.sample_rate  = static_cast<double>(cfg.rate);
     bridge_cfg.center_freq  = cfg.freq;
     bridge_cfg.gain_db      = cfg.gain;
     bridge_cfg.bandwidth    = 0;  // auto
     bridge_cfg.channel      = 0;
     bridge_cfg.antenna      = nullptr;
-    bridge_cfg.direction    = SOAPY_BRIDGE_TX;
+    bridge_cfg.direction    = RADIO_BRIDGE_TX;
 
-    soapy_bridge_t* bridge = soapy_bridge_create(&bridge_cfg);
+    radio_bridge_t* bridge = radio_bridge_create(&bridge_cfg);
     if (!bridge) {
-        std::fprintf(stderr, "Error: %s\n", soapy_bridge_last_error());
+        std::fprintf(stderr, "Error: %s\n", radio_bridge_last_error());
         return nullptr;
     }
 
     std::fprintf(stderr, "TX device ready. Actual: rate=%.0f freq=%.0f gain=%.1f\n",
-                 soapy_bridge_get_sample_rate(bridge),
-                 soapy_bridge_get_center_freq(bridge),
-                 soapy_bridge_get_gain(bridge));
+                 radio_bridge_get_sample_rate(bridge),
+                 radio_bridge_get_center_freq(bridge),
+                 radio_bridge_get_gain(bridge));
     return bridge;
 }
 
@@ -339,7 +356,7 @@ void emit_ack(uint64_t seq, bool ok) {
 }
 
 int run_stdin_mode(TxConfig& cfg) {
-    soapy_bridge_t* bridge = nullptr;
+    radio_bridge_t* bridge = nullptr;
     if (!cfg.dry_run) {
         bridge = open_tx_device(cfg);
         if (!bridge) return 1;
@@ -408,7 +425,7 @@ int run_stdin_mode(TxConfig& cfg) {
         }
     }
 
-    if (bridge) soapy_bridge_destroy(bridge);
+    if (bridge) radio_bridge_destroy(bridge);
     std::fprintf(stderr, "\nStdin closed. %" PRIu64 " requests processed.\n",
                  seq);
     return 0;
@@ -445,7 +462,9 @@ int main(int argc, char** argv) {
     double airtime_sec = static_cast<double>(iq.size()) /
                          static_cast<double>(cfg.rate);
 
-    std::fprintf(stderr, "=== LoRa TX (SoapySDR via C bridge) ===\n");
+    std::fprintf(stderr, "=== LoRa TX ===\n");
+    std::fprintf(stderr, "  Device args: %s\n", cfg.args.empty() ? "(auto)" : cfg.args.c_str());
+    std::fprintf(stderr, "  Clock:       %s\n", cfg.clock.empty() ? "(default)" : cfg.clock.c_str());
     std::fprintf(stderr, "  Payload:     \"%s\" (%zu bytes)\n",
                  cfg.payload.c_str(), cfg.payload.size());
     std::fprintf(stderr, "  Frequency:   %.6f MHz\n", cfg.freq / 1e6);
@@ -467,7 +486,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    soapy_bridge_t* bridge = open_tx_device(cfg);
+    radio_bridge_t* bridge = open_tx_device(cfg);
     if (!bridge) return 1;
 
     for (int tx_num = 0; tx_num < cfg.repeat; tx_num++) {
@@ -475,7 +494,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "TX %d/%d...\n", tx_num + 1, cfg.repeat);
         }
         if (transmit_iq(bridge, iq) < 0) {
-            soapy_bridge_destroy(bridge);
+            radio_bridge_destroy(bridge);
             return 1;
         }
         std::fprintf(stderr, "  Sent %zu samples (%.3f ms)\n",
@@ -486,7 +505,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    soapy_bridge_destroy(bridge);
+    // Stop stream and release streamer, but skip device deallocation —
+    // static teardown can crash under dual-libc++.
+    radio_bridge_destroy_ex(bridge, 1);
     std::fprintf(stderr, "\nDone.\n");
-    return 0;
+    _exit(0);
 }

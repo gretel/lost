@@ -1,42 +1,57 @@
 # SPDX-License-Identifier: ISC
-if(TARGET SoapySDR)
-  # --- C bridge: compiled with SYSTEM compiler to match SoapySDR/UHD ABI ---
-  # The GR4 project uses Homebrew LLVM 19 with its own libc++, but SoapySDR and
-  # UHD link against Apple's system libc++. Loading both libc++ in one process
-  # causes a malloc crash. The C bridge isolates the ABI boundary: it's compiled
-  # as pure C with the system compiler, so only C types cross between the two worlds.
-  enable_language(C)
+#
+# Hardware applications using the unified radio_bridge API.
+#
+# The radio_bridge API has two backends: UHD (preferred) and SoapySDR (fallback).
+# Both are compiled as pure C to isolate the dual-libc++ ABI boundary on macOS
+# (LLVM 19 for GR4 C++23 vs system libc++ for UHD/SoapySDR).
+# Only one backend is linked into each binary — they export identical symbols.
 
-  add_library(soapy_c_bridge STATIC soapy_c_bridge.c)
-  # Force system C compiler (Apple Clang) for this target, overriding toolchain.cmake
-  set_target_properties(soapy_c_bridge PROPERTIES
-    C_COMPILER_LAUNCHER ""
-    LANGUAGE C
-  )
-  target_include_directories(soapy_c_bridge PRIVATE ${SoapySDR_INCLUDE_DIRS})
-  target_link_libraries(soapy_c_bridge PRIVATE SoapySDR)
-  target_compile_options(soapy_c_bridge PRIVATE -fstack-protector-strong)
-  if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-      target_compile_definitions(soapy_c_bridge PRIVATE _FORTIFY_SOURCE=2)
-  endif()
-
-  # --- lora_rx_soapy: compiled with LLVM 19 (GR4 toolchain) ---
-  # Uses SoapySource.hpp which calls only C functions from soapy_c_bridge.
-  # Does NOT include any SoapySDR C++ headers.
-  add_executable(lora_rx_soapy lora_rx_soapy.cpp)
-  target_link_libraries(lora_rx_soapy PRIVATE gnuradio-blocklib-core gr-lora soapy_c_bridge)
-
-  # --- lora_tx_soapy: compiled with LLVM 19 (GR4 toolchain) ---
-  # Uses algorithm headers directly (no GR4 graph needed for batch TX).
-  # Calls soapy_c_bridge for hardware access.
-  add_executable(lora_tx_soapy lora_tx_soapy.cpp)
-  target_link_libraries(lora_tx_soapy PRIVATE gr-lora soapy_c_bridge)
-
-  # --- lora_loopback_soapy: TX+RX hardware loopback test ---
-  # Opens both TX and RX on same B210, transmits a LoRa frame, captures IQ,
-  # then decodes offline to verify the round-trip.
-  add_executable(lora_loopback_soapy lora_loopback_soapy.cpp)
-  target_link_libraries(lora_loopback_soapy PRIVATE gnuradio-blocklib-core gr-lora gr-testing soapy_c_bridge)
-else()
-  message(STATUS "SoapySDR not found -- skipping lora hardware apps")
+# --- Detect available SDR backends ---
+find_package(UHD QUIET)
+# SoapySDR target may already exist from the GR4 subdirectory
+if(NOT TARGET SoapySDR)
+    find_package(SoapySDR CONFIG QUIET)
 endif()
+
+if(NOT UHD_FOUND AND NOT TARGET SoapySDR)
+    message(STATUS "Neither UHD nor SoapySDR found -- skipping hardware apps")
+    return()
+endif()
+
+enable_language(C)
+
+# --- Build radio_bridge static library (one backend) ---
+if(UHD_FOUND)
+    message(STATUS "Using UHD backend for radio_bridge (preferred)")
+    add_library(radio_bridge STATIC uhd_radio_bridge.c)
+    target_include_directories(radio_bridge PRIVATE ${UHD_INCLUDE_DIRS})
+    target_link_libraries(radio_bridge PRIVATE ${UHD_LIBRARIES})
+elseif(TARGET SoapySDR)
+    message(STATUS "Using SoapySDR backend for radio_bridge (fallback)")
+    add_library(radio_bridge STATIC soapy_radio_bridge.c)
+    target_include_directories(radio_bridge PRIVATE ${SoapySDR_INCLUDE_DIRS})
+    target_link_libraries(radio_bridge PRIVATE SoapySDR)
+endif()
+
+set_target_properties(radio_bridge PROPERTIES LANGUAGE C)
+target_compile_options(radio_bridge PRIVATE -fstack-protector-strong)
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_definitions(radio_bridge PRIVATE _FORTIFY_SOURCE=2)
+endif()
+
+# --- lora_rx: single-channel LoRa receiver ---
+add_executable(lora_rx lora_rx.cpp)
+target_link_libraries(lora_rx PRIVATE gnuradio-blocklib-core gr-lora radio_bridge)
+
+# --- lora_tx: LoRa transmitter (batch + CBOR streaming) ---
+add_executable(lora_tx lora_tx.cpp)
+target_link_libraries(lora_tx PRIVATE gr-lora radio_bridge)
+
+# --- lora_loopback: TX->RX hardware loopback test ---
+add_executable(lora_loopback lora_loopback.cpp)
+target_link_libraries(lora_loopback PRIVATE gnuradio-blocklib-core gr-lora gr-testing radio_bridge)
+
+# --- lora_scanner: dual-RX multi-channel LoRa scanner ---
+add_executable(lora_scanner lora_scanner.cpp)
+target_link_libraries(lora_scanner PRIVATE gnuradio-blocklib-core gr-lora radio_bridge)

@@ -8,13 +8,13 @@ CBOR from stdin, and prints formatted text with running statistics.
 
 Usage:
     # UDP mode (default):
-    lora_rx_soapy --udp 127.0.0.1:5556 &
+    lora_rx --udp 127.0.0.1:5556 &
     python3 scripts/lora_mon.py
     python3 scripts/lora_mon.py --port 5556 --json
     python3 scripts/lora_mon.py --compact --stats
 
     # Pipe mode:
-    lora_rx_soapy --cbor | python3 scripts/lora_mon.py --stdin
+    lora_rx --cbor | python3 scripts/lora_mon.py --stdin
 
 Dependencies: cbor2
 """

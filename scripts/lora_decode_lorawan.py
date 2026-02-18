@@ -23,7 +23,7 @@ LoRaWAN MAC frame format (LoRaWAN L2 1.0.4 spec, section 4):
     FCtrl (uplink):   ADR[7] | ADRACKReq[6] | ACK[5] | ClassB[4] | FOptsLen[3:0]
     FCtrl (downlink): ADR[7] | RFU[6]       | ACK[5] | FPending[4] | FOptsLen[3:0]
 
-Note: for live monitoring, use lora_mon.py (reads UDP from lora_rx_soapy).
+Note: for live monitoring, use lora_mon.py (reads UDP from lora_rx).
 This script is for offline analysis of saved CBOR streams.
 
 Usage:

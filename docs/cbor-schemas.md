@@ -18,16 +18,16 @@ self-delimiting, so consumers can decode a concatenated stream directly:
 
 ```bash
 # Pipe to offline decoder (direnv adds build/apps to PATH)
-lora_rx_soapy --cbor | python3 scripts/lora_decode_meshcore.py
+lora_rx --cbor | python3 scripts/lora_decode_meshcore.py
 
 # Pipe to streaming monitor
-lora_rx_soapy --cbor | python3 scripts/lora_mon.py --stdin
+lora_rx --cbor | python3 scripts/lora_mon.py --stdin
 
 # Save for later
-lora_rx_soapy --cbor > captured.cbor
+lora_rx --cbor > captured.cbor
 
 # Both UDP and stdout CBOR simultaneously
-lora_rx_soapy --cbor --udp 127.0.0.1:5556
+lora_rx --cbor --udp 127.0.0.1:5556
 ```
 
 ```
@@ -51,9 +51,9 @@ lora_rx_soapy --cbor --udp 127.0.0.1:5556
 }
 ```
 
-## TX Request (`lora_tx_soapy --stdin`)
+## TX Request (`lora_tx --stdin`)
 
-Read from stdin by `lora_tx_soapy` in streaming mode. One CBOR map per
+Read from stdin by `lora_tx` in streaming mode. One CBOR map per
 request. All fields except `type` and `payload` are optional — CLI defaults
 apply for any omitted field.
 
@@ -76,7 +76,7 @@ apply for any omitted field.
 
 ## TX Acknowledgement (stdout)
 
-Emitted by `lora_tx_soapy --stdin` after processing each request.
+Emitted by `lora_tx --stdin` after processing each request.
 
 ```
 {

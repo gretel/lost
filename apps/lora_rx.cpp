@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: ISC
 //
-// lora_rx_soapy: Hardware LoRa receiver using SoapySDR + B210.
+// lora_rx: Hardware LoRa receiver.
 //
-// All LoRa PHY parameters (SF, BW, CR, sync word, preamble length) are
-// configurable via CLI options. Defaults: SF8/BW62.5k/CR4/8/sync=0x12.
+// Uses the unified radio_bridge API (UHD or SoapySDR backend, selected at
+// link time). Supports any device the linked backend can enumerate.
+// All LoRa PHY parameters and device settings are configurable via CLI.
+// Defaults: SF8/BW62.5k/CR4/8/sync=0x12, auto-discover device.
 //
-// Graph: SoapySource -> BurstDetector -> SymbolDemodulator -> FrameSink
+// Graph: RadioSource -> BurstDetector -> SymbolDemodulator -> FrameSink
 //
 // Robustness:
 //   - Probes for device before building graph (with timeout).
@@ -31,13 +33,15 @@
 #include <gnuradio-4.0/lora/SymbolDemodulator.hpp>
 
 #include "FrameSink.hpp"
-#include "SoapySource.hpp"
-#include "soapy_c_bridge.h"
+#include "RadioSource.hpp"
+#include "radio_bridge.h"
 
 namespace {
 volatile std::sig_atomic_t g_running = 1;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 struct RxConfig {
+    std::string args{};              ///< device args (empty = auto-discover)
+    std::string clock{};             ///< clock source (empty = device default)
     double   freq{869'618'000.0};
     double   gain{30.0};
     float    rate{250'000.f};
@@ -52,22 +56,29 @@ struct RxConfig {
 void print_usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s [options]\n\n"
-        "Options:\n"
+        "Device options:\n"
+        "  --args <str>      Device args (default: auto-discover)\n"
+        "                    Examples: type=b200, addr=192.168.10.2\n"
+        "  --clock <src>     Clock source (default: device default)\n"
+        "                    Examples: internal, external, gpsdo\n"
         "  --freq <hz>       RX center frequency (default: 869618000)\n"
         "  --gain <db>       RX gain in dB (default: 30)\n"
-        "  --rate <sps>      Sample rate in S/s (default: 250000)\n"
+        "  --rate <sps>      Sample rate in S/s (default: 250000)\n\n"
+        "LoRa PHY options:\n"
         "  --bw <hz>         LoRa bandwidth (default: 62500)\n"
         "  --sf <7-12>       Spreading factor (default: 8)\n"
         "  --sync <hex>      Sync word, e.g. 0x12 (default: 0x12)\n"
-        "  --preamble <n>    Preamble length in symbols (default: 8)\n"
+        "  --preamble <n>    Preamble length in symbols (default: 8)\n\n"
+        "Output options:\n"
         "  --udp <host:port> Send CBOR frames via UDP (e.g. 127.0.0.1:5556)\n"
         "  --cbor            Write CBOR to stdout instead of text\n"
         "  -h, --help        Show this help\n\n"
-        "Example:\n"
+        "Examples:\n"
+        "  %s\n"
+        "  %s --args type=b200 --clock external\n"
         "  %s --sf 12 --bw 125000 --rate 500000\n"
-        "  %s --udp 127.0.0.1:5556\n"
         "  %s --cbor | python3 scripts/lora_decode_meshcore.py\n",
-        prog, prog, prog, prog);
+        prog, prog, prog, prog, prog);
 }
 
 bool parse_args(int argc, char** argv, RxConfig& cfg) {
@@ -76,6 +87,10 @@ bool parse_args(int argc, char** argv, RxConfig& cfg) {
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return false;
+        } else if (arg == "--args" && i + 1 < argc) {
+            cfg.args = argv[++i];
+        } else if (arg == "--clock" && i + 1 < argc) {
+            cfg.clock = argv[++i];
         } else if (arg == "--freq" && i + 1 < argc) {
             cfg.freq = std::stod(argv[++i]);
         } else if (arg == "--gain" && i + 1 < argc) {
@@ -103,16 +118,16 @@ bool parse_args(int argc, char** argv, RxConfig& cfg) {
     return true;
 }
 
-/// Probe for the B210 with a timeout. Returns true if found.
-/// UHD enumeration can hang indefinitely on macOS if the device is in a
+/// Probe for a device with a timeout. Returns true if found.
+/// Device enumeration can hang indefinitely on macOS if the device is in a
 /// bad USB state, so we run the probe on a detached thread and give up
 /// after timeout_sec seconds.
-bool probe_device_with_timeout(const char* driver, int timeout_sec) {
-    std::fprintf(stderr, "Probing for %s device (timeout %ds)...\n",
-                 driver, timeout_sec);
+bool probe_device_with_timeout(const std::string& device_args, int timeout_sec) {
+    std::fprintf(stderr, "Probing for device (args=\"%s\", timeout %ds)...\n",
+                 device_args.c_str(), timeout_sec);
 
-    auto future = std::async(std::launch::async, [driver]() {
-        return soapy_bridge_probe(driver);
+    auto future = std::async(std::launch::async, [&device_args]() {
+        return radio_bridge_probe(device_args.empty() ? nullptr : device_args.c_str());
     });
 
     auto status = future.wait_for(std::chrono::seconds(timeout_sec));
@@ -120,10 +135,10 @@ bool probe_device_with_timeout(const char* driver, int timeout_sec) {
         std::fprintf(stderr,
             "ERROR: Device probe timed out after %ds.\n"
             "       The device may be in a bad USB state. Try:\n"
-            "         1. Unplug and replug the B210\n"
-            "         2. uhd_find_devices --args=\"type=b200\"\n",
+            "         1. Unplug and replug the device\n"
+            "         2. uhd_find_devices\n",
             timeout_sec);
-        // The async thread may still be running inside UHD enumeration.
+        // The async thread may still be running inside device enumeration.
         // We can't cancel it, but we exit the process anyway.
         return false;
     }
@@ -147,14 +162,15 @@ int main(int argc, char** argv) {
 
     const auto os_factor = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
-    std::fprintf(stderr, "=== LoRa RX (SoapySDR via C bridge) ===\n");
+    std::fprintf(stderr, "=== LoRa RX ===\n");
+    std::fprintf(stderr, "  Device args: %s\n", cfg.args.empty() ? "(auto)" : cfg.args.c_str());
+    std::fprintf(stderr, "  Clock:       %s\n", cfg.clock.empty() ? "(default)" : cfg.clock.c_str());
     std::fprintf(stderr, "  Frequency:   %.6f MHz\n", cfg.freq / 1e6);
     std::fprintf(stderr, "  Gain:        %.0f dB\n", cfg.gain);
     std::fprintf(stderr, "  Sample rate: %.0f S/s\n", static_cast<double>(cfg.rate));
     std::fprintf(stderr, "  OS factor:   %u\n", os_factor);
     std::fprintf(stderr, "  SF=%u  BW=%u  sync=0x%02X  preamble=%u\n",
                  cfg.sf, cfg.bw, cfg.sync, cfg.preamble);
-    std::fprintf(stderr, "  Device:      uhd (B210), clock_source=external\n");
     if (!cfg.udp.empty()) {
         std::fprintf(stderr, "  UDP CBOR:    %s\n", cfg.udp.c_str());
     }
@@ -168,9 +184,9 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, signal_handler);
 
     // --- Probe device before building graph ---
-    if (!probe_device_with_timeout("uhd", 10)) {
+    if (!probe_device_with_timeout(cfg.args, 10)) {
         std::fprintf(stderr,
-            "ERROR: No UHD device found. Is the B210 connected and powered?\n");
+            "ERROR: No device found. Is the device connected and powered?\n");
         return 1;
     }
     std::fprintf(stderr, "Device found.\n\n");
@@ -178,10 +194,9 @@ int main(int argc, char** argv) {
     // --- Build the graph ---
     gr::Graph graph;
 
-    auto& source = graph.emplaceBlock<gr::lora::SoapySource>({
-        {"device", std::string("uhd")},
-        {"clock_source", std::string("external")},
-        {"device_args", std::string("recv_frame_size=16360")},
+    auto& source = graph.emplaceBlock<gr::lora::RadioSource>({
+        {"device_args", cfg.args},
+        {"clock_source", cfg.clock},
         {"sample_rate", cfg.rate},
         {"center_freq", cfg.freq},
         {"gain", cfg.gain},
@@ -223,11 +238,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Skip SoapySDRDevice_unmake() on shutdown — it segfaults in UHD on
-    // macOS due to dual-libc++ teardown ordering.  The stream is still
-    // properly deactivated and closed; only the device handle leaks, which
-    // is fine since the process is exiting.
-    source._skip_unmake = true;
+    // Skip device deallocation on shutdown — it can segfault on macOS due to
+    // dual-libc++ teardown ordering. The stream is still properly stopped;
+    // only the device handle leaks, which is fine since the process is exiting.
+    source._skip_free = true;
 
     std::fprintf(stderr, "Starting receiver... (Ctrl+C to stop)\n\n");
 
@@ -261,14 +275,17 @@ int main(int argc, char** argv) {
     if (!ret.has_value()) {
         std::fprintf(stderr, "Scheduler error: %s\n",
                      std::format("{}", ret.error()).c_str());
-        _exit(1);
     }
+
+    // Explicitly stop the stream and release the device before _exit().
+    // _exit() skips C++ destructors, so RadioSource::stop() would never run,
+    // leaving the USB device claimed and requiring a replug.
+    source.stop();
 
     std::fprintf(stderr, "\nReceiver stopped.\n");
 
-    // Use _exit() to skip C++ static destructors. UHD/SoapySDR have
-    // static teardown code that segfaults on macOS due to the dual-libc++
-    // environment (LLVM 19 vs system libc++). The stream was already
-    // deactivated and closed by soapy_bridge_destroy_ex() above.
+    // Use _exit() to skip C++ static destructors that may crash under
+    // dual-libc++ (LLVM 19 vs system) during static teardown. The stream
+    // and streamer were already released by source.stop() above.
     _exit(0);
 }

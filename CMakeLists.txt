@@ -55,7 +55,7 @@ if(ENABLE_LORA_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif()
 
-# --- Hardware applications (require SoapySDR) ---
+# --- Hardware applications (require UHD or SoapySDR) ---
 option(ENABLE_LORA_APPS "Enable gr4-lora hardware applications" ON)
 if(ENABLE_LORA_APPS)
     # SoapySDR may already be found by GR4 subdirectory; if not, search common paths

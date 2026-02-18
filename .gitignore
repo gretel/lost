@@ -27,6 +27,9 @@ tmp/
 # Agent
 CLAUDE.md
 
+# GR4 reference docs (not our code)
+docs/GR4_CORE_*
+
 # IDE
 .vs/
 .vscode/
