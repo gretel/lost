@@ -23,12 +23,16 @@ from meshcore_tx import (
     PATH_HASH_SIZE,
     PAYLOAD_ADVERT,
     PAYLOAD_ANON_REQ,
+    PAYLOAD_TXT,
     PUB_KEY_SIZE,
+    ROUTE_DIRECT,
     ROUTE_FLOOD,
     SIGNATURE_SIZE,
     build_advert,
     build_anon_req,
+    build_bizcard_uri,
     build_contact_uri,
+    build_txt_msg,
     build_wire_packet,
     load_or_create_identity,
     make_cbor_tx_request,
@@ -409,7 +413,7 @@ class TestAnonReq(unittest.TestCase):
         pkt = build_anon_req(TEST_SEED_EXPANDED, TEST_SEED_PUB, dest_pub, b"Hello")
 
         # Wire: header(1) + path_len(1) + payload
-        self.assertEqual(pkt[0] & 0x03, ROUTE_FLOOD)
+        self.assertEqual(pkt[0] & 0x03, ROUTE_DIRECT)  # default is DIRECT
         self.assertEqual((pkt[0] >> 2) & 0x0F, PAYLOAD_ANON_REQ)
         self.assertEqual(pkt[1], 0)  # path_len
 
@@ -417,6 +421,23 @@ class TestAnonReq(unittest.TestCase):
         # payload: dest_hash(1) + sender_pub(32) + MAC(2) + ciphertext
         self.assertEqual(payload[0], dest_pub[0])  # dest_hash = first byte of pubkey
         self.assertEqual(payload[1 : 1 + PUB_KEY_SIZE], TEST_SEED_PUB)
+
+    def test_anon_req_flood_route(self):
+        """ANON_REQ can use FLOOD routing explicitly."""
+        from nacl.signing import SigningKey
+
+        seed2 = os.urandom(32)
+        sk2 = SigningKey(seed2)
+        dest_pub = bytes(sk2.verify_key)
+
+        pkt = build_anon_req(
+            TEST_SEED_EXPANDED,
+            TEST_SEED_PUB,
+            dest_pub,
+            b"Hi",
+            route_type=ROUTE_FLOOD,
+        )
+        self.assertEqual(pkt[0] & 0x03, ROUTE_FLOOD)
 
     def test_anon_req_decrypt(self):
         """Recipient must be able to decrypt ANON_REQ."""
@@ -451,6 +472,132 @@ class TestAnonReq(unittest.TestCase):
         # Remaining bytes are the message (may have trailing zeros from AES padding)
         msg = decrypted[4 : 4 + len(message)]
         self.assertEqual(msg, message)
+
+
+class TestTxtMsg(unittest.TestCase):
+    """Tests for TXT_MSG (encrypted text to a known contact)."""
+
+    def test_txt_msg_structure(self):
+        """TXT_MSG has correct wire format: dest_hash + src_hash + encrypted."""
+        from nacl.signing import SigningKey
+
+        seed2 = os.urandom(32)
+        sk2 = SigningKey(seed2)
+        dest_pub = bytes(sk2.verify_key)
+
+        pkt = build_txt_msg(TEST_SEED_EXPANDED, TEST_SEED_PUB, dest_pub, "Hello")
+
+        # Wire: header(1) + path_len(1) + payload
+        self.assertEqual(pkt[0] & 0x03, ROUTE_DIRECT)  # default
+        self.assertEqual((pkt[0] >> 2) & 0x0F, PAYLOAD_TXT)
+        self.assertEqual(pkt[1], 0)  # path_len
+
+        payload = pkt[2:]
+        # payload: dest_hash(1) + src_hash(1) + MAC(2) + ciphertext
+        self.assertEqual(payload[0], dest_pub[0])  # dest_hash
+        self.assertEqual(payload[1], TEST_SEED_PUB[0])  # src_hash
+
+    def test_txt_msg_decrypt(self):
+        """Recipient must be able to decrypt TXT_MSG."""
+        from nacl.signing import SigningKey
+
+        seed2 = os.urandom(32)
+        sk2 = SigningKey(seed2)
+        dest_expanded = meshcore_expanded_key(seed2)
+        dest_pub = bytes(sk2.verify_key)
+
+        pkt = build_txt_msg(
+            TEST_SEED_EXPANDED,
+            TEST_SEED_PUB,
+            dest_pub,
+            "Hello gr4-lora",
+            timestamp=1700000000,
+        )
+
+        payload = pkt[2:]
+        # Skip dest_hash(1) + src_hash(1) to get MAC+ciphertext
+        encrypted = payload[2:]
+
+        # Recipient computes shared secret from sender's pubkey
+        secret = meshcore_shared_secret(dest_expanded, TEST_SEED_PUB)
+
+        # Decrypt
+        decrypted = meshcore_mac_then_decrypt(secret, encrypted)
+        self.assertIsNotNone(decrypted)
+        assert decrypted is not None  # for type checker
+
+        # First 4 bytes are timestamp
+        ts = struct.unpack_from("<I", decrypted, 0)[0]
+        self.assertEqual(ts, 1700000000)
+
+        # Byte 4 is attempt number
+        self.assertEqual(decrypted[4], 0)
+
+        # Remaining bytes are the message text
+        msg = decrypted[5 : 5 + len("Hello gr4-lora")]
+        self.assertEqual(msg, b"Hello gr4-lora")
+
+    def test_txt_msg_attempt_number(self):
+        """Attempt number is encoded in plaintext byte 4."""
+        from nacl.signing import SigningKey
+
+        seed2 = os.urandom(32)
+        sk2 = SigningKey(seed2)
+        dest_expanded = meshcore_expanded_key(seed2)
+        dest_pub = bytes(sk2.verify_key)
+
+        pkt = build_txt_msg(
+            TEST_SEED_EXPANDED,
+            TEST_SEED_PUB,
+            dest_pub,
+            "retry",
+            attempt=3,
+        )
+
+        payload = pkt[2:]
+        encrypted = payload[2:]
+        secret = meshcore_shared_secret(dest_expanded, TEST_SEED_PUB)
+        decrypted = meshcore_mac_then_decrypt(secret, encrypted)
+        self.assertIsNotNone(decrypted)
+        assert decrypted is not None
+        self.assertEqual(decrypted[4], 3)
+
+    def test_txt_msg_flood_route(self):
+        """TXT_MSG can use FLOOD routing explicitly."""
+        from nacl.signing import SigningKey
+
+        seed2 = os.urandom(32)
+        sk2 = SigningKey(seed2)
+        dest_pub = bytes(sk2.verify_key)
+
+        pkt = build_txt_msg(
+            TEST_SEED_EXPANDED,
+            TEST_SEED_PUB,
+            dest_pub,
+            "flood",
+            route_type=ROUTE_FLOOD,
+        )
+        self.assertEqual(pkt[0] & 0x03, ROUTE_FLOOD)
+
+    def test_txt_msg_symmetry(self):
+        """Both parties compute the same shared secret for TXT_MSG."""
+        from nacl.signing import SigningKey
+
+        seed2 = os.urandom(32)
+        sk2 = SigningKey(seed2)
+        dest_expanded = meshcore_expanded_key(seed2)
+        dest_pub = bytes(sk2.verify_key)
+
+        # Alice sends to Bob
+        pkt = build_txt_msg(TEST_SEED_EXPANDED, TEST_SEED_PUB, dest_pub, "from Alice")
+        encrypted = pkt[2 + 2 :]  # skip header + path_len + dest_hash + src_hash
+
+        # Bob decrypts using his key + Alice's pubkey
+        secret = meshcore_shared_secret(dest_expanded, TEST_SEED_PUB)
+        decrypted = meshcore_mac_then_decrypt(secret, encrypted)
+        self.assertIsNotNone(decrypted)
+        assert decrypted is not None
+        self.assertIn(b"from Alice", decrypted)
 
 
 class TestIdentity(unittest.TestCase):
@@ -508,10 +655,10 @@ class TestCborTxRequest(unittest.TestCase):
 
 
 class TestContactUri(unittest.TestCase):
-    """Tests for MeshCore contact URI and QR code generation."""
+    """Tests for MeshCore contact URI generation (mobile app QR format)."""
 
-    def test_contact_uri_basic(self):
-        """Contact URI with name and default type."""
+    def test_contact_uri_format(self):
+        """Contact URI uses meshcore://contact/add? format."""
         pub = bytes(range(32))
         uri = build_contact_uri(pub, "TestNode")
         self.assertTrue(uri.startswith("meshcore://contact/add?"))
@@ -530,7 +677,6 @@ class TestContactUri(unittest.TestCase):
         """Contact URI with special characters in name."""
         pub = bytes(range(32))
         uri = build_contact_uri(pub, "My Node+1")
-        # Spaces and special chars should be percent-encoded
         self.assertNotIn(" ", uri)
         self.assertIn("My%20Node%2B1", uri)
 
@@ -540,6 +686,24 @@ class TestContactUri(unittest.TestCase):
         uri = build_contact_uri(pub, "Relay", node_type=ADVERT_NODE_REPEATER)
         self.assertIn("type=2", uri)
 
+    def test_bizcard_uri_is_hex_packet(self):
+        """Biz card URI is meshcore:// + hex-encoded ADVERT packet."""
+        pkt = build_advert(TEST_SEED, TEST_SEED_PUB, name="TestNode")
+        uri = build_bizcard_uri(pkt)
+        self.assertTrue(uri.startswith("meshcore://"))
+        recovered = bytes.fromhex(uri[11:])
+        self.assertEqual(recovered, pkt)
+
+    def test_bizcard_uri_roundtrip(self):
+        """Biz card URI hex decodes back to original ADVERT packet."""
+        pkt = build_advert(TEST_SEED, TEST_SEED_PUB, name="Roundtrip")
+        uri = build_bizcard_uri(pkt)
+        recovered = bytes.fromhex(uri[11:])
+        self.assertEqual(recovered[0] & 0x03, ROUTE_FLOOD)
+        self.assertEqual((recovered[0] >> 2) & 0x0F, PAYLOAD_ADVERT)
+        payload = recovered[2:]
+        self.assertEqual(payload[:PUB_KEY_SIZE], TEST_SEED_PUB)
+
     def test_qr_code_generation(self):
         """QR code generates without error (output goes to terminal)."""
         import io
@@ -547,7 +711,6 @@ class TestContactUri(unittest.TestCase):
 
         pub = bytes(range(32))
         uri = build_contact_uri(pub, "Test")
-        # Verify segno can encode the URI without error
         qr = segno.make(uri)
         buf = io.BytesIO()
         qr.save(buf, kind="svg")

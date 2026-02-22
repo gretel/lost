@@ -31,11 +31,14 @@ from meshcore_tx import (
     CIPHER_MAC_SIZE,
     PAYLOAD_ADVERT,
     PAYLOAD_ANON_REQ,
+    PAYLOAD_TXT,
     PUB_KEY_SIZE,
+    ROUTE_DIRECT,
     ROUTE_FLOOD,
     SIGNATURE_SIZE,
     build_advert,
     build_anon_req,
+    build_txt_msg,
     build_wire_packet,
     make_header,
     meshcore_encrypt_then_mac,
@@ -174,7 +177,7 @@ class TestAnonReqRoundtrip(unittest.TestCase):
 
         self.assertIsNotNone(pkt)
         self.assertEqual(pkt.version, 0)
-        self.assertEqual(pkt.route_type, ROUTE_FLOOD)
+        self.assertEqual(pkt.route_type, ROUTE_DIRECT)  # default is DIRECT
         self.assertEqual(pkt.payload_type, PAYLOAD_ANON_REQ)
         self.assertFalse(pkt.has_transport)
         self.assertEqual(pkt.path_length, 0)
@@ -223,8 +226,87 @@ class TestAnonReqRoundtrip(unittest.TestCase):
         )
         pkt = parse_meshcore(pkt_bytes)
 
-        self.assertEqual(pkt.route_name, "FLOOD")
+        self.assertEqual(pkt.route_name, "DIRECT")  # default is DIRECT
         self.assertEqual(pkt.payload_name, "ANON_REQ")
+
+
+# ---- TXT_MSG encode→decode ----
+
+
+class TestTxtMsgRoundtrip(unittest.TestCase):
+    """Verify build_txt_msg() output is correctly parsed by parse_meshcore()."""
+
+    def setUp(self):
+        """Create a destination keypair for encryption tests."""
+        self.dest_seed = os.urandom(32)
+        self.dest_sk = SigningKey(self.dest_seed)
+        self.dest_pub = bytes(self.dest_sk.verify_key)
+        self.dest_expanded = meshcore_expanded_key(self.dest_seed)
+
+    def test_basic_txt_msg(self):
+        """TXT_MSG round-trips: header, route, payload type."""
+        pkt_bytes = build_txt_msg(
+            TEST_SEED_EXPANDED, TEST_SEED_PUB, self.dest_pub, "Hello"
+        )
+        pkt = parse_meshcore(pkt_bytes)
+
+        self.assertIsNotNone(pkt)
+        self.assertEqual(pkt.version, 0)
+        self.assertEqual(pkt.route_type, ROUTE_DIRECT)  # default is DIRECT
+        self.assertEqual(pkt.payload_type, PAYLOAD_TXT)
+        self.assertFalse(pkt.has_transport)
+        self.assertEqual(pkt.path_length, 0)
+
+    def test_txt_msg_hashes(self):
+        """TXT_MSG app_payload starts with dest_hash + src_hash."""
+        pkt_bytes = build_txt_msg(
+            TEST_SEED_EXPANDED, TEST_SEED_PUB, self.dest_pub, "Hashes"
+        )
+        pkt = parse_meshcore(pkt_bytes)
+
+        self.assertIsNotNone(pkt)
+        # app_payload: dest_hash(1) + src_hash(1) + MAC(2) + ciphertext
+        self.assertGreater(len(pkt.app_payload), 4)
+        self.assertEqual(pkt.app_payload[0], self.dest_pub[0])  # dest_hash
+        self.assertEqual(pkt.app_payload[1], TEST_SEED_PUB[0])  # src_hash
+
+    def test_txt_msg_decrypt_from_decoder_output(self):
+        """Recipient decrypts TXT_MSG using fields extracted by decoder."""
+        text = "Secret message from gr4-lora"
+        ts = 1700000000
+        pkt_bytes = build_txt_msg(
+            TEST_SEED_EXPANDED,
+            TEST_SEED_PUB,
+            self.dest_pub,
+            text,
+            timestamp=ts,
+        )
+        pkt = parse_meshcore(pkt_bytes)
+
+        # Extract encrypted payload (skip dest_hash + src_hash)
+        encrypted = pkt.app_payload[2:]
+
+        # Recipient computes shared secret and decrypts
+        secret = meshcore_shared_secret(self.dest_expanded, TEST_SEED_PUB)
+        decrypted = meshcore_mac_then_decrypt(secret, encrypted)
+
+        self.assertIsNotNone(decrypted)
+        # First 4 bytes are timestamp
+        decoded_ts = struct.unpack_from("<I", decrypted, 0)[0]
+        self.assertEqual(decoded_ts, ts)
+        # Byte 4 is attempt
+        self.assertEqual(decrypted[4], 0)
+        # Rest is message text
+        decoded_msg = decrypted[5 : 5 + len(text)]
+        self.assertEqual(decoded_msg, text.encode("utf-8"))
+
+    def test_txt_msg_route_names(self):
+        """Decoder produces correct human-readable names for TXT_MSG."""
+        pkt_bytes = build_txt_msg(TEST_SEED_EXPANDED, TEST_SEED_PUB, self.dest_pub, "X")
+        pkt = parse_meshcore(pkt_bytes)
+
+        self.assertEqual(pkt.route_name, "DIRECT")
+        self.assertEqual(pkt.payload_name, "TXT")
 
 
 # ---- Transport codes ----
@@ -359,7 +441,7 @@ class TestCborPipeline(unittest.TestCase):
         self.assertTrue(output, "Decoder produced no output")
 
         parsed = json.loads(output)
-        self.assertEqual(parsed["meshcore"]["route"], "FLOOD")
+        self.assertEqual(parsed["meshcore"]["route"], "DIRECT")  # default is DIRECT
         self.assertEqual(parsed["meshcore"]["payload_type"], "ANON_REQ")
         self.assertGreater(parsed["meshcore"]["app_payload_len"], 0)
 

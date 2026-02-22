@@ -3,26 +3,29 @@
 """
 meshcore_tx.py -- MeshCore protocol TX message builder.
 
-Constructs MeshCore packets (ADVERT, ANON_REQ) and sends them to lora_tx
-via CBOR on stdout. Manages persistent Ed25519 identity keypairs.
+Constructs MeshCore packets (ADVERT, TXT_MSG, ANON_REQ) and sends them
+to lora_tx via CBOR on stdout. Manages persistent Ed25519 identity keypairs.
 
 Usage:
-  # Generate or load identity, send ADVERT beacon:
-  meshcore_tx.py advert --name "MyNode"
-
-  # Send anonymous encrypted message to a known peer:
-  meshcore_tx.py anon-req --dest <pubkey_hex> "Hello from gr4-lora"
-
-  # Pipe to lora_tx:
+  # Send ADVERT beacon (broadcast, uses FLOOD routing):
   meshcore_tx.py advert --name "MyNode" | lora_tx --stdin
+
+  # Send encrypted message to a known contact (DIRECT routing):
+  meshcore_tx.py send --dest <64hex_pubkey> "Hello" | lora_tx --stdin
+
+  # Send anonymous encrypted request (includes sender pubkey):
+  meshcore_tx.py anon-req --dest <64hex_pubkey> "Hello" | lora_tx --stdin
+
+  # Print contact QR code (scannable by MeshCore companion app):
+  meshcore_tx.py advert --name "MyNode" --qr
 
   # Dry run (print packet hex to stderr, CBOR to stdout):
   meshcore_tx.py advert --name "MyNode" --dry-run
 
 Key management:
-  Identity is stored in ~/.config/gr4-lora/identity.bin (96 bytes:
-  64-byte Ed25519 private key + 32-byte public key). Generated on first
-  run if missing. Use --identity <path> to override.
+  Identity is stored in ~/.config/gr4-lora/identity.bin (64 bytes:
+  32-byte seed + 32-byte public key). Generated on first run if
+  missing. Use --identity <path> to override.
 
 Protocol reference:
   MeshCore v1 packet format. See docs/lora-protocols.md and
@@ -249,23 +252,30 @@ def meshcore_mac_then_decrypt(shared_secret: bytes, data: bytes) -> bytes | None
     return cipher.decrypt(ciphertext)
 
 
-# ---- MeshCore contact URI + QR code ----
+# ---- MeshCore contact QR code ----
 
-# Node type names for the contact URI
-NODE_TYPE_NAMES = {
-    ADVERT_NODE_CHAT: "chat",
-    ADVERT_NODE_REPEATER: "repeater",
-    ADVERT_NODE_ROOM: "room",
-    ADVERT_NODE_SENSOR: "sensor",
-}
+# Two URI formats exist in the MeshCore ecosystem:
+#
+# 1. Mobile app QR format (meshcore://contact/add?...):
+#    Used by the MeshCore companion mobile apps (Android/iOS) for scanning.
+#    Contains name + public_key + type as URL parameters.
+#    Documented in MeshCore/docs/qr_codes.md.
+#
+# 2. CLI "biz card" format (meshcore://<hex-encoded wire packet>):
+#    Used by meshcore-cli import_contact / firmware serial export.
+#    Contains the full signed ADVERT wire packet.
+#
+# We generate format 1 for QR codes (scannable by companion app).
 
 
 def build_contact_uri(
     pub_key: bytes, name: str, node_type: int = ADVERT_NODE_CHAT
 ) -> str:
-    """Build a MeshCore contact URI for QR code sharing.
+    """Build a MeshCore contact URI for QR code scanning by the companion app.
 
     Format: meshcore://contact/add?name=<name>&public_key=<64hex>&type=<int>
+
+    This is the mobile app QR format documented in MeshCore/docs/qr_codes.md.
     """
     from urllib.parse import quote
 
@@ -275,6 +285,18 @@ def build_contact_uri(
     params.append(f"public_key={pub_key.hex()}")
     params.append(f"type={node_type}")
     return "meshcore://contact/add?" + "&".join(params)
+
+
+def build_bizcard_uri(advert_packet: bytes) -> str:
+    """Build a MeshCore CLI "biz card" URI from a raw ADVERT wire packet.
+
+    Format: meshcore://<hex-encoded raw ADVERT packet>
+
+    Used by meshcore-cli import_contact and firmware serial/BLE companion
+    protocol. The CLI calls bytes.fromhex(uri[11:]) and feeds the result
+    into importContact() which deserializes it as a Packet.
+    """
+    return "meshcore://" + advert_packet.hex()
 
 
 def print_qr_code(uri: str) -> None:
@@ -321,6 +343,7 @@ def build_advert(
     timestamp: int | None = None,
     lat: float | None = None,
     lon: float | None = None,
+    route_type: int = ROUTE_FLOOD,
 ) -> bytes:
     """Build a MeshCore ADVERT packet payload.
 
@@ -363,8 +386,8 @@ def build_advert(
     # Build payload
     payload = pub_key + ts_bytes + signature + app_data
 
-    # Build wire packet (ADVERT via FLOOD)
-    header = make_header(ROUTE_FLOOD, PAYLOAD_ADVERT)
+    # Build wire packet (ADVERT defaults to FLOOD — it's a broadcast)
+    header = make_header(route_type, PAYLOAD_ADVERT)
     return build_wire_packet(header, payload)
 
 
@@ -375,6 +398,7 @@ def build_anon_req(
     data: bytes,
     *,
     timestamp: int | None = None,
+    route_type: int = ROUTE_DIRECT,
 ) -> bytes:
     """Build a MeshCore ANON_REQ packet.
 
@@ -403,8 +427,56 @@ def build_anon_req(
     dest_hash = dest_pub[:PATH_HASH_SIZE]
     payload = dest_hash + pub_key + encrypted
 
-    # Build wire packet (ANON_REQ via FLOOD)
-    header = make_header(ROUTE_FLOOD, PAYLOAD_ANON_REQ)
+    # Build wire packet (ANON_REQ defaults to DIRECT)
+    header = make_header(route_type, PAYLOAD_ANON_REQ)
+    return build_wire_packet(header, payload)
+
+
+def build_txt_msg(
+    expanded_prv: bytes,
+    pub_key: bytes,
+    dest_pub: bytes,
+    text: str,
+    *,
+    timestamp: int | None = None,
+    attempt: int = 0,
+    route_type: int = ROUTE_DIRECT,
+) -> bytes:
+    """Build a MeshCore TXT_MSG packet (encrypted text to a known contact).
+
+    Uses the same wire format as REQ/RESPONSE (createDatagram):
+    Payload: [dest_hash(1)][src_hash(1)][MAC(2)][encrypted_data(N*16)]
+
+    Encrypted plaintext: [timestamp(4)][attempt(1)][message_text(N)]
+
+    Both parties must know each other's public keys (shared secret via ECDH).
+
+    expanded_prv: 64-byte MeshCore expanded private key (for ECDH).
+    pub_key: 32-byte sender's Ed25519 public key.
+    dest_pub: 32-byte recipient's Ed25519 public key.
+    text: Message text (UTF-8).
+    attempt: Retry attempt number (0 for first send).
+    """
+    if timestamp is None:
+        timestamp = int(time.time())
+
+    # Compute shared secret
+    secret = meshcore_shared_secret(expanded_prv, dest_pub)
+
+    # Build plaintext: timestamp(4) + attempt(1) + text
+    ts_bytes = struct.pack("<I", timestamp)
+    plaintext = ts_bytes + bytes([attempt & 0xFF]) + text.encode("utf-8")
+
+    # Encrypt then MAC
+    encrypted = meshcore_encrypt_then_mac(secret, plaintext)
+
+    # Build payload: dest_hash(1) + src_hash(1) + encrypted
+    dest_hash = dest_pub[:PATH_HASH_SIZE]
+    src_hash = pub_key[:PATH_HASH_SIZE]
+    payload = dest_hash + src_hash + encrypted
+
+    # Build wire packet (TXT_MSG defaults to DIRECT)
+    header = make_header(route_type, PAYLOAD_TXT)
     return build_wire_packet(header, payload)
 
 
@@ -418,12 +490,38 @@ def make_cbor_tx_request(packet: bytes, **phy_overrides) -> bytes:
     return cbor2.dumps(msg)
 
 
+# ---- Route type helpers ----
+
+ROUTE_NAMES = {
+    "flood": ROUTE_FLOOD,
+    "direct": ROUTE_DIRECT,
+    "tc-flood": ROUTE_T_FLOOD,
+    "tc-direct": ROUTE_T_DIRECT,
+}
+
+
+def _parse_dest_pubkey(hex_str: str) -> bytes:
+    """Parse and validate a destination public key from hex string."""
+    try:
+        dest_pub = bytes.fromhex(hex_str)
+    except ValueError:
+        sys.stderr.write(f"ERROR: invalid hex in destination key: {hex_str!r}\n")
+        sys.exit(1)
+    if len(dest_pub) != PUB_KEY_SIZE:
+        sys.stderr.write(
+            f"ERROR: destination key must be {PUB_KEY_SIZE * 2} hex chars "
+            f"({PUB_KEY_SIZE} bytes), got {len(hex_str)} chars\n"
+        )
+        sys.exit(1)
+    return dest_pub
+
+
 # ---- CLI ----
 
 
 def cmd_advert(args, expanded_prv: bytes, pub_key: bytes, seed: bytes) -> bytes:
     """Build and emit an ADVERT packet."""
-    packet = build_advert(
+    return build_advert(
         seed,
         pub_key,
         node_type=args.node_type,
@@ -431,30 +529,60 @@ def cmd_advert(args, expanded_prv: bytes, pub_key: bytes, seed: bytes) -> bytes:
         lat=args.lat,
         lon=args.lon,
     )
-    return packet
+
+
+def cmd_send(args, expanded_prv: bytes, pub_key: bytes, seed: bytes) -> bytes:
+    """Build and emit a TXT_MSG packet."""
+    dest_pub = _parse_dest_pubkey(args.dest)
+
+    message = " ".join(args.message)
+    if not message:
+        sys.stderr.write("ERROR: message cannot be empty\n")
+        sys.exit(1)
+
+    route = ROUTE_NAMES[args.route]
+    return build_txt_msg(expanded_prv, pub_key, dest_pub, message, route_type=route)
 
 
 def cmd_anon_req(args, expanded_prv: bytes, pub_key: bytes, seed: bytes) -> bytes:
     """Build and emit an ANON_REQ packet."""
-    dest_pub = bytes.fromhex(args.dest)
-    if len(dest_pub) != PUB_KEY_SIZE:
-        sys.stderr.write(
-            f"ERROR: destination public key must be {PUB_KEY_SIZE} bytes ({PUB_KEY_SIZE * 2} hex chars)\n"
-        )
-        sys.exit(1)
+    dest_pub = _parse_dest_pubkey(args.dest)
 
     message = " ".join(args.message).encode("utf-8")
     if not message:
         sys.stderr.write("ERROR: message cannot be empty\n")
         sys.exit(1)
 
-    packet = build_anon_req(expanded_prv, pub_key, dest_pub, message)
-    return packet
+    route = ROUTE_NAMES[args.route]
+    return build_anon_req(expanded_prv, pub_key, dest_pub, message, route_type=route)
+
+
+_EPILOG = """\
+examples:
+  # Broadcast ADVERT beacon:
+  %(prog)s advert --name "MyNode" | lora_tx --stdin
+
+  # Print contact QR code (scannable by MeshCore companion):
+  %(prog)s advert --name "MyNode" --qr
+
+  # Send encrypted message to a known contact (direct):
+  %(prog)s send --dest <64hex> "Hello from gr4-lora" | lora_tx --stdin
+
+  # Send via flood routing:
+  %(prog)s send --dest <64hex> --route flood "Hello" | lora_tx --stdin
+
+  # Anonymous encrypted request (includes sender pubkey):
+  %(prog)s anon-req --dest <64hex> "Hello" | lora_tx --stdin
+
+  # Show identity public key:
+  %(prog)s --show-key
+"""
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="MeshCore TX message builder. Outputs CBOR TX requests for lora_tx --stdin.",
+        epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -469,31 +597,25 @@ def main():
         help="Print packet hex to stderr, still output CBOR to stdout",
     )
     parser.add_argument(
-        "--freq", type=int, default=None, help="Override TX frequency (Hz)"
+        "--freq", type=int, default=None, help="Override TX frequency in Hz"
     )
     parser.add_argument(
-        "--sf", type=int, default=None, help="Override spreading factor"
+        "--sf", type=int, default=None, help="Override spreading factor (7-12)"
     )
-    parser.add_argument("--bw", type=int, default=None, help="Override bandwidth (Hz)")
+    parser.add_argument("--bw", type=int, default=None, help="Override bandwidth in Hz")
     parser.add_argument(
-        "--show-key", action="store_true", help="Print public key and exit"
-    )
-    parser.add_argument(
-        "--qr",
-        action="store_true",
-        help="Print MeshCore contact QR code to terminal and exit",
-    )
-    parser.add_argument(
-        "--qr-name",
-        type=str,
-        default="",
-        help="Node name for QR contact URI (default: empty)",
+        "--show-key", action="store_true", help="Print public key hex and exit"
     )
 
     sub = parser.add_subparsers(dest="command")
 
     # advert subcommand
-    p_advert = sub.add_parser("advert", help="Send ADVERT beacon")
+    p_advert = sub.add_parser(
+        "advert",
+        help="Send ADVERT beacon (broadcast identity)",
+        description="Broadcast an ADVERT beacon advertising this node's identity. "
+        "Uses FLOOD routing by default (ADVERTs are broadcasts).",
+    )
     p_advert.add_argument("--name", type=str, default="", help="Node name (UTF-8)")
     p_advert.add_argument(
         "--node-type",
@@ -502,13 +624,53 @@ def main():
         choices=[1, 2, 3, 4],
         help="Node type: 1=chat, 2=repeater, 3=room, 4=sensor (default: 1)",
     )
-    p_advert.add_argument("--lat", type=float, default=None, help="Latitude")
-    p_advert.add_argument("--lon", type=float, default=None, help="Longitude")
+    p_advert.add_argument("--lat", type=float, default=None, help="Latitude (float)")
+    p_advert.add_argument("--lon", type=float, default=None, help="Longitude (float)")
+    p_advert.add_argument(
+        "--qr",
+        action="store_true",
+        help="Print contact QR code to terminal and exit (no CBOR output)",
+    )
+
+    # send subcommand (TXT_MSG)
+    p_send = sub.add_parser(
+        "send",
+        help="Send encrypted message to a known contact",
+        description="Send an encrypted TXT_MSG to a contact whose public key you know. "
+        "Both parties must have exchanged keys (ECDH shared secret). "
+        "Uses DIRECT routing by default.",
+    )
+    p_send.add_argument(
+        "--dest",
+        required=True,
+        help="Destination public key (64 hex chars = 32 bytes)",
+    )
+    p_send.add_argument(
+        "--route",
+        choices=list(ROUTE_NAMES.keys()),
+        default="direct",
+        help="Routing type (default: direct)",
+    )
+    p_send.add_argument("message", nargs="+", help="Message text")
 
     # anon-req subcommand
-    p_anon = sub.add_parser("anon-req", help="Send anonymous encrypted request")
+    p_anon = sub.add_parser(
+        "anon-req",
+        help="Send anonymous encrypted request (includes sender pubkey)",
+        description="Send an encrypted ANON_REQ to a contact. Includes the sender's "
+        "public key in cleartext so the recipient can derive the shared secret "
+        "without prior contact. Uses DIRECT routing by default.",
+    )
     p_anon.add_argument(
-        "--dest", required=True, help="Destination public key (64 hex chars)"
+        "--dest",
+        required=True,
+        help="Destination public key (64 hex chars = 32 bytes)",
+    )
+    p_anon.add_argument(
+        "--route",
+        choices=list(ROUTE_NAMES.keys()),
+        default="direct",
+        help="Routing type (default: direct)",
     )
     p_anon.add_argument("message", nargs="+", help="Message text")
 
@@ -521,24 +683,31 @@ def main():
         print(pub_key.hex())
         return
 
-    if args.qr:
-        name = args.qr_name
-        uri = build_contact_uri(pub_key, name)
-        sys.stderr.write(f"Contact URI: {uri}\n")
-        sys.stderr.write(f"Public key:  {pub_key.hex()}\n")
-        if name:
-            sys.stderr.write(f"Name:        {name}\n")
-        sys.stderr.write("\n")
-        print_qr_code(uri)
-        return
-
     if args.command is None:
         parser.print_help()
         sys.exit(1)
 
+    # Handle --qr for advert subcommand
+    if args.command == "advert" and args.qr:
+        name = args.name or ""
+        uri = build_contact_uri(pub_key, name, args.node_type)
+        sys.stderr.write(f"Contact URI: {uri}\n")
+        sys.stderr.write(f"Public key:  {pub_key.hex()}\n")
+        if name:
+            sys.stderr.write(f"Name:        {name}\n")
+        # Also show the CLI biz card URI for reference
+        packet = cmd_advert(args, expanded_prv, pub_key, seed)
+        biz_uri = build_bizcard_uri(packet)
+        sys.stderr.write(f"Biz card:    {biz_uri}\n")
+        sys.stderr.write("\n")
+        print_qr_code(uri)
+        return
+
     # Build packet
     if args.command == "advert":
         packet = cmd_advert(args, expanded_prv, pub_key, seed)
+    elif args.command == "send":
+        packet = cmd_send(args, expanded_prv, pub_key, seed)
     elif args.command == "anon-req":
         packet = cmd_anon_req(args, expanded_prv, pub_key, seed)
     else:
