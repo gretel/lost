@@ -436,14 +436,34 @@ int run_stdin_mode(TxConfig& cfg) {
 
             bool ok = true;
             if (!cfg.dry_run) {
+                // Build contiguous buffer with silence gaps between
+                // repeats so the entire sequence is one burst. The bridge
+                // uses a timed start for RF frontend settling.
+                std::vector<std::complex<float>> tx_buf;
+                uint32_t gap_samps = static_cast<uint32_t>(
+                    req_cfg.rate * static_cast<float>(req_cfg.gap_ms)
+                    / 1000.0f);
                 for (int r = 0; r < req_cfg.repeat; r++) {
-                    if (transmit_iq(bridge, iq) < 0) {
-                        ok = false;
-                        break;
+                    tx_buf.insert(tx_buf.end(), iq.begin(), iq.end());
+                    if (r + 1 < req_cfg.repeat && gap_samps > 0) {
+                        tx_buf.resize(tx_buf.size() + gap_samps,
+                                      std::complex<float>(0.f, 0.f));
                     }
-                    if (r + 1 < req_cfg.repeat && req_cfg.gap_ms > 0) {
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(req_cfg.gap_ms));
+                }
+                if (transmit_iq(bridge, tx_buf) < 0) {
+                    ok = false;
+                } else {
+                    // Wait for BURST_ACK from the FPGA, confirming all
+                    // samples have been transmitted over the air. Without
+                    // this, the USRP may be freed (on stdin close) before
+                    // the FPGA finishes clocking out the burst.
+                    double total_sec = static_cast<double>(tx_buf.size())
+                                     / static_cast<double>(req_cfg.rate);
+                    double wait_sec = 0.1 + total_sec + 1.0;
+                    int ack = radio_bridge_wait_burst_ack(bridge, wait_sec);
+                    if (ack != 1) {
+                        std::fprintf(stderr, "  WARNING: BURST_ACK %s\n",
+                                     ack == 0 ? "timeout" : "error");
                     }
                 }
             }
@@ -977,20 +997,47 @@ int main(int argc, char** argv) {
     radio_bridge_t* bridge = open_tx_device(cfg);
     if (!bridge) return 1;
 
+    // Build the complete TX buffer: all repeats with silence gaps as a
+    // single contiguous burst. The bridge uses a timed start (100ms
+    // future) so the FPGA TX chain and DAC/PA settle before clocking
+    // out samples. Using a single burst avoids per-repeat EOB/SOB which
+    // causes TIME_ERROR on the B210 FPGA when bursts are closely spaced.
+    std::vector<std::complex<float>> tx_buf;
+    uint32_t gap_samples = static_cast<uint32_t>(
+        cfg.rate * static_cast<float>(cfg.gap_ms) / 1000.0f);
     for (int tx_num = 0; tx_num < cfg.repeat; tx_num++) {
-        if (cfg.repeat > 1) {
-            std::fprintf(stderr, "TX %d/%d...\n", tx_num + 1, cfg.repeat);
+        tx_buf.insert(tx_buf.end(), iq.begin(), iq.end());
+        if (tx_num + 1 < cfg.repeat && gap_samples > 0) {
+            tx_buf.resize(tx_buf.size() + gap_samples,
+                          std::complex<float>(0.f, 0.f));
         }
-        if (transmit_iq(bridge, iq) < 0) {
-            radio_bridge_destroy(bridge);
-            return 1;
-        }
-        std::fprintf(stderr, "  Sent %zu samples (%.3f ms)\n",
-                     iq.size(), airtime_sec * 1000.0);
-        if (tx_num + 1 < cfg.repeat && cfg.gap_ms > 0) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(cfg.gap_ms));
-        }
+    }
+    double total_sec = static_cast<double>(tx_buf.size())
+                     / static_cast<double>(cfg.rate);
+    if (cfg.repeat > 1) {
+        std::fprintf(stderr, "  Total: %d packets, %zu samples (%.1f ms)\n",
+                     cfg.repeat, tx_buf.size(), total_sec * 1000.0);
+    }
+
+    if (transmit_iq(bridge, tx_buf) < 0) {
+        radio_bridge_destroy(bridge);
+        return 1;
+    }
+    std::fprintf(stderr, "  Sent %zu samples (%.1f ms)\n",
+                 tx_buf.size(), total_sec * 1000.0);
+
+    // Wait for BURST_ACK from the FPGA, confirming all samples have been
+    // transmitted over the air. Timeout = timed start (0.1s) + airtime + margin.
+    double wait_sec = 0.1 + total_sec + 1.0;
+    std::fprintf(stderr, "  Waiting for BURST_ACK (timeout %.1f s)...\n",
+                 wait_sec);
+    int ack = radio_bridge_wait_burst_ack(bridge, wait_sec);
+    if (ack == 1) {
+        std::fprintf(stderr, "  TX confirmed by FPGA.\n");
+    } else if (ack == 0) {
+        std::fprintf(stderr, "  WARNING: BURST_ACK timeout — some samples may not have been transmitted.\n");
+    } else {
+        std::fprintf(stderr, "  ERROR: TX async error (code %d).\n", ack);
     }
 
     radio_bridge_destroy_ex(bridge, 1);

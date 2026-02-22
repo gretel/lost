@@ -103,6 +103,13 @@ int radio_bridge_write(radio_bridge_t* bridge, const float* buf,
                        size_t num_samples, double timeout_sec,
                        int end_burst);
 
+/// Wait for BURST_ACK from the FPGA, confirming that the end-of-burst
+/// has been fully transmitted over the air. Call after the final
+/// radio_bridge_write() with end_burst=1.
+/// Returns 1 on BURST_ACK received, 0 on timeout, negative on error.
+/// timeout_sec: max time to wait (should be >= burst airtime + 0.2s).
+int radio_bridge_wait_burst_ack(radio_bridge_t* bridge, double timeout_sec);
+
 /// Get actual configured values (for verification after create).
 double radio_bridge_get_sample_rate(const radio_bridge_t* bridge);
 double radio_bridge_get_center_freq(const radio_bridge_t* bridge);

@@ -34,7 +34,8 @@ struct radio_bridge {
     // Runtime stats
     uint64_t             overflow_count;
     uint64_t             underflow_count;
-    uint64_t             sample_count;
+    uint64_t             sample_count;        // per-burst (reset on EOB)
+    uint64_t             total_sample_count;  // lifetime total
 };
 
 struct radio_bridge_multi {
@@ -325,8 +326,38 @@ radio_bridge_t* radio_bridge_create(const radio_bridge_config_t* config) {
         uhd_tx_streamer_max_num_samps(bridge->tx_streamer, &bridge->max_samps);
         fprintf(stderr, "[uhd_bridge] TX max_samps_per_packet=%zu\n", bridge->max_samps);
 
-        // TX metadata: no time spec, start-of-burst, not end-of-burst
-        uhd_tx_metadata_make(&bridge->tx_md, false, 0, 0.0, true, false);
+        // Wait for TX LO lock (required before streaming)
+        fprintf(stderr, "[uhd_bridge] Checking TX LO lock...\n");
+        {
+            uhd_sensor_value_handle lo_sensor = NULL;
+            if (uhd_sensor_value_make(&lo_sensor) == UHD_ERROR_NONE) {
+                int locked = 0;
+                for (int i = 0; i < 20; i++) {  // up to 2 seconds
+                    if (uhd_usrp_get_tx_sensor(usrp, "lo_locked", ch,
+                            &lo_sensor) == UHD_ERROR_NONE) {
+                        bool val = false;
+                        uhd_sensor_value_to_bool(lo_sensor, &val);
+                        if (val) {
+                            locked = 1;
+                            break;
+                        }
+                    }
+                    usleep(100000);
+                }
+                uhd_sensor_value_free(&lo_sensor);
+                if (locked) {
+                    fprintf(stderr, "[uhd_bridge] TX LO locked\n");
+                } else {
+                    fprintf(stderr, "[uhd_bridge] WARNING: TX LO not locked after 2s\n");
+                }
+            }
+        }
+
+        // TX metadata is built fresh in radio_bridge_write() for each
+        // burst. The first write uses get_time_now()+0.1s for a timed
+        // start so the FPGA TX chain and DAC/PA settle before clocking
+        // out samples. Does NOT reset device time (safe for loopback).
+        bridge->tx_md = NULL;
     }
 
     // Read back actual values
@@ -408,17 +439,46 @@ int radio_bridge_write(radio_bridge_t* bridge, const float* buf,
         return RADIO_BRIDGE_ERR_NULL;
     }
 
-    // Update end-of-burst flag in metadata
-    // We need to recreate the metadata for each call since the C API
-    // doesn't expose a setter for end_of_burst.
-    if (bridge->tx_md) {
-        uhd_tx_metadata_free(&bridge->tx_md);
+    // Build TX metadata for this chunk.
+    //
+    // The first write of a burst uses a timed start (has_time_spec=true,
+    // start_of_burst=true) so the FPGA waits for the RF frontend (DAC/PA)
+    // to settle before clocking out samples. Without this, short bursts
+    // are lost entirely because the PA isn't ready yet.
+    //
+    // Uses get_time_now() + 0.1s (Pattern A from UHD tx_waveforms.cpp)
+    // instead of set_time_now(0) + 0.1s. This avoids resetting the device
+    // clock, which would disrupt a concurrent RX stream on the same device
+    // (e.g. loopback mode with dual USRP handles).
+    //
+    // Subsequent writes clear has_time_spec. The last write sets end_of_burst.
+    {
+        int is_first = (bridge->sample_count == 0) ? 1 : 0;
+        if (bridge->tx_md) {
+            uhd_tx_metadata_free(&bridge->tx_md);
+        }
+        if (is_first) {
+            // Read current device time and schedule 100ms into the future.
+            // Uses get_time_now() (like UHD tx_waveforms.cpp) instead of
+            // set_time_now(0) to avoid resetting the device clock, which
+            // would disrupt a concurrent RX stream in loopback mode.
+            int64_t now_full = 0;
+            double now_frac = 0.0;
+            uhd_usrp_get_time_now(bridge->usrp, 0, &now_full, &now_frac);
+            uhd_tx_metadata_make(&bridge->tx_md,
+                                 true,     // has_time_spec
+                                 now_full, // full_secs
+                                 now_frac + 0.1,  // frac_secs + 100ms
+                                 true,     // start_of_burst
+                                 end_burst ? true : false);
+        } else {
+            uhd_tx_metadata_make(&bridge->tx_md,
+                                 false,    // has_time_spec
+                                 0, 0.0,
+                                 false,    // start_of_burst
+                                 end_burst ? true : false);
+        }
     }
-    // After first write, no start-of-burst
-    int sob = (bridge->sample_count == 0) ? 1 : 0;
-    uhd_tx_metadata_make(&bridge->tx_md, false, 0, 0.0,
-                         sob ? true : false,
-                         end_burst ? true : false);
 
     const void* buffs[] = {buf};
     size_t items_sent = 0;
@@ -430,7 +490,100 @@ int radio_bridge_write(radio_bridge_t* bridge, const float* buf,
     }
 
     bridge->sample_count += items_sent;
+    bridge->total_sample_count += items_sent;
+
+    // Reset sample_count at end-of-burst so the next burst gets a fresh
+    // timed start. Async message polling (BURST_ACK, UNDERFLOW, etc.) is
+    // handled by radio_bridge_wait_burst_ack() — the caller should invoke
+    // it after the final write to confirm the FPGA finished transmitting.
+    if (end_burst) {
+        bridge->sample_count = 0;
+    }
+
     return (int)items_sent;
+}
+
+// --- Wait for BURST_ACK ---
+
+int radio_bridge_wait_burst_ack(radio_bridge_t* bridge, double timeout_sec) {
+    if (!bridge || !bridge->tx_streamer) {
+        return RADIO_BRIDGE_ERR_NULL;
+    }
+
+    uhd_async_metadata_handle async_md = NULL;
+    if (uhd_async_metadata_make(&async_md) != UHD_ERROR_NONE) {
+        set_error("uhd_async_metadata_make failed");
+        return RADIO_BRIDGE_ERR_DEVICE;
+    }
+
+    // Poll in a loop with short timeouts until we get BURST_ACK or
+    // the total timeout expires. UHD's recv_async_msg returns one
+    // message at a time, and there may be UNDERFLOW messages before
+    // the BURST_ACK.
+    int result = 0;
+    double elapsed = 0.0;
+    double poll_interval = 0.2;  // 200ms per poll
+
+    while (elapsed < timeout_sec) {
+        double remaining = timeout_sec - elapsed;
+        double this_timeout = (remaining < poll_interval) ? remaining : poll_interval;
+        if (this_timeout < 0.01) this_timeout = 0.01;
+
+        bool have_msg = false;
+        if (uhd_tx_streamer_recv_async_msg(bridge->tx_streamer,
+                &async_md, this_timeout, &have_msg) != UHD_ERROR_NONE) {
+            break;
+        }
+
+        elapsed += this_timeout;
+
+        if (!have_msg) continue;
+
+        uhd_async_metadata_event_code_t event_code;
+        uhd_async_metadata_event_code(async_md, &event_code);
+
+        switch (event_code) {
+            case UHD_ASYNC_METADATA_EVENT_CODE_BURST_ACK:
+                fprintf(stderr, "[uhd_bridge] BURST_ACK received (%.1f ms)\n",
+                        elapsed * 1000.0);
+                result = 1;
+                goto done;
+
+            case UHD_ASYNC_METADATA_EVENT_CODE_UNDERFLOW:
+                fprintf(stderr, "[uhd_bridge] TX UNDERFLOW while waiting for BURST_ACK\n");
+                bridge->underflow_count++;
+                break;
+
+            case UHD_ASYNC_METADATA_EVENT_CODE_TIME_ERROR:
+                fprintf(stderr, "[uhd_bridge] TX TIME_ERROR while waiting for BURST_ACK\n");
+                result = RADIO_BRIDGE_ERR_DEVICE;
+                goto done;
+
+            case UHD_ASYNC_METADATA_EVENT_CODE_SEQ_ERROR:
+            case UHD_ASYNC_METADATA_EVENT_CODE_SEQ_ERROR_IN_BURST:
+                fprintf(stderr, "[uhd_bridge] TX SEQ_ERROR while waiting for BURST_ACK\n");
+                break;
+
+            case UHD_ASYNC_METADATA_EVENT_CODE_UNDERFLOW_IN_PACKET:
+                fprintf(stderr, "[uhd_bridge] TX UNDERFLOW_IN_PACKET\n");
+                bridge->underflow_count++;
+                break;
+
+            default:
+                fprintf(stderr, "[uhd_bridge] TX async event 0x%x\n",
+                        (unsigned)event_code);
+                break;
+        }
+    }
+
+    if (result == 0) {
+        fprintf(stderr, "[uhd_bridge] BURST_ACK timeout after %.1f s\n",
+                timeout_sec);
+    }
+
+done:
+    uhd_async_metadata_free(&async_md);
+    return result;
 }
 
 // --- Getters ---
@@ -461,8 +614,13 @@ void radio_bridge_destroy_ex(radio_bridge_t* bridge, int skip_free) {
         fprintf(stderr, "[uhd_bridge] Total TX underflows: %llu\n",
                 (unsigned long long)bridge->underflow_count);
     }
-    fprintf(stderr, "[uhd_bridge] Total samples: %llu\n",
-            (unsigned long long)bridge->sample_count);
+    {
+        uint64_t total = (bridge->direction == RADIO_BRIDGE_TX)
+                       ? bridge->total_sample_count
+                       : bridge->sample_count;
+        fprintf(stderr, "[uhd_bridge] Total samples: %llu\n",
+                (unsigned long long)total);
+    }
 
     // Stop RX stream
     if (bridge->rx_streamer) {

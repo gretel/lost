@@ -292,6 +292,15 @@ int radio_bridge_write(radio_bridge_t* bridge, const float* buf,
     return ret;
 }
 
+int radio_bridge_wait_burst_ack(radio_bridge_t* bridge, double timeout_sec) {
+    (void)bridge;
+    (void)timeout_sec;
+    // SoapySDR has no async message API. The write call is synchronous
+    // enough that samples are flushed by the time writeStream returns.
+    // Return success (1) to indicate "no wait needed".
+    return 1;
+}
+
 double radio_bridge_get_sample_rate(const radio_bridge_t* bridge) {
     return bridge ? bridge->sample_rate : 0.0;
 }
