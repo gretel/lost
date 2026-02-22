@@ -511,7 +511,213 @@ const boost::ut::suite<"Downchirp detection"> downchirp_tests = [] {
 };
 
 // ============================================================================
-// Test 6: Error paths — wrong sync word, CRC failure, low SNR
+// Test 6: Oversampling factor sweep — os_factor = 2, 4, 8, 16
+//
+// Diagnoses the os_factor=16 CRC_FAIL bug observed with RTL-SDR reception
+// at 1 MS/s. Uses generate_frame_iq at each os_factor with known-good data
+// to isolate whether the bug is in BurstDetector/SymbolDemodulator or in
+// the RF path. Also tests long payloads (70 bytes, typical Meshtastic) to
+// detect SFO accumulation drift that corrupts late symbols.
+//
+// Reference: gr-lora_sdr issue #91 (same symptom: <5% CRC valid at any
+// os_factor with RTL-SDR/Airspy), issue #79 (HackRF CRC fails on long
+// packets only — classic SFO accumulation).
+// ============================================================================
+
+namespace {
+
+/// Helper: generate IQ at a specific os_factor and run through the decode chain.
+DecodeResult run_decode_os(const std::string& payload_str, uint8_t test_os_factor,
+                           float cfo_hz = 0.f, float snr_db = 100.f) {
+    using namespace gr;
+    using namespace gr::lora;
+    using namespace gr::lora::test;
+
+    std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
+    uint32_t test_sps = N * test_os_factor;
+    auto iq = generate_frame_iq(payload, SF, CR, test_os_factor,
+                                SYNC_WORD, PREAMBLE_LEN,
+                                true, test_sps * 5);
+
+    // Apply impairments if requested
+    float sample_rate = static_cast<float>(BW * test_os_factor);
+    if (snr_db < 99.f) add_awgn(iq, snr_db);
+    if (std::abs(cfo_hz) > 0.1f) apply_cfo(iq, cfo_hz, sample_rate);
+
+    Graph graph;
+
+    auto& src = graph.emplaceBlock<testing::TagSource<std::complex<float>,
+        testing::ProcessFunction::USE_PROCESS_BULK>>({
+        {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
+        {"repeat_tags", false},
+        {"mark_tag", false}
+    });
+    src.values = iq;
+
+    auto& burst = graph.emplaceBlock<BurstDetector>();
+    burst.center_freq  = CENTER_FREQ;
+    burst.bandwidth    = BW;
+    burst.sf           = SF;
+    burst.sync_word    = SYNC_WORD;
+    burst.os_factor    = test_os_factor;
+    burst.preamble_len = PREAMBLE_LEN;
+
+    auto& demod = graph.emplaceBlock<SymbolDemodulator>();
+    demod.sf        = SF;
+    demod.bandwidth = BW;
+
+    auto& sink = graph.emplaceBlock<testing::TagSink<uint8_t,
+        testing::ProcessFunction::USE_PROCESS_BULK>>({
+        {"log_samples", true},
+        {"log_tags", true}
+    });
+
+    (void)graph.connect<"out">(src).template to<"in">(burst);
+    (void)graph.connect<"out">(burst).template to<"in">(demod);
+    (void)graph.connect<"out">(demod).template to<"in">(sink);
+
+    scheduler::Simple sched;
+    if (auto ret = sched.exchange(std::move(graph)); !ret) {
+        throw std::runtime_error(std::format("failed to init scheduler: {}", ret.error()));
+    }
+    sched.runAndWait();
+
+    return {{sink._samples.begin(), sink._samples.end()}, sink._tags};
+}
+
+/// Check that a decode result has the expected payload and CRC valid.
+void expect_decode_ok(const DecodeResult& result, const std::string& expected_payload,
+                      const std::string& label) {
+    using namespace boost::ut;
+
+    std::printf("  %s: %zu bytes output (expected %zu)\n",
+                label.c_str(), result.samples.size(), expected_payload.size());
+
+    expect(ge(result.samples.size(), expected_payload.size()))
+        << label << " output too small: " << result.samples.size()
+        << " expected >= " << expected_payload.size();
+
+    if (result.samples.size() >= expected_payload.size()) {
+        std::string decoded(result.samples.begin(),
+                            result.samples.begin()
+                            + static_cast<std::ptrdiff_t>(expected_payload.size()));
+        expect(eq(decoded, expected_payload))
+            << label << " payload mismatch: \"" << decoded << "\"";
+    }
+
+    bool found_crc = false;
+    for (const auto& t : result.tags) {
+        if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+            expect(it->second.value_or<bool>(false))
+                << label << " CRC should be valid";
+            found_crc = true;
+        }
+    }
+    expect(found_crc) << label << " should have crc_valid tag";
+}
+
+}  // namespace
+
+const boost::ut::suite<"Oversampling factor sweep"> os_factor_tests = [] {
+    using namespace boost::ut;
+
+    // Short payload (14 bytes) — baseline, works at os_factor=4
+    static const std::string short_payload = "LoRa PHY test!";
+
+    // Long payload (70 bytes) — typical Meshtastic length, stresses SFO tracking
+    static const std::string long_payload =
+        "This is a 70-byte test payload for SFO accumulation drift testing!!!!!";
+    static_assert(sizeof("This is a 70-byte test payload for SFO accumulation drift testing!!!!!") - 1 == 70);
+
+    // ------------------------------------------------------------------
+    // Clean channel (no AWGN, no CFO) — pure demod correctness
+    // ------------------------------------------------------------------
+
+    "os_factor=2 short payload"_test = [] {
+        auto result = run_decode_os(short_payload, 2);
+        expect_decode_ok(result, short_payload, "os=2 short");
+    };
+
+    "os_factor=4 short payload (control)"_test = [] {
+        auto result = run_decode_os(short_payload, 4);
+        expect_decode_ok(result, short_payload, "os=4 short");
+    };
+
+    "os_factor=8 short payload"_test = [] {
+        auto result = run_decode_os(short_payload, 8);
+        expect_decode_ok(result, short_payload, "os=8 short");
+    };
+
+    "os_factor=16 short payload"_test = [] {
+        auto result = run_decode_os(short_payload, 16);
+        expect_decode_ok(result, short_payload, "os=16 short");
+    };
+
+    "os_factor=4 long payload (control)"_test = [] {
+        auto result = run_decode_os(long_payload, 4);
+        expect_decode_ok(result, long_payload, "os=4 long");
+    };
+
+    "os_factor=8 long payload"_test = [] {
+        auto result = run_decode_os(long_payload, 8);
+        expect_decode_ok(result, long_payload, "os=8 long");
+    };
+
+    "os_factor=16 long payload"_test = [] {
+        auto result = run_decode_os(long_payload, 16);
+        expect_decode_ok(result, long_payload, "os=16 long");
+    };
+
+    // ------------------------------------------------------------------
+    // With CFO (+500 Hz) — tests CFO estimation accuracy at each os_factor
+    // ------------------------------------------------------------------
+
+    "os_factor=4 short +500Hz CFO (control)"_test = [] {
+        auto result = run_decode_os(short_payload, 4, 500.f);
+        expect_decode_ok(result, short_payload, "os=4 short +500Hz");
+    };
+
+    "os_factor=16 short +500Hz CFO"_test = [] {
+        auto result = run_decode_os(short_payload, 16, 500.f);
+        expect_decode_ok(result, short_payload, "os=16 short +500Hz");
+    };
+
+    "os_factor=16 long +500Hz CFO"_test = [] {
+        auto result = run_decode_os(long_payload, 16, 500.f);
+        expect_decode_ok(result, long_payload, "os=16 long +500Hz");
+    };
+
+    // ------------------------------------------------------------------
+    // With AWGN (+10 dB) — tests sensitivity at high os_factor
+    // ------------------------------------------------------------------
+
+    "os_factor=4 short +10dB SNR (control)"_test = [] {
+        auto result = run_decode_os(short_payload, 4, 0.f, 10.f);
+        expect_decode_ok(result, short_payload, "os=4 short 10dB");
+    };
+
+    "os_factor=16 short +10dB SNR"_test = [] {
+        auto result = run_decode_os(short_payload, 16, 0.f, 10.f);
+        expect_decode_ok(result, short_payload, "os=16 short 10dB");
+    };
+
+    "os_factor=16 long +10dB SNR"_test = [] {
+        auto result = run_decode_os(long_payload, 16, 0.f, 10.f);
+        expect_decode_ok(result, long_payload, "os=16 long 10dB");
+    };
+
+    // ------------------------------------------------------------------
+    // Combined: CFO + AWGN at os_factor=16 — worst-case scenario
+    // ------------------------------------------------------------------
+
+    "os_factor=16 long +500Hz CFO +10dB SNR"_test = [] {
+        auto result = run_decode_os(long_payload, 16, 500.f, 10.f);
+        expect_decode_ok(result, long_payload, "os=16 long +500Hz 10dB");
+    };
+};
+
+// ============================================================================
+// Test 7: Error paths — wrong sync word, CRC failure, low SNR
 // ============================================================================
 
 const boost::ut::suite<"Error path tests"> error_path_tests = [] {
