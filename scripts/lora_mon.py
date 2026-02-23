@@ -3,18 +3,12 @@
 """
 lora_mon.py -- LoRa streaming monitor.
 
-Connects to a lora_rx UDP server and receives CBOR-encoded LoRa frames,
-or reads concatenated CBOR from stdin. Prints formatted text with running
-statistics.
+Connects to a lora_trx/lora_rx UDP server and displays decoded frames.
 
 Usage:
-    # UDP mode (default) -- connects to lora_rx UDP server:
-    lora_rx --udp 5556 &
-    python3 scripts/lora_mon.py --connect 127.0.0.1:5556
-    python3 scripts/lora_mon.py --port 5556   # legacy: binds locally
-
-    # Pipe mode:
-    lora_rx --cbor | python3 scripts/lora_mon.py --stdin
+    lora_mon.py                           # connects to 127.0.0.1:5555
+    lora_mon.py --connect 127.0.0.1:5556
+    lora_mon.py --connect [::1]:5555      # IPv6
 
 Dependencies: cbor2
 """
@@ -22,16 +16,13 @@ Dependencies: cbor2
 from __future__ import annotations
 
 import argparse
-import json
 import socket
 import struct
 import sys
-from dataclasses import dataclass, field
-from typing import Any, TextIO
+from typing import Any
 
 import cbor2
 
-from cbor_stream import read_cbor_seq
 from lora_common import (
     PAYLOAD_NAMES,
     ROUTE_NAMES,
@@ -40,7 +31,8 @@ from lora_common import (
     sync_word_name,
 )
 
-DEFAULT_PORT = 5556
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 5555
 
 
 # ---- MeshCore v1 one-line summary ----
@@ -92,47 +84,10 @@ def parse_meshcore_summary(data: bytes) -> str:
     return f"v{version} {route_name}/{ptype_name}{transport_str} path={path_len}{advert_info}"
 
 
-# ---- Stats ----
-
-
-@dataclass
-class Stats:
-    total: int = 0
-    crc_ok: int = 0
-    crc_fail: int = 0
-    first_ts: str = ""
-    last_ts: str = ""
-    protocols: dict[str, int] = field(default_factory=dict)
-
-    def update(self, msg: dict[str, Any]) -> None:
-        self.total += 1
-        if msg.get("crc_valid", False):
-            self.crc_ok += 1
-        else:
-            self.crc_fail += 1
-        ts = msg.get("ts", "")
-        if not self.first_ts:
-            self.first_ts = ts
-        self.last_ts = ts
-        sw = msg.get("phy", {}).get("sync_word", 0)
-        label = sync_word_name(sw)
-        self.protocols[label] = self.protocols.get(label, 0) + 1
-
-    def summary(self) -> str:
-        if self.total == 0:
-            return "No frames received"
-        pct = self.crc_ok / self.total * 100
-        protos = ", ".join(f"{k}:{v}" for k, v in sorted(self.protocols.items()))
-        return (
-            f"frames={self.total} crc_ok={self.crc_ok} ({pct:.0f}%) "
-            f"crc_fail={self.crc_fail} [{protos}]"
-        )
-
-
 # ---- Frame formatting ----
 
 
-def format_frame(msg: dict[str, Any], *, compact: bool = False) -> str:
+def format_frame(msg: dict[str, Any]) -> str:
     """Format a single lora_frame message as human-readable text."""
     payload = msg.get("payload", b"")
     phy = msg.get("phy", {})
@@ -144,12 +99,19 @@ def format_frame(msg: dict[str, Any], *, compact: bool = False) -> str:
     cr = phy.get("cr", 0)
     sync_word = phy.get("sync_word", 0)
     sw_label = sync_word_name(sync_word)
+    snr_db = phy.get("snr_db")
+    rx_ch = msg.get("rx_channel")
     dc = " (downchirp)" if msg.get("is_downchirp") else ""
 
     header = (
         f"#{seq:<4d} [{ts_short}] {len(payload):>3d}B "
-        f"SF{phy.get('sf', '?')} CR4/{4 + cr} {crc_str} {sw_label}{dc}"
+        f"SF{phy.get('sf', '?')} CR4/{4 + cr} {crc_str} {sw_label}"
     )
+    if snr_db is not None:
+        header += f" SNR={snr_db:.1f}dB"
+    if rx_ch is not None:
+        header += f" ch={rx_ch}"
+    header += dc
 
     lines = [header]
 
@@ -165,68 +127,33 @@ def format_frame(msg: dict[str, Any], *, compact: bool = False) -> str:
     if any(0x20 <= b < 0x7F for b in payload[:40]):
         lines.append(f"     {format_ascii(payload, max_bytes=40)}")
 
-    if compact:
-        return lines[0]
     return "\n".join(lines)
-
-
-def format_frame_json(msg: dict[str, Any]) -> str:
-    """Format a single lora_frame message as a JSON line."""
-    payload = msg.get("payload", b"")
-    phy = msg.get("phy", {})
-    out = {
-        "seq": msg.get("seq", 0),
-        "ts": msg.get("ts", ""),
-        "payload_len": len(payload),
-        "payload_hex": format_hex(payload, sep=""),
-        "crc_valid": msg.get("crc_valid", False),
-        "sf": phy.get("sf", 0),
-        "bw": phy.get("bw", 0),
-        "cr": phy.get("cr", 0),
-        "sync_word": phy.get("sync_word", 0),
-    }
-    if msg.get("is_downchirp"):
-        out["is_downchirp"] = True
-    sw = phy.get("sync_word", 0)
-    if sw == 0x12 and payload:
-        mc = parse_meshcore_summary(payload)
-        if mc:
-            out["meshcore"] = mc
-    return json.dumps(out)
 
 
 # ---- UDP receiver ----
 
 
-def connect_udp(
-    host: str,
-    port: int,
-    out: TextIO,
-    *,
-    use_json: bool = False,
-    compact: bool = False,
-    stats_every: int = 0,
-) -> Stats:
-    """Connect to a lora_rx UDP server and receive CBOR frames.
+def connect_udp(host: str, port: int) -> None:
+    """Connect to a lora_trx/lora_rx UDP server and display frames."""
+    # Resolve address family
+    af = socket.AF_INET
+    if ":" in host:
+        af = socket.AF_INET6
 
-    Sends a registration datagram, then receives frames from the server.
-    The server fans out frames to all registered consumers.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(af, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # Bind an ephemeral port so the server can send back to us
-    sock.bind(("0.0.0.0", 0))
+    sock.bind(("" if af == socket.AF_INET else "::", 0))
     local_port = sock.getsockname()[1]
 
-    # Send registration datagram to the server
     sock.sendto(b"sub", (host, port))
     print(
-        f"Registered with UDP server {host}:{port} (listening on :{local_port}) ...",
+        f"Connected to {host}:{port} (listening on :{local_port})",
         file=sys.stderr,
     )
     sys.stderr.flush()
 
-    stats = Stats()
+    total = 0
+    crc_ok = 0
     try:
         while True:
             data, _addr = sock.recvfrom(65536)
@@ -238,194 +165,53 @@ def connect_udp(
             if not isinstance(msg, dict) or msg.get("type") != "lora_frame":
                 continue
 
-            stats.update(msg)
+            total += 1
+            if msg.get("crc_valid", False):
+                crc_ok += 1
 
-            if use_json:
-                out.write(format_frame_json(msg))
-            else:
-                out.write(format_frame(msg, compact=compact))
-            out.write("\n")
-            out.flush()
-
-            if stats_every > 0 and stats.total % stats_every == 0:
-                print(f"--- {stats.summary()}", file=sys.stderr)
-                sys.stderr.flush()
+            print(format_frame(msg))
+            sys.stdout.flush()
 
     except KeyboardInterrupt:
         pass
     finally:
         sock.close()
 
-    return stats
-
-
-def receive_udp(
-    port: int,
-    out: TextIO,
-    *,
-    use_json: bool = False,
-    compact: bool = False,
-    stats_every: int = 0,
-    bind_addr: str = "0.0.0.0",
-) -> Stats:
-    """Legacy: bind a UDP port locally and receive CBOR datagrams."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((bind_addr, port))
-    print(f"Listening on UDP {bind_addr}:{port} ...", file=sys.stderr)
-    sys.stderr.flush()
-
-    stats = Stats()
-    try:
-        while True:
-            data, _addr = sock.recvfrom(65536)
-            try:
-                msg = cbor2.loads(data)
-            except Exception:
-                continue
-
-            if not isinstance(msg, dict) or msg.get("type") != "lora_frame":
-                continue
-
-            stats.update(msg)
-
-            if use_json:
-                out.write(format_frame_json(msg))
-            else:
-                out.write(format_frame(msg, compact=compact))
-            out.write("\n")
-            out.flush()
-
-            if stats_every > 0 and stats.total % stats_every == 0:
-                print(f"--- {stats.summary()}", file=sys.stderr)
-                sys.stderr.flush()
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        sock.close()
-
-    return stats
-
-
-def receive_stdin(
-    out: TextIO,
-    *,
-    use_json: bool = False,
-    compact: bool = False,
-    stats_every: int = 0,
-) -> Stats:
-    """Read CBOR Sequence (RFC 8742) from stdin, decode, write text to out."""
-    stats = Stats()
-    try:
-        for msg in read_cbor_seq(sys.stdin.buffer):
-            if not isinstance(msg, dict) or msg.get("type") != "lora_frame":
-                continue
-
-            stats.update(msg)
-
-            if use_json:
-                out.write(format_frame_json(msg))
-            else:
-                out.write(format_frame(msg, compact=compact))
-            out.write("\n")
-            out.flush()
-
-            if stats_every > 0 and stats.total % stats_every == 0:
-                print(f"--- {stats.summary()}", file=sys.stderr)
-                sys.stderr.flush()
-
-    except KeyboardInterrupt:
-        pass
-    except BrokenPipeError:
-        pass
-
-    return stats
+    if total > 0:
+        pct = crc_ok / total * 100
+        print(
+            f"\n--- {total} frames, {crc_ok} CRC_OK ({pct:.0f}%)",
+            file=sys.stderr,
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="LoRa streaming monitor -- connects to lora_rx UDP server or reads stdin"
+        description="LoRa streaming monitor -- connects to lora_trx/lora_rx UDP server"
     )
     parser.add_argument(
         "--connect",
         metavar="HOST:PORT",
-        help="connect to lora_rx UDP server (e.g. 127.0.0.1:5556)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=DEFAULT_PORT,
-        help=f"legacy: bind a local UDP port (default: {DEFAULT_PORT})",
-    )
-    parser.add_argument(
-        "--bind",
-        default="0.0.0.0",
-        help="legacy: bind address for --port mode (default: 0.0.0.0)",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="output JSON lines instead of text",
-    )
-    parser.add_argument(
-        "--compact",
-        action="store_true",
-        help="one line per frame (no hex/ascii/detail)",
-    )
-    parser.add_argument(
-        "--stats-every",
-        type=int,
-        default=0,
-        metavar="N",
-        help="print stats summary to stderr every N frames (0=off)",
-    )
-    parser.add_argument(
-        "--stats",
-        action="store_true",
-        help="print final stats summary to stderr on exit",
-    )
-    parser.add_argument(
-        "--stdin",
-        action="store_true",
-        help="read CBOR Sequence (RFC 8742) from stdin instead of UDP",
+        default=f"{DEFAULT_HOST}:{DEFAULT_PORT}",
+        help=f"UDP server address (default: {DEFAULT_HOST}:{DEFAULT_PORT})",
     )
     args = parser.parse_args()
 
-    if args.stdin:
-        stats = receive_stdin(
-            sys.stdout,
-            use_json=args.json,
-            compact=args.compact,
-            stats_every=args.stats_every,
-        )
-    elif args.connect:
-        # Parse host:port
-        colon = args.connect.rfind(":")
-        if colon <= 0:
-            parser.error("--connect requires HOST:PORT (e.g. 127.0.0.1:5556)")
-        host = args.connect[:colon]
-        port = int(args.connect[colon + 1 :])
-        stats = connect_udp(
-            host,
-            port,
-            sys.stdout,
-            use_json=args.json,
-            compact=args.compact,
-            stats_every=args.stats_every,
-        )
+    # Parse host:port (handle IPv6 bracket notation)
+    spec = args.connect
+    if spec.startswith("["):
+        # [host]:port
+        bracket = spec.index("]")
+        host = spec[1:bracket]
+        port = int(spec[bracket + 2 :])
     else:
-        stats = receive_udp(
-            args.port,
-            sys.stdout,
-            use_json=args.json,
-            compact=args.compact,
-            stats_every=args.stats_every,
-            bind_addr=args.bind,
-        )
+        colon = spec.rfind(":")
+        if colon <= 0:
+            parser.error("--connect requires HOST:PORT (e.g. 127.0.0.1:5555)")
+        host = spec[:colon]
+        port = int(spec[colon + 1 :])
 
-    if args.stats and stats.total > 0:
-        print(f"--- {stats.summary()}", file=sys.stderr)
+    connect_udp(host, port)
 
 
 if __name__ == "__main__":

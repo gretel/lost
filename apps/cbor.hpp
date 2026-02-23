@@ -9,6 +9,7 @@
 #define GR4_LORA_CBOR_HPP
 
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -64,6 +65,15 @@ inline void encode_bool(std::vector<uint8_t>& buf, bool val) {
     buf.push_back(val ? 0xF5 : 0xF4);  // true=0xF5, false=0xF4
 }
 
+inline void encode_float64(std::vector<uint8_t>& buf, double val) {
+    buf.push_back(0xFB);  // major 7, additional 27 = IEEE 754 double
+    uint64_t bits{};
+    std::memcpy(&bits, &val, 8);
+    for (int i = 7; i >= 0; i--) {
+        buf.push_back(static_cast<uint8_t>(bits >> (8 * i)));
+    }
+}
+
 inline void encode_map_begin(std::vector<uint8_t>& buf, uint64_t n_pairs) {
     encode_head(buf, 5, n_pairs);
 }
@@ -92,6 +102,12 @@ inline void kv_bytes(std::vector<uint8_t>& buf,
                      const uint8_t* data, std::size_t len) {
     encode_text(buf, key);
     encode_bytes(buf, data, len);
+}
+
+inline void kv_float64(std::vector<uint8_t>& buf,
+                       const std::string& key, double val) {
+    encode_text(buf, key);
+    encode_float64(buf, val);
 }
 
 // ============================================================================
@@ -190,8 +206,8 @@ inline Value decode_item(std::span<const uint8_t> data, std::size_t& pos) {
 /// Decode a CBOR map with text keys from `data`.
 /// Returns the decoded key-value pairs. Throws DecodeError on malformed input.
 inline Map decode_map(std::span<const uint8_t> data) {
+    if (data.empty()) throw DecodeError("empty input");
     std::size_t pos = 0;
-    if (pos >= data.size()) throw DecodeError("empty input");
 
     uint8_t head = data[pos++];
     uint8_t major = static_cast<uint8_t>(head >> 5);

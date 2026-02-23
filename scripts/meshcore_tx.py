@@ -48,6 +48,8 @@ import sys
 import time
 from pathlib import Path
 
+import socket
+
 import cbor2
 import segno
 from Crypto.Cipher import AES
@@ -559,20 +561,23 @@ def cmd_anon_req(args, expanded_prv: bytes, pub_key: bytes, seed: bytes) -> byte
 
 _EPILOG = """\
 examples:
-  # Broadcast ADVERT beacon:
-  %(prog)s advert --name "MyNode" | lora_tx --stdin
+  # Broadcast ADVERT beacon via pipe to lora_tx:
+  %(prog)s advert --name "MyNode" | lora_tx
+
+  # Send via UDP to lora_trx:
+  %(prog)s advert --name "MyNode" --udp 127.0.0.1:5555
 
   # Print contact QR code (scannable by MeshCore companion):
   %(prog)s advert --name "MyNode" --qr
 
   # Send encrypted message to a known contact (direct):
-  %(prog)s send --dest <64hex> "Hello from gr4-lora" | lora_tx --stdin
+  %(prog)s send --dest <64hex> "Hello from gr4-lora" | lora_tx
 
-  # Send via flood routing:
-  %(prog)s send --dest <64hex> --route flood "Hello" | lora_tx --stdin
+  # Send to lora_trx via UDP:
+  %(prog)s send --dest <64hex> --udp localhost:5555 "Hello"
 
   # Anonymous encrypted request (includes sender pubkey):
-  %(prog)s anon-req --dest <64hex> "Hello" | lora_tx --stdin
+  %(prog)s anon-req --dest <64hex> "Hello" | lora_tx
 
   # Show identity public key:
   %(prog)s --show-key
@@ -603,6 +608,13 @@ def main():
         "--sf", type=int, default=None, help="Override spreading factor (7-12)"
     )
     parser.add_argument("--bw", type=int, default=None, help="Override bandwidth in Hz")
+    parser.add_argument(
+        "--udp",
+        type=str,
+        default=None,
+        metavar="HOST:PORT",
+        help="Send CBOR TX request via UDP instead of stdout (e.g. 127.0.0.1:5555)",
+    )
     parser.add_argument(
         "--show-key", action="store_true", help="Print public key hex and exit"
     )
@@ -735,8 +747,21 @@ def main():
         phy["dry_run"] = True
 
     cbor_msg = make_cbor_tx_request(packet, **phy)
-    sys.stdout.buffer.write(cbor_msg)
-    sys.stdout.buffer.flush()
+
+    if args.udp:
+        # Send via UDP to lora_trx
+        parts = args.udp.rsplit(":", 1)
+        if len(parts) != 2:
+            sys.stderr.write(f"ERROR: --udp must be host:port, got '{args.udp}'\n")
+            sys.exit(1)
+        host, port = parts[0], int(parts[1])
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(cbor_msg, (host, port))
+        sock.close()
+        sys.stderr.write(f"Sent {len(cbor_msg)} bytes to {host}:{port}\n")
+    else:
+        sys.stdout.buffer.write(cbor_msg)
+        sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <string>
@@ -49,9 +50,13 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     uint8_t              _cr{4};
     bool                 _crc_valid{false};
     bool                 _is_downchirp{false};
+    double               _snr_db{0.0};
+    int64_t              _rx_channel{-1};
     bool                 _collecting{false};
     std::vector<uint8_t> _frame;
     uint32_t             _frame_count{0};
+
+    std::function<void(const std::vector<uint8_t>&)> _frame_callback{};
 
     int                              _udp_fd{-1};
     std::vector<struct sockaddr_in>  _udp_clients;
@@ -91,15 +96,11 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                 break;  // real error or fd closed
             }
             std::lock_guard<std::mutex> lock(_udp_mutex);
-            bool found = false;
-            for (const auto& c : _udp_clients) {
-                if (c.sin_addr.s_addr == sender.sin_addr.s_addr &&
-                    c.sin_port == sender.sin_port) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
+            auto match = [&](const auto& c) {
+                return c.sin_addr.s_addr == sender.sin_addr.s_addr &&
+                       c.sin_port == sender.sin_port;
+            };
+            if (!std::ranges::any_of(_udp_clients, match)) {
                 _udp_clients.push_back(sender);
                 char addr_str[INET_ADDRSTRLEN];
                 ::inet_ntop(AF_INET, &sender.sin_addr,
@@ -212,11 +213,17 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
         const char* crc_str = _crc_valid ? "CRC_OK" : "CRC_FAIL";
 
-        std::printf("[%s] #%u  %u bytes  CR=4/%u  %s  sync=0x%02X%s\n",
+        std::printf("[%s] #%u  %u bytes  CR=4/%u  %s  sync=0x%02X  SNR=%.1f dB",
                     ts.c_str(), _frame_count,
-                    _pay_len, 4 + _cr, crc_str,
-                    sync_word,
-                    _is_downchirp ? "  (downchirp)" : "");
+                    _pay_len, 4u + _cr, crc_str,
+                    sync_word, _snr_db);
+        if (_rx_channel >= 0) {
+            std::printf("  ch=%d", static_cast<int>(_rx_channel));
+        }
+        if (_is_downchirp) {
+            std::printf("  (downchirp)");
+        }
+        std::printf("\n");
 
         std::printf("  Hex: %s\n", to_hex(frame_span).c_str());
         std::printf("  ASCII: %s\n", to_ascii(frame_span).c_str());
@@ -228,18 +235,22 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         std::vector<uint8_t> buf;
         buf.reserve(128 + _pay_len);
 
-        cbor::encode_map_begin(buf, 9);
+        uint32_t top_fields = 9;
+        if (_rx_channel >= 0) top_fields++;
+
+        cbor::encode_map_begin(buf, top_fields);
         cbor::kv_text(buf, "type", "lora_frame");
         cbor::kv_text(buf, "ts", ts);
         cbor::kv_uint(buf, "seq", _frame_count);
 
         cbor::encode_text(buf, "phy");
-        cbor::encode_map_begin(buf, 5);
+        cbor::encode_map_begin(buf, 6);
         cbor::kv_uint(buf, "sf", phy_sf);
         cbor::kv_uint(buf, "bw", phy_bw);
         cbor::kv_uint(buf, "cr", _cr);
         cbor::kv_bool(buf, "crc_valid", _crc_valid);
         cbor::kv_uint(buf, "sync_word", sync_word);
+        cbor::kv_float64(buf, "snr_db", _snr_db);
 
         cbor::kv_bytes(buf, "payload", _frame.data(),
                        std::min(static_cast<std::size_t>(_pay_len),
@@ -248,6 +259,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         cbor::kv_bool(buf, "crc_valid", _crc_valid);
         cbor::kv_uint(buf, "cr", _cr);
         cbor::kv_bool(buf, "is_downchirp", _is_downchirp);
+        if (_rx_channel >= 0) {
+            cbor::kv_uint(buf, "rx_channel", static_cast<uint64_t>(_rx_channel));
+        }
 
         return buf;
     }
@@ -271,8 +285,11 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         _frame_count++;
         auto ts = timestamp_now();
 
-        if (cbor_stdout || _udp_fd >= 0) {
+        if (_frame_callback || cbor_stdout || _udp_fd >= 0) {
             auto buf = buildFrameCbor(ts);
+            if (_frame_callback) {
+                _frame_callback(buf);
+            }
             if (cbor_stdout) {
                 sendFrameStdout(buf);
             }
@@ -308,6 +325,18 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                     _is_downchirp = it2->second.value_or<bool>(false);
                 } else {
                     _is_downchirp = false;
+                }
+                if (auto it2 = tag.map.find("snr_db");
+                    it2 != tag.map.end()) {
+                    _snr_db = it2->second.value_or<double>(0.0);
+                } else {
+                    _snr_db = 0.0;
+                }
+                if (auto it2 = tag.map.find("rx_channel");
+                    it2 != tag.map.end()) {
+                    _rx_channel = it2->second.value_or<int64_t>(-1);
+                } else {
+                    _rx_channel = -1;
                 }
 
                 _frame.clear();

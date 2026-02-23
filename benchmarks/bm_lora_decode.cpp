@@ -246,10 +246,8 @@ const boost::ut::suite decode_benchmarks = [] {
         double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
         double frames_per_sec = static_cast<double>(N_FRAMES) / elapsed_s;
 
-        // LoRa airtime for this frame: n_total_symbols * T_sym
-        // T_sym = 2^SF / BW = 256 / 62500 = 4.096 ms
         double t_sym_s = static_cast<double>(N) / static_cast<double>(BW);
-        std::size_t total_syms = PREAMBLE_LEN + 2 + 2 + n_payload_symbols;  // +SFD
+        std::size_t total_syms = PREAMBLE_LEN + 2 + 2 + n_payload_symbols;
         double airtime_s = static_cast<double>(total_syms) * t_sym_s + t_sym_s * 0.25;
         double max_realtime_fps = 1.0 / airtime_s;
         double margin = frames_per_sec / max_realtime_fps;
@@ -264,6 +262,14 @@ const boost::ut::suite decode_benchmarks = [] {
         std::printf("  Margin:          %.0fx real-time\n", margin);
         std::printf("  Concurrent ch:   ~%.0f (at 100%% CPU)\n", margin);
         std::fflush(stdout);
+
+        // Assert minimum real-time margin: must decode at least 100x faster
+        // than real-time on Apple M1. Catches catastrophic regressions.
+        expect(gt(margin, 100.0)) << "Real-time margin below 100x — performance regression";
+
+        // Assert per-frame decode time stays under 1 ms (on M1: ~26 us typical)
+        double per_frame_us = elapsed_s / N_FRAMES * 1e6;
+        expect(lt(per_frame_us, 1000.0)) << "Per-frame decode exceeds 1 ms — regression";
     }
 };
 

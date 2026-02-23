@@ -172,6 +172,7 @@ int transmit_graph(const std::vector<std::complex<float>>& iq,
     }
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> sched;
+    sched.timeout_inactivity_count = 1'000'000U;
     if (auto ret = sched.exchange(std::move(graph)); !ret) {
         std::fprintf(stderr, "ERROR: Scheduler init failed\n");
         return -1;
@@ -194,7 +195,7 @@ void log_tx_info(const std::vector<uint8_t>& payload,
     std::fprintf(stderr, "  Frequency:   %.6f MHz\n", cfg.freq / 1e6);
     std::fprintf(stderr, "  Gain:        %.0f dB\n", cfg.gain);
     std::fprintf(stderr, "  SF=%u  BW=%u  CR=4/%u  sync=0x%02X  preamble=%u\n",
-                 cfg.sf, cfg.bw, 4 + cfg.cr, cfg.sync_word, cfg.preamble_len);
+                 cfg.sf, cfg.bw, 4u + cfg.cr, cfg.sync_word, cfg.preamble_len);
     std::fprintf(stderr, "  IQ samples:  %zu (%.3f ms airtime)\n",
                  iq_len, airtime_sec * 1000.0);
 }

@@ -79,10 +79,11 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
     uint16_t preamble_len = 8;
     float    energy_thresh = 1e-6f;  ///< minimum symbol energy to continue output
     uint32_t max_symbols  = 256;     ///< safety limit on symbols per burst
+    int32_t  rx_channel   = -1;      ///< RX channel index (-1 = not set)
 
     GR_MAKE_REFLECTABLE(BurstDetector, in, out,
                         center_freq, bandwidth, sf, sync_word, os_factor, preamble_len,
-                        energy_thresh, max_symbols);
+                        energy_thresh, max_symbols, rx_channel);
 
     // --- Internal state ---
     enum State : uint8_t { DETECT, SYNC, OUTPUT };
@@ -135,6 +136,7 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
     // Output state
     uint32_t _output_symb_cnt = 0;
     bool     _burst_tag_published = false;
+    float    _snr_db = 0.f;  ///< preamble-based SNR estimate (dB)
 
     // Pre-allocated scratch buffers (avoid per-call heap allocation)
     std::vector<std::complex<float>> _scratch_N;      ///< N-element scratch for dechirp
@@ -307,6 +309,37 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
         float sto_frac = static_cast<float>(k_residual - (k_residual > 0.5 ? 1.0 : 0.0));
 
         return sto_frac;
+    }
+
+    /// Preamble-based SNR estimation (GR3 determine_snr algorithm).
+    /// Dechirps each preamble symbol, takes FFT, computes peak-vs-rest ratio.
+    /// Returns average SNR in dB across _up_symb_to_use preamble symbols.
+    /// Must be called after CFO/SFO correction (_preamble_upchirps is corrected).
+    [[nodiscard]] float determine_snr() {
+        const auto n_syms = _up_symb_to_use;
+        if (n_syms == 0) return 0.f;
+
+        float snr_sum = 0.f;
+        for (uint32_t i = 0; i < n_syms; i++) {
+            detail::complex_multiply(_scratch_N.data(), &_preamble_upchirps[_N * i],
+                                     _downchirp.data(), _N);
+            auto fft_out = _fft.compute(
+                std::span<const std::complex<float>>(_scratch_N.data(), _N));
+
+            float total_energy = 0.f;
+            float peak_energy = 0.f;
+            for (uint32_t j = 0; j < _N; j++) {
+                float mag_sq = fft_out[j].real() * fft_out[j].real()
+                             + fft_out[j].imag() * fft_out[j].imag();
+                total_energy += mag_sq;
+                if (mag_sq > peak_energy) peak_energy = mag_sq;
+            }
+            float noise_energy = total_energy - peak_energy;
+            if (noise_energy > 0.f) {
+                snr_sum += 10.f * std::log10(peak_energy / noise_energy);
+            }
+        }
+        return snr_sum / static_cast<float>(n_syms);
     }
 
     /// Check if downsampled symbol has sufficient energy.
@@ -654,7 +687,8 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
                     break;
                 }
 
-                // Sync succeeded -- transition to OUTPUT
+                // Sync succeeded -- estimate SNR, transition to OUTPUT
+                _snr_db = determine_snr();
                 _state = OUTPUT;
                 _output_symb_cnt = 0;
                 _burst_tag_published = false;
@@ -693,6 +727,10 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
                 tag["cfo_int"]      = gr::pmt::Value(static_cast<int64_t>(_cfo_int));
                 tag["cfo_frac"]     = gr::pmt::Value(static_cast<double>(_cfo_frac));
                 tag["is_downchirp"] = gr::pmt::Value(false);
+                tag["snr_db"]       = gr::pmt::Value(static_cast<double>(_snr_db));
+                if (rx_channel >= 0) {
+                    tag["rx_channel"] = gr::pmt::Value(static_cast<int64_t>(rx_channel));
+                }
                 this->publishTag(tag, 0UZ);
                 _burst_tag_published = true;
             }

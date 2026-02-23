@@ -65,6 +65,8 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
     int      _cfo_int  = 0;
     float    _cfo_frac = 0.f;
     bool     _is_downchirp = false;  ///< true if burst uses downchirp preamble
+    double   _snr_db = 0.0;         ///< preamble SNR from BurstDetector
+    int64_t  _rx_channel = -1;      ///< RX channel index (-1 = not set)
 
     // Reference downchirp (built with CFO baked in)
     std::vector<std::complex<float>> _downchirp;
@@ -227,6 +229,10 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
         out_tag["cr"]            = gr::pmt::Value(static_cast<int64_t>(_cr));
         out_tag["crc_valid"]     = gr::pmt::Value(crc_valid);
         out_tag["is_downchirp"]  = gr::pmt::Value(_is_downchirp);
+        out_tag["snr_db"]        = gr::pmt::Value(_snr_db);
+        if (_rx_channel >= 0) {
+            out_tag["rx_channel"] = gr::pmt::Value(_rx_channel);
+        }
         this->publishTag(out_tag, 0UZ);
 
         // --- Publish message ---
@@ -274,6 +280,16 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
                         _is_downchirp = it2->second.value_or<bool>(false);
                     } else {
                         _is_downchirp = false;
+                    }
+                    if (auto it2 = tag.map.find("snr_db"); it2 != tag.map.end()) {
+                        _snr_db = it2->second.value_or<double>(0.0);
+                    } else {
+                        _snr_db = 0.0;
+                    }
+                    if (auto it2 = tag.map.find("rx_channel"); it2 != tag.map.end()) {
+                        _rx_channel = it2->second.value_or<int64_t>(-1);
+                    } else {
+                        _rx_channel = -1;
                     }
 
                     buildDownchirpWithCFO();
