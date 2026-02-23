@@ -7,8 +7,10 @@
 
 #include <benchmark.hpp>
 
+#include <chrono>
 #include <complex>
 #include <cstdint>
+#include <format>
 #include <numbers>
 #include <vector>
 
@@ -237,16 +239,11 @@ const boost::ut::suite rx_benchmarks = [] {
     }
 };
 
-// ============================================================================
-// TX chain benchmarks
-// ============================================================================
-
 const boost::ut::suite tx_benchmarks = [] {
     using namespace benchmark;
 
     ::benchmark::results::add_separator();
 
-    // --- Full TX chain: payload -> IQ ---
     {
         constexpr int REPS = 1'000;
         ::benchmark::benchmark<REPS>(std::string_view("generate_frame_iq (14B, os=1)"), PAYLOAD.size()) =
@@ -257,7 +254,6 @@ const boost::ut::suite tx_benchmarks = [] {
             };
     }
 
-    // --- Full TX chain with 4x oversampling (hardware rate) ---
     {
         constexpr int REPS = 500;
         ::benchmark::benchmark<REPS>(std::string_view("generate_frame_iq (14B, os=4)"), PAYLOAD.size()) =
@@ -267,6 +263,67 @@ const boost::ut::suite tx_benchmarks = [] {
                 g_sink = iq.size();
             };
     }
+};
+
+const boost::ut::suite performance_assertions = [] {
+    using namespace boost::ut;
+
+    "FFT must complete under 10 us per symbol"_test = [] {
+        gr::algorithm::FFT<std::complex<float>> fft;
+        auto dechirped = make_dechirped_symbol(42);
+        fft.compute(dechirped); // warm up
+
+        constexpr int REPS = 5'000;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < REPS; i++) {
+            auto result = fft.compute(dechirped);
+            g_sink = result.size();
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double per_call_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / REPS;
+        expect(lt(per_call_us, 10.0)) << std::format("FFT took {:.1f} us (limit: 10 us)", per_call_us);
+    };
+
+    "TX chain (os=4) must complete under 500 us"_test = [] {
+        auto warmup = gr::lora::generate_frame_iq(PAYLOAD, SF, CR, 4, SYNC_WORD, PREAMBLE_LEN, true, 0);
+        g_sink = warmup.size();
+
+        constexpr int REPS = 1'000;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < REPS; i++) {
+            auto iq = gr::lora::generate_frame_iq(PAYLOAD, SF, CR, 4, SYNC_WORD, PREAMBLE_LEN, true, 0);
+            g_sink = iq.size();
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double per_call_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / REPS;
+        expect(lt(per_call_us, 500.0)) << std::format("TX chain took {:.1f} us (limit: 500 us)", per_call_us);
+    };
+
+    "Hamming decode must complete under 100 ns"_test = [] {
+        uint8_t cw = gr::lora::hamming_encode(0x0A, CR);
+
+        constexpr int REPS = 100'000;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < REPS; i++) {
+            auto nib = gr::lora::hamming_decode_hard(cw, CR);
+            g_sink = nib;
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double per_call_ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / REPS;
+        expect(lt(per_call_ns, 100.0)) << std::format("Hamming decode took {:.1f} ns (limit: 100 ns)", per_call_ns);
+    };
+
+    "CRC-16 (14 bytes) must complete under 1 us"_test = [] {
+        constexpr int REPS = 50'000;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < REPS; i++) {
+            auto crc = gr::lora::crc16(PAYLOAD);
+            g_sink = crc;
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double per_call_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / REPS;
+        expect(lt(per_call_us, 1.0)) << std::format("CRC-16 took {:.3f} us (limit: 1 us)", per_call_us);
+    };
 };
 
 int main() { /* boost::ut runs suites automatically */ }

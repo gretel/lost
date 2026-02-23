@@ -1,4 +1,4 @@
 [submodule "gnuradio4"]
 	path = gnuradio4
 	url = https://github.com/gretel/gnuradio4.git
-	branch = fix-arm64
+	branch = soapy-sink

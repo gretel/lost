@@ -40,6 +40,7 @@ struct RxConfig {
     uint8_t     sf{8};
     uint16_t    sync{0x12};
     uint16_t    preamble{8};
+    std::string clock{};
     std::string udp{};
     bool        cbor{false};
 };
@@ -54,7 +55,8 @@ void print_usage() {
         "  --device-param <str>  Device params, key=val,... (default: type=b200)\n"
         "  --freq <hz>           RX frequency (default: 869618000)\n"
         "  --gain <db>           RX gain (default: 30)\n"
-        "  --rate <sps>          Sample rate (default: 250000)\n\n"
+        "  --rate <sps>          Sample rate (default: 250000)\n"
+        "  --clock <source>      Clock source: internal, external, gpsdo\n\n"
         "LoRa PHY:\n"
         "  --bw <hz>             Bandwidth (default: 62500)\n"
         "  --sf <7-12>           Spreading factor (default: 8)\n"
@@ -87,6 +89,7 @@ bool parse_args(int argc, char* argv[], RxConfig& cfg) {
         if (arg == "--sf" && i + 1 < argc) { cfg.sf = static_cast<uint8_t>(std::stoul(argv[++i])); continue; }
         if (arg == "--sync" && i + 1 < argc) { cfg.sync = static_cast<uint16_t>(std::stoul(argv[++i], nullptr, 0)); continue; }
         if (arg == "--preamble" && i + 1 < argc) { cfg.preamble = static_cast<uint16_t>(std::stoul(argv[++i])); continue; }
+        if (arg == "--clock" && i + 1 < argc) { cfg.clock = argv[++i]; continue; }
         if (arg == "--udp" && i + 1 < argc) { cfg.udp = argv[++i]; continue; }
         if (arg == "--cbor") { cfg.cbor = true; continue; }
         std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
@@ -118,6 +121,9 @@ int main(int argc, char* argv[]) {
     std::fprintf(stderr, "  OS factor:   %u\n", os_factor);
     std::fprintf(stderr, "  SF=%u  BW=%u  sync=0x%02X  preamble=%u\n",
                  cfg.sf, cfg.bw, cfg.sync, cfg.preamble);
+    if (!cfg.clock.empty()) {
+        std::fprintf(stderr, "  Clock:       %s\n", cfg.clock.c_str());
+    }
     if (!cfg.udp.empty()) {
         std::fprintf(stderr, "  UDP CBOR:    %s\n", cfg.udp.c_str());
     }
@@ -134,6 +140,7 @@ int main(int argc, char* argv[]) {
         {"sample_rate", cfg.rate},
         {"rx_center_frequency", gr::Tensor<double>{cfg.freq}},
         {"rx_gains", gr::Tensor<double>{cfg.gain}},
+        {"clock_source", cfg.clock},
         {"max_chunck_size", static_cast<uint32_t>(512U << 4U)},
         {"max_overflow_count", gr::Size_t{0}},
     });
@@ -145,6 +152,7 @@ int main(int argc, char* argv[]) {
         {"sync_word", cfg.sync},
         {"os_factor", os_factor},
         {"preamble_len", cfg.preamble},
+        {"rx_channel", int32_t{0}},
     });
 
     auto& demod = graph.emplaceBlock<gr::lora::SymbolDemodulator>({

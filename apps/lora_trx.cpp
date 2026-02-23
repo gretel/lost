@@ -40,6 +40,7 @@
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/soapy/Soapy.hpp>
 #include <gnuradio-4.0/soapy/SoapySink.hpp>
+#include <gnuradio-4.0/testing/NullSources.hpp>
 
 #include "FrameSink.hpp"
 #include "cbor.hpp"
@@ -62,6 +63,7 @@ struct TrxConfig {
     uint8_t              cr{4};
     uint16_t             sync{0x12};
     uint16_t             preamble{8};
+    std::string          clock{};
     std::vector<uint32_t> rx_channels{0};
     uint32_t             tx_channel{0};
     std::string          listen{"127.0.0.1"};
@@ -145,7 +147,8 @@ void print_usage() {
         "  --freq <hz>           Center frequency (default: 869618000)\n"
         "  --gain-rx <db>        RX gain (default: 30)\n"
         "  --gain-tx <db>        TX gain (default: 75)\n"
-        "  --rate <sps>          Sample rate (default: 250000)\n\n"
+        "  --rate <sps>          Sample rate (default: 250000)\n"
+        "  --clock <source>      Clock source: internal, external, gpsdo\n\n"
         "LoRa PHY:\n"
         "  --bw <hz>             Bandwidth (default: 62500)\n"
         "  --sf <7-12>           Spreading factor (default: 8)\n"
@@ -194,6 +197,7 @@ bool parse_args(int argc, char* argv[], TrxConfig& cfg) {
         if (arg == "--cr" && i + 1 < argc) { cfg.cr = static_cast<uint8_t>(std::stoul(argv[++i])); continue; }
         if (arg == "--sync" && i + 1 < argc) { cfg.sync = static_cast<uint16_t>(std::stoul(argv[++i], nullptr, 0)); continue; }
         if (arg == "--preamble" && i + 1 < argc) { cfg.preamble = static_cast<uint16_t>(std::stoul(argv[++i])); continue; }
+        if (arg == "--clock" && i + 1 < argc) { cfg.clock = argv[++i]; continue; }
         if (arg == "--rx-channels" && i + 1 < argc) { cfg.rx_channels = parse_channel_list(argv[++i]); continue; }
         if (arg == "--tx-channel" && i + 1 < argc) { cfg.tx_channel = static_cast<uint32_t>(std::stoul(argv[++i])); continue; }
         if (arg == "--listen" && i + 1 < argc) { cfg.listen = argv[++i]; continue; }
@@ -220,7 +224,7 @@ std::vector<std::complex<float>> generate_iq(
                                        true, sps * 2, 2, cfg.bw);
 }
 
-int transmit(const std::vector<std::complex<float>>& iq, const TrxConfig& cfg) {
+int transmit_1ch(const std::vector<std::complex<float>>& iq, const TrxConfig& cfg) {
     gr::Graph graph;
     using cf32 = std::complex<float>;
 
@@ -239,6 +243,7 @@ int transmit(const std::vector<std::complex<float>>& iq, const TrxConfig& cfg) {
         {"tx_center_frequency", gr::Tensor<double>{cfg.freq}},
         {"tx_gains", gr::Tensor<double>{cfg.gain_tx}},
         {"tx_channels", gr::Tensor<gr::Size_t>(gr::data_from, {static_cast<gr::Size_t>(cfg.tx_channel)})},
+        {"clock_source", cfg.clock},
         {"timed_tx", true},
         {"wait_burst_ack", true},
         {"max_underflow_count", gr::Size_t{0}},
@@ -263,6 +268,76 @@ int transmit(const std::vector<std::complex<float>>& iq, const TrxConfig& cfg) {
         return -1;
     }
     return 0;
+}
+
+// 2RX+2TX mode: B210 requires balanced channel enables (2+2=4, passes update_enables).
+// Real IQ goes to TX channel cfg.tx_channel, zeros go to the other channel.
+int transmit_2ch(const std::vector<std::complex<float>>& iq, const TrxConfig& cfg) {
+    gr::Graph graph;
+    using cf32 = std::complex<float>;
+
+    auto& source = graph.emplaceBlock<gr::testing::TagSource<cf32,
+        gr::testing::ProcessFunction::USE_PROCESS_BULK>>({
+        {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
+        {"repeat_tags", false},
+        {"mark_tag", false},
+    });
+    source.values = iq;
+
+    auto& null_source = graph.emplaceBlock<gr::testing::ConstantSource<cf32>>({
+        {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
+    });
+
+    auto& sink = graph.emplaceBlock<gr::blocks::soapy::SoapySinkBlock<cf32, 2UZ>>({
+        {"device", cfg.device},
+        {"device_parameter", cfg.device_param},
+        {"sample_rate", cfg.rate},
+        {"tx_center_frequency", gr::Tensor<double>(gr::data_from, {cfg.freq, cfg.freq})},
+        {"tx_gains", gr::Tensor<double>(gr::data_from, {cfg.gain_tx, 0.0})},
+        {"tx_channels", gr::Tensor<gr::Size_t>(gr::data_from, {gr::Size_t{0}, gr::Size_t{1}})},
+        {"clock_source", cfg.clock},
+        {"timed_tx", true},
+        {"wait_burst_ack", true},
+        {"max_underflow_count", gr::Size_t{0}},
+    });
+
+    // Connect real IQ to the active TX port, zeros to the dummy port.
+    auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
+    if (cfg.tx_channel == 0) {
+        if (!ok(graph.connect<"out">(source).to<"in", 0>(sink)) ||
+            !ok(graph.connect<"out">(null_source).to<"in", 1>(sink))) {
+            std::fprintf(stderr, "TX: failed to connect 2-ch graph\n");
+            return -1;
+        }
+    } else {
+        if (!ok(graph.connect<"out">(null_source).to<"in", 0>(sink)) ||
+            !ok(graph.connect<"out">(source).to<"in", 1>(sink))) {
+            std::fprintf(stderr, "TX: failed to connect 2-ch graph\n");
+            return -1;
+        }
+    }
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> sched;
+    sched.timeout_inactivity_count = 1'000'000U;
+    if (auto ret = sched.exchange(std::move(graph)); !ret) {
+        std::fprintf(stderr, "TX: scheduler init failed\n");
+        return -1;
+    }
+
+    auto ret = sched.runAndWait();
+    if (!ret.has_value()) {
+        std::fprintf(stderr, "TX: scheduler error: %s\n",
+                     std::format("{}", ret.error()).c_str());
+        return -1;
+    }
+    return 0;
+}
+
+int transmit(const std::vector<std::complex<float>>& iq, const TrxConfig& cfg) {
+    if (cfg.rx_channels.size() > 1) {
+        return transmit_2ch(iq, cfg);
+    }
+    return transmit_1ch(iq, cfg);
 }
 
 void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
@@ -339,6 +414,7 @@ void build_rx_graph_multi(gr::Graph& graph, const TrxConfig& cfg,
             {"rx_center_frequency", gr::Tensor<double>{cfg.freq}},
             {"rx_gains", gr::Tensor<double>{cfg.gain_rx}},
             {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, {static_cast<gr::Size_t>(ch)})},
+            {"clock_source", cfg.clock},
             {"max_chunck_size", static_cast<uint32_t>(512U << 4U)},
             {"max_overflow_count", gr::Size_t{0}},
         });
@@ -407,6 +483,9 @@ int main(int argc, char* argv[]) {
     for (auto ch : cfg.rx_channels) std::fprintf(stderr, " %u", ch);
     std::fprintf(stderr, "\n");
     std::fprintf(stderr, "  TX channel:  %u\n", cfg.tx_channel);
+    if (!cfg.clock.empty()) {
+        std::fprintf(stderr, "  Clock:       %s\n", cfg.clock.c_str());
+    }
     std::fprintf(stderr, "  Listen:      %s:%u\n", cfg.listen.c_str(), cfg.port);
     std::fprintf(stderr, "\n");
 
@@ -485,6 +564,7 @@ int main(int argc, char* argv[]) {
     build_rx_graph_multi(rx_graph, cfg, frame_callback);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> rx_sched;
+    rx_sched.timeout_inactivity_count = 1'000'000U;
     if (auto ret = rx_sched.exchange(std::move(rx_graph)); !ret) {
         std::fprintf(stderr, "ERROR: RX scheduler init failed\n");
         ::close(udp.fd);

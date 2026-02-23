@@ -42,6 +42,7 @@ struct TxConfig {
     uint8_t     cr{4};
     uint16_t    sync_word{0x12};
     uint16_t    preamble_len{8};
+    std::string clock{};
     int         repeat{1};
     int         gap_ms{1000};
     bool        dry_run{false};
@@ -58,7 +59,8 @@ void print_usage() {
         "  --device-param <str>  Device params, key=val,... (default: type=b200)\n"
         "  --freq <hz>           TX frequency (default: 869618000)\n"
         "  --gain <db>           TX gain (default: 75)\n"
-        "  --rate <sps>          Sample rate (default: 250000)\n\n"
+        "  --rate <sps>          Sample rate (default: 250000)\n"
+        "  --clock <source>      Clock source: internal, external, gpsdo\n\n"
         "LoRa PHY:\n"
         "  --bw <hz>             Bandwidth (default: 62500)\n"
         "  --sf <7-12>           Spreading factor (default: 8)\n"
@@ -94,6 +96,7 @@ bool parse_args(int argc, char** argv, TxConfig& cfg) {
         if (arg == "--cr" && i + 1 < argc) { cfg.cr = static_cast<uint8_t>(std::stoul(argv[++i])); continue; }
         if (arg == "--sync" && i + 1 < argc) { cfg.sync_word = static_cast<uint16_t>(std::stoul(argv[++i], nullptr, 0)); continue; }
         if (arg == "--preamble" && i + 1 < argc) { cfg.preamble_len = static_cast<uint16_t>(std::stoul(argv[++i])); continue; }
+        if (arg == "--clock" && i + 1 < argc) { cfg.clock = argv[++i]; continue; }
         if (arg == "--repeat" && i + 1 < argc) { cfg.repeat = std::stoi(argv[++i]); continue; }
         if (arg == "--gap" && i + 1 < argc) { cfg.gap_ms = std::stoi(argv[++i]); continue; }
         if (arg == "--dry-run") { cfg.dry_run = true; continue; }
@@ -161,6 +164,7 @@ int transmit_graph(const std::vector<std::complex<float>>& iq,
         {"sample_rate", cfg.rate},
         {"tx_center_frequency", gr::Tensor<double>{cfg.freq}},
         {"tx_gains", gr::Tensor<double>{cfg.gain}},
+        {"clock_source", cfg.clock},
         {"timed_tx", true},
         {"wait_burst_ack", true},
         {"max_underflow_count", gr::Size_t{0}},
@@ -196,6 +200,9 @@ void log_tx_info(const std::vector<uint8_t>& payload,
     std::fprintf(stderr, "  Gain:        %.0f dB\n", cfg.gain);
     std::fprintf(stderr, "  SF=%u  BW=%u  CR=4/%u  sync=0x%02X  preamble=%u\n",
                  cfg.sf, cfg.bw, 4u + cfg.cr, cfg.sync_word, cfg.preamble_len);
+    if (!cfg.clock.empty()) {
+        std::fprintf(stderr, "  Clock:       %s\n", cfg.clock.c_str());
+    }
     std::fprintf(stderr, "  IQ samples:  %zu (%.3f ms airtime)\n",
                  iq_len, airtime_sec * 1000.0);
 }
