@@ -39,7 +39,6 @@ def decode_frame(msg: dict[str, Any]) -> dict[str, Any]:
         "sf": phy.get("sf", 0),
         "bw": phy.get("bw", 0),
         "sync_word": phy.get("sync_word", 0),
-        "protocol": msg.get("protocol", ""),
         "is_downchirp": msg.get("is_downchirp", False),
     }
 

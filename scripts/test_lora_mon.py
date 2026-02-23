@@ -78,9 +78,9 @@ class TestFormatFrame(unittest.TestCase):
         self.assertEqual(text.count("\n"), 0)
 
     def test_sync_word_label(self):
-        self.assertIn("MeshCore", lora_mon.format_frame(make_frame(sync_word=0x12)))
-        self.assertIn("Meshtastic", lora_mon.format_frame(make_frame(sync_word=0x2B)))
-        self.assertIn("LoRaWAN", lora_mon.format_frame(make_frame(sync_word=0x34)))
+        self.assertIn("0x12", lora_mon.format_frame(make_frame(sync_word=0x12)))
+        self.assertIn("0x2B", lora_mon.format_frame(make_frame(sync_word=0x2B)))
+        self.assertIn("0x34", lora_mon.format_frame(make_frame(sync_word=0x34)))
         self.assertIn("0xFF", lora_mon.format_frame(make_frame(sync_word=0xFF)))
 
     def test_json_roundtrip(self):
@@ -347,11 +347,11 @@ class TestLoraCommon(unittest.TestCase):
         self.assertEqual(lora_common.format_hex(b"\xab\xcd", sep=""), "ABCD")
 
     def test_format_ascii_basic(self):
-        self.assertEqual(lora_common.format_ascii(b"Hi\x00"), "Hi.")
+        self.assertEqual(lora_common.format_ascii(b"Hi\x00"), "Hi\\x00")
 
     def test_sync_word_name(self):
-        self.assertEqual(lora_common.sync_word_name(0x12), "MeshCore/Reticulum")
-        self.assertEqual(lora_common.sync_word_name(0x2B), "Meshtastic")
+        self.assertEqual(lora_common.sync_word_name(0x12), "0x12")
+        self.assertEqual(lora_common.sync_word_name(0x2B), "0x2B")
         self.assertEqual(lora_common.sync_word_name(0xFF), "0xFF")
 
     def test_constants(self):

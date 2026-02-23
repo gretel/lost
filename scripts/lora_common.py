@@ -6,14 +6,6 @@ lora_common.py -- Shared constants and helpers for LoRa decoder scripts.
 
 from __future__ import annotations
 
-# ---- Protocol constants ----
-
-SYNC_NAMES: dict[int, str] = {
-    0x12: "MeshCore/Reticulum",
-    0x2B: "Meshtastic",
-    0x34: "LoRaWAN",
-}
-
 ROUTE_NAMES: list[str] = ["T_FLOOD", "FLOOD", "DIRECT", "T_DIRECT"]
 
 PAYLOAD_NAMES: list[str] = [
@@ -36,12 +28,9 @@ PAYLOAD_NAMES: list[str] = [
 ]
 
 
-# ---- Formatting helpers ----
-
-
 def sync_word_name(sw: int) -> str:
-    """Map sync word to a human-readable protocol name."""
-    return SYNC_NAMES.get(sw, f"0x{sw:02X}")
+    """Format sync word as hex string."""
+    return f"0x{sw:02X}"
 
 
 def format_hex(data: bytes, *, sep: str = " ", max_bytes: int | None = None) -> str:
@@ -55,10 +44,32 @@ def format_hex(data: bytes, *, sep: str = " ", max_bytes: int | None = None) -> 
 
 
 def format_ascii(data: bytes, *, max_bytes: int | None = None) -> str:
-    """Format bytes as printable ASCII (replace non-printable with '.')."""
-    if max_bytes is not None:
-        s = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in data[:max_bytes])
-        if len(data) > max_bytes:
-            s += "..."
-        return s
-    return "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in data)
+    """Decode as UTF-8 where valid, replace invalid bytes with hex escapes."""
+    raw = data[:max_bytes] if max_bytes is not None else data
+    parts: list[str] = []
+    i = 0
+    while i < len(raw):
+        b = raw[i]
+        if b < 0x20 and b not in (0x09, 0x0A):
+            parts.append(f"\\x{b:02x}")
+            i += 1
+        elif b < 0x80:
+            parts.append(chr(b))
+            i += 1
+        else:
+            # Try to decode a multi-byte UTF-8 sequence
+            for length in (4, 3, 2):
+                if i + length <= len(raw):
+                    try:
+                        parts.append(raw[i : i + length].decode("utf-8"))
+                        i += length
+                        break
+                    except UnicodeDecodeError:
+                        continue
+            else:
+                parts.append(f"\\x{b:02x}")
+                i += 1
+    s = "".join(parts)
+    if max_bytes is not None and len(data) > max_bytes:
+        s += "..."
+    return s

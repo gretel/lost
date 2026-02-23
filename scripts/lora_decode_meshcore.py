@@ -6,8 +6,8 @@ lora_decode_meshcore.py -- MeshCore v1 protocol decoder.
 Reads concatenated CBOR frames on stdin, parses the MeshCore v1 packet
 framing, and prints decoded information.
 
-Only processes frames where protocol == "meshcore_or_reticulum".
-Frames with other protocols are passed through with minimal annotation.
+Only processes frames where sync_word == 0x12 (MeshCore/Reticulum).
+Frames with other sync words are passed through with minimal annotation.
 
 Note: for live monitoring, use lora_mon.py (reads UDP from lora_rx).
 This script is for offline analysis of saved CBOR streams.
@@ -225,10 +225,10 @@ def print_passthrough_text(msg: dict[str, Any]) -> None:
     """Print non-MeshCore frame with minimal annotation."""
     payload = msg.get("payload", b"")
     crc = "CRC_OK" if msg.get("crc_valid", False) else "CRC_FAIL"
-    protocol = msg.get("protocol", "unknown")
+    sw = msg.get("phy", {}).get("sync_word", 0)
     print(
         f"[{msg.get('ts', '')}] #{msg.get('seq', 0)}  "
-        f"{len(payload)} bytes  {crc}  [{protocol}]"
+        f"{len(payload)} bytes  {crc}  [sync=0x{sw:02X}]"
     )
     print(f"  Hex: {format_hex(payload[:64])}")
     print()
@@ -251,8 +251,8 @@ def main() -> None:
             if not isinstance(msg, dict) or msg.get("type") != "lora_frame":
                 continue
 
-            protocol = msg.get("protocol", "")
-            if protocol != "meshcore_or_reticulum":
+            sw = msg.get("phy", {}).get("sync_word", 0)
+            if sw != 0x12:
                 if args.all:
                     print_passthrough_text(msg)
                 continue

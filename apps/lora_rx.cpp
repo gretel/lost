@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: ISC
 //
-// lora_rx: Hardware LoRa receiver using native GR4 SoapySDR blocks.
-//
-// Single-channel receiver with SoapySimpleSource (any SoapySDR device).
-// Default device: uhd (USRP B210/B220 via SoapyUHD).
+// lora_rx: LoRa receiver using native GR4 SoapySDR blocks.
 //
 // Graph: SoapySimpleSource -> BurstDetector -> SymbolDemodulator -> FrameSink
 //
-// All LoRa PHY parameters and device settings are configurable via CLI.
-// Defaults: SF8/BW62.5k/CR4/8/sync=0x12 at 869.618 MHz.
+// Defaults: SF8/BW62.5k/CR4/8/sync=0x12 at 869.618 MHz (uhd, type=b200).
 
 #include <atomic>
 #include <chrono>
@@ -48,30 +44,38 @@ struct RxConfig {
     bool        cbor{false};
 };
 
-void print_usage(const char* progname) {
+void print_usage() {
     std::fprintf(stderr,
-        "Usage: %s [options]\n\n"
-        "Options:\n"
-        "  --device <name>       SoapySDR driver name (default: uhd)\n"
-        "  --device-param <str>  Extra device params, key=val,key=val (default: type=b200)\n"
-        "  --freq <Hz>           RX center frequency (default: 869618000)\n"
-        "  --gain <dB>           RX gain (default: 30)\n"
-        "  --rate <S/s>          Sample rate (default: 250000)\n"
-        "  --bw <Hz>             LoRa bandwidth (default: 62500)\n"
+        "Usage: ./lora_rx [options]\n\n"
+        "Receive and decode LoRa frames. Output goes to stdout as text\n"
+        "(default), CBOR (--cbor), or UDP (--udp). See docs/cbor-schemas.md.\n\n"
+        "Device:\n"
+        "  --device <name>       SoapySDR driver (default: uhd)\n"
+        "  --device-param <str>  Device params, key=val,... (default: type=b200)\n"
+        "  --freq <hz>           RX frequency (default: 869618000)\n"
+        "  --gain <db>           RX gain (default: 30)\n"
+        "  --rate <sps>          Sample rate (default: 250000)\n\n"
+        "LoRa PHY:\n"
+        "  --bw <hz>             Bandwidth (default: 62500)\n"
         "  --sf <7-12>           Spreading factor (default: 8)\n"
         "  --sync <hex>          Sync word (default: 0x12)\n"
-        "  --preamble <n>        Preamble length (default: 8)\n"
-        "  --udp [host:]port     Enable CBOR UDP server\n"
-        "  --cbor                Write CBOR to stdout\n"
-        "  -h, --help            Show this help\n",
-        progname);
+        "  --preamble <n>        Preamble length (default: 8)\n\n"
+        "Output:\n"
+        "  --udp [host:]port     CBOR UDP server (consumers register by sending any datagram)\n"
+        "  --cbor                Write CBOR to stdout instead of text\n\n"
+        "  -h, --help            Show this help\n\n"
+        "Examples:\n"
+        "  ./lora_rx\n"
+        "  ./lora_rx --cbor | lora_mon.py --stdin\n"
+        "  ./lora_rx --udp 5556\n"
+        "  ./lora_rx --device rtlsdr --rate 1000000 --gain 29\n");
 }
 
 bool parse_args(int argc, char* argv[], RxConfig& cfg) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
-            print_usage(argv[0]);
+            print_usage();
             return false;
         }
         if (arg == "--device" && i + 1 < argc) { cfg.device = argv[++i]; continue; }
@@ -86,7 +90,7 @@ bool parse_args(int argc, char* argv[], RxConfig& cfg) {
         if (arg == "--udp" && i + 1 < argc) { cfg.udp = argv[++i]; continue; }
         if (arg == "--cbor") { cfg.cbor = true; continue; }
         std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
-        print_usage(argv[0]);
+        print_usage();
         return false;
     }
     return true;
@@ -122,7 +126,6 @@ int main(int argc, char* argv[]) {
     }
     std::fprintf(stderr, "\n");
 
-    // --- Build the graph ---
     gr::Graph graph;
 
     auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>({
@@ -132,7 +135,7 @@ int main(int argc, char* argv[]) {
         {"rx_center_frequency", gr::Tensor<double>{cfg.freq}},
         {"rx_gains", gr::Tensor<double>{cfg.gain}},
         {"max_chunck_size", static_cast<uint32_t>(512U << 4U)},
-        {"max_overflow_count", gr::Size_t{0}},  // disable overflow limit
+        {"max_overflow_count", gr::Size_t{0}},
     });
 
     auto& detector = graph.emplaceBlock<gr::lora::BurstDetector>({
@@ -157,7 +160,6 @@ int main(int argc, char* argv[]) {
     });
     sink.cbor_stdout = cfg.cbor;
 
-    // Connect: source -> detector -> demod -> sink
     if (graph.connect<"out">(source).to<"in">(detector) != gr::ConnectionResult::SUCCESS) {
         std::fprintf(stderr, "ERROR: failed to connect source -> detector\n");
         return 1;
@@ -179,7 +181,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Monitor thread: poll g_running, request scheduler stop on signal.
     std::atomic<bool> monitor_done{false};
     std::thread monitor([&sched, &monitor_done]() {
         while (g_running && !monitor_done.load(std::memory_order_relaxed)) {

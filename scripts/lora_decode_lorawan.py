@@ -343,10 +343,10 @@ def main() -> None:
                 if args.all:
                     payload = msg.get("payload", b"")
                     crc = "CRC_OK" if msg.get("crc_valid", False) else "CRC_FAIL"
-                    protocol = msg.get("protocol", "unknown")
+                    sw = phy.get("sync_word", 0)
                     print(
                         f"[{msg.get('ts', '')}] #{msg.get('seq', 0)}  "
-                        f"{len(payload)} bytes  {crc}  [{protocol}]"
+                        f"{len(payload)} bytes  {crc}  [sync=0x{sw:02X}]"
                     )
                     print(f"  Hex: {format_hex(payload[:64])}")
                     print()

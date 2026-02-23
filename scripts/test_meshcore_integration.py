@@ -58,16 +58,22 @@ TEST_SEED_PUB = bytes.fromhex(
 TEST_SEED_EXPANDED = meshcore_expanded_key(TEST_SEED)
 
 
-def _make_lora_frame(payload: bytes) -> dict:
+def _make_lora_frame(payload: bytes, sync_word: int = 0x12) -> dict:
     """Wrap raw MeshCore bytes in a lora_frame dict (mimics FrameSink output)."""
     return {
         "type": "lora_frame",
         "payload": payload,
-        "sf": 8,
-        "cr": 4,
         "crc_valid": True,
-        "sync_word": 0x12,
-        "protocol": "meshcore_or_reticulum",
+        "phy": {
+            "sf": 8,
+            "bw": 62500,
+            "cr": 4,
+            "crc_valid": True,
+            "sync_word": sync_word,
+        },
+        "payload_len": len(payload),
+        "cr": 4,
+        "is_downchirp": False,
         "seq": 1,
     }
 
@@ -467,9 +473,8 @@ class TestCborPipeline(unittest.TestCase):
             self.assertEqual(parsed["seq"], i + 1)
 
     def test_non_meshcore_filtered(self):
-        """Frames with wrong protocol are filtered out by default."""
-        frame = _make_lora_frame(b"\x00" * 10)
-        frame["protocol"] = "lorawan"
+        """Frames with wrong sync word are filtered out by default."""
+        frame = _make_lora_frame(b"\x00" * 10, sync_word=0x34)
         cbor_data = cbor2.dumps(frame)
 
         output = self._run_decoder(cbor_data)

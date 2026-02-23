@@ -1,26 +1,10 @@
 // SPDX-License-Identifier: ISC
 //
-// FrameSink: protocol-agnostic LoRa frame output sink.
+// FrameSink: LoRa frame output sink.
 //
-// Consumes uint8_t payload bytes from SymbolDemodulator and watches for
-// the {pay_len, cr, crc_valid} tag that marks the start of each frame.
-// Accumulates pay_len bytes, then outputs the frame.
-//
-// Output modes:
-//   - Default: text (hex dump + ASCII) goes to stdout.
-//   - --cbor:  concatenated CBOR maps go to stdout (machine-readable).
-//              Self-delimiting — each CBOR map knows its own length.
-//   - --udp:   binds a UDP port and fans out CBOR frames to all registered
-//              consumers. A consumer registers by sending any datagram to
-//              the bound port. Multiple consumers are supported.
-//   - --cbor and --udp can be combined.
-//
-// Protocol-agnostic: the CBOR schema contains only PHY-layer metadata.
-// A "protocol" hint is derived from the sync word:
-//   0x12 -> "meshcore_or_reticulum"
-//   0x2B -> "meshtastic"
-//   0x34 -> "lorawan"
-//   else -> "unknown"
+// Consumes uint8_t payload bytes from SymbolDemodulator, accumulates
+// frames delimited by {pay_len, cr, crc_valid} tags, then outputs them
+// as text (default), CBOR stdout (--cbor), or CBOR UDP (--udp).
 
 #ifndef GR4_LORA_FRAME_SINK_HPP
 #define GR4_LORA_FRAME_SINK_HPP
@@ -50,29 +34,17 @@
 
 namespace gr::lora {
 
-/// Guess the likely protocol from sync word.
-[[nodiscard]] inline std::string guess_protocol(uint16_t sync_word) {
-    switch (sync_word) {
-    case 0x12: return "meshcore_or_reticulum";
-    case 0x2B: return "meshtastic";
-    case 0x34: return "lorawan";
-    default:   return "unknown";
-    }
-}
-
 struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     gr::PortIn<uint8_t> in;
 
-    // Configuration
-    std::string udp_dest{};            ///< "[host:]port" for UDP server (empty=off)
-    bool        cbor_stdout{false};    ///< write CBOR to stdout instead of text
-    uint16_t    sync_word{0x12};       ///< for protocol hint in output
-    uint8_t     phy_sf{8};             ///< SF for metadata
-    uint32_t    phy_bw{62500};         ///< BW for metadata
+    std::string udp_dest{};
+    bool        cbor_stdout{false};
+    uint16_t    sync_word{0x12};
+    uint8_t     phy_sf{8};
+    uint32_t    phy_bw{62500};
 
     GR_MAKE_REFLECTABLE(FrameSink, in, udp_dest, cbor_stdout, sync_word, phy_sf, phy_bw);
 
-    // Frame accumulation state
     uint32_t             _pay_len{0};
     uint8_t              _cr{4};
     bool                 _crc_valid{false};
@@ -81,14 +53,13 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     std::vector<uint8_t> _frame;
     uint32_t             _frame_count{0};
 
-    // UDP server state: bind a port, accept registrations, fan out frames.
     int                              _udp_fd{-1};
     std::vector<struct sockaddr_in>  _udp_clients;
     std::mutex                       _udp_mutex;
     std::thread                      _udp_listener;
     bool                             _udp_running{false};
 
-    /// Parse "[host:]port" into bind address and port.
+    /// "[host:]port" -> bind address + port number.
     static bool parse_udp_dest(const std::string& spec,
                                std::string& host, uint16_t& port) {
         auto colon = spec.rfind(':');
@@ -103,7 +74,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         return port > 0;
     }
 
-    /// Background thread: poll the bound socket for registration datagrams.
     void udpListenerLoop() {
         while (_udp_running) {
             struct sockaddr_in sender{};
@@ -120,7 +90,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                 }
                 break;  // real error or fd closed
             }
-            // Register this sender address if not already known
             std::lock_guard<std::mutex> lock(_udp_mutex);
             bool found = false;
             for (const auto& c : _udp_clients) {
@@ -184,7 +153,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
             return;
         }
 
-        // Set non-blocking for the listener thread
         int flags = ::fcntl(_udp_fd, F_GETFL, 0);
         ::fcntl(_udp_fd, F_SETFL, flags | O_NONBLOCK);
 
@@ -192,7 +160,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                      "(consumers register by sending any datagram)\n",
                      host.c_str(), port);
 
-        // Start background listener for registration datagrams
         _udp_running = true;
         _udp_listener = std::thread([this] { udpListenerLoop(); });
     }
@@ -244,12 +211,11 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         auto frame_span = std::span<const uint8_t>(_frame.data(), _pay_len);
 
         const char* crc_str = _crc_valid ? "CRC_OK" : "CRC_FAIL";
-        auto protocol = guess_protocol(sync_word);
 
-        std::printf("[%s] #%u  %u bytes  CR=4/%u  %s  %s%s\n",
+        std::printf("[%s] #%u  %u bytes  CR=4/%u  %s  sync=0x%02X%s\n",
                     ts.c_str(), _frame_count,
                     _pay_len, 4 + _cr, crc_str,
-                    protocol.c_str(),
+                    sync_word,
                     _is_downchirp ? "  (downchirp)" : "");
 
         std::printf("  Hex: %s\n", to_hex(frame_span).c_str());
@@ -258,14 +224,11 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         std::fflush(stdout);
     }
 
-    /// Build the CBOR datagram for one frame. Shared by UDP and stdout paths.
     [[nodiscard]] std::vector<uint8_t> buildFrameCbor(const std::string& ts) {
-        auto protocol = guess_protocol(sync_word);
-
         std::vector<uint8_t> buf;
         buf.reserve(128 + _pay_len);
 
-        cbor::encode_map_begin(buf, 10);
+        cbor::encode_map_begin(buf, 9);
         cbor::kv_text(buf, "type", "lora_frame");
         cbor::kv_text(buf, "ts", ts);
         cbor::kv_uint(buf, "seq", _frame_count);
@@ -284,7 +247,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         cbor::kv_uint(buf, "payload_len", _pay_len);
         cbor::kv_bool(buf, "crc_valid", _crc_valid);
         cbor::kv_uint(buf, "cr", _cr);
-        cbor::kv_text(buf, "protocol", protocol);
         cbor::kv_bool(buf, "is_downchirp", _is_downchirp);
 
         return buf;
@@ -301,8 +263,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     }
 
     static void sendFrameStdout(const std::vector<uint8_t>& buf) {
-        // Write raw CBOR to stdout as a CBOR Sequence (RFC 8742):
-        // concatenated self-delimiting CBOR items, no framing.
         std::fwrite(buf.data(), 1, buf.size(), stdout);
         std::fflush(stdout);
     }
@@ -325,11 +285,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     }
 
     void processOne(uint8_t byte) noexcept {
-        // Check for new frame tag
         if (this->inputTagsPresent()) {
             const auto& tag = this->mergedInputTag();
             if (auto it = tag.map.find("pay_len"); it != tag.map.end()) {
-                // New frame starting -- flush any incomplete previous frame
                 if (_collecting && !_frame.empty()) {
                     _pay_len = static_cast<uint32_t>(_frame.size());
                     emitFrame();
@@ -358,7 +316,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
             }
         }
 
-        // Accumulate payload bytes
         if (_collecting) {
             if (_frame.size() < _pay_len) {
                 _frame.push_back(byte);

@@ -35,7 +35,6 @@ from cbor_stream import read_cbor_seq
 from lora_common import (
     PAYLOAD_NAMES,
     ROUTE_NAMES,
-    SYNC_NAMES,
     format_ascii,
     format_hex,
     sync_word_name,
@@ -116,8 +115,8 @@ class Stats:
             self.first_ts = ts
         self.last_ts = ts
         sw = msg.get("phy", {}).get("sync_word", 0)
-        proto = SYNC_NAMES.get(sw, f"0x{sw:02X}")
-        self.protocols[proto] = self.protocols.get(proto, 0) + 1
+        label = sync_word_name(sw)
+        self.protocols[label] = self.protocols.get(label, 0) + 1
 
     def summary(self) -> str:
         if self.total == 0:
@@ -144,12 +143,12 @@ def format_frame(msg: dict[str, Any], *, compact: bool = False) -> str:
     ts_short = ts[11:23] if len(ts) > 11 else ts  # HH:MM:SS.mmm
     cr = phy.get("cr", 0)
     sync_word = phy.get("sync_word", 0)
-    proto = SYNC_NAMES.get(sync_word, f"0x{sync_word:02X}")
+    sw_label = sync_word_name(sync_word)
     dc = " (downchirp)" if msg.get("is_downchirp") else ""
 
     header = (
         f"#{seq:<4d} [{ts_short}] {len(payload):>3d}B "
-        f"SF{phy.get('sf', '?')} CR4/{4 + cr} {crc_str} {proto}{dc}"
+        f"SF{phy.get('sf', '?')} CR4/{4 + cr} {crc_str} {sw_label}{dc}"
     )
 
     lines = [header]

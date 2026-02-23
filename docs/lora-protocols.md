@@ -56,10 +56,10 @@ The FrameSink block identifies protocols by their LoRa sync word.
 
 ## Detection Strategy
 
-The PHY layer can only distinguish protocols by sync word. Since MeshCore
-and Reticulum share sync_word=0x12, the FrameSink labels them jointly as
-`"meshcore_or_reticulum"`. Application-layer parsers (Python decoder
-scripts) can further classify based on payload structure.
+The PHY layer can only distinguish protocols by sync word. MeshCore
+and Reticulum share sync_word=0x12 — they are indistinguishable at the
+PHY layer. FrameSink outputs the raw sync word value; application-layer
+parsers (Python decoder scripts) classify based on payload structure.
 
 For a multi-protocol scanner, run parallel BurstDetector instances with
 different sync_word settings (0x12, 0x2B, 0x34).

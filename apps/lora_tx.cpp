@@ -1,25 +1,14 @@
 // SPDX-License-Identifier: ISC
 //
-// lora_tx: Hardware LoRa transmitter using native GR4 SoapySDR blocks.
+// lora_tx: LoRa transmitter using native GR4 SoapySDR blocks.
 //
-// Generates a complete LoRa frame from a payload string using the shared
-// algorithm functions, then transmits via a GR4 graph:
-//   TagSource<cf32> -> SoapySinkBlock<cf32>
+// Graph: TagSource<cf32> -> SoapySinkBlock<cf32>
 //
-// Two modes:
+// CLI mode:   ./lora_tx [options] <payload>
+// Stdin mode: meshcore_tx.py send ... | ./lora_tx [options]
 //
-//   CLI mode (default):
-//     lora_tx [options] <payload_string>
-//     Transmits one or more copies of the payload.
-//
-//   Stdin mode (--stdin):
-//     lora_tx --stdin [--dry-run]
-//     Reads concatenated CBOR TX request objects from stdin.
-//     See docs/cbor-schemas.md for the schema.
-//
-// *** SAFETY: This program transmits on radio frequencies. ***
-// *** Ensure you have authorization to transmit on the configured frequency. ***
-// *** The --dry-run flag generates IQ without transmitting. ***
+// When no positional argument is given, reads CBOR TX requests from stdin.
+// See docs/cbor-schemas.md for the CBOR schema.
 
 #include <unistd.h>
 
@@ -56,46 +45,43 @@ struct TxConfig {
     int         repeat{1};
     int         gap_ms{1000};
     bool        dry_run{false};
-    bool        stdin_mode{false};
     std::string payload;
 };
 
-void print_usage(const char* prog) {
+void print_usage() {
     std::fprintf(stderr,
-        "Usage: %s [options] <payload_string>\n\n"
-        "Device options:\n"
-        "  --device <name>       SoapySDR driver name (default: uhd)\n"
-        "  --device-param <str>  Extra device params, key=val,key=val (default: type=b200)\n"
+        "Usage: ./lora_tx [options] [payload]\n\n"
+        "Transmit a LoRa frame. If no payload argument is given, reads\n"
+        "CBOR TX requests from stdin (see docs/cbor-schemas.md).\n\n"
+        "Device:\n"
+        "  --device <name>       SoapySDR driver (default: uhd)\n"
+        "  --device-param <str>  Device params, key=val,... (default: type=b200)\n"
         "  --freq <hz>           TX frequency (default: 869618000)\n"
         "  --gain <db>           TX gain (default: 75)\n"
         "  --rate <sps>          Sample rate (default: 250000)\n\n"
-        "LoRa PHY options:\n"
-        "  --bw <hz>             LoRa bandwidth (default: 62500)\n"
+        "LoRa PHY:\n"
+        "  --bw <hz>             Bandwidth (default: 62500)\n"
         "  --sf <7-12>           Spreading factor (default: 8)\n"
         "  --cr <1-4>            Coding rate (default: 4)\n"
-        "  --sync <hex>          Sync word, e.g. 0x12 (default: 0x12)\n"
+        "  --sync <hex>          Sync word (default: 0x12)\n"
         "  --preamble <n>        Preamble length (default: 8)\n\n"
-        "TX options:\n"
+        "TX:\n"
         "  --repeat <n>          Transmit count (default: 1)\n"
         "  --gap <ms>            Gap between repeats (default: 1000)\n"
-        "  --dry-run             Generate IQ without transmitting\n"
-        "  --stdin               Read CBOR TX requests from stdin\n\n"
-        "Other:\n"
+        "  --dry-run             Generate IQ without transmitting\n\n"
         "  -h, --help            Show this help\n\n"
         "Examples:\n"
-        "  %s \"Hello World\"\n"
-        "  %s --device uhd --device-param type=b200 \"Hello World\"\n"
-        "  %s --sf 12 --bw 125000 --rate 500000 \"Hello World\"\n"
-        "  %s --repeat 5 --gap 2000 --gain 75 \"Test\"\n\n"
-        "*** Ensure you have authorization to transmit! ***\n",
-        prog, prog, prog, prog, prog);
+        "  ./lora_tx \"Hello World\"\n"
+        "  ./lora_tx --repeat 5 --gap 2000 \"Test\"\n"
+        "  meshcore_tx.py send ... | ./lora_tx\n"
+        "  ./lora_tx --dry-run < requests.cbor\n");
 }
 
 bool parse_args(int argc, char** argv, TxConfig& cfg) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
-            print_usage(argv[0]);
+            print_usage();
             return false;
         }
         if (arg == "--device" && i + 1 < argc) { cfg.device = argv[++i]; continue; }
@@ -111,12 +97,12 @@ bool parse_args(int argc, char** argv, TxConfig& cfg) {
         if (arg == "--repeat" && i + 1 < argc) { cfg.repeat = std::stoi(argv[++i]); continue; }
         if (arg == "--gap" && i + 1 < argc) { cfg.gap_ms = std::stoi(argv[++i]); continue; }
         if (arg == "--dry-run") { cfg.dry_run = true; continue; }
-        if (arg == "--stdin") { cfg.stdin_mode = true; continue; }
         if (arg[0] == '-') {
             std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
-            print_usage(argv[0]);
+            print_usage();
             return false;
         }
+        // Positional: payload (rest of args joined by spaces)
         cfg.payload = arg;
         for (int j = i + 1; j < argc; j++) {
             cfg.payload += " ";
@@ -126,8 +112,6 @@ bool parse_args(int argc, char** argv, TxConfig& cfg) {
     }
     return true;
 }
-
-// --- IQ generation ---
 
 std::vector<std::complex<float>> generate_iq(const std::vector<uint8_t>& payload,
                                              const TxConfig& cfg) {
@@ -158,8 +142,6 @@ std::vector<std::complex<float>> build_tx_buffer(
     return buf;
 }
 
-// --- Hardware TX via GR4 graph ---
-
 int transmit_graph(const std::vector<std::complex<float>>& iq,
                    const TxConfig& cfg) {
     gr::Graph graph;
@@ -181,7 +163,7 @@ int transmit_graph(const std::vector<std::complex<float>>& iq,
         {"tx_gains", gr::Tensor<double>{cfg.gain}},
         {"timed_tx", true},
         {"wait_burst_ack", true},
-        {"max_underflow_count", gr::Size_t{0}},  // disable underflow limit
+        {"max_underflow_count", gr::Size_t{0}},
     });
 
     if (graph.connect<"out">(source).to<"in">(sink) != gr::ConnectionResult::SUCCESS) {
@@ -259,7 +241,7 @@ std::vector<uint8_t> read_cbor_object(int fd) {
             gr::lora::cbor::decode_map(std::span<const uint8_t>(buf));
             return buf;
         } catch (const gr::lora::cbor::DecodeError&) {
-            // need more data
+            // incomplete — read more
         }
         std::size_t prev = buf.size();
         buf.resize(prev + kChunkSize);
@@ -372,14 +354,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (cfg.stdin_mode) {
-        return run_stdin_mode(cfg);
-    }
-
+    // Auto-detect mode: positional payload -> CLI mode, otherwise stdin
     if (cfg.payload.empty()) {
-        std::fprintf(stderr, "Error: no payload specified.\n\n");
-        print_usage(argv[0]);
-        return 1;
+        return run_stdin_mode(cfg);
     }
 
     if (cfg.payload.size() > 255) {

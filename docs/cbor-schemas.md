@@ -46,7 +46,6 @@ lora_rx --cbor --udp 127.0.0.1:5556
   "payload_len":  5,                  // uint
   "crc_valid":    true,               // bool (top-level duplicate for convenience)
   "cr":           4,                  // uint (top-level duplicate)
-  "protocol":     "meshcore_or_reticulum",  // text, guess from sync_word
   "is_downchirp": false               // bool
 }
 ```
