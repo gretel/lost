@@ -8,7 +8,7 @@ agree on wire format. Also tests the full CBOR pipeline: wrap packet in a
 lora_frame CBOR message, pipe through the decoder, verify JSON output.
 
 These tests run without hardware — they exercise the protocol layer only.
-The PHY loopback (lora_tx --loopback) is tested separately on B210 hardware.
+The PHY loopback is tested separately on B210 hardware via lora_trx.
 """
 
 import io

@@ -2,7 +2,7 @@
 //
 // FrameSink: LoRa frame output sink.
 //
-// Consumes uint8_t payload bytes from SymbolDemodulator, accumulates
+// Consumes uint8_t payload bytes from DemodDecoder, accumulates
 // frames delimited by {pay_len, cr, crc_valid} tags, then outputs them
 // as text (default), CBOR stdout (--cbor), or CBOR UDP (--udp).
 
@@ -283,6 +283,10 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
     void emitFrame() {
         _frame_count++;
+        std::fprintf(stderr, "[FrameSink] frame #%u: %u bytes, CR=4/%u, %s%s\n",
+                     _frame_count, _pay_len, 4u + _cr,
+                     _crc_valid ? "CRC_OK" : "CRC_FAIL",
+                     _is_downchirp ? " (downchirp)" : "");
         auto ts = timestamp_now();
 
         if (_frame_callback || cbor_stdout || _udp_fd >= 0) {

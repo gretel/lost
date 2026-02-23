@@ -1,7 +1,8 @@
 ---
-Checks:          '*,-fuchsia-*,-google-*,-zircon-*,-abseil-*,-modernize-use-trailing-return-type,-llvm*,-cert-dcl21-cpp'
+Checks:          '*,-fuchsia-*,-google-*,-zircon-*,-abseil-*,-altera-*,-modernize-use-trailing-return-type,-llvm*,-cert-dcl21-cpp'
 WarningsAsErrors: '*'
 HeaderFilterRegex: ''
 FormatStyle:     none
-cppcoreguidelines-non-private-member-variables-in-classes: IgnorePublicMemberVariables
-altera-unroll-loops: false
+CheckOptions:
+  - key: cppcoreguidelines-non-private-member-variables-in-classes.IgnorePublicMemberVariables
+    value: true

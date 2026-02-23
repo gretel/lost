@@ -7,31 +7,19 @@ Python: `pip install cbor2`, then `cbor2.loads(datagram)`.
 
 ## RX Output
 
-Three CBOR output modes, combinable:
-
-- **`--udp [host:]port`** — UDP server: binds port, broadcasts CBOR frames to
-  registered clients. Clients send a 1-byte registration datagram to join.
-- **`--cbor`** — concatenated CBOR maps written to stdout (replaces text).
-- **Text** (default) — human-readable hex dump + ASCII to stdout.
-
-`lora_trx` always enables UDP on `--port` (default 5555). `lora_rx` supports
-`--udp` and `--cbor` flags. All three modes can operate simultaneously.
+`lora_trx` outputs decoded frames as CBOR `lora_frame` maps via UDP (default
+port 5555, IPv6 dual-stack). Clients send a 1-byte registration datagram to
+join the broadcast.
 
 ```bash
-# Pipe to offline decoder (direnv adds build/apps to PATH)
-lora_rx --cbor | python3 scripts/lora_decode_meshcore.py
-
-# Save for later
-lora_rx --cbor > captured.cbor
-
-# Both UDP and stdout CBOR simultaneously
-lora_rx --cbor --udp 5556
-
 # Monitor lora_trx via UDP (default port 5555)
 python3 scripts/lora_mon.py
 
 # Monitor with custom address
 python3 scripts/lora_mon.py --connect 192.168.1.10:5555
+
+# Pipe to offline decoder
+python3 scripts/lora_mon.py | python3 scripts/lora_decode_meshcore.py
 ```
 
 ```
@@ -47,7 +35,7 @@ python3 scripts/lora_mon.py --connect 192.168.1.10:5555
     "sync_word":  18,                 // uint (0x12 = 18)
     "snr_db":     12.3                // float64, preamble-based SNR estimate (dB)
   },
-  "rx_channel":   0,                  // uint, optional, RX channel index (lora_trx only)
+  "rx_channel":   0,                  // uint, optional, RX channel index
   "payload":      h'48656C6C6F',      // bytes, raw payload
   "payload_len":  5,                  // uint
   "crc_valid":    true,               // bool (top-level duplicate for convenience)
@@ -58,13 +46,11 @@ python3 scripts/lora_mon.py --connect 192.168.1.10:5555
 
 ## TX Request
 
-Accepted by `lora_tx` on stdin and by `lora_trx` via UDP. One CBOR map per
+Sent to `lora_trx` via UDP on `--port` (default 5555). One CBOR map per
 request. All fields except `type` and `payload` are optional — CLI defaults
 apply for any omitted field.
 
-- **`lora_tx`**: reads CBOR from stdin (pipe mode).
-- **`lora_trx`**: receives CBOR via UDP on `--port` (default 5555). Send with
-  `meshcore_tx.py --udp host:port` or any CBOR-capable UDP client.
+Send with `meshcore_tx.py --udp host:port` or any CBOR-capable UDP client.
 
 ```
 {
@@ -85,8 +71,7 @@ apply for any omitted field.
 
 ## TX Acknowledgement
 
-Emitted by `lora_tx` on stdout (pipe mode) and by `lora_trx` via UDP
-(sent back to the requesting client's address).
+Sent back to the requesting client's UDP address after TX completes.
 
 ```
 {
@@ -133,44 +118,31 @@ Sends a CBOR TX request via UDP: `meshcore_tx.py --udp 127.0.0.1:5555 send
 ## Python Examples
 
 ```python
-# Read concatenated CBOR from stdin (pipe mode)
-# Uses cbor_stream.read_cbor_seq() which handles pipe streaming correctly.
-# Do NOT use cbor2.CBORDecoder(stream).decode() — it blocks on pipes.
-import sys
-from cbor_stream import read_cbor_seq
-
-for frame in read_cbor_seq(sys.stdin.buffer):
-    if not isinstance(frame, dict) or frame.get("type") != "lora_frame":
-        continue
-    snr = frame.get("phy", {}).get("snr_db")
-    ch = frame.get("rx_channel")
-    info = f"#{frame['seq']} {frame['payload_len']}B CRC={'OK' if frame['crc_valid'] else 'FAIL'}"
-    if snr is not None:
-        info += f" SNR={snr:.1f}dB"
-    if ch is not None:
-        info += f" ch={ch}"
-    print(info)
-```
-
-```python
+# Read CBOR frames from lora_trx via UDP
 import socket
 import cbor2
 
-# Connect to lora_trx UDP server (register + receive frames)
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.sendto(b"\x00", ("127.0.0.1", 5555))  # register
 while True:
     data, addr = sock.recvfrom(65536)
     frame = cbor2.loads(data)
     if frame.get("type") == "lora_frame":
-        print(f"#{frame['seq']} {frame['payload_len']}B CRC={'OK' if frame['crc_valid'] else 'FAIL'}")
+        snr = frame.get("phy", {}).get("snr_db")
+        ch = frame.get("rx_channel")
+        info = f"#{frame['seq']} {frame['payload_len']}B CRC={'OK' if frame['crc_valid'] else 'FAIL'}"
+        if snr is not None:
+            info += f" SNR={snr:.1f}dB"
+        if ch is not None:
+            info += f" ch={ch}"
+        print(info)
 ```
 
 ```python
+# Send TX request to lora_trx via UDP
 import socket
 import cbor2
 
-# Send TX request to lora_trx via UDP
 packet = bytes.fromhex("48656C6C6F")  # "Hello"
 msg = cbor2.dumps({"type": "lora_tx", "payload": packet})
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

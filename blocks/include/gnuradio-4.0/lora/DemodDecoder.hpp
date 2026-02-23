@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
-#ifndef GNURADIO_LORA_SYMBOL_DEMODULATOR_HPP
-#define GNURADIO_LORA_SYMBOL_DEMODULATOR_HPP
+#ifndef GNURADIO_LORA_DEMOD_DECODER_HPP
+#define GNURADIO_LORA_DEMOD_DECODER_HPP
 
 #include <algorithm>
 #include <cmath>
@@ -21,72 +21,65 @@
 
 namespace gr::lora {
 
-/// SymbolDemodulator: aligned IQ symbol blocks -> decoded payload bytes.
+/// DemodDecoder: aligned IQ symbol blocks -> decoded payload bytes.
 ///
 /// Full LoRa RX decode pipeline in a single block:
-///   dechirp + FFT -> Gray mapping -> deinterleave -> Hamming decode
+///   dechirp+FFT -> gray demap -> deinterleave -> Hamming decode
 ///   -> header parse -> dewhiten -> CRC verify
 ///
-/// Processes symbols in groups: first 8 symbols are the header block
-/// (sf_app=sf-2, cw_len=8), then payload blocks of cw_len=(4+cr) each.
+/// Interface contract:
+///   Input:  cf32 stream, N (= 2^sf) samples per symbol, from FrameSync.
+///   Output: uint8 decoded payload bytes.
+///   msg_out: publishes {payload, crc_valid, is_downchirp} per decoded frame.
 ///
-/// Input:  N (= 2^sf) complex samples per symbol, from BurstDetector.
-/// Output: decoded payload bytes.
-/// Message port: publishes decoded payload + CRC status.
+/// Tag protocol:
+///   Reads `burst_start` tag with {sf, cfo_int, cfo_frac, is_downchirp,
+///   snr_db, rx_channel}. Publishes output tag with {pay_len, cr,
+///   crc_valid, is_downchirp, snr_db, rx_channel} at the first output byte.
 ///
-/// State machine:
-///   IDLE    -> waiting for burst_start tag
-///   HEADER  -> accumulating 8 header symbols
-///   PAYLOAD -> accumulating payload symbols, emitting decoded bytes at end
-struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwarding> {
+/// Rate: variable (N*num_symbols cf32 -> pay_len uint8), manual consume/publish.
+struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
     gr::PortIn<std::complex<float>>  in;
     gr::PortOut<uint8_t>             out;
-    gr::MsgPortOut                   msg_out;  ///< decoded payload message
+    gr::MsgPortOut                   msg_out;
 
-    // Configuration
     uint8_t  sf           = 8;
-    uint32_t bandwidth    = 62500;     ///< LoRa bandwidth in Hz (for LDRO auto-detect)
+    uint32_t bandwidth    = 62500;
     bool     impl_head    = false;
-    uint8_t  impl_cr      = 4;        ///< CR for implicit header mode
-    uint8_t  impl_pay_len = 0;        ///< payload len for implicit header mode
-    bool     impl_has_crc = true;     ///< CRC flag for implicit header mode
-    uint8_t  ldro_mode    = 2;        ///< 0=off, 1=on, 2=auto
+    uint8_t  impl_cr      = 4;
+    uint8_t  impl_pay_len = 0;
+    bool     impl_has_crc = true;
+    uint8_t  ldro_mode    = 2;  // 0=off, 1=on, 2=auto
+    bool     debug        = false;
 
-    GR_MAKE_REFLECTABLE(SymbolDemodulator, in, out, msg_out,
-                        sf, bandwidth, impl_head, impl_cr, impl_pay_len, impl_has_crc, ldro_mode);
+    GR_MAKE_REFLECTABLE(DemodDecoder, in, out, msg_out,
+                        sf, bandwidth, impl_head, impl_cr, impl_pay_len, impl_has_crc, ldro_mode, debug);
 
-    // --- Internal state ---
     enum State : uint8_t { IDLE, HEADER, PAYLOAD };
 
     State    _state = IDLE;
-    uint32_t _N     = 0;   ///< 2^sf
+    uint32_t _N     = 0;
 
-    // CFO parameters (from burst_start tag)
     int      _cfo_int  = 0;
     float    _cfo_frac = 0.f;
-    bool     _is_downchirp = false;  ///< true if burst uses downchirp preamble
-    double   _snr_db = 0.0;         ///< preamble SNR from BurstDetector
-    int64_t  _rx_channel = -1;      ///< RX channel index (-1 = not set)
+    bool     _is_downchirp = false;
+    double   _snr_db = 0.0;
+    int64_t  _rx_channel = -1;
 
-    // Reference downchirp (built with CFO baked in)
     std::vector<std::complex<float>> _downchirp;
     std::vector<std::complex<float>> _dechirped;
 
-    // Symbol accumulation
-    std::vector<uint16_t> _symbol_buffer;  ///< accumulated symbols for current block
-    uint32_t _total_symbols_rx = 0;        ///< total symbols received in this frame
+    std::vector<uint16_t> _symbol_buffer;
+    uint32_t _total_symbols_rx = 0;
 
-    // Header decode results
     uint8_t  _cr       = 4;
     uint32_t _pay_len  = 0;
     bool     _has_crc  = true;
     bool     _ldro     = false;
-    uint32_t _symb_numb = 0;  ///< total payload symbols expected
+    uint32_t _symb_numb = 0;
 
-    // Nibble accumulation (across deinterleave blocks)
     std::vector<uint8_t> _nibbles;
 
-    // FFT engine
     gr::algorithm::FFT<std::complex<float>> _fft;
 
     void start() { recalculate(); }
@@ -96,7 +89,6 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
         _downchirp.resize(_N);
         _dechirped.resize(_N);
 
-        // Default downchirp (will be rebuilt with CFO on burst_start)
         std::vector<std::complex<float>> upchirp(_N);
         build_ref_chirps(upchirp.data(), _downchirp.data(), sf, 1);
 
@@ -104,7 +96,6 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
         _state = IDLE;
     }
 
-    /// Build the reference downchirp with CFO baked in.
     void buildDownchirpWithCFO() {
         std::vector<std::complex<float>> upchirp(_N);
         build_upchirp(upchirp.data(),
@@ -113,7 +104,6 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
         for (uint32_t n = 0; n < _N; n++) {
             _downchirp[n] = std::conj(upchirp[n]);
         }
-        // Apply CFO_frac correction
         for (uint32_t n = 0; n < _N; n++) {
             float phase = -2.f * static_cast<float>(std::numbers::pi) * _cfo_frac
                         / static_cast<float>(_N) * static_cast<float>(n);
@@ -121,45 +111,35 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
         }
     }
 
-    /// Dechirp one symbol -> raw symbol value (argmax - 1).
-    /// Gray mapping and header division happen in processBlock().
     [[nodiscard]] uint16_t demodSymbol(const std::complex<float>* samples) {
         auto max_idx = dechirp_argmax(samples, _downchirp.data(),
                                       _dechirped.data(), _N, _fft);
-        // Subtract 1 (cancel TX +1 offset)
         return static_cast<uint16_t>(
             mod(static_cast<int64_t>(max_idx) - 1, static_cast<int64_t>(_N)));
     }
 
-    /// Gray demapping: x ^ (x >> 1)
     [[nodiscard]] static uint16_t grayMap(uint16_t symbol) {
         return static_cast<uint16_t>(symbol ^ (symbol >> 1));
     }
 
-    /// Process a complete interleaver block of symbols -> nibbles.
-    /// Order: GrayMapping -> header_divide -> Deinterleave -> HammingDec
     [[nodiscard]] std::vector<uint8_t> processBlock(
             const std::vector<uint16_t>& symbols,
             uint8_t sf_app, uint8_t cw_len, uint8_t cr_app,
             bool is_header_block) {
-        // Step 1: Gray demapping (BEFORE divide-by-4)
         std::vector<uint16_t> gray_syms;
         gray_syms.reserve(symbols.size());
         for (auto s : symbols) {
             gray_syms.push_back(grayMap(s));
         }
 
-        // Step 2: For header/LDRO blocks, divide by 4 (right-shift by SF - sf_app)
         if (is_header_block) {
             for (auto& s : gray_syms) {
                 s >>= (sf - sf_app);
             }
         }
 
-        // Step 3: Deinterleave
         auto codewords = deinterleave_block(gray_syms, sf, cw_len, sf_app);
 
-        // Hamming decode
         std::vector<uint8_t> nibbles;
         nibbles.reserve(codewords.size());
         for (auto cw : codewords) {
@@ -169,19 +149,15 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
         return nibbles;
     }
 
-    /// Decode the accumulated nibbles into payload bytes.
-    /// Handles header parsing, dewhitening, CRC verification, and output.
     void decodeFrame(std::span<uint8_t> out_span, std::size_t& out_idx) {
         if (_nibbles.size() < 5 && !impl_head) return;
 
-        // --- Header decode ---
         std::size_t data_start = 0;
         if (!impl_head) {
             auto info = parse_explicit_header(
                 _nibbles[0], _nibbles[1], _nibbles[2], _nibbles[3], _nibbles[4]);
 
             if (!info.checksum_valid || info.payload_len == 0) {
-                // Header error -- discard
                 return;
             }
 
@@ -196,17 +172,14 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
             data_start = 0;
         }
 
-        // --- Dewhitening ---
         uint32_t total_data_nibs = _pay_len * 2 + (_has_crc ? 4 : 0);
         std::size_t avail_nibs = (_nibbles.size() > data_start)
                                ? _nibbles.size() - data_start : 0;
         std::size_t use_nibs = std::min(static_cast<std::size_t>(total_data_nibs), avail_nibs);
-        // Round down to even (need pairs)
         use_nibs &= ~std::size_t{1};
         auto decoded_bytes = dewhiten(
             std::span<const uint8_t>(&_nibbles[data_start], use_nibs), _pay_len);
 
-        // --- CRC verification ---
         bool crc_valid = true;
         if (_has_crc && _pay_len >= 2
             && decoded_bytes.size() >= _pay_len + 2u) {
@@ -216,14 +189,17 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
                 decoded_bytes[_pay_len + 1]);
         }
 
-        // --- Output payload bytes ---
+        if (debug) {
+            std::fprintf(stderr, "[DemodDecoder] frame: pay_len=%u cr=%u crc=%s nibbles=%zu\n",
+                         _pay_len, _cr, crc_valid ? "OK" : "FAIL", _nibbles.size());
+        }
+
         for (uint32_t i = 0; i < _pay_len && out_idx < out_span.size(); i++) {
             if (i < decoded_bytes.size()) {
                 out_span[out_idx++] = decoded_bytes[i];
             }
         }
 
-        // --- Publish tag ---
         gr::property_map out_tag;
         out_tag["pay_len"]       = gr::pmt::Value(static_cast<int64_t>(_pay_len));
         out_tag["cr"]            = gr::pmt::Value(static_cast<int64_t>(_cr));
@@ -235,7 +211,6 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
         }
         this->publishTag(out_tag, 0UZ);
 
-        // --- Publish message ---
         std::string payload_str;
         for (uint32_t i = 0; i < _pay_len && i < decoded_bytes.size(); i++) {
             payload_str.push_back(static_cast<char>(decoded_bytes[i]));
@@ -262,7 +237,6 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
             const auto& tag = this->mergedInputTag();
             if (auto it = tag.map.find("burst_start"); it != tag.map.end()) {
                 if (it->second.value_or<bool>(false)) {
-                    // new burst — reset and start header accumulation
                     if (auto sf_it = tag.map.find("sf"); sf_it != tag.map.end()) {
                         auto new_sf = static_cast<uint8_t>(sf_it->second.value_or<int64_t>(sf));
                         if (new_sf != sf) {
@@ -292,10 +266,16 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
                         _rx_channel = -1;
                     }
 
+                    if (debug) {
+                        std::fprintf(stderr, "[DemodDecoder] IDLE->HEADER: sf=%u cfo_int=%d cfo_frac=%.3f snr=%.1f dB%s\n",
+                                     sf, _cfo_int, static_cast<double>(_cfo_frac),
+                                     static_cast<double>(_snr_db),
+                                     _is_downchirp ? " (downchirp)" : "");
+                    }
+
                     buildDownchirpWithCFO();
 
-                    // Determine LDRO mode
-                    if (ldro_mode == 2) {  // AUTO
+                    if (ldro_mode == 2) {
                         _ldro = (static_cast<float>(1u << sf) * 1e3f
                                 / static_cast<float>(bandwidth)) > LDRO_MAX_DURATION_MS;
                     } else {
@@ -307,19 +287,17 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
                     _nibbles.clear();
                     _total_symbols_rx = 0;
                     _symb_numb = 0;
-                    _cr = 4;  // header always uses CR=4
+                    _cr = 4;
                 }
             }
         }
 
         if (_state == IDLE) {
-            // Consume all input to prevent scheduler deadlock.
             std::ignore = input.consume(in_span.size());
             output.publish(0UZ);
             return gr::work::Status::OK;
         }
         if (in_span.size() < _N) {
-            // Not enough for a full symbol -- consume to allow EOS
             std::ignore = input.consume(in_span.size());
             output.publish(0UZ);
             return gr::work::Status::OK;
@@ -329,28 +307,29 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
         std::size_t out_idx = 0;
 
         while (in_idx + _N <= in_span.size()) {
-            // Demodulate one symbol (raw argmax-1, no divide-by-4)
             uint16_t symbol = demodSymbol(&in_span[in_idx]);
             _symbol_buffer.push_back(symbol);
             _total_symbols_rx++;
             in_idx += _N;
 
             if (_state == HEADER) {
-                // Header block: 8 symbols, sf_app = sf-2, cw_len = 8, cr_app = 4
                 if (_symbol_buffer.size() == 8) {
                     auto header_nibbles = processBlock(
                         _symbol_buffer,
-                        static_cast<uint8_t>(sf - 2),  // sf_app
-                        8,                              // cw_len
-                        4,                              // cr_app (always 4 for header)
-                        true);
+                        static_cast<uint8_t>(sf - 2),
+                        8, 4, true);
                     _nibbles.insert(_nibbles.end(), header_nibbles.begin(), header_nibbles.end());
                     _symbol_buffer.clear();
 
-                    // Parse header to determine payload parameters
                     if (!impl_head && _nibbles.size() >= 5) {
                         auto info = parse_explicit_header(
                             _nibbles[0], _nibbles[1], _nibbles[2], _nibbles[3], _nibbles[4]);
+
+                        if (debug) {
+                            std::fprintf(stderr, "[DemodDecoder] header: pay_len=%u cr=%u has_crc=%d checksum=%s\n",
+                                         info.payload_len, info.cr, info.has_crc,
+                                         info.checksum_valid ? "OK" : "FAIL");
+                        }
 
                         if (!info.checksum_valid || info.payload_len == 0) {
                             _state = IDLE;
@@ -361,7 +340,6 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
                         _cr      = info.cr;
                         _has_crc = info.has_crc;
 
-                        // Calculate total payload symbols
                         _symb_numb = 8 + static_cast<uint32_t>(
                             std::ceil(static_cast<double>(
                                 2 * _pay_len - sf + 2 + 5 + (_has_crc ? 4 : 0))
@@ -372,48 +350,35 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
                     _state = PAYLOAD;
                 }
             } else if (_state == PAYLOAD) {
-                // Payload blocks: cw_len = 4+cr symbols each
                 uint8_t cw_len = 4 + _cr;
                 uint8_t sf_app = _ldro ? static_cast<uint8_t>(sf - 2) : sf;
 
                 if (_symbol_buffer.size() == cw_len) {
                     auto payload_nibbles = processBlock(
-                        _symbol_buffer,
-                        sf_app,
-                        cw_len,
-                        _cr,
-                        false);
+                        _symbol_buffer, sf_app, cw_len, _cr, false);
                     _nibbles.insert(_nibbles.end(),
                                     payload_nibbles.begin(), payload_nibbles.end());
                     _symbol_buffer.clear();
                 }
 
-                // Check if we have all symbols
                 if (_symb_numb > 0 && _total_symbols_rx >= _symb_numb) {
-                    // Process any remaining symbols in buffer
                     if (!_symbol_buffer.empty()) {
                         uint8_t remaining_cw_len = 4 + _cr;
                         uint8_t remaining_sf_app = _ldro ? static_cast<uint8_t>(sf - 2) : sf;
-                        // Pad with zeros if needed
                         while (_symbol_buffer.size() < remaining_cw_len) {
                             _symbol_buffer.push_back(0);
                         }
                         auto last_nibbles = processBlock(
-                            _symbol_buffer,
-                            remaining_sf_app,
-                            remaining_cw_len,
-                            _cr,
-                            false);
+                            _symbol_buffer, remaining_sf_app, remaining_cw_len, _cr, false);
                         _nibbles.insert(_nibbles.end(),
                                         last_nibbles.begin(), last_nibbles.end());
                         _symbol_buffer.clear();
                     }
 
-                    // Decode the complete frame
                     decodeFrame(out_span, out_idx);
 
                     _state = IDLE;
-                    break;  // stop consuming more symbols for this frame
+                    break;
                 }
             }
         }
@@ -426,4 +391,4 @@ struct SymbolDemodulator : gr::Block<SymbolDemodulator, gr::NoDefaultTagForwardi
 
 }  // namespace gr::lora
 
-#endif  // GNURADIO_LORA_SYMBOL_DEMODULATOR_HPP
+#endif  // GNURADIO_LORA_DEMOD_DECODER_HPP

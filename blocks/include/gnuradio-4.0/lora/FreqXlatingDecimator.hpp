@@ -12,7 +12,7 @@
 //   3. Decimate: output every `decimation`-th filtered sample
 //
 // The block manages its own input/output via consume/publish in processBulk,
-// similar to BurstDetector.
+// similar to FrameSync.
 
 #ifndef GNURADIO_LORA_FREQ_XLATING_DECIMATOR_HPP
 #define GNURADIO_LORA_FREQ_XLATING_DECIMATOR_HPP

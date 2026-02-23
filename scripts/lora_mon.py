@@ -3,7 +3,7 @@
 """
 lora_mon.py -- LoRa streaming monitor.
 
-Connects to a lora_trx/lora_rx UDP server and displays decoded frames.
+Connects to a lora_trx UDP server and displays decoded frames.
 
 Usage:
     lora_mon.py                           # connects to 127.0.0.1:5555
@@ -134,7 +134,7 @@ def format_frame(msg: dict[str, Any]) -> str:
 
 
 def connect_udp(host: str, port: int) -> None:
-    """Connect to a lora_trx/lora_rx UDP server and display frames."""
+    """Connect to a lora_trx UDP server and display frames."""
     # Resolve address family
     af = socket.AF_INET
     if ":" in host:
@@ -187,7 +187,7 @@ def connect_udp(host: str, port: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="LoRa streaming monitor -- connects to lora_trx/lora_rx UDP server"
+        description="LoRa streaming monitor -- connects to lora_trx UDP server"
     )
     parser.add_argument(
         "--connect",

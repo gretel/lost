@@ -44,7 +44,7 @@ volatile std::size_t g_sink = 0;
 
 /// Standalone RX decode of a frame's payload symbols (algorithm-level).
 ///
-/// This mirrors SymbolDemodulator's internal pipeline but without the
+/// This mirrors the DemodDecoder pipeline but without the
 /// GR4 block machinery, measuring pure decode throughput.
 struct AlgorithmRxDecoder {
     gr::algorithm::FFT<std::complex<float>> fft;

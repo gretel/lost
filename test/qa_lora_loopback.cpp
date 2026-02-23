@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: ISC
-/// TX->RX loopback test (algorithm-level only).
+/// TX->RX loopback tests: algorithm-level and graph-level.
 /// Per-stage TX tests are in qa_lora_tx.cpp.
 
 #include "test_helpers.hpp"
@@ -7,6 +7,12 @@
 #include <chrono>
 #include <cstdio>
 
+#include <gnuradio-4.0/Graph.hpp>
+#include <gnuradio-4.0/Scheduler.hpp>
+#include <gnuradio-4.0/testing/TagMonitors.hpp>
+
+#include <gnuradio-4.0/lora/FrameSync.hpp>
+#include <gnuradio-4.0/lora/DemodDecoder.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
 using namespace gr::lora::test;
@@ -417,6 +423,129 @@ const boost::ut::suite<"Loopback timing"> timing_tests = [] {
         // Must be at least 1x real-time (decode faster than airtime)
         expect(gt(margin, 1.0))
             << "Decode slower than real-time: " << margin << "x";
+    };
+};
+
+// ============================================================================
+// Graph-level loopback: TX IQ -> FrameSync -> DemodDecoder -> payload
+// This exercises the same pipeline as lora_trx.
+// ============================================================================
+
+const boost::ut::suite<"Graph-level loopback"> graph_loopback_tests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace gr::lora;
+
+    auto run_graph_loopback = [](const std::vector<uint8_t>& payload,
+                                 uint8_t test_sf, uint8_t test_cr,
+                                 uint32_t test_bw, uint8_t os_factor,
+                                 uint16_t sync_word, uint16_t preamble_len,
+                                 const std::string& label) {
+        uint32_t sps = (1u << test_sf) * os_factor;
+        auto iq = generate_frame_iq(payload, test_sf, test_cr, os_factor,
+                                    sync_word, preamble_len,
+                                    true, sps * 5, 2, test_bw, false);
+
+        Graph graph;
+        auto& src = graph.emplaceBlock<testing::TagSource<std::complex<float>,
+            testing::ProcessFunction::USE_PROCESS_BULK>>({
+            {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
+            {"repeat_tags", false},
+            {"mark_tag", false}
+        });
+        src.values = iq;
+
+        auto& sync = graph.emplaceBlock<FrameSync>();
+        sync.center_freq  = CENTER_FREQ;
+        sync.bandwidth    = test_bw;
+        sync.sf           = test_sf;
+        sync.sync_word    = sync_word;
+        sync.os_factor    = os_factor;
+        sync.preamble_len = preamble_len;
+
+        auto& demod = graph.emplaceBlock<DemodDecoder>();
+        demod.sf        = test_sf;
+        demod.bandwidth = test_bw;
+
+        auto& sink = graph.emplaceBlock<testing::TagSink<uint8_t,
+            testing::ProcessFunction::USE_PROCESS_BULK>>({
+            {"log_samples", true},
+            {"log_tags", true}
+        });
+
+        (void)graph.connect<"out">(src).template to<"in">(sync);
+        (void)graph.connect<"out">(sync).template to<"in">(demod);
+        (void)graph.connect<"out">(demod).template to<"in">(sink);
+
+        scheduler::Simple sched;
+        if (auto ret = sched.exchange(std::move(graph)); !ret) {
+            throw std::runtime_error(std::format("failed to init scheduler: {}", ret.error()));
+        }
+        sched.runAndWait();
+
+        std::printf("  %s: %zu bytes output (expected %zu)\n",
+                    label.c_str(), sink._samples.size(), payload.size());
+
+        expect(ge(sink._samples.size(), payload.size()))
+            << label << " output too small: " << sink._samples.size();
+
+        if (sink._samples.size() >= payload.size()) {
+            std::string decoded(sink._samples.begin(),
+                                sink._samples.begin()
+                                + static_cast<std::ptrdiff_t>(payload.size()));
+            std::string expected(payload.begin(), payload.end());
+            expect(eq(decoded, expected))
+                << label << " payload mismatch: \"" << decoded << "\"";
+        }
+
+        bool found_crc = false;
+        for (const auto& t : sink._tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                expect(it->second.value_or<bool>(false))
+                    << label << " CRC should be valid";
+                found_crc = true;
+            }
+        }
+        expect(found_crc) << label << " should have crc_valid tag";
+    };
+
+    "MeshCore ADVERT-like payload through graph"_test = [&run_graph_loopback] {
+        // MeshCore ADVERT header: version + route + payload_type + flags + 32B pubkey + name
+        // Use 48 bytes — realistic ADVERT size (truncated name)
+        std::vector<uint8_t> advert(48);
+        advert[0] = 0x01;  // version
+        advert[1] = 0x00;  // route: FLOOD
+        advert[2] = 0x01;  // payload: ADVERT
+        for (std::size_t i = 3; i < advert.size(); i++) {
+            advert[i] = static_cast<uint8_t>(i & 0xFF);
+        }
+        run_graph_loopback(advert, SF, CR, BW, OS_FACTOR,
+                           SYNC_WORD, PREAMBLE_LEN, "MeshCore ADVERT (48B)");
+    };
+
+    "MeshCore TXT_MSG-like payload through graph"_test = [&run_graph_loopback] {
+        // Typical TXT_MSG: ~22 bytes
+        std::vector<uint8_t> msg = {
+            0x01,       // version
+            0x00,       // route: FLOOD
+            0x06,       // payload: TXT_MSG
+            'H', 'e', 'l', 'l', 'o', ' ', 'f', 'r', 'o', 'm', ' ',
+            'l', 'o', 'r', 'a', '_', 't', 'r', 'x'
+        };
+        run_graph_loopback(msg, SF, CR, BW, OS_FACTOR,
+                           SYNC_WORD, PREAMBLE_LEN, "MeshCore TXT_MSG (22B)");
+    };
+
+    "Short payload (5B) through graph at os_factor=1"_test = [&run_graph_loopback] {
+        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o'};
+        run_graph_loopback(payload, SF, CR, BW, 1,
+                           SYNC_WORD, PREAMBLE_LEN, "Hello (5B, os=1)");
+    };
+
+    "Empty-ish payload (1B) through graph"_test = [&run_graph_loopback] {
+        std::vector<uint8_t> payload = {0x42};
+        run_graph_loopback(payload, SF, CR, BW, OS_FACTOR,
+                           SYNC_WORD, PREAMBLE_LEN, "Single byte (1B)");
     };
 };
 

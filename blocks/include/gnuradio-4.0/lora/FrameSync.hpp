@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
-#ifndef GNURADIO_LORA_BURST_DETECTOR_HPP
-#define GNURADIO_LORA_BURST_DETECTOR_HPP
+#ifndef GNURADIO_LORA_FRAME_SYNC_HPP
+#define GNURADIO_LORA_FRAME_SYNC_HPP
 
 #include <algorithm>
 #include <cmath>
@@ -54,19 +54,19 @@ inline void complex_multiply(std::complex<float>* out, const std::complex<float>
 
 }  // namespace detail
 
-/// BurstDetector: IQ samples -> aligned, downsampled, CFO/STO-corrected symbol blocks.
+/// FrameSync: IQ samples -> aligned, downsampled, CFO/STO-corrected symbol blocks.
 ///
 /// Scans for LoRa preamble (consecutive upchirps), estimates CFO (integer +
 /// fractional), STO (fractional), and SFO, then outputs aligned N-sample
 /// symbol blocks until burst energy drops below threshold.
 ///
-/// Tags each burst start with `{sf, cfo_int, cfo_frac, burst_start}`.
+/// Tags each burst start with `{sf, cfo_int, cfo_frac, burst_start, snr_db, rx_channel}`.
 ///
 /// State machine:
 ///   DETECT -> look for preamble_len-3 consecutive upchirps
 ///   SYNC   -> estimate CFO/STO/SFO, verify sync word, align timing
 ///   OUTPUT -> emit aligned symbols until energy drops or max symbols reached
-struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
+struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
     gr::PortIn<std::complex<float>>  in;
     gr::PortOut<std::complex<float>> out;
 
@@ -80,10 +80,11 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
     float    energy_thresh = 1e-6f;  ///< minimum symbol energy to continue output
     uint32_t max_symbols  = 256;     ///< safety limit on symbols per burst
     int32_t  rx_channel   = -1;      ///< RX channel index (-1 = not set)
+    bool     debug        = false;
 
-    GR_MAKE_REFLECTABLE(BurstDetector, in, out,
+    GR_MAKE_REFLECTABLE(FrameSync, in, out,
                         center_freq, bandwidth, sf, sync_word, os_factor, preamble_len,
-                        energy_thresh, max_symbols, rx_channel);
+                        energy_thresh, max_symbols, rx_channel, debug);
 
     // --- Internal state ---
     enum State : uint8_t { DETECT, SYNC, OUTPUT };
@@ -395,6 +396,11 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
                 break;
             }
 
+            if (debug && _symbol_cnt > 2) {
+                std::fprintf(stderr, "[FrameSync] DETECT: cnt=%d bin=%d new=%d\n",
+                             _symbol_cnt, _bin_idx, _bin_idx_new);
+            }
+
             // Look for consecutive reference upchirps (within +/-kPreambleBinTolerance)
             if (std::abs(mod(std::abs(_bin_idx_new - _bin_idx) + 1, static_cast<int64_t>(_N)) - 1)
                     <= kPreambleBinTolerance && _bin_idx_new != -1) {
@@ -429,6 +435,9 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
             _bin_idx = _bin_idx_new;
 
             if (static_cast<uint32_t>(_symbol_cnt) == _n_up_req) {
+                if (debug) {
+                    std::fprintf(stderr, "[FrameSync] DETECT->SYNC: k_hat=%d\n", _k_hat);
+                }
                 _additional_upchirps = 0;
                 _state = SYNC;
                 _sync_phase = NET_ID1;
@@ -687,9 +696,13 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
                     break;
                 }
 
-                // Sync succeeded -- estimate SNR, transition to OUTPUT
                 _snr_db = determine_snr();
                 _state = OUTPUT;
+                if (debug) {
+                    std::fprintf(stderr, "[FrameSync] SYNC->OUTPUT: cfo_int=%d cfo_frac=%.3f sto_frac=%.3f snr=%.1f dB\n",
+                                 _cfo_int, static_cast<double>(_cfo_frac),
+                                 static_cast<double>(_sto_frac), static_cast<double>(_snr_db));
+                }
                 _output_symb_cnt = 0;
                 _burst_tag_published = false;
 
@@ -713,13 +726,16 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
         case OUTPUT: {
             if (!has_energy(_in_down.data(), _N)
                 || _output_symb_cnt >= max_symbols) {
+                if (debug) {
+                    std::fprintf(stderr, "[FrameSync] OUTPUT->DETECT: %u symbols emitted\n",
+                                 _output_symb_cnt);
+                }
                 resetToDetect();
                 _items_to_consume = static_cast<int>(_sps);
                 items_to_output = 0;
                 break;
             }
 
-            // Publish burst_start tag on first symbol
             if (!_burst_tag_published) {
                 gr::property_map tag;
                 tag["burst_start"]  = gr::pmt::Value(true);
@@ -766,4 +782,4 @@ struct BurstDetector : gr::Block<BurstDetector, gr::NoDefaultTagForwarding> {
 
 }  // namespace gr::lora
 
-#endif  // GNURADIO_LORA_BURST_DETECTOR_HPP
+#endif  // GNURADIO_LORA_FRAME_SYNC_HPP

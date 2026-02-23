@@ -9,7 +9,7 @@ framing, and prints decoded information.
 Only processes frames where sync_word == 0x12 (MeshCore/Reticulum).
 Frames with other sync words are passed through with minimal annotation.
 
-Note: for live monitoring, use lora_mon.py (reads UDP from lora_rx).
+Note: for live monitoring, use lora_mon.py (reads UDP from lora_trx).
 This script is for offline analysis of saved CBOR streams.
 
 Usage:

@@ -85,7 +85,7 @@ const boost::ut::suite<"FFTDemod block"> fft_demod_tests = [] {
         }
 
         // Raw dechirp argmax should directly be the symbol value
-        // (the -1 offset is only in the full RX chain after GrayDemap adds +1 on TX side)
+        // (the -1 offset is only in the full RX chain after gray_demap adds +1 on TX side)
         expect(eq(static_cast<uint16_t>(max_idx), static_cast<uint16_t>(test_symbol)))
             << "FFT dechirp: expected argmax " << test_symbol << " got " << max_idx;
     };

@@ -61,5 +61,5 @@ and Reticulum share sync_word=0x12 — they are indistinguishable at the
 PHY layer. FrameSink outputs the raw sync word value; application-layer
 parsers (Python decoder scripts) classify based on payload structure.
 
-For a multi-protocol scanner, run parallel BurstDetector instances with
+For a multi-protocol scanner, run parallel FrameSync instances with
 different sync_word settings (0x12, 0x2B, 0x34).

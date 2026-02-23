@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: ISC
-/// Tests for the 2-block LoRa RX architecture: BurstDetector + SymbolDemodulator.
+/// Tests for the 2-block LoRa RX pipeline:
+///   FrameSync → DemodDecoder
 ///
 /// Test progression:
-///   1. SymbolDemodulator algorithm-level (bypass BurstDetector, feed aligned symbols)
-///   2. BurstDetector + SymbolDemodulator graph: GR3 IQ → decoded payload
+///   1. DemodDecoder algorithm-level (bypass FrameSync, feed aligned symbols)
+///   2. Full pipeline graph: GR3 IQ → decoded payload
 ///   3. Multi-frame: two back-to-back frames
 ///   4. Robustness: AWGN + CFO
 
@@ -17,8 +18,8 @@
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
-#include <gnuradio-4.0/lora/BurstDetector.hpp>
-#include <gnuradio-4.0/lora/SymbolDemodulator.hpp>
+#include <gnuradio-4.0/lora/FrameSync.hpp>
+#include <gnuradio-4.0/lora/DemodDecoder.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
 using namespace gr::lora::test;
@@ -65,7 +66,7 @@ void apply_cfo(std::vector<std::complex<float>>& iq, float cfo_hz, float sample_
     }
 }
 
-/// Helper: run a full BurstDetector + SymbolDemodulator graph on given IQ data.
+/// Helper: run the full RX pipeline on given IQ data.
 /// Returns {decoded_bytes, tags}.
 struct DecodeResult {
     std::vector<uint8_t> samples;
@@ -86,15 +87,15 @@ DecodeResult run_decode(const std::vector<std::complex<float>>& iq) {
     });
     src.values = iq;
 
-    auto& burst = graph.emplaceBlock<BurstDetector>();
-    burst.center_freq  = CENTER_FREQ;
-    burst.bandwidth    = BW;
-    burst.sf           = SF;
-    burst.sync_word    = SYNC_WORD;
-    burst.os_factor    = OS_FACTOR;
-    burst.preamble_len = PREAMBLE_LEN;
+    auto& sync = graph.emplaceBlock<FrameSync>();
+    sync.center_freq  = CENTER_FREQ;
+    sync.bandwidth    = BW;
+    sync.sf           = SF;
+    sync.sync_word    = SYNC_WORD;
+    sync.os_factor    = OS_FACTOR;
+    sync.preamble_len = PREAMBLE_LEN;
 
-    auto& demod = graph.emplaceBlock<SymbolDemodulator>();
+    auto& demod = graph.emplaceBlock<DemodDecoder>();
     demod.sf        = SF;
     demod.bandwidth = BW;
 
@@ -104,8 +105,8 @@ DecodeResult run_decode(const std::vector<std::complex<float>>& iq) {
         {"log_tags", true}
     });
 
-    (void)graph.connect<"out">(src).template to<"in">(burst);
-    (void)graph.connect<"out">(burst).template to<"in">(demod);
+    (void)graph.connect<"out">(src).template to<"in">(sync);
+    (void)graph.connect<"out">(sync).template to<"in">(demod);
     (void)graph.connect<"out">(demod).template to<"in">(sink);
 
     scheduler::Simple sched;
@@ -120,17 +121,17 @@ DecodeResult run_decode(const std::vector<std::complex<float>>& iq) {
 } // namespace
 
 // ============================================================================
-// Test 1: SymbolDemodulator algorithm-level
-//   Feed aligned, downsampled symbols directly (bypassing BurstDetector).
+// Test 1: DemodDecoder algorithm-level
+//   Feed aligned, downsampled symbols directly (bypassing FrameSync).
 //   Uses the GR3 test vector IQ but only the payload symbols (after preamble).
 // ============================================================================
 
-const boost::ut::suite<"SymbolDemodulator algorithm-level"> symdemod_algo_tests = [] {
+const boost::ut::suite<"Decode pipeline algorithm-level"> decode_algo_tests = [] {
     using namespace boost::ut;
     using namespace gr;
     using namespace gr::lora;
 
-    "SymbolDemodulator decodes Hello MeshCore from aligned symbols"_test = [] {
+    "DemodDecoder decodes Hello MeshCore from aligned symbols"_test = [] {
         auto iq = load_cf32("tx_07_iq_frame.cf32");
         auto expected_payload = load_text("payload.txt");
 
@@ -144,8 +145,8 @@ const boost::ut::suite<"SymbolDemodulator algorithm-level"> symdemod_algo_tests 
         // Build aligned symbol blocks (N samples each, downsampled from os_factor)
         // NOTE: use offset 0, NOT OS_FACTOR/2. The chirp phase formula means
         // that samples at indices 0, OS, 2*OS, ... match the os_factor=1 chirp
-        // used by SymbolDemodulator's dechirp reference. Offset OS/2 causes
-        // the FFT peak to fall between bins (scalloping), giving ±1 errors.
+        // used by DemodDecoder's dechirp reference. Offset OS/2 causes
+        // the FFT peak to fall between bins (scalloping), giving +/-1 errors.
         std::vector<std::complex<float>> aligned_symbols;
         for (std::size_t s = 0; s < n_payload_syms; s++) {
             std::size_t sym_start = payload_start + s * SPS;
@@ -174,7 +175,7 @@ const boost::ut::suite<"SymbolDemodulator algorithm-level"> symdemod_algo_tests 
                       {"cfo_frac", gr::pmt::Value(0.0)}}}
         };
 
-        auto& demod = graph.emplaceBlock<SymbolDemodulator>();
+        auto& demod = graph.emplaceBlock<DemodDecoder>();
         demod.sf = SF;
 
         auto& sink = graph.emplaceBlock<testing::TagSink<uint8_t,
@@ -193,7 +194,7 @@ const boost::ut::suite<"SymbolDemodulator algorithm-level"> symdemod_algo_tests 
         expect(sched.runAndWait().has_value());
 
         auto& output = sink._samples;
-        std::printf("SymbolDemodulator algo: %zu bytes output (expected %zu)\n",
+        std::printf("Decode pipeline algo: %zu bytes output (expected %zu)\n",
                     output.size(), expected_payload.size());
 
         expect(ge(output.size(), expected_payload.size()))
@@ -220,20 +221,20 @@ const boost::ut::suite<"SymbolDemodulator algorithm-level"> symdemod_algo_tests 
 };
 
 // ============================================================================
-// Test 2: Full 2-block graph: BurstDetector → SymbolDemodulator
+// Test 2: Full RX pipeline: FrameSync → DemodDecoder
 //   GR3 test vector IQ → decoded "Hello MeshCore"
 // ============================================================================
 
-const boost::ut::suite<"Full 2-block RX graph"> full_graph_tests = [] {
+const boost::ut::suite<"Full RX pipeline"> full_graph_tests = [] {
     using namespace boost::ut;
 
-    "BurstDetector + SymbolDemodulator decodes Hello MeshCore"_test = [] {
+    "Full pipeline decodes Hello MeshCore"_test = [] {
         auto iq = load_cf32("tx_07_iq_frame.cf32");
         auto expected_payload = load_text("payload.txt");
 
         auto result = run_decode(iq);
 
-        std::printf("Full 2-block: %zu bytes output (expected %zu)\n",
+        std::printf("Full pipeline: %zu bytes output (expected %zu)\n",
                     result.samples.size(), expected_payload.size());
 
         expect(ge(result.samples.size(), expected_payload.size()))
@@ -415,8 +416,8 @@ const boost::ut::suite<"Robustness tests"> robustness_tests = [] {
 //
 // Design: downchirp detection uses input conjugation (conj(downchirp) = upchirp).
 // The RX conjugates the IQ stream, making downchirp frames appear as normal
-// upchirp frames to BurstDetector + SymbolDemodulator. This is the standard
-// SDR approach (two parallel chains: normal + conjugated).
+// upchirp frames to the RX pipeline. This is the standard SDR approach
+// (two parallel chains: normal + conjugated).
 //
 // These tests verify: (a) inverted_iq TX produces conjugated output,
 // (b) conjugating the input before the RX chain decodes downchirp frames.
@@ -515,9 +516,9 @@ const boost::ut::suite<"Downchirp detection"> downchirp_tests = [] {
 //
 // Diagnoses the os_factor=16 CRC_FAIL bug observed with RTL-SDR reception
 // at 1 MS/s. Uses generate_frame_iq at each os_factor with known-good data
-// to isolate whether the bug is in BurstDetector/SymbolDemodulator or in
-// the RF path. Also tests long payloads (70 bytes, typical Meshtastic) to
-// detect SFO accumulation drift that corrupts late symbols.
+// to isolate whether the bug is in the RX pipeline or in the RF path. Also
+// tests long payloads (70 bytes, typical Meshtastic) to detect SFO
+// accumulation drift that corrupts late symbols.
 //
 // Reference: gr-lora_sdr issue #91 (same symptom: <5% CRC valid at any
 // os_factor with RTL-SDR/Airspy), issue #79 (HackRF CRC fails on long
@@ -554,15 +555,15 @@ DecodeResult run_decode_os(const std::string& payload_str, uint8_t test_os_facto
     });
     src.values = iq;
 
-    auto& burst = graph.emplaceBlock<BurstDetector>();
-    burst.center_freq  = CENTER_FREQ;
-    burst.bandwidth    = BW;
-    burst.sf           = SF;
-    burst.sync_word    = SYNC_WORD;
-    burst.os_factor    = test_os_factor;
-    burst.preamble_len = PREAMBLE_LEN;
+    auto& sync = graph.emplaceBlock<FrameSync>();
+    sync.center_freq  = CENTER_FREQ;
+    sync.bandwidth    = BW;
+    sync.sf           = SF;
+    sync.sync_word    = SYNC_WORD;
+    sync.os_factor    = test_os_factor;
+    sync.preamble_len = PREAMBLE_LEN;
 
-    auto& demod = graph.emplaceBlock<SymbolDemodulator>();
+    auto& demod = graph.emplaceBlock<DemodDecoder>();
     demod.sf        = SF;
     demod.bandwidth = BW;
 
@@ -572,8 +573,8 @@ DecodeResult run_decode_os(const std::string& payload_str, uint8_t test_os_facto
         {"log_tags", true}
     });
 
-    (void)graph.connect<"out">(src).template to<"in">(burst);
-    (void)graph.connect<"out">(burst).template to<"in">(demod);
+    (void)graph.connect<"out">(src).template to<"in">(sync);
+    (void)graph.connect<"out">(sync).template to<"in">(demod);
     (void)graph.connect<"out">(demod).template to<"in">(sink);
 
     scheduler::Simple sched;
@@ -733,7 +734,7 @@ const boost::ut::suite<"Error path tests"> error_path_tests = [] {
 
         auto result = run_decode(iq);  // decoder uses SYNC_WORD=0x12
 
-        // BurstDetector should reject: no decoded output
+        // FrameSync should reject: no decoded output
         expect(eq(result.samples.size(), 0UZ))
             << "Wrong sync word should produce 0 bytes, got " << result.samples.size();
 
@@ -759,7 +760,7 @@ const boost::ut::suite<"Error path tests"> error_path_tests = [] {
 
         auto result = run_decode(iq);
 
-        // SymbolDemodulator should still output bytes, but crc_valid=false
+        // DemodDecoder should still output bytes, but crc_valid=false
         // (it always outputs payload on header success, regardless of CRC)
         if (!result.samples.empty()) {
             bool found_crc = false;

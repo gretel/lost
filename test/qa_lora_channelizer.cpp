@@ -4,7 +4,7 @@
 /// Test progression:
 ///   1. firdes_low_pass: tap count, DC gain, symmetry, stopband attenuation
 ///   2. FreqXlatingDecimator: frequency shift, decimation, FIR filtering
-///   3. Integration: wideband LoRa frame → channelizer → BurstDetector → SymbolDemodulator
+///   3. Integration: wideband LoRa frame → channelizer → FrameSync → DemodDecoder
 
 #include "test_helpers.hpp"
 
@@ -18,8 +18,8 @@
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
 #include <gnuradio-4.0/lora/FreqXlatingDecimator.hpp>
-#include <gnuradio-4.0/lora/BurstDetector.hpp>
-#include <gnuradio-4.0/lora/SymbolDemodulator.hpp>
+#include <gnuradio-4.0/lora/FrameSync.hpp>
+#include <gnuradio-4.0/lora/DemodDecoder.hpp>
 #include <gnuradio-4.0/lora/algorithm/firdes.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
@@ -437,7 +437,7 @@ const boost::ut::suite<"Channelizer integration"> integration_tests = [] {
 
         // Simple upsample-by-4: insert original samples every 4th position,
         // then shift to +50 kHz. For a proper test, we don't need perfect
-        // interpolation — the BurstDetector at os_factor=4 will handle the
+        // interpolation — the FrameSync at os_factor=4 will handle the
         // equivalent of seeing 4 samples per chip.
         for (std::size_t i = 0; i < frame_iq.size(); i++) {
             // Zero-order hold: replicate each sample 4 times (crude but
@@ -461,7 +461,7 @@ const boost::ut::suite<"Channelizer integration"> integration_tests = [] {
         }
 
         // 3. Channelize: shift -50 kHz, filter, decimate 4x → 62.5 kHz baseband
-        //    Then feed to BurstDetector (os_factor=1) + SymbolDemodulator
+        //    Then feed to FrameSync (os_factor=1) + decode pipeline
         auto taps = firdes_low_pass(65, wb_rate, 31250.0);
 
         Graph graph;
@@ -479,15 +479,15 @@ const boost::ut::suite<"Channelizer integration"> integration_tests = [] {
         xlat.decimation = upsample;
         xlat.setTaps(taps);
 
-        auto& burst = graph.emplaceBlock<BurstDetector>();
-        burst.center_freq  = CENTER_FREQ;
-        burst.bandwidth    = BW;
-        burst.sf           = SF;
-        burst.sync_word    = SYNC_WORD;
-        burst.os_factor    = 1;  // output from channelizer is at BW rate
-        burst.preamble_len = PREAMBLE_LEN;
+        auto& sync = graph.emplaceBlock<FrameSync>();
+        sync.center_freq  = CENTER_FREQ;
+        sync.bandwidth    = BW;
+        sync.sf           = SF;
+        sync.sync_word    = SYNC_WORD;
+        sync.os_factor    = 1;  // output from channelizer is at BW rate
+        sync.preamble_len = PREAMBLE_LEN;
 
-        auto& demod = graph.emplaceBlock<SymbolDemodulator>();
+        auto& demod = graph.emplaceBlock<DemodDecoder>();
         demod.sf        = SF;
         demod.bandwidth = BW;
 
@@ -498,8 +498,8 @@ const boost::ut::suite<"Channelizer integration"> integration_tests = [] {
         });
 
         (void)graph.connect<"out">(src).template to<"in">(xlat);
-        (void)graph.connect<"out">(xlat).template to<"in">(burst);
-        (void)graph.connect<"out">(burst).template to<"in">(demod);
+        (void)graph.connect<"out">(xlat).template to<"in">(sync);
+        (void)graph.connect<"out">(sync).template to<"in">(demod);
         (void)graph.connect<"out">(demod).template to<"in">(sink);
 
         scheduler::Simple sched;
@@ -552,15 +552,15 @@ const boost::ut::suite<"Channelizer integration"> integration_tests = [] {
         xlat.decimation = 1;
         // No taps: pure passthrough
 
-        auto& burst = graph.emplaceBlock<BurstDetector>();
-        burst.center_freq  = CENTER_FREQ;
-        burst.bandwidth    = BW;
-        burst.sf           = SF;
-        burst.sync_word    = SYNC_WORD;
-        burst.os_factor    = OS_FACTOR;
-        burst.preamble_len = PREAMBLE_LEN;
+        auto& sync = graph.emplaceBlock<FrameSync>();
+        sync.center_freq  = CENTER_FREQ;
+        sync.bandwidth    = BW;
+        sync.sf           = SF;
+        sync.sync_word    = SYNC_WORD;
+        sync.os_factor    = OS_FACTOR;
+        sync.preamble_len = PREAMBLE_LEN;
 
-        auto& demod = graph.emplaceBlock<SymbolDemodulator>();
+        auto& demod = graph.emplaceBlock<DemodDecoder>();
         demod.sf        = SF;
         demod.bandwidth = BW;
 
@@ -571,8 +571,8 @@ const boost::ut::suite<"Channelizer integration"> integration_tests = [] {
         });
 
         (void)graph.connect<"out">(src).template to<"in">(xlat);
-        (void)graph.connect<"out">(xlat).template to<"in">(burst);
-        (void)graph.connect<"out">(burst).template to<"in">(demod);
+        (void)graph.connect<"out">(xlat).template to<"in">(sync);
+        (void)graph.connect<"out">(sync).template to<"in">(demod);
         (void)graph.connect<"out">(demod).template to<"in">(sink);
 
         scheduler::Simple sched;
@@ -644,15 +644,15 @@ const boost::ut::suite<"Channelizer integration"> integration_tests = [] {
         xlat.decimation = upsample;
         xlat.setTaps(taps);
 
-        auto& burst = graph.emplaceBlock<BurstDetector>();
-        burst.center_freq  = CENTER_FREQ;
-        burst.bandwidth    = BW;
-        burst.sf           = SF;
-        burst.sync_word    = SYNC_WORD;
-        burst.os_factor    = 1;
-        burst.preamble_len = PREAMBLE_LEN;
+        auto& sync = graph.emplaceBlock<FrameSync>();
+        sync.center_freq  = CENTER_FREQ;
+        sync.bandwidth    = BW;
+        sync.sf           = SF;
+        sync.sync_word    = SYNC_WORD;
+        sync.os_factor    = 1;
+        sync.preamble_len = PREAMBLE_LEN;
 
-        auto& demod = graph.emplaceBlock<SymbolDemodulator>();
+        auto& demod = graph.emplaceBlock<DemodDecoder>();
         demod.sf        = SF;
         demod.bandwidth = BW;
 
@@ -663,8 +663,8 @@ const boost::ut::suite<"Channelizer integration"> integration_tests = [] {
         });
 
         (void)graph.connect<"out">(src).template to<"in">(xlat);
-        (void)graph.connect<"out">(xlat).template to<"in">(burst);
-        (void)graph.connect<"out">(burst).template to<"in">(demod);
+        (void)graph.connect<"out">(xlat).template to<"in">(sync);
+        (void)graph.connect<"out">(sync).template to<"in">(demod);
         (void)graph.connect<"out">(demod).template to<"in">(sink);
 
         scheduler::Simple sched;

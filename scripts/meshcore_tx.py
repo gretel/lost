@@ -4,17 +4,17 @@
 meshcore_tx.py -- MeshCore protocol TX message builder.
 
 Constructs MeshCore packets (ADVERT, TXT_MSG, ANON_REQ) and sends them
-to lora_tx via CBOR on stdout. Manages persistent Ed25519 identity keypairs.
+to lora_trx via CBOR over UDP. Manages persistent Ed25519 identity keypairs.
 
 Usage:
-  # Send ADVERT beacon (broadcast, uses FLOOD routing):
-  meshcore_tx.py advert --name "MyNode" | lora_tx --stdin
+  # Send ADVERT beacon via UDP to lora_trx:
+  meshcore_tx.py advert --name "MyNode" --udp 127.0.0.1:5555
 
   # Send encrypted message to a known contact (DIRECT routing):
-  meshcore_tx.py send --dest <64hex_pubkey> "Hello" | lora_tx --stdin
+  meshcore_tx.py send --dest <64hex_pubkey> --udp localhost:5555 "Hello"
 
   # Send anonymous encrypted request (includes sender pubkey):
-  meshcore_tx.py anon-req --dest <64hex_pubkey> "Hello" | lora_tx --stdin
+  meshcore_tx.py anon-req --dest <64hex_pubkey> --udp localhost:5555 "Hello"
 
   # Print contact QR code (scannable by MeshCore companion app):
   meshcore_tx.py advert --name "MyNode" --qr
@@ -483,7 +483,7 @@ def build_txt_msg(
 
 
 def make_cbor_tx_request(packet: bytes, **phy_overrides) -> bytes:
-    """Wrap a MeshCore wire packet in a CBOR TX request for lora_tx --stdin."""
+    """Wrap a MeshCore wire packet in a CBOR TX request for lora_trx."""
     msg = {
         "type": "lora_tx",
         "payload": packet,
@@ -561,23 +561,20 @@ def cmd_anon_req(args, expanded_prv: bytes, pub_key: bytes, seed: bytes) -> byte
 
 _EPILOG = """\
 examples:
-  # Broadcast ADVERT beacon via pipe to lora_tx:
-  %(prog)s advert --name "MyNode" | lora_tx
-
-  # Send via UDP to lora_trx:
+  # Broadcast ADVERT beacon via UDP to lora_trx:
   %(prog)s advert --name "MyNode" --udp 127.0.0.1:5555
 
   # Print contact QR code (scannable by MeshCore companion):
   %(prog)s advert --name "MyNode" --qr
 
   # Send encrypted message to a known contact (direct):
-  %(prog)s send --dest <64hex> "Hello from gr4-lora" | lora_tx
-
-  # Send to lora_trx via UDP:
-  %(prog)s send --dest <64hex> --udp localhost:5555 "Hello"
+  %(prog)s send --dest <64hex> --udp localhost:5555 "Hello from gr4-lora"
 
   # Anonymous encrypted request (includes sender pubkey):
-  %(prog)s anon-req --dest <64hex> "Hello" | lora_tx
+  %(prog)s anon-req --dest <64hex> --udp localhost:5555 "Hello"
+
+  # Dry run (CBOR to stdout, no transmission):
+  %(prog)s advert --name "MyNode" --dry-run
 
   # Show identity public key:
   %(prog)s --show-key
@@ -586,7 +583,7 @@ examples:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MeshCore TX message builder. Outputs CBOR TX requests for lora_tx --stdin.",
+        description="MeshCore TX message builder. Outputs CBOR TX requests for lora_trx.",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -731,9 +728,7 @@ def main():
     sys.stderr.write(f"  Header: 0x{packet[0]:02X}\n")
     sys.stderr.write(f"  Hex: {packet.hex()}\n")
     if args.dry_run:
-        sys.stderr.write(
-            "  (dry run — CBOR written to stdout but not piped to lora_tx)\n"
-        )
+        sys.stderr.write("  (dry run — CBOR written to stdout, not transmitted)\n")
 
     # Build CBOR TX request
     phy = {}

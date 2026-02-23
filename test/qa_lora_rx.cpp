@@ -20,11 +20,11 @@ const boost::ut::suite<"GrayMapping RX"> gray_mapping_rx_tests = [] {
     using namespace boost::ut;
     using namespace gr::lora;
 
-    "GrayMapping inverts GrayDemap (algorithm-level)"_test = [] {
+    "GrayMapping inverts gray_demap (algorithm-level)"_test = [] {
         auto gray_mapped  = load_u32("tx_06_gray_mapped.u32");
         auto interleaved  = load_u32("tx_05_interleaved.u32");
 
-        // tx_06_gray_mapped = gray_to_binary(interleaved) + 1 mod N   (TX GrayDemap)
+        // tx_06_gray_mapped = gray_to_binary(interleaved) + 1 mod N   (TX gray_demap)
         // RX FFTDemod: subtracts 1 -> gives gray_to_binary(interleaved)
         // RX GrayMapping: binary_to_gray(x) = x ^ (x >> 1) -> gives interleaved
         for (std::size_t i = 0; i < gray_mapped.size(); i++) {

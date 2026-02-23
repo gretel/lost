@@ -2,15 +2,15 @@
 //
 // lora_trx: full-duplex LoRa transceiver using native GR4 SoapySDR blocks.
 //
-// RX: SoapySource -> BurstDetector -> SymbolDemodulator -> FrameSink (callback)
+// RX: SoapySource -> FrameSync -> DemodDecoder -> FrameSink
 // TX: TagSource<cf32> -> SoapySinkBlock<cf32> (ephemeral graph per request)
 //
 // Supports dual-RX (--rx-channels 0,1) for simultaneous decode on two
 // antennas via SoapyDualSimpleSource feeding two parallel decode chains.
 // TX always uses a single channel (--tx-channel, default 0).
 //
-// All I/O is CBOR over UDP. No stdout, no stdin. Clients register by
-// sending any datagram; RX frames are fanned out to all known clients.
+// All I/O is CBOR over UDP. No stdout, no stdin. 
+// RX frames are fanned out to all connected clients.
 // TX requests (type: "lora_tx") are processed and acked.
 
 #include <unistd.h>
@@ -35,8 +35,8 @@
 #include <gnuradio-4.0/Tensor.hpp>
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
-#include <gnuradio-4.0/lora/BurstDetector.hpp>
-#include <gnuradio-4.0/lora/SymbolDemodulator.hpp>
+#include <gnuradio-4.0/lora/FrameSync.hpp>
+#include <gnuradio-4.0/lora/DemodDecoder.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/soapy/Soapy.hpp>
 #include <gnuradio-4.0/soapy/SoapySink.hpp>
@@ -67,7 +67,8 @@ struct TrxConfig {
     std::vector<uint32_t> rx_channels{0};
     uint32_t             tx_channel{0};
     std::string          listen{"127.0.0.1"};
-    uint16_t             port{5556};
+    uint16_t             port{5555};
+    bool                 debug{false};
 };
 
 // --- UDP state (owned by main thread) ---
@@ -139,7 +140,6 @@ void print_usage() {
     std::fprintf(stderr,
         "Usage: lora_trx [options]\n\n"
         "Full-duplex LoRa transceiver. All I/O is CBOR over UDP.\n"
-        "Clients register by sending any datagram to the UDP port.\n"
         "TX requests use type \"lora_tx\" (see docs/cbor-schemas.md).\n\n"
         "Device:\n"
         "  --device <name>       SoapySDR driver (default: uhd)\n"
@@ -160,11 +160,13 @@ void print_usage() {
         "  --tx-channel <n>      TX channel (default: 0)\n\n"
         "Network:\n"
         "  --listen <addr>       UDP bind address (default: 127.0.0.1)\n"
-        "  --port <port>         UDP port (default: 5556)\n\n"
+        "  --port <port>         UDP port (default: 5555)\n\n"
+        "Debug:\n"
+        "  --debug               Enable verbose state-machine traces on stderr\n\n"
         "  -h, --help            Show this help\n\n"
         "Examples:\n"
         "  lora_trx\n"
-        "  lora_trx --listen 0.0.0.0 --port 5555\n"
+        "  lora_trx --listen 0.0.0.0 --port 9000\n"
         "  lora_trx --rx-channels 0,1 --tx-channel 0\n"
         "  lora_trx --rx-channels 1 --tx-channel 0\n");
 }
@@ -202,6 +204,7 @@ bool parse_args(int argc, char* argv[], TrxConfig& cfg) {
         if (arg == "--tx-channel" && i + 1 < argc) { cfg.tx_channel = static_cast<uint32_t>(std::stoul(argv[++i])); continue; }
         if (arg == "--listen" && i + 1 < argc) { cfg.listen = argv[++i]; continue; }
         if (arg == "--port" && i + 1 < argc) { cfg.port = static_cast<uint16_t>(std::stoul(argv[++i])); continue; }
+        if (arg == "--debug") { cfg.debug = true; continue; }
         std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
         print_usage();
         return false;
@@ -419,7 +422,7 @@ void build_rx_graph_multi(gr::Graph& graph, const TrxConfig& cfg,
             {"max_overflow_count", gr::Size_t{0}},
         });
 
-        auto& det = graph.emplaceBlock<gr::lora::BurstDetector>({
+        auto& sync = graph.emplaceBlock<gr::lora::FrameSync>({
             {"center_freq", static_cast<uint32_t>(cfg.freq)},
             {"bandwidth", cfg.bw},
             {"sf", cfg.sf},
@@ -427,11 +430,13 @@ void build_rx_graph_multi(gr::Graph& graph, const TrxConfig& cfg,
             {"os_factor", os},
             {"preamble_len", cfg.preamble},
             {"rx_channel", static_cast<int32_t>(ch)},
+            {"debug", cfg.debug},
         });
 
-        auto& demod = graph.emplaceBlock<gr::lora::SymbolDemodulator>({
+        auto& demod = graph.emplaceBlock<gr::lora::DemodDecoder>({
             {"sf", cfg.sf},
             {"bandwidth", cfg.bw},
+            {"debug", cfg.debug},
         });
 
         auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
@@ -442,8 +447,8 @@ void build_rx_graph_multi(gr::Graph& graph, const TrxConfig& cfg,
         sink._frame_callback = callback;
 
         auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
-        if (!ok(graph.connect<"out">(source).to<"in">(det)) ||
-            !ok(graph.connect<"out">(det).to<"in">(demod)) ||
+        if (!ok(graph.connect<"out">(source).to<"in">(sync)) ||
+            !ok(graph.connect<"out">(sync).to<"in">(demod)) ||
             !ok(graph.connect<"out">(demod).to<"in">(sink))) {
             std::fprintf(stderr, "ERROR: failed to connect RX chain for channel %u\n", ch);
         }
@@ -486,6 +491,9 @@ int main(int argc, char* argv[]) {
     if (!cfg.clock.empty()) {
         std::fprintf(stderr, "  Clock:       %s\n", cfg.clock.c_str());
     }
+    if (cfg.debug) {
+        std::fprintf(stderr, "  Debug:       enabled\n");
+    }
     std::fprintf(stderr, "  Listen:      %s:%u\n", cfg.listen.c_str(), cfg.port);
     std::fprintf(stderr, "\n");
 
@@ -499,13 +507,10 @@ int main(int argc, char* argv[]) {
 
     if (::inet_pton(AF_INET6, cfg.listen.c_str(), &bind6.sin6_addr) == 1) {
         use_v6 = true;
-    } else if (cfg.listen == "0.0.0.0" || cfg.listen == "127.0.0.1") {
-        // Map common IPv4 addresses to dual-stack
+    } else if (cfg.listen == "0.0.0.0") {
+        // Dual-stack: accept both IPv4 and IPv6 on all interfaces
         use_v6 = true;
-        if (cfg.listen == "127.0.0.1") {
-            bind6.sin6_addr = IN6ADDR_LOOPBACK_INIT;
-        }
-        // else sin6_addr stays IN6ADDR_ANY (from zero-init)
+        // sin6_addr stays IN6ADDR_ANY (from zero-init)
     } else if (::inet_pton(AF_INET, cfg.listen.c_str(), &bind4.sin_addr) == 1) {
         use_v6 = false;
     } else {
