@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: ISC
 """
-lora_mqtt.py -- Experimental LoRa-to-MQTT bridge for letsmesh.net.
+lora_mqtt.py -- LoRa-to-MQTT bridge for letsmesh.net.
 
 Subscribes to lora_trx CBOR UDP frames and publishes them to an MQTT
 broker in the meshcoretomqtt JSON format used by letsmesh.net packet
-analyzers.
+analyzers. TLS is always enabled (port 443 by default).
+
+Duplicate frames from dual-channel RX are suppressed.
 
 Usage:
     lora_mqtt.py --iata BER
-    lora_mqtt.py --iata BER --mqtt-host mqtt-eu-v1.letsmesh.net --tls
     lora_mqtt.py --iata BER --connect 127.0.0.1:5555
+    lora_mqtt.py --iata BER --mqtt-host mqtt-eu-v1.letsmesh.net
 
 meshcoretomqtt JSON format (published per frame):
     {
@@ -51,10 +53,10 @@ from meshcore_crypto import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
 DEFAULT_MQTT_HOST = "mqtt-eu-v1.letsmesh.net"
-DEFAULT_MQTT_PORT = 1883
-DEFAULT_MQTT_TLS_PORT = 8883
+DEFAULT_MQTT_PORT = 443
 KEEPALIVE_INTERVAL = 5.0
 RECV_TIMEOUT = 10.0
+DEDUP_WINDOW = 2.0  # seconds; suppress duplicate payloads within this window
 
 
 def frame_to_meshcore_json(msg: dict[str, Any]) -> dict[str, Any] | None:
@@ -101,17 +103,15 @@ def run_bridge(
     mqtt_port: int,
     iata: str,
     pub_key_hex: str,
-    use_tls: bool,
     topic_prefix: str,
 ) -> None:
     """Run the UDP-to-MQTT bridge."""
-    # MQTT setup
+    # MQTT setup (TLS always)
     topic = f"{topic_prefix}/{iata}/{pub_key_hex}/packets"
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    if use_tls:
-        client.tls_set()
+    client.tls_set()
 
-    sys.stderr.write(f"Connecting to MQTT broker {mqtt_host}:{mqtt_port}...\n")
+    sys.stderr.write(f"Connecting to MQTT broker {mqtt_host}:{mqtt_port} (TLS)...\n")
     try:
         client.connect(mqtt_host, mqtt_port, keepalive=60)
     except Exception as exc:
@@ -135,7 +135,10 @@ def run_bridge(
     )
 
     published = 0
+    deduplicated = 0
     last_keepalive = time.monotonic()
+    # Dedup: (payload_hex, timestamp) of recently published frames
+    recent: dict[str, float] = {}
 
     try:
         while True:
@@ -163,8 +166,18 @@ def run_bridge(
             if mqtt_msg is None:
                 continue
 
+            # Dedup: skip if we published the same payload recently
+            raw_hex = mqtt_msg["raw"]
+            if raw_hex in recent and now - recent[raw_hex] < DEDUP_WINDOW:
+                deduplicated += 1
+                continue
+
+            # Expire old entries
+            recent = {k: v for k, v in recent.items() if now - v < DEDUP_WINDOW}
+            recent[raw_hex] = now
+
             payload_json = json.dumps(mqtt_msg)
-            result = client.publish(topic, payload_json)
+            client.publish(topic, payload_json)
             published += 1
 
             sys.stderr.write(
@@ -180,7 +193,9 @@ def run_bridge(
         client.loop_stop()
         client.disconnect()
 
-    sys.stderr.write(f"\n--- {published} frames published to MQTT\n")
+    sys.stderr.write(
+        f"\n--- {published} frames published, {deduplicated} duplicates suppressed\n"
+    )
 
 
 def main() -> None:
@@ -201,8 +216,8 @@ def main() -> None:
     parser.add_argument(
         "--mqtt-port",
         type=int,
-        default=None,
-        help=f"MQTT broker port (default: {DEFAULT_MQTT_PORT} or {DEFAULT_MQTT_TLS_PORT} with --tls)",
+        default=DEFAULT_MQTT_PORT,
+        help=f"MQTT broker port (default: {DEFAULT_MQTT_PORT})",
     )
     parser.add_argument(
         "--iata",
@@ -214,11 +229,6 @@ def main() -> None:
         type=Path,
         default=DEFAULT_IDENTITY_FILE,
         help=f"Identity file for public key (default: {DEFAULT_IDENTITY_FILE})",
-    )
-    parser.add_argument(
-        "--tls",
-        action="store_true",
-        help="Use TLS for MQTT connection",
     )
     parser.add_argument(
         "--topic-prefix",
@@ -244,18 +254,13 @@ def main() -> None:
     expanded_prv, pub_key, seed = load_or_create_identity(args.identity)
     pub_key_hex = pub_key.hex()
 
-    mqtt_port = args.mqtt_port
-    if mqtt_port is None:
-        mqtt_port = DEFAULT_MQTT_TLS_PORT if args.tls else DEFAULT_MQTT_PORT
-
     run_bridge(
         host,
         port,
         args.mqtt_host,
-        mqtt_port,
+        args.mqtt_port,
         args.iata,
         pub_key_hex,
-        args.tls,
         args.topic_prefix,
     )
 
