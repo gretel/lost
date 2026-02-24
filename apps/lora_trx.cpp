@@ -2,15 +2,16 @@
 //
 // lora_trx: full-duplex LoRa transceiver using native GR4 SoapySDR blocks.
 //
-// RX: SoapySource -> FrameSync -> DemodDecoder -> FrameSink
+// 1-ch RX: SoapySimpleSource -> FrameSync -> DemodDecoder -> FrameSink
+// 2-ch RX: SoapyDualSimpleSource -+-> FrameSync -> DemodDecoder -> FrameSink
+//                                 +-> FrameSync -> DemodDecoder -> FrameSink
 // TX: TagSource<cf32> -> SoapySinkBlock<cf32> (ephemeral graph per request)
 //
-// Supports dual-RX (--rx-channels 0,1) for simultaneous decode on two
-// antennas via SoapyDualSimpleSource feeding two parallel decode chains.
-// TX always uses a single channel (--tx-channel, default 0).
+// Dual-RX uses a single MIMO stream (one device handle, two output ports).
+// Full-duplex TX in both modes: RX runs continuously while TX uses an
+// ephemeral graph with a separate device handle.
 //
-// All I/O is CBOR over UDP. No stdout, no stdin. 
-// RX frames are fanned out to all connected clients.
+// All I/O is CBOR over UDP. RX frames fan out to all connected clients.
 // TX requests (type: "lora_tx") are processed and acked.
 
 #include <unistd.h>
@@ -212,9 +213,12 @@ bool parse_args(int argc, char* argv[], TrxConfig& cfg) {
     return true;
 }
 
-// --- TX (ephemeral graph, runs in main thread) ---
+// --- TX ---
 
-std::vector<std::complex<float>> generate_iq(
+using cf32 = std::complex<float>;
+using Device = gr::blocks::soapy::Device;
+
+std::vector<cf32> generate_iq(
         const std::vector<uint8_t>& payload, const TrxConfig& cfg,
         uint8_t cr_override = 0, uint16_t sync_override = 0,
         uint16_t preamble_override = 0) {
@@ -227,9 +231,9 @@ std::vector<std::complex<float>> generate_iq(
                                        true, sps * 2, 2, cfg.bw);
 }
 
-int transmit_1ch(const std::vector<std::complex<float>>& iq, const TrxConfig& cfg) {
+// Ephemeral TX graph for single-channel RX mode (1RX+1TX, no MIMO conflicts).
+int transmit_1ch(const std::vector<cf32>& iq, const TrxConfig& cfg) {
     gr::Graph graph;
-    using cf32 = std::complex<float>;
 
     auto& source = graph.emplaceBlock<gr::testing::TagSource<cf32,
         gr::testing::ProcessFunction::USE_PROCESS_BULK>>({
@@ -273,78 +277,124 @@ int transmit_1ch(const std::vector<std::complex<float>>& iq, const TrxConfig& cf
     return 0;
 }
 
-// 2RX+2TX mode: B210 requires balanced channel enables (2+2=4, passes update_enables).
-// Real IQ goes to TX channel cfg.tx_channel, zeros go to the other channel.
-int transmit_2ch(const std::vector<std::complex<float>>& iq, const TrxConfig& cfg) {
-    gr::Graph graph;
-    using cf32 = std::complex<float>;
+// Persistent TX state for MIMO mode: device + stream stay open for the process
+// lifetime to avoid update_enables() races when creating/destroying handles
+// while the MIMO RX stream is active.
+struct TxState {
+    Device                              device{};
+    Device::Stream<cf32, SOAPY_SDR_TX>  stream{};
+    uint32_t                            chunk_size{512U << 4U};
+    uint32_t                            timeout_us{1'000'000U};
+    uint32_t                            tx_channel{0};
+};
 
-    auto& source = graph.emplaceBlock<gr::testing::TagSource<cf32,
-        gr::testing::ProcessFunction::USE_PROCESS_BULK>>({
-        {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
-        {"repeat_tags", false},
-        {"mark_tag", false},
-    });
-    source.values = iq;
+bool tx_state_init(TxState& tx, const TrxConfig& cfg) {
+    tx.tx_channel = cfg.tx_channel;
 
-    auto& null_source = graph.emplaceBlock<gr::testing::ConstantSource<cf32>>({
-        {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
-    });
+    auto args = gr::blocks::soapy::detail::buildDeviceArgs(cfg.device, cfg.device_param);
+    tx.device = Device(args);
 
-    auto& sink = graph.emplaceBlock<gr::blocks::soapy::SoapySinkBlock<cf32, 2UZ>>({
-        {"device", cfg.device},
-        {"device_parameter", cfg.device_param},
-        {"sample_rate", cfg.rate},
-        {"tx_center_frequency", gr::Tensor<double>(gr::data_from, {cfg.freq, cfg.freq})},
-        {"tx_gains", gr::Tensor<double>(gr::data_from, {cfg.gain_tx, 0.0})},
-        {"tx_channels", gr::Tensor<gr::Size_t>(gr::data_from, {gr::Size_t{0}, gr::Size_t{1}})},
-        {"clock_source", cfg.clock},
-        {"timed_tx", true},
-        {"wait_burst_ack", true},
-        {"max_underflow_count", gr::Size_t{0}},
-    });
-
-    // Connect real IQ to the active TX port, zeros to the dummy port.
-    auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
-    if (cfg.tx_channel == 0) {
-        if (!ok(graph.connect<"out">(source).to<"in", 0>(sink)) ||
-            !ok(graph.connect<"out">(null_source).to<"in", 1>(sink))) {
-            std::fprintf(stderr, "TX: failed to connect 2-ch graph\n");
-            return -1;
-        }
-    } else {
-        if (!ok(graph.connect<"out">(null_source).to<"in", 0>(sink)) ||
-            !ok(graph.connect<"out">(source).to<"in", 1>(sink))) {
-            std::fprintf(stderr, "TX: failed to connect 2-ch graph\n");
-            return -1;
-        }
+    if (!cfg.clock.empty()) {
+        tx.device.setClockSource(cfg.clock);
     }
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> sched;
-    sched.timeout_inactivity_count = 1'000'000U;
-    if (auto ret = sched.exchange(std::move(graph)); !ret) {
-        std::fprintf(stderr, "TX: scheduler init failed\n");
-        return -1;
+    // Configure both TX channels (2RX+2TX balanced for B210)
+    for (uint32_t ch = 0; ch < 2; ch++) {
+        tx.device.setSampleRate(SOAPY_SDR_TX, ch, static_cast<double>(cfg.rate));
+        tx.device.setCenterFrequency(SOAPY_SDR_TX, ch, cfg.freq);
     }
+    tx.device.setGain(SOAPY_SDR_TX, cfg.tx_channel, cfg.gain_tx);
 
-    auto ret = sched.runAndWait();
-    if (!ret.has_value()) {
-        std::fprintf(stderr, "TX: scheduler error: %s\n",
-                     std::format("{}", ret.error()).c_str());
-        return -1;
-    }
-    return 0;
+    gr::Tensor<gr::Size_t> channels(gr::data_from, {gr::Size_t{0}, gr::Size_t{1}});
+    tx.stream = tx.device.setupStream<cf32, SOAPY_SDR_TX>(channels);
+    tx.stream.activate();
+
+    std::fprintf(stderr, "  TX: persistent 2-ch handle opened (channel %u active)\n",
+                 cfg.tx_channel);
+    return true;
 }
 
-int transmit(const std::vector<std::complex<float>>& iq, const TrxConfig& cfg) {
-    if (cfg.rx_channels.size() > 1) {
-        return transmit_2ch(iq, cfg);
+void tx_state_close(TxState& tx) {
+    if (tx.stream.get() != nullptr) {
+        tx.stream.deactivate();
+        tx.stream.reset();
+    }
+    tx.device.reset();
+}
+
+int transmit_direct(TxState& tx, const std::vector<cf32>& iq) {
+    // Prepare zero buffer for the dummy channel
+    std::vector<cf32> zeros(tx.chunk_size, cf32(0.f, 0.f));
+
+    std::size_t offset = 0;
+    bool first = true;
+
+    while (offset < iq.size()) {
+        auto remaining = iq.size() - offset;
+        auto chunk = std::min(static_cast<std::size_t>(tx.chunk_size), remaining);
+        bool last = (offset + chunk >= iq.size());
+
+        int flags = 0;
+        long long time_ns = 0;
+
+        if (first) {
+            flags |= SOAPY_SDR_HAS_TIME;
+            time_ns = static_cast<long long>(tx.device.getHardwareTime())
+                    + static_cast<long long>(0.1 * 1e9);
+            first = false;
+        }
+        if (last) {
+            flags |= SOAPY_SDR_END_BURST;
+        }
+
+        auto iq_span = std::span<const cf32>(iq.data() + offset, chunk);
+        auto zero_span = std::span<const cf32>(zeros.data(), chunk);
+
+        int ret;
+        if (tx.tx_channel == 0) {
+            ret = tx.stream.writeStream(flags, time_ns, tx.timeout_us, iq_span, zero_span);
+        } else {
+            ret = tx.stream.writeStream(flags, time_ns, tx.timeout_us, zero_span, iq_span);
+        }
+
+        if (ret < 0) {
+            if (ret == SOAPY_SDR_UNDERFLOW) {
+                continue;
+            }
+            std::fprintf(stderr, "TX: writeStream error %d: %s\n", ret, SoapySDR_errToStr(ret));
+            return -1;
+        }
+        offset += static_cast<std::size_t>(ret);
+    }
+
+    // Wait for BURST_ACK
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::size_t chan_mask = 0;
+        int flags = 0;
+        long long time_ns = 0;
+        int ret = tx.stream.readStreamStatus(chan_mask, flags, time_ns, 100'000U);
+        if (ret == 0 && (flags & SOAPY_SDR_END_BURST)) {
+            return 0;  // BURST_ACK received
+        }
+        if (ret != SOAPY_SDR_TIMEOUT && ret != SOAPY_SDR_UNDERFLOW && ret != 0) {
+            break;
+        }
+    }
+    std::fprintf(stderr, "TX: BURST_ACK timeout\n");
+    return 0;  // non-fatal
+}
+
+int transmit(const std::vector<cf32>& iq, const TrxConfig& cfg, TxState* tx) {
+    if (tx != nullptr) {
+        return transmit_direct(*tx, iq);
     }
     return transmit_1ch(iq, cfg);
 }
 
 void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
-                       UdpState& udp, const struct sockaddr_storage& sender) {
+                       UdpState& udp, const struct sockaddr_storage& sender,
+                       TxState* tx) {
     using gr::lora::cbor::get_uint_or;
     using gr::lora::cbor::get_bool_or;
 
@@ -365,13 +415,13 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
 
     // repeat + gap
     if (repeat > 1) {
-        std::vector<std::complex<float>> buf;
+        std::vector<cf32> buf;
         auto gap_samples = static_cast<uint32_t>(
             cfg.rate * static_cast<float>(gap_ms) / 1000.0f);
         for (int r = 0; r < repeat; r++) {
             buf.insert(buf.end(), iq.begin(), iq.end());
             if (r + 1 < repeat && gap_samples > 0) {
-                buf.resize(buf.size() + gap_samples, std::complex<float>(0.f, 0.f));
+                buf.resize(buf.size() + gap_samples, cf32(0.f, 0.f));
             }
         }
         iq = std::move(buf);
@@ -385,7 +435,7 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
 
     bool ok = true;
     if (!dry_run) {
-        ok = (transmit(iq, cfg) == 0);
+        ok = (transmit(iq, cfg, tx) == 0);
     }
 
     // send ack back to the requesting client
@@ -399,17 +449,54 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
     udp.sendTo(ack, sender);
 }
 
-// --- RX graph builders ---
+// --- RX graph builder ---
 
-// RX graph: one SoapySimpleSource per channel, each with its own decode chain.
-// Each source opens the device independently — SoapyUHD's weak_ptr registry shares
-// the underlying B210 hardware. Using separate single-channel streams avoids the
-// SoapySDR MIMO stream activation bug (STREAM_ERROR on dual-channel setupStream).
-void build_rx_graph_multi(gr::Graph& graph, const TrxConfig& cfg,
-                          std::function<void(std::vector<uint8_t>)> callback) {
+// Adds a FrameSync -> DemodDecoder -> FrameSink chain to the graph and returns
+// a reference to the FrameSync input port (for connecting to a source).
+auto& add_decode_chain(gr::Graph& graph, const TrxConfig& cfg, uint32_t ch,
+                       std::function<void(std::vector<uint8_t>)> callback) {
     auto os = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
-    for (auto ch : cfg.rx_channels) {
+    auto& sync = graph.emplaceBlock<gr::lora::FrameSync>({
+        {"center_freq", static_cast<uint32_t>(cfg.freq)},
+        {"bandwidth", cfg.bw},
+        {"sf", cfg.sf},
+        {"sync_word", cfg.sync},
+        {"os_factor", os},
+        {"preamble_len", cfg.preamble},
+        {"rx_channel", static_cast<int32_t>(ch)},
+        {"debug", cfg.debug},
+    });
+
+    auto& demod = graph.emplaceBlock<gr::lora::DemodDecoder>({
+        {"sf", cfg.sf},
+        {"bandwidth", cfg.bw},
+        {"debug", cfg.debug},
+    });
+
+    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
+        {"sync_word", cfg.sync},
+        {"phy_sf", cfg.sf},
+        {"phy_bw", cfg.bw},
+    });
+    sink._frame_callback = callback;
+
+    auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
+    if (!ok(graph.connect<"out">(sync).to<"in">(demod)) ||
+        !ok(graph.connect<"out">(demod).to<"in">(sink))) {
+        std::fprintf(stderr, "ERROR: failed to connect decode chain for channel %u\n", ch);
+    }
+    return sync;
+}
+
+// 1 channel: SoapySimpleSource (single stream, one device handle)
+// 2 channels: SoapyDualSimpleSource (MIMO stream, one device handle, two output ports)
+void build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
+                    std::function<void(std::vector<uint8_t>)> callback) {
+    auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
+
+    if (cfg.rx_channels.size() == 1) {
+        auto ch = cfg.rx_channels[0];
         auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>({
             {"device", cfg.device},
             {"device_parameter", cfg.device_param},
@@ -421,36 +508,30 @@ void build_rx_graph_multi(gr::Graph& graph, const TrxConfig& cfg,
             {"max_chunck_size", static_cast<uint32_t>(512U << 4U)},
             {"max_overflow_count", gr::Size_t{0}},
         });
-
-        auto& sync = graph.emplaceBlock<gr::lora::FrameSync>({
-            {"center_freq", static_cast<uint32_t>(cfg.freq)},
-            {"bandwidth", cfg.bw},
-            {"sf", cfg.sf},
-            {"sync_word", cfg.sync},
-            {"os_factor", os},
-            {"preamble_len", cfg.preamble},
-            {"rx_channel", static_cast<int32_t>(ch)},
-            {"debug", cfg.debug},
+        auto& sync = add_decode_chain(graph, cfg, ch, callback);
+        if (!ok(graph.connect<"out">(source).to<"in">(sync))) {
+            std::fprintf(stderr, "ERROR: failed to connect source -> decode chain\n");
+        }
+    } else {
+        // 2-channel MIMO: single device handle, time-aligned streams
+        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapyDualSimpleSource<std::complex<float>>>({
+            {"device", cfg.device},
+            {"device_parameter", cfg.device_param},
+            {"sample_rate", cfg.rate},
+            {"rx_center_frequency", gr::Tensor<double>(gr::data_from, {cfg.freq, cfg.freq})},
+            {"rx_gains", gr::Tensor<double>(gr::data_from, {cfg.gain_rx, cfg.gain_rx})},
+            {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, {
+                static_cast<gr::Size_t>(cfg.rx_channels[0]),
+                static_cast<gr::Size_t>(cfg.rx_channels[1])})},
+            {"clock_source", cfg.clock},
+            {"max_chunck_size", static_cast<uint32_t>(512U << 4U)},
+            {"max_overflow_count", gr::Size_t{0}},
         });
-
-        auto& demod = graph.emplaceBlock<gr::lora::DemodDecoder>({
-            {"sf", cfg.sf},
-            {"bandwidth", cfg.bw},
-            {"debug", cfg.debug},
-        });
-
-        auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-            {"sync_word", cfg.sync},
-            {"phy_sf", cfg.sf},
-            {"phy_bw", cfg.bw},
-        });
-        sink._frame_callback = callback;
-
-        auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
-        if (!ok(graph.connect<"out">(source).to<"in">(sync)) ||
-            !ok(graph.connect<"out">(sync).to<"in">(demod)) ||
-            !ok(graph.connect<"out">(demod).to<"in">(sink))) {
-            std::fprintf(stderr, "ERROR: failed to connect RX chain for channel %u\n", ch);
+        auto& sync0 = add_decode_chain(graph, cfg, cfg.rx_channels[0], callback);
+        auto& sync1 = add_decode_chain(graph, cfg, cfg.rx_channels[1], callback);
+        if (!ok(graph.connect<"out", 0>(source).to<"in">(sync0)) ||
+            !ok(graph.connect<"out", 1>(source).to<"in">(sync1))) {
+            std::fprintf(stderr, "ERROR: failed to connect MIMO source -> decode chains\n");
         }
     }
 }
@@ -564,14 +645,30 @@ int main(int argc, char* argv[]) {
         udp.broadcast(cbor_frame);
     };
 
+    // --- Open persistent TX handle for MIMO mode ---
+    // In MIMO mode the TX device handle must stay open to avoid
+    // update_enables() races when creating/destroying handles.
+    bool multi_ch = cfg.rx_channels.size() > 1;
+    TxState tx_state;
+    TxState* tx_ptr = nullptr;
+    if (multi_ch) {
+        if (!tx_state_init(tx_state, cfg)) {
+            std::fprintf(stderr, "ERROR: failed to init TX state\n");
+            ::close(udp.fd);
+            return 1;
+        }
+        tx_ptr = &tx_state;
+    }
+
     // --- Build and start RX graph in a background thread ---
     gr::Graph rx_graph;
-    build_rx_graph_multi(rx_graph, cfg, frame_callback);
+    build_rx_graph(rx_graph, cfg, frame_callback);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> rx_sched;
     rx_sched.timeout_inactivity_count = 1'000'000U;
     if (auto ret = rx_sched.exchange(std::move(rx_graph)); !ret) {
         std::fprintf(stderr, "ERROR: RX scheduler init failed\n");
+        if (tx_ptr) tx_state_close(tx_state);
         ::close(udp.fd);
         return 1;
     }
@@ -586,7 +683,7 @@ int main(int argc, char* argv[]) {
         rx_done.store(true, std::memory_order_relaxed);
     });
 
-    std::fprintf(stderr, "  RX running (%zu channel%s)... Ctrl+C to stop.\n\n",
+    std::fprintf(stderr, "  RX running (%zu channel%s, full-duplex TX)... Ctrl+C to stop.\n\n",
                  cfg.rx_channels.size(),
                  cfg.rx_channels.size() > 1 ? "s" : "");
 
@@ -619,19 +716,23 @@ int main(int argc, char* argv[]) {
                                          static_cast<std::size_t>(n)));
             auto type = gr::lora::cbor::get_text_or(msg, "type", "");
             if (type == "lora_tx") {
-                handle_tx_request(msg, cfg, udp, sender);
+                handle_tx_request(msg, cfg, udp, sender, tx_ptr);
             }
         } catch (const gr::lora::cbor::DecodeError&) {
             // Not a valid CBOR map — ignore (registration-only datagram)
         }
     }
 
-    // --- Shutdown ---
+    // --- Shutdown (order matters: stop RX first, then TX) ---
     std::fprintf(stderr, "\nStopping...\n");
     if (!rx_done.load(std::memory_order_relaxed)) {
         rx_sched.requestStop();
     }
     rx_thread.join();
+
+    if (tx_ptr) {
+        tx_state_close(tx_state);
+    }
 
     ::close(udp.fd);
     std::fprintf(stderr, "TRX stopped.\n");
