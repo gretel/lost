@@ -99,6 +99,134 @@ class TestFormatFrame(unittest.TestCase):
         self.assertNotIn("ch=", text)
 
 
+# ---- Decryption display ----
+
+
+class TestFormatFrameDecryption(unittest.TestCase):
+    """Test format_frame() with decryption parameters."""
+
+    def setUp(self):
+        from nacl.signing import SigningKey
+
+        from meshcore_crypto import meshcore_expanded_key
+
+        self.dest_seed = os.urandom(32)
+        self.dest_sk = SigningKey(self.dest_seed)
+        self.dest_pub = bytes(self.dest_sk.verify_key)
+        self.dest_expanded = meshcore_expanded_key(self.dest_seed)
+
+        self.sender_seed = os.urandom(32)
+        self.sender_sk = SigningKey(self.sender_seed)
+        self.sender_pub = bytes(self.sender_sk.verify_key)
+        self.sender_expanded = meshcore_expanded_key(self.sender_seed)
+
+    def test_txt_msg_decrypted(self):
+        """TXT_MSG shows decrypted text when keys are available."""
+        from meshcore_tx import build_txt_msg
+
+        pkt = build_txt_msg(
+            self.sender_expanded, self.sender_pub, self.dest_pub, "Hello World"
+        )
+        msg = make_frame(payload=pkt, crc_valid=True, sync_word=0x12)
+        known_keys = {self.sender_pub.hex(): self.sender_pub}
+        text = lora_mon.format_frame(
+            msg,
+            our_prv=self.dest_expanded,
+            our_pub=self.dest_pub,
+            known_keys=known_keys,
+        )
+        self.assertIn("TXT_MSG from", text)
+        self.assertIn("Hello World", text)
+
+    def test_anon_req_decrypted(self):
+        """ANON_REQ shows decrypted text when addressed to us."""
+        from meshcore_tx import build_anon_req
+
+        pkt = build_anon_req(
+            self.sender_expanded, self.sender_pub, self.dest_pub, b"AnonMsg"
+        )
+        msg = make_frame(payload=pkt, crc_valid=True, sync_word=0x12)
+        text = lora_mon.format_frame(
+            msg,
+            our_prv=self.dest_expanded,
+            our_pub=self.dest_pub,
+            known_keys={},
+        )
+        self.assertIn("ANON_REQ from", text)
+        self.assertIn("AnonMsg", text)
+
+    def test_no_decryption_without_keys(self):
+        """Without our_prv/our_pub, no decryption line appears."""
+        from meshcore_tx import build_txt_msg
+
+        pkt = build_txt_msg(
+            self.sender_expanded, self.sender_pub, self.dest_pub, "Secret"
+        )
+        msg = make_frame(payload=pkt, crc_valid=True, sync_word=0x12)
+        text = lora_mon.format_frame(msg)
+        self.assertNotIn("TXT_MSG from", text)
+        self.assertNotIn("ANON_REQ from", text)
+
+    def test_no_decryption_for_crc_fail(self):
+        """CRC_FAIL frames are not decrypted even with keys."""
+        from meshcore_tx import build_txt_msg
+
+        pkt = build_txt_msg(
+            self.sender_expanded, self.sender_pub, self.dest_pub, "NoCRC"
+        )
+        msg = make_frame(payload=pkt, crc_valid=False, sync_word=0x12)
+        known_keys = {self.sender_pub.hex(): self.sender_pub}
+        text = lora_mon.format_frame(
+            msg,
+            our_prv=self.dest_expanded,
+            our_pub=self.dest_pub,
+            known_keys=known_keys,
+        )
+        self.assertNotIn("TXT_MSG from", text)
+
+    def test_no_decryption_for_non_meshcore(self):
+        """Non-MeshCore sync words are not decrypted."""
+        from meshcore_tx import build_txt_msg
+
+        pkt = build_txt_msg(
+            self.sender_expanded, self.sender_pub, self.dest_pub, "Meshtastic"
+        )
+        msg = make_frame(payload=pkt, crc_valid=True, sync_word=0x2B)
+        known_keys = {self.sender_pub.hex(): self.sender_pub}
+        text = lora_mon.format_frame(
+            msg,
+            our_prv=self.dest_expanded,
+            our_pub=self.dest_pub,
+            known_keys=known_keys,
+        )
+        self.assertNotIn("TXT_MSG from", text)
+
+
+# ---- MeshCore summary ----
+
+
+class TestParseMeshcoreSummary(unittest.TestCase):
+    def test_advert_with_name(self):
+        from meshcore_tx import build_advert
+
+        seed = bytes.fromhex(
+            "deadbeefcafebabe0123456789abcdeffedcba9876543210baadf00ddeadbeef"
+        )
+        pub = bytes.fromhex(
+            "682500378e875577ff16b044bb6f2823bc4a7fcb3f34cab962f13553fb2369b5"
+        )
+        pkt = build_advert(seed, pub, name="NodeX")
+        summary = lora_mon.parse_meshcore_summary(pkt)
+        self.assertIn("FLOOD/ADVERT", summary)
+        self.assertIn('"NodeX"', summary)
+
+    def test_empty_payload(self):
+        self.assertEqual(lora_mon.parse_meshcore_summary(b""), "")
+
+    def test_single_byte(self):
+        self.assertEqual(lora_mon.parse_meshcore_summary(b"\x00"), "")
+
+
 # ---- UDP integration ----
 
 
