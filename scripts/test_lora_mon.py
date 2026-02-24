@@ -98,6 +98,16 @@ class TestFormatFrame(unittest.TestCase):
         text = lora_mon.format_frame(make_frame())
         self.assertNotIn("ch=", text)
 
+    def test_noise_floor_shown(self):
+        msg = make_frame()
+        msg["phy"]["noise_floor_db"] = -45.3
+        text = lora_mon.format_frame(msg)
+        self.assertIn("NF=-45.3dBFS", text)
+
+    def test_no_noise_floor_when_absent(self):
+        text = lora_mon.format_frame(make_frame())
+        self.assertNotIn("NF=", text)
+
 
 # ---- Decryption display ----
 

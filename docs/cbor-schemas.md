@@ -33,7 +33,8 @@ python3 scripts/lora_mon.py | python3 scripts/lora_decode_meshcore.py
     "cr":         4,                  // uint, coding rate (1–4)
     "crc_valid":  true,               // bool
     "sync_word":  18,                 // uint (0x12 = 18)
-    "snr_db":     12.3                // float64, preamble-based SNR estimate (dB)
+    "snr_db":     12.3,               // float64, preamble-based SNR estimate (dB)
+    "noise_floor_db": -42.1            // float64, optional, EMA noise floor (dBFS)
   },
   "rx_channel":   0,                  // uint, optional, RX channel index
   "payload":      h'48656C6C6F',      // bytes, raw payload

@@ -552,6 +552,13 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    // Homebrew UHD patches B2XX_FPGA_FILE_NAME to use full absolute Cellar paths.
+    // These break after Homebrew revision bumps (e.g. 4.9.0.1 → 4.9.0.1_1).
+    // Override with bare filenames so find_image_path() resolves via UHD_IMAGES_DIR.
+    if (cfg.device == "uhd" && cfg.device_param.find("fpga=") == std::string::npos) {
+        cfg.device_param += ",fpga=usrp_b210_fpga.bin";
+    }
+
     auto os = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
     std::fprintf(stderr, "=== LoRa TRX (Soapy) ===\n");

@@ -139,6 +139,16 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
     bool     _burst_tag_published = false;
     float    _snr_db = 0.f;  ///< preamble-based SNR estimate (dB)
 
+    // Noise floor estimation (EMA of mean symbol power during DETECT idle)
+    float    _noise_floor_db = -999.f;  ///< dBFS, -999 = not yet estimated
+    float    _noise_ema      = 0.f;     ///< exponential moving average of mean |x|^2
+    bool     _noise_ema_init = false;   ///< true after first update
+
+    // Periodic noise floor logging (debug mode)
+    uint64_t           _nf_sample_cnt   = 0;       ///< samples processed since last log
+    uint64_t           _nf_log_interval = 0;       ///< samples per log interval (set in start)
+    std::vector<float> _nf_history;                 ///< all noise floor dB values for median
+
     // Pre-allocated scratch buffers (avoid per-call heap allocation)
     std::vector<std::complex<float>> _scratch_N;      ///< N-element scratch for dechirp
     std::vector<std::complex<float>> _scratch_2N;     ///< 2N-element scratch
@@ -154,6 +164,11 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
     void start() {
         recalculate();
+        // 10-second log interval: sample_rate = bandwidth * os_factor
+        _nf_log_interval = static_cast<uint64_t>(bandwidth) * os_factor * 10;
+        _nf_sample_cnt = 0;
+        _nf_history.clear();
+        _nf_history.reserve(1024);
     }
 
     void recalculate() {
@@ -390,6 +405,46 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         case DETECT: {
             _bin_idx_new = static_cast<int32_t>(get_symbol_val(_in_down.data(), _downchirp.data()));
 
+            // Update noise floor EMA from idle symbols (no preamble building)
+            if (_symbol_cnt <= 1) {
+                float mean_power = 0.f;
+                for (uint32_t i = 0; i < _N; i++) {
+                    mean_power += _in_down[i].real() * _in_down[i].real()
+                                + _in_down[i].imag() * _in_down[i].imag();
+                }
+                mean_power /= static_cast<float>(_N);
+                constexpr float kNoiseEmaAlpha = 0.05f;  // ~20-symbol time constant
+                if (!_noise_ema_init) {
+                    _noise_ema = mean_power;
+                    _noise_ema_init = true;
+                } else {
+                    _noise_ema += kNoiseEmaAlpha * (mean_power - _noise_ema);
+                }
+                if (_noise_ema > 0.f) {
+                    _noise_floor_db = 10.f * std::log10(_noise_ema);
+                }
+
+                // Periodic noise floor log (debug mode, every ~10s)
+                _nf_sample_cnt += _sps;
+                if (debug && _nf_log_interval > 0 && _noise_floor_db > -999.f) {
+                    if (_nf_sample_cnt >= _nf_log_interval) {
+                        _nf_sample_cnt = 0;
+                        _nf_history.push_back(_noise_floor_db);
+                        // Compute median from sorted copy
+                        auto sorted = _nf_history;
+                        std::sort(sorted.begin(), sorted.end());
+                        float median = sorted[sorted.size() / 2];
+                        std::fprintf(stderr,
+                            "[FrameSync] noise floor: %.1f dBFS  median: %.1f dBFS  (n=%zu)",
+                            static_cast<double>(_noise_floor_db),
+                            static_cast<double>(median),
+                            _nf_history.size());
+                        if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
+
             if (!has_energy(_in_down.data(), _N)) {
                 _symbol_cnt = 1;
                 _bin_idx = -1;
@@ -397,8 +452,10 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
             }
 
             if (debug && _symbol_cnt > 2) {
-                std::fprintf(stderr, "[FrameSync] DETECT: cnt=%d bin=%d new=%d\n",
+                std::fprintf(stderr, "[FrameSync] DETECT: cnt=%d bin=%d new=%d",
                              _symbol_cnt, _bin_idx, _bin_idx_new);
+                if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
+                std::fprintf(stderr, "\n");
             }
 
             // Look for consecutive reference upchirps (within +/-kPreambleBinTolerance)
@@ -436,7 +493,9 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
             if (static_cast<uint32_t>(_symbol_cnt) == _n_up_req) {
                 if (debug) {
-                    std::fprintf(stderr, "[FrameSync] DETECT->SYNC: k_hat=%d\n", _k_hat);
+                    std::fprintf(stderr, "[FrameSync] DETECT->SYNC: k_hat=%d", _k_hat);
+                    if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
+                    std::fprintf(stderr, "\n");
                 }
                 _additional_upchirps = 0;
                 _state = SYNC;
@@ -699,9 +758,12 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 _snr_db = determine_snr();
                 _state = OUTPUT;
                 if (debug) {
-                    std::fprintf(stderr, "[FrameSync] SYNC->OUTPUT: cfo_int=%d cfo_frac=%.3f sto_frac=%.3f snr=%.1f dB\n",
+                    std::fprintf(stderr, "[FrameSync] SYNC->OUTPUT: cfo_int=%d cfo_frac=%.3f sto_frac=%.3f snr=%.1f dB noise=%.1f dBFS",
                                  _cfo_int, static_cast<double>(_cfo_frac),
-                                 static_cast<double>(_sto_frac), static_cast<double>(_snr_db));
+                                 static_cast<double>(_sto_frac), static_cast<double>(_snr_db),
+                                 static_cast<double>(_noise_floor_db));
+                    if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
+                    std::fprintf(stderr, "\n");
                 }
                 _output_symb_cnt = 0;
                 _burst_tag_published = false;
@@ -727,8 +789,10 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
             if (!has_energy(_in_down.data(), _N)
                 || _output_symb_cnt >= max_symbols) {
                 if (debug) {
-                    std::fprintf(stderr, "[FrameSync] OUTPUT->DETECT: %u symbols emitted\n",
+                    std::fprintf(stderr, "[FrameSync] OUTPUT->DETECT: %u symbols emitted",
                                  _output_symb_cnt);
+                    if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
+                    std::fprintf(stderr, "\n");
                 }
                 resetToDetect();
                 _items_to_consume = static_cast<int>(_sps);
@@ -744,6 +808,9 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 tag["cfo_frac"]     = gr::pmt::Value(static_cast<double>(_cfo_frac));
                 tag["is_downchirp"] = gr::pmt::Value(false);
                 tag["snr_db"]       = gr::pmt::Value(static_cast<double>(_snr_db));
+                if (_noise_floor_db > -999.f) {
+                    tag["noise_floor_db"] = gr::pmt::Value(static_cast<double>(_noise_floor_db));
+                }
                 if (rx_channel >= 0) {
                     tag["rx_channel"] = gr::pmt::Value(static_cast<int64_t>(rx_channel));
                 }

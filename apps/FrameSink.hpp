@@ -51,6 +51,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     bool                 _crc_valid{false};
     bool                 _is_downchirp{false};
     double               _snr_db{0.0};
+    double               _noise_floor_db{-999.0};
     int64_t              _rx_channel{-1};
     bool                 _collecting{false};
     std::vector<uint8_t> _frame;
@@ -217,6 +218,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                     ts.c_str(), _frame_count,
                     _pay_len, 4u + _cr, crc_str,
                     sync_word, _snr_db);
+        if (_noise_floor_db > -999.0) {
+            std::printf("  NF=%.1f dBFS", _noise_floor_db);
+        }
         if (_rx_channel >= 0) {
             std::printf("  ch=%d", static_cast<int>(_rx_channel));
         }
@@ -244,13 +248,18 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         cbor::kv_uint(buf, "seq", _frame_count);
 
         cbor::encode_text(buf, "phy");
-        cbor::encode_map_begin(buf, 6);
+        uint32_t phy_fields = 6;
+        if (_noise_floor_db > -999.0) phy_fields++;
+        cbor::encode_map_begin(buf, phy_fields);
         cbor::kv_uint(buf, "sf", phy_sf);
         cbor::kv_uint(buf, "bw", phy_bw);
         cbor::kv_uint(buf, "cr", _cr);
         cbor::kv_bool(buf, "crc_valid", _crc_valid);
         cbor::kv_uint(buf, "sync_word", sync_word);
         cbor::kv_float64(buf, "snr_db", _snr_db);
+        if (_noise_floor_db > -999.0) {
+            cbor::kv_float64(buf, "noise_floor_db", _noise_floor_db);
+        }
 
         cbor::kv_bytes(buf, "payload", _frame.data(),
                        std::min(static_cast<std::size_t>(_pay_len),
@@ -335,6 +344,12 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                     _snr_db = it2->second.value_or<double>(0.0);
                 } else {
                     _snr_db = 0.0;
+                }
+                if (auto it2 = tag.map.find("noise_floor_db");
+                    it2 != tag.map.end()) {
+                    _noise_floor_db = it2->second.value_or<double>(-999.0);
+                } else {
+                    _noise_floor_db = -999.0;
                 }
                 if (auto it2 = tag.map.find("rx_channel");
                     it2 != tag.map.end()) {

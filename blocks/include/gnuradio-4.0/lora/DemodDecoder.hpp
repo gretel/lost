@@ -64,6 +64,7 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
     float    _cfo_frac = 0.f;
     bool     _is_downchirp = false;
     double   _snr_db = 0.0;
+    double   _noise_floor_db = -999.0;
     int64_t  _rx_channel = -1;
 
     std::vector<std::complex<float>> _downchirp;
@@ -206,6 +207,9 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
         out_tag["crc_valid"]     = gr::pmt::Value(crc_valid);
         out_tag["is_downchirp"]  = gr::pmt::Value(_is_downchirp);
         out_tag["snr_db"]        = gr::pmt::Value(_snr_db);
+        if (_noise_floor_db > -999.0) {
+            out_tag["noise_floor_db"] = gr::pmt::Value(_noise_floor_db);
+        }
         if (_rx_channel >= 0) {
             out_tag["rx_channel"] = gr::pmt::Value(_rx_channel);
         }
@@ -260,6 +264,11 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
                     } else {
                         _snr_db = 0.0;
                     }
+                    if (auto it2 = tag.map.find("noise_floor_db"); it2 != tag.map.end()) {
+                        _noise_floor_db = it2->second.value_or<double>(-999.0);
+                    } else {
+                        _noise_floor_db = -999.0;
+                    }
                     if (auto it2 = tag.map.find("rx_channel"); it2 != tag.map.end()) {
                         _rx_channel = it2->second.value_or<int64_t>(-1);
                     } else {
@@ -267,9 +276,10 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
                     }
 
                     if (debug) {
-                        std::fprintf(stderr, "[DemodDecoder] IDLE->HEADER: sf=%u cfo_int=%d cfo_frac=%.3f snr=%.1f dB%s\n",
+                        std::fprintf(stderr, "[DemodDecoder] IDLE->HEADER: sf=%u cfo_int=%d cfo_frac=%.3f snr=%.1f dB noise=%.1f dBFS%s\n",
                                      sf, _cfo_int, static_cast<double>(_cfo_frac),
                                      static_cast<double>(_snr_db),
+                                     _noise_floor_db,
                                      _is_downchirp ? " (downchirp)" : "");
                     }
 

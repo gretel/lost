@@ -80,15 +80,21 @@ def meshcore_expanded_key(seed: bytes) -> bytes:
 # ---- ECDH shared secret ----
 
 
-def meshcore_shared_secret(my_prv_64: bytes, other_pub_32: bytes) -> bytes:
+def meshcore_shared_secret(my_prv_64: bytes, other_pub_32: bytes) -> bytes | None:
     """Compute MeshCore ECDH shared secret via X25519.
 
     my_prv_64: 64-byte expanded private key (first 32 bytes = scalar).
     other_pub_32: 32-byte Ed25519 public key.
+
+    Returns 32-byte shared secret, or None if other_pub_32 is not a valid
+    Ed25519 public key (e.g. truncated, corrupted, or wrong key type).
     """
-    curve_sk = _clamp_scalar(my_prv_64[:32])
-    curve_pk = crypto_sign_ed25519_pk_to_curve25519(other_pub_32)
-    return crypto_scalarmult(curve_sk, curve_pk)
+    try:
+        curve_sk = _clamp_scalar(my_prv_64[:32])
+        curve_pk = crypto_sign_ed25519_pk_to_curve25519(other_pub_32)
+        return crypto_scalarmult(curve_sk, curve_pk)
+    except Exception:
+        return None
 
 
 # ---- Encrypt / Decrypt ----
@@ -313,6 +319,8 @@ def try_decrypt_txt_msg(
 
     for hex_key, pubkey_bytes in known_keys.items():
         secret = meshcore_shared_secret(our_prv, pubkey_bytes)
+        if secret is None:
+            continue
         plaintext = meshcore_mac_then_decrypt(secret, encrypted)
         if plaintext is not None:
             # Verify hashes match (dest should be us, src should be them)
@@ -359,6 +367,8 @@ def try_decrypt_anon_req(
         return None
 
     secret = meshcore_shared_secret(our_prv, sender_pub)
+    if secret is None:
+        return None
     plaintext = meshcore_mac_then_decrypt(secret, encrypted)
     if plaintext is None:
         return None

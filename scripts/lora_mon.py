@@ -124,6 +124,7 @@ def format_frame(
     sync_word = phy.get("sync_word", 0)
     sw_label = sync_word_name(sync_word)
     snr_db = phy.get("snr_db")
+    noise_floor_db = phy.get("noise_floor_db")
     rx_ch = msg.get("rx_channel")
     dc = " (downchirp)" if msg.get("is_downchirp") else ""
 
@@ -133,6 +134,8 @@ def format_frame(
     )
     if snr_db is not None:
         header += f" SNR={snr_db:.1f}dB"
+    if noise_floor_db is not None:
+        header += f" NF={noise_floor_db:.1f}dBFS"
     if rx_ch is not None:
         header += f" ch={rx_ch}"
     header += dc
