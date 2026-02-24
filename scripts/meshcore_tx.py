@@ -40,9 +40,6 @@ Crypto:
 from __future__ import annotations
 
 import argparse
-import hashlib
-import hmac
-import os
 import struct
 import sys
 import time
@@ -52,11 +49,22 @@ import socket
 
 import cbor2
 import segno
-from Crypto.Cipher import AES
-from nacl.signing import SigningKey, VerifyKey
-from nacl.bindings import (
-    crypto_sign_ed25519_pk_to_curve25519,
-    crypto_scalarmult,
+from nacl.signing import SigningKey
+
+from meshcore_crypto import (
+    PUB_KEY_SIZE,
+    PRV_KEY_SIZE,
+    SIGNATURE_SIZE,
+    CIPHER_KEY_SIZE,
+    CIPHER_BLOCK_SIZE,
+    CIPHER_MAC_SIZE,
+    PATH_HASH_SIZE,
+    DEFAULT_IDENTITY_FILE,
+    load_or_create_identity,
+    meshcore_expanded_key,
+    meshcore_shared_secret,
+    meshcore_encrypt_then_mac,
+    meshcore_mac_then_decrypt,
 )
 
 # ---- MeshCore protocol constants ----
@@ -82,15 +90,6 @@ PAYLOAD_MULTI = 0x0A
 PAYLOAD_CTRL = 0x0B
 PAYLOAD_RAW_CUSTOM = 0x0F
 
-# Key/crypto sizes (from MeshCore.h)
-PUB_KEY_SIZE = 32
-PRV_KEY_SIZE = 64
-SIGNATURE_SIZE = 64
-CIPHER_KEY_SIZE = 16
-CIPHER_BLOCK_SIZE = 16
-CIPHER_MAC_SIZE = 2
-PATH_HASH_SIZE = 1
-
 # ADVERT flags
 ADVERT_NODE_CHAT = 0x01
 ADVERT_NODE_REPEATER = 0x02
@@ -100,158 +99,6 @@ ADVERT_HAS_LOCATION = 0x10
 ADVERT_HAS_FEATURE1 = 0x20
 ADVERT_HAS_FEATURE2 = 0x40
 ADVERT_HAS_NAME = 0x80
-
-# Default identity path
-DEFAULT_IDENTITY_DIR = Path.home() / ".config" / "gr4-lora"
-DEFAULT_IDENTITY_FILE = DEFAULT_IDENTITY_DIR / "identity.bin"
-
-
-# ---- Identity management ----
-
-
-def load_or_create_identity(path: Path) -> tuple[bytes, bytes, bytes]:
-    """Load or generate an Ed25519 keypair in MeshCore format.
-
-    Returns (expanded_prv_64, pub_key_32, seed_32):
-      expanded_prv = SHA-512(seed) with clamping (MeshCore's ed25519 private key)
-      pub_key = 32-byte Ed25519 public key
-      seed = 32-byte random seed (needed for libsodium signing)
-
-    The file stores [seed(32) | pub_key(32)] = 64 bytes.
-    The expanded private key is derived on load via SHA-512(seed).
-    """
-    if path.exists():
-        data = path.read_bytes()
-        if len(data) == 64:
-            seed = data[:32]
-            pub = data[32:64]
-            # Validate: derive pubkey from seed and check
-            sk = SigningKey(seed)
-            if bytes(sk.verify_key) == pub:
-                expanded = meshcore_expanded_key(seed)
-                sys.stderr.write(f"Loaded identity from {path}\n")
-                sys.stderr.write(f"  Public key: {pub.hex()}\n")
-                return expanded, pub, seed
-            else:
-                sys.stderr.write(
-                    f"WARNING: identity file {path} has mismatched keys, regenerating\n"
-                )
-        else:
-            sys.stderr.write(
-                f"WARNING: identity file {path} has wrong size ({len(data)}), regenerating\n"
-            )
-
-    # Generate new keypair
-    seed = os.urandom(32)
-    sk = SigningKey(seed)
-    pub = bytes(sk.verify_key)
-    expanded = meshcore_expanded_key(seed)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(seed + pub)
-    path.chmod(0o600)
-    sys.stderr.write(f"Generated new identity at {path}\n")
-    sys.stderr.write(f"  Public key: {pub.hex()}\n")
-    return expanded, pub, seed
-
-
-# ---- MeshCore crypto ----
-
-
-def _clamp_scalar(scalar: bytes) -> bytes:
-    """Apply Curve25519 clamping to a 32-byte scalar.
-
-    This matches MeshCore's ed25519_key_exchange() clamping:
-      e[0] &= 248; e[31] &= 63; e[31] |= 64;
-    """
-    ba = bytearray(scalar)
-    ba[0] &= 248
-    ba[31] &= 63
-    ba[31] |= 64
-    return bytes(ba)
-
-
-def meshcore_expanded_key(seed: bytes) -> bytes:
-    """Expand a 32-byte seed into MeshCore's 64-byte private key format.
-
-    MeshCore's ed25519_create_keypair: private_key = SHA-512(seed), then
-    clamp bytes [0] and [31]. The first 32 bytes become the Ed25519 scalar,
-    the second 32 bytes are used for signing nonces.
-    """
-    expanded = hashlib.sha512(seed).digest()
-    return _clamp_scalar(expanded[:32]) + expanded[32:]
-
-
-def meshcore_shared_secret(my_prv_64: bytes, other_pub_32: bytes) -> bytes:
-    """Compute MeshCore ECDH shared secret.
-
-    Replicates MeshCore's ed25519_key_exchange():
-      1. Take private_key[0:32] and clamp (idempotent if already clamped)
-      2. Convert Ed25519 public key from Edwards to Montgomery (X25519)
-      3. X25519 scalar multiply
-
-    my_prv_64: MeshCore expanded private key (SHA-512(seed) with clamping).
-               First 32 bytes are the scalar.
-    other_pub_32: Ed25519 public key (32 bytes).
-    """
-    # Clamp first 32 bytes (idempotent if already clamped by ed25519_create_keypair)
-    curve_sk = _clamp_scalar(my_prv_64[:32])
-    # Convert Ed25519 public key to Curve25519 (Montgomery X coordinate)
-    curve_pk = crypto_sign_ed25519_pk_to_curve25519(other_pub_32)
-    # X25519 scalar multiply
-    return crypto_scalarmult(curve_sk, curve_pk)
-
-
-def meshcore_encrypt_then_mac(shared_secret: bytes, plaintext: bytes) -> bytes:
-    """Encrypt data using MeshCore's encryptThenMAC.
-
-    AES-128-ECB encrypt (zero-padded to 16-byte blocks), then
-    HMAC-SHA256(secret, ciphertext) truncated to 2 bytes.
-
-    Returns: MAC(2) + ciphertext(N*16).
-    """
-    key = shared_secret[:CIPHER_KEY_SIZE]  # AES-128 uses first 16 bytes
-
-    # Pad plaintext to 16-byte boundary
-    padded = plaintext + b"\x00" * (
-        (CIPHER_BLOCK_SIZE - len(plaintext) % CIPHER_BLOCK_SIZE) % CIPHER_BLOCK_SIZE
-    )
-
-    # AES-128-ECB encrypt
-    cipher = AES.new(key, AES.MODE_ECB)
-    ciphertext = cipher.encrypt(padded)
-
-    # HMAC-SHA256 truncated to 2 bytes
-    mac = hmac.new(shared_secret[:PUB_KEY_SIZE], ciphertext, hashlib.sha256).digest()[
-        :CIPHER_MAC_SIZE
-    ]
-
-    return mac + ciphertext
-
-
-def meshcore_mac_then_decrypt(shared_secret: bytes, data: bytes) -> bytes | None:
-    """Decrypt data using MeshCore's MACThenDecrypt.
-
-    Verifies 2-byte HMAC-SHA256 MAC, then AES-128-ECB decrypts.
-
-    Returns plaintext on success, None on MAC failure.
-    """
-    if len(data) <= CIPHER_MAC_SIZE:
-        return None
-
-    mac_received = data[:CIPHER_MAC_SIZE]
-    ciphertext = data[CIPHER_MAC_SIZE:]
-
-    key = shared_secret[:CIPHER_KEY_SIZE]
-    mac_computed = hmac.new(
-        shared_secret[:PUB_KEY_SIZE], ciphertext, hashlib.sha256
-    ).digest()[:CIPHER_MAC_SIZE]
-
-    if mac_received != mac_computed:
-        return None
-
-    cipher = AES.new(key, AES.MODE_ECB)
-    return cipher.decrypt(ciphertext)
 
 
 # ---- MeshCore contact QR code ----
@@ -582,35 +429,39 @@ examples:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="MeshCore TX message builder. Outputs CBOR TX requests for lora_trx.",
-        epilog=_EPILOG,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
+    # Shared arguments available to all subcommands
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument(
         "--identity",
         type=Path,
         default=DEFAULT_IDENTITY_FILE,
         help=f"Identity file path (default: {DEFAULT_IDENTITY_FILE})",
     )
-    parser.add_argument(
+    shared.add_argument(
         "--dry-run",
         action="store_true",
         help="Print packet hex to stderr, still output CBOR to stdout",
     )
-    parser.add_argument(
+    shared.add_argument(
         "--freq", type=int, default=None, help="Override TX frequency in Hz"
     )
-    parser.add_argument(
+    shared.add_argument(
         "--sf", type=int, default=None, help="Override spreading factor (7-12)"
     )
-    parser.add_argument("--bw", type=int, default=None, help="Override bandwidth in Hz")
-    parser.add_argument(
+    shared.add_argument("--bw", type=int, default=None, help="Override bandwidth in Hz")
+    shared.add_argument(
         "--udp",
         type=str,
         default=None,
         metavar="HOST:PORT",
         help="Send CBOR TX request via UDP instead of stdout (e.g. 127.0.0.1:5555)",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="MeshCore TX message builder. Outputs CBOR TX requests for lora_trx.",
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[shared],
     )
     parser.add_argument(
         "--show-key", action="store_true", help="Print public key hex and exit"
@@ -621,6 +472,7 @@ def main():
     # advert subcommand
     p_advert = sub.add_parser(
         "advert",
+        parents=[shared],
         help="Send ADVERT beacon (broadcast identity)",
         description="Broadcast an ADVERT beacon advertising this node's identity. "
         "Uses FLOOD routing by default (ADVERTs are broadcasts).",
@@ -644,6 +496,7 @@ def main():
     # send subcommand (TXT_MSG)
     p_send = sub.add_parser(
         "send",
+        parents=[shared],
         help="Send encrypted message to a known contact",
         description="Send an encrypted TXT_MSG to a contact whose public key you know. "
         "Both parties must have exchanged keys (ECDH shared secret). "
@@ -665,6 +518,7 @@ def main():
     # anon-req subcommand
     p_anon = sub.add_parser(
         "anon-req",
+        parents=[shared],
         help="Send anonymous encrypted request (includes sender pubkey)",
         description="Send an encrypted ANON_REQ to a contact. Includes the sender's "
         "public key in cleartext so the recipient can derive the shared secret "
