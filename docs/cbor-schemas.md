@@ -8,7 +8,7 @@ Python: `pip install cbor2`, then `cbor2.loads(datagram)`.
 ## RX Output
 
 `lora_trx` outputs decoded frames as CBOR `lora_frame` maps via UDP (default
-port 5555, IPv6 dual-stack). Clients send a 1-byte registration datagram to
+port 5555). Clients send a 1-byte registration datagram to
 join the broadcast.
 
 ```bash
