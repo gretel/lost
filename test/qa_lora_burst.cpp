@@ -513,16 +513,6 @@ const boost::ut::suite<"Downchirp detection"> downchirp_tests = [] {
 
 // ============================================================================
 // Test 6: Oversampling factor sweep — os_factor = 2, 4, 8, 16
-//
-// Diagnoses the os_factor=16 CRC_FAIL bug observed with RTL-SDR reception
-// at 1 MS/s. Uses generate_frame_iq at each os_factor with known-good data
-// to isolate whether the bug is in the RX pipeline or in the RF path. Also
-// tests long payloads (70 bytes, typical Meshtastic) to detect SFO
-// accumulation drift that corrupts late symbols.
-//
-// Reference: gr-lora_sdr issue #91 (same symptom: <5% CRC valid at any
-// os_factor with RTL-SDR/Airspy), issue #79 (HackRF CRC fails on long
-// packets only — classic SFO accumulation).
 // ============================================================================
 
 namespace {

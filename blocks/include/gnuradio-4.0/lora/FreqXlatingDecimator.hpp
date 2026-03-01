@@ -81,7 +81,7 @@ struct FreqXlatingDecimator : gr::Block<FreqXlatingDecimator,
 
     [[nodiscard]] gr::work::Status processBulk(
             gr::InputSpanLike auto& input,
-            gr::OutputSpanLike auto& output) noexcept {
+            gr::OutputSpanLike auto& output) {
         auto in_span  = std::span(input);
         auto out_span = std::span(output);
 

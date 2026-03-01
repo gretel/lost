@@ -30,12 +30,15 @@
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/Tensor.hpp>
 
 #include "cbor.hpp"
 
 namespace gr::lora {
 
 struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
+    using Description = Doc<"LoRa frame output sink — text display, CBOR UDP broadcast, diversity metadata">;
+
     gr::PortIn<uint8_t> in;
 
     std::string udp_dest{};
@@ -52,12 +55,21 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     bool                 _is_downchirp{false};
     double               _snr_db{0.0};
     double               _noise_floor_db{-999.0};
+    double               _peak_db{-999.0};
     int64_t              _rx_channel{-1};
     bool                 _collecting{false};
     std::vector<uint8_t> _frame;
     uint32_t             _frame_count{0};
 
-    std::function<void(const std::vector<uint8_t>&)> _frame_callback{};
+    // Diversity combiner metadata (optional, populated from diversity_* tags)
+    int64_t              _diversity_n_candidates{0};
+    int64_t              _diversity_decoded_channel{-1};
+    int64_t              _diversity_crc_mask{0};
+    int64_t              _diversity_gap_us{0};
+    std::vector<int64_t> _diversity_rx_channels;
+    std::vector<double>  _diversity_snr_db;
+
+    std::function<void(const std::vector<uint8_t>&, bool crc_valid)> _frame_callback{};
 
     int                              _udp_fd{-1};
     std::vector<struct sockaddr_in>  _udp_clients;
@@ -221,11 +233,27 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         if (_noise_floor_db > -999.0) {
             std::printf("  NF=%.1f dBFS", _noise_floor_db);
         }
+        if (_peak_db > -999.0) {
+            std::printf("  peak=%.1f dBFS", _peak_db);
+        }
         if (_rx_channel >= 0) {
             std::printf("  ch=%d", static_cast<int>(_rx_channel));
         }
         if (_is_downchirp) {
             std::printf("  (downchirp)");
+        }
+        if (_diversity_n_candidates > 0) {
+            std::printf("  div=%lld",
+                        static_cast<long long>(_diversity_n_candidates));
+            if (_diversity_gap_us > 0) {
+                if (_diversity_gap_us >= 1000) {
+                    std::printf("  gap=%.1f ms",
+                                static_cast<double>(_diversity_gap_us) / 1000.0);
+                } else {
+                    std::printf("  gap=%lld us",
+                                static_cast<long long>(_diversity_gap_us));
+                }
+            }
         }
         std::printf("\n");
 
@@ -241,6 +269,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
         uint32_t top_fields = 9;
         if (_rx_channel >= 0) top_fields++;
+        if (_diversity_n_candidates > 0) top_fields++;
 
         cbor::encode_map_begin(buf, top_fields);
         cbor::kv_text(buf, "type", "lora_frame");
@@ -250,6 +279,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         cbor::encode_text(buf, "phy");
         uint32_t phy_fields = 6;
         if (_noise_floor_db > -999.0) phy_fields++;
+        if (_peak_db > -999.0) phy_fields++;
         cbor::encode_map_begin(buf, phy_fields);
         cbor::kv_uint(buf, "sf", phy_sf);
         cbor::kv_uint(buf, "bw", phy_bw);
@@ -259,6 +289,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         cbor::kv_float64(buf, "snr_db", _snr_db);
         if (_noise_floor_db > -999.0) {
             cbor::kv_float64(buf, "noise_floor_db", _noise_floor_db);
+        }
+        if (_peak_db > -999.0) {
+            cbor::kv_float64(buf, "peak_db", _peak_db);
         }
 
         cbor::kv_bytes(buf, "payload", _frame.data(),
@@ -270,6 +303,36 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         cbor::kv_bool(buf, "is_downchirp", _is_downchirp);
         if (_rx_channel >= 0) {
             cbor::kv_uint(buf, "rx_channel", static_cast<uint64_t>(_rx_channel));
+        }
+
+        // Diversity combiner metadata (only present when N>1 combiner is active)
+        if (_diversity_n_candidates > 0) {
+            cbor::encode_text(buf, "diversity");
+            cbor::encode_map_begin(buf, 6);
+
+            // rx_channels: int array
+            cbor::encode_text(buf, "rx_channels");
+            cbor::encode_array_begin(buf, static_cast<uint32_t>(_diversity_rx_channels.size()));
+            for (auto ch : _diversity_rx_channels) {
+                cbor::encode_uint(buf, static_cast<uint64_t>(ch));
+            }
+
+            cbor::kv_uint(buf, "decoded_channel",
+                          static_cast<uint64_t>(_diversity_decoded_channel));
+
+            // snr_db: double array
+            cbor::encode_text(buf, "snr_db");
+            cbor::encode_array_begin(buf, static_cast<uint32_t>(_diversity_snr_db.size()));
+            for (auto snr : _diversity_snr_db) {
+                cbor::encode_float64(buf, snr);
+            }
+
+            cbor::kv_uint(buf, "crc_mask",
+                          static_cast<uint64_t>(_diversity_crc_mask));
+            cbor::kv_uint(buf, "n_candidates",
+                          static_cast<uint64_t>(_diversity_n_candidates));
+            cbor::kv_uint(buf, "gap_us",
+                          static_cast<uint64_t>(_diversity_gap_us));
         }
 
         return buf;
@@ -301,7 +364,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         if (_frame_callback || cbor_stdout || _udp_fd >= 0) {
             auto buf = buildFrameCbor(ts);
             if (_frame_callback) {
-                _frame_callback(buf);
+                _frame_callback(buf, _crc_valid);
             }
             if (cbor_stdout) {
                 sendFrameStdout(buf);
@@ -314,7 +377,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         }
     }
 
-    void processOne(uint8_t byte) noexcept {
+    void processOne(uint8_t byte) {
         if (this->inputTagsPresent()) {
             const auto& tag = this->mergedInputTag();
             if (auto it = tag.map.find("pay_len"); it != tag.map.end()) {
@@ -351,11 +414,56 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                 } else {
                     _noise_floor_db = -999.0;
                 }
+                if (auto it2 = tag.map.find("peak_db");
+                    it2 != tag.map.end()) {
+                    _peak_db = it2->second.value_or<double>(-999.0);
+                } else {
+                    _peak_db = -999.0;
+                }
                 if (auto it2 = tag.map.find("rx_channel");
                     it2 != tag.map.end()) {
                     _rx_channel = it2->second.value_or<int64_t>(-1);
                 } else {
                     _rx_channel = -1;
+                }
+
+                // Diversity combiner metadata (optional — only present
+                // when DiversityCombiner is in the pipeline with N>1)
+                _diversity_n_candidates = 0;
+                _diversity_decoded_channel = -1;
+                _diversity_crc_mask = 0;
+                _diversity_gap_us = 0;
+                _diversity_rx_channels.clear();
+                _diversity_snr_db.clear();
+                if (auto it2 = tag.map.find("diversity_n_candidates");
+                    it2 != tag.map.end()) {
+                    _diversity_n_candidates = it2->second.value_or<int64_t>(0);
+                }
+                if (_diversity_n_candidates > 0) {
+                    if (auto it2 = tag.map.find("diversity_decoded_channel");
+                        it2 != tag.map.end()) {
+                        _diversity_decoded_channel = it2->second.value_or<int64_t>(-1);
+                    }
+                    if (auto it2 = tag.map.find("diversity_crc_mask");
+                        it2 != tag.map.end()) {
+                        _diversity_crc_mask = it2->second.value_or<int64_t>(0);
+                    }
+                    if (auto it2 = tag.map.find("diversity_gap_us");
+                        it2 != tag.map.end()) {
+                        _diversity_gap_us = it2->second.value_or<int64_t>(0);
+                    }
+                    if (auto it2 = tag.map.find("diversity_rx_channels");
+                        it2 != tag.map.end()) {
+                        if (auto* tensor = it2->second.get_if<gr::Tensor<int64_t>>()) {
+                            _diversity_rx_channels.assign(tensor->begin(), tensor->end());
+                        }
+                    }
+                    if (auto it2 = tag.map.find("diversity_snr_db");
+                        it2 != tag.map.end()) {
+                        if (auto* tensor = it2->second.get_if<gr::Tensor<double>>()) {
+                            _diversity_snr_db.assign(tensor->begin(), tensor->end());
+                        }
+                    }
                 }
 
                 _frame.clear();

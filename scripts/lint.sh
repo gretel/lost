@@ -11,7 +11,7 @@
 # Requires: build/compile_commands.json (cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON)
 set -euo pipefail
 
-LLVM_PREFIX="${LLVM_PREFIX:-$(brew --prefix llvm@20 2>/dev/null || echo /opt/homebrew/opt/llvm@20)}"
+LLVM_PREFIX="${LLVM_PREFIX:-$(brew --prefix llvm@21 2>/dev/null || echo /opt/homebrew/opt/llvm@21)}"
 CLANG_TIDY="${LLVM_PREFIX}/bin/clang-tidy"
 CLANG_TIDY_DIFF="${LLVM_PREFIX}/share/clang/clang-tidy-diff.py"
 BUILD_DIR="${BUILD_DIR:-build}"

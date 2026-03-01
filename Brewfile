@@ -2,7 +2,7 @@
 # Install: brew bundle
 # Verify:  brew bundle check
 
-brew "llvm@20"      # C++23 toolchain (GR4 requires Clang >= 18); also provides clang-tidy, clang-format
+brew "llvm@21"      # C++23 toolchain (GR4 requires Clang >= 19); also provides clang-tidy, clang-format
 brew "cmake"        # Build system (>= 3.27)
 brew "ninja"        # Fast build backend
 brew "ccache"       # Compiler cache

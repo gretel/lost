@@ -20,12 +20,16 @@ __pycache__/
 # Scratch
 tmp/
 
+# Data (DuckDB databases)
+data/
+
 # macOS
 .DS_Store
 ._*
 
 # Agent
 CLAUDE.md
+GR4LORA_REVIEW.md
 
 # GR4 reference docs (not our code)
 docs/GR4_CORE_*

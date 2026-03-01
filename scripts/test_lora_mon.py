@@ -559,5 +559,157 @@ class TestCborStream(unittest.TestCase):
         self.assertEqual(items[0]["type"], "lora_frame")
 
 
+# ---- peak_db in format_frame ----
+
+
+class TestFormatFramePeak(unittest.TestCase):
+    def test_peak_shown(self):
+        msg = make_frame()
+        msg["phy"]["peak_db"] = -6.2
+        text = lora_mon.format_frame(msg)
+        self.assertIn("peak=-6.2dBFS", text)
+
+    def test_no_peak_when_absent(self):
+        text = lora_mon.format_frame(make_frame())
+        self.assertNotIn("peak=", text)
+
+
+# ---- gain_advice ----
+
+
+class TestGainAdvice(unittest.TestCase):
+    def test_clipping(self):
+        """Peak above -3 dBFS should warn about clipping."""
+        advice = lora_mon.gain_advice({"peak_db": -1.5})
+        self.assertIsNotNone(advice)
+        self.assertIn("GAIN HIGH", advice)
+        self.assertIn("reduce", advice.lower())
+
+    def test_noise_too_high(self):
+        """Noise floor above -25 dBFS should warn."""
+        advice = lora_mon.gain_advice({"noise_floor_db": -20.0})
+        self.assertIsNotNone(advice)
+        self.assertIn("GAIN HIGH", advice)
+
+    def test_noise_too_low(self):
+        """Noise floor below -65 dBFS should warn."""
+        advice = lora_mon.gain_advice({"noise_floor_db": -70.0})
+        self.assertIsNotNone(advice)
+        self.assertIn("GAIN LOW", advice)
+        self.assertIn("increase", advice.lower())
+
+    def test_sweet_spot_no_advice(self):
+        """Normal levels should return None."""
+        advice = lora_mon.gain_advice({"peak_db": -12.0, "noise_floor_db": -45.0})
+        self.assertIsNone(advice)
+
+    def test_empty_phy_no_advice(self):
+        """No peak or noise floor should return None."""
+        self.assertIsNone(lora_mon.gain_advice({}))
+
+    def test_clipping_overrides_noise(self):
+        """Clipping warning takes priority over noise floor."""
+        advice = lora_mon.gain_advice({"peak_db": -1.0, "noise_floor_db": -70.0})
+        self.assertIn("peak", advice)
+
+
+# ---- format_config ----
+
+
+class TestFormatConfig(unittest.TestCase):
+    def test_config_contains_freq(self):
+        msg = {
+            "type": "config",
+            "phy": {
+                "freq": 869618000.0,
+                "sf": 8,
+                "bw": 62500,
+                "cr": 4,
+                "sync_word": 18,
+                "preamble": 8,
+                "rx_gain": 40.0,
+                "tx_gain": 74.0,
+            },
+            "server": {
+                "device": "uhd",
+                "status_interval": 10,
+                "sample_rate": 250000.0,
+            },
+        }
+        text = lora_mon.format_config(msg)
+        self.assertIn("869.618", text)
+        self.assertIn("SF8", text)
+        self.assertIn("RX=40", text)
+        self.assertIn("uhd", text)
+        self.assertIn("250 kS/s", text)
+
+    def test_config_empty(self):
+        """Empty config should not crash."""
+        text = lora_mon.format_config({"type": "config"})
+        self.assertIn("config", text)
+
+
+# ---- format_status ----
+
+
+class TestFormatStatus(unittest.TestCase):
+    def test_status_shows_counts(self):
+        msg = {
+            "type": "status",
+            "ts": "2026-02-25T12:00:00Z",
+            "phy": {"rx_gain": 40.0, "tx_gain": 74.0},
+            "frames": {"total": 42, "crc_ok": 38, "crc_fail": 4},
+        }
+        text = lora_mon.format_status(msg)
+        self.assertIn("42 frames", text)
+        self.assertIn("38 OK", text)
+        self.assertIn("4 fail", text)
+        self.assertIn("90%", text)
+        self.assertIn("12:00:00", text)
+
+    def test_status_zero_frames(self):
+        msg = {
+            "type": "status",
+            "ts": "2026-02-25T12:00:00Z",
+            "phy": {"rx_gain": 40.0},
+            "frames": {"total": 0, "crc_ok": 0, "crc_fail": 0},
+        }
+        text = lora_mon.format_status(msg)
+        self.assertIn("0 frames", text)
+
+
+# ---- load_config ----
+
+
+class TestLoadConfig(unittest.TestCase):
+    def test_load_missing_returns_empty(self):
+        """Non-existent config path returns empty dict."""
+        result = lora_common.load_config("/nonexistent/config.toml")
+        self.assertEqual(result, {})
+
+    def test_load_valid_toml(self):
+        """Valid TOML file is parsed correctly."""
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+            f.write('udp_listen = "10.0.0.1"\nudp_port = 7777\n')
+            f.flush()
+            cfg = lora_common.load_config(f.name)
+        self.assertEqual(cfg["udp_listen"], "10.0.0.1")
+        self.assertEqual(cfg["udp_port"], 7777)
+        os.unlink(f.name)
+
+    def test_config_udp_defaults(self):
+        """Empty config returns default host and port."""
+        self.assertEqual(lora_common.config_udp_host({}), "127.0.0.1")
+        self.assertEqual(lora_common.config_udp_port({}), 5555)
+
+    def test_config_udp_from_dict(self):
+        """Config values are extracted correctly."""
+        cfg = {"udp_listen": "0.0.0.0", "udp_port": 9999}
+        self.assertEqual(lora_common.config_udp_host(cfg), "0.0.0.0")
+        self.assertEqual(lora_common.config_udp_port(cfg), 9999)
+
+
 if __name__ == "__main__":
     unittest.main()

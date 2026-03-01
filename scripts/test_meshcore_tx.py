@@ -398,9 +398,10 @@ class TestAdvert(unittest.TestCase):
         self.assertTrue(flags & ADVERT_HAS_NAME)
         self.assertTrue(flags & 0x10)  # HAS_LOCATION
 
-        lat, lon = struct.unpack_from("<ff", app_data, 1)
-        self.assertAlmostEqual(lat, 51.5074, places=3)
-        self.assertAlmostEqual(lon, -0.1278, places=3)
+        # Location is int32 scaled by 1e6, per MeshCore spec
+        lat_i, lon_i = struct.unpack_from("<ii", app_data, 1)
+        self.assertAlmostEqual(lat_i / 1e6, 51.5074, places=3)
+        self.assertAlmostEqual(lon_i / 1e6, -0.1278, places=3)
 
 
 class TestAnonReq(unittest.TestCase):

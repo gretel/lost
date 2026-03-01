@@ -3,6 +3,7 @@
 #define GNURADIO_LORA_UTILITIES_HPP
 
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -19,6 +20,7 @@ using LLR = double;  ///< Log-Likelihood Ratio type
 
 /// Positive modulus: result is always in [0, b-1].
 [[nodiscard]] inline constexpr int64_t mod(int64_t a, int64_t b) noexcept {
+    assert(b != 0 && "mod() called with divisor 0");
     return (a % b + b) % b;
 }
 

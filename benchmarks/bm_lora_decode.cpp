@@ -77,7 +77,6 @@ struct AlgorithmRxDecoder {
             gr::lora::mod(static_cast<int64_t>(max_idx) - 1, static_cast<int64_t>(N)));
     }
 
-    /// Gray demapping.
     [[nodiscard]] static uint16_t grayMap(uint16_t s) {
         return static_cast<uint16_t>(s ^ (s >> 1));
     }
@@ -111,7 +110,6 @@ struct AlgorithmRxDecoder {
             }
         }
 
-        // Parse header
         if (all_nibbles.size() < 5) return {};
         auto hdr = gr::lora::parse_explicit_header(
             all_nibbles[0], all_nibbles[1], all_nibbles[2],
@@ -216,7 +214,6 @@ const boost::ut::suite decode_benchmarks = [] {
         constexpr int REPS = 500;
         ::benchmark::benchmark<REPS>(std::string_view("TX+RX loopback (14B)"), 1) =
             [&decoder] {
-                // TX
                 auto frame_iq = gr::lora::generate_frame_iq(
                     PAYLOAD, SF, CR, 1, SYNC_WORD, PREAMBLE_LEN, true, 0);
 

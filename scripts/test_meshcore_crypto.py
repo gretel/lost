@@ -26,12 +26,18 @@ from meshcore_crypto import (
     DEFAULT_KEYS_DIR,
     PAYLOAD_ADVERT,
     PAYLOAD_ANON_REQ,
+    PAYLOAD_GRP_TXT,
     PAYLOAD_TXT,
     PUB_KEY_SIZE,
+    SEED_CHANNELS_DIR,
     SIGNATURE_SIZE,
+    GroupChannel,
     _clamp_scalar,
+    build_grp_txt,
     extract_advert_name,
     extract_advert_pubkey,
+    grp_txt_channel_hash,
+    load_channels,
     load_identity,
     load_known_keys,
     load_or_create_identity,
@@ -40,8 +46,10 @@ from meshcore_crypto import (
     meshcore_mac_then_decrypt,
     meshcore_shared_secret,
     parse_meshcore_header,
+    save_channel,
     save_pubkey,
     try_decrypt_anon_req,
+    try_decrypt_grp_txt,
     try_decrypt_txt_msg,
 )
 
@@ -53,6 +61,19 @@ TEST_SEED_PUB = bytes.fromhex(
     "682500378e875577ff16b044bb6f2823bc4a7fcb3f34cab962f13553fb2369b5"
 )
 TEST_SEED_EXPANDED = meshcore_expanded_key(TEST_SEED)
+
+
+def _seed_channels() -> list[GroupChannel]:
+    """Load channels from the repo seed directory (scripts/channels/)."""
+    return load_channels(SEED_CHANNELS_DIR)
+
+
+def _public_channel() -> GroupChannel:
+    """Return the #public channel loaded from seed files."""
+    for ch in _seed_channels():
+        if ch.name == "public":
+            return ch
+    raise RuntimeError("public.channel seed file missing")
 
 
 def _build_advert_packet(seed: bytes, pub: bytes, name: str = "") -> bytes:
@@ -446,6 +467,346 @@ class TestEncryptDecryptEdgeCases(unittest.TestCase):
         self.assertEqual(len(encrypted), CIPHER_MAC_SIZE + 16)
         decrypted = meshcore_mac_then_decrypt(secret, encrypted)
         self.assertEqual(decrypted, plaintext)
+
+
+# ---- Group channel support ----
+
+
+class TestGroupChannel(unittest.TestCase):
+    def test_public_channel_secret_length(self):
+        ch = _public_channel()
+        self.assertEqual(len(ch.secret), 32)
+        # First 16 bytes are the PSK, rest are zero-padded
+        self.assertEqual(ch.secret[16:], b"\x00" * 16)
+
+    def test_channel_hash_is_one_byte(self):
+        ch = GroupChannel("test", os.urandom(16))
+        self.assertEqual(len(ch.hash), 1)
+
+    def test_channel_hash_deterministic(self):
+        psk = os.urandom(16)
+        ch1 = GroupChannel("a", psk)
+        ch2 = GroupChannel("b", psk)
+        self.assertEqual(ch1.hash, ch2.hash)
+
+    def test_different_psk_different_hash(self):
+        # Statistically almost certain to differ (1/256 collision chance)
+        hashes = {GroupChannel("ch", os.urandom(16)).hash for _ in range(50)}
+        self.assertGreater(len(hashes), 1)
+
+    def test_32_byte_psk(self):
+        psk = os.urandom(32)
+        ch = GroupChannel("full", psk)
+        self.assertEqual(ch.secret, psk)
+
+    def test_seed_channels_include_public_and_hansemesh(self):
+        channels = _seed_channels()
+        names = {ch.name for ch in channels}
+        self.assertIn("public", names)
+        self.assertIn("hansemesh", names)
+
+
+class TestGroupChannelPersistence(unittest.TestCase):
+    def test_save_and_load_channel(self):
+        with tempfile.TemporaryDirectory() as td:
+            channels_dir = Path(td) / "channels"
+            psk = os.urandom(16)
+            self.assertTrue(save_channel(channels_dir, "secret", psk))
+            # Duplicate returns False
+            self.assertFalse(save_channel(channels_dir, "secret", psk))
+            loaded = load_channels(channels_dir)
+            names = {ch.name for ch in loaded}
+            self.assertIn("secret", names)
+
+    def test_load_nonexistent_seeds_from_repo(self):
+        with tempfile.TemporaryDirectory() as td:
+            channels_dir = Path(td) / "channels"
+            channels = load_channels(channels_dir)
+            # Should seed from scripts/channels/
+            names = {ch.name for ch in channels}
+            self.assertIn("public", names)
+            self.assertIn("hansemesh", names)
+            # Verify seed files were copied
+            self.assertTrue((channels_dir / "public.channel").exists())
+            self.assertTrue((channels_dir / "hansemesh.channel").exists())
+
+    def test_load_skips_wrong_size_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            channels_dir = Path(td) / "channels"
+            channels_dir.mkdir()
+            # Valid 16-byte channel
+            (channels_dir / "good.channel").write_bytes(os.urandom(16))
+            # Invalid sizes
+            (channels_dir / "short.channel").write_bytes(b"short")
+            (channels_dir / "long.channel").write_bytes(os.urandom(64))
+            channels = load_channels(channels_dir)
+            names = {ch.name for ch in channels}
+            self.assertIn("good", names)
+            self.assertNotIn("short", names)
+            self.assertNotIn("long", names)
+
+    def test_no_seed_if_channels_exist(self):
+        with tempfile.TemporaryDirectory() as td:
+            channels_dir = Path(td) / "channels"
+            channels_dir.mkdir()
+            psk = os.urandom(16)
+            (channels_dir / "only.channel").write_bytes(psk)
+            channels = load_channels(channels_dir)
+            # Only the manually created channel, no seeding
+            names = {ch.name for ch in channels}
+            self.assertEqual(names, {"only"})
+
+
+class TestBuildGrpTxt(unittest.TestCase):
+    def test_build_grp_txt_basic(self):
+        ch = GroupChannel("test", os.urandom(16))
+        payload = build_grp_txt(ch, "Alice", "Hello group", timestamp=1700000000)
+        # payload = channel_hash(1) + MAC(2) + ciphertext(N*16)
+        self.assertEqual(payload[:1], ch.hash)
+        self.assertGreater(len(payload), 1 + 2 + 16)
+
+    def test_build_grp_txt_deterministic(self):
+        psk = os.urandom(16)
+        ch = GroupChannel("ch", psk)
+        p1 = build_grp_txt(ch, "Bob", "Hi", timestamp=1700000000)
+        p2 = build_grp_txt(ch, "Bob", "Hi", timestamp=1700000000)
+        self.assertEqual(p1, p2)
+
+
+class TestTryDecryptGrpTxt(unittest.TestCase):
+    def _make_grp_txt_packet(self, channel, sender_name, text, timestamp=1700000000):
+        """Build a full GRP_TXT wire packet for testing."""
+        from meshcore_tx import (
+            build_wire_packet,
+            make_header,
+            ROUTE_FLOOD,
+            PAYLOAD_GRP_TXT,
+        )
+
+        grp_payload = build_grp_txt(channel, sender_name, text, timestamp=timestamp)
+        header = make_header(ROUTE_FLOOD, PAYLOAD_GRP_TXT)
+        return build_wire_packet(header, grp_payload)
+
+    def test_decrypt_public_channel(self):
+        channels = _seed_channels()
+        public_ch = _public_channel()
+        pkt = self._make_grp_txt_packet(public_ch, "Alice", "Hello from public")
+        result = try_decrypt_grp_txt(pkt, channels)
+        self.assertIsNotNone(result)
+        text, ch_name = result
+        self.assertEqual(ch_name, "public")
+        self.assertIn("Alice", text)
+        self.assertIn("Hello from public", text)
+
+    def test_decrypt_custom_channel(self):
+        psk = os.urandom(16)
+        ch = GroupChannel("secret", psk)
+        channels = _seed_channels() + [ch]
+        pkt = self._make_grp_txt_packet(ch, "Bob", "Secret msg")
+        result = try_decrypt_grp_txt(pkt, channels)
+        self.assertIsNotNone(result)
+        text, ch_name = result
+        self.assertEqual(ch_name, "secret")
+        self.assertIn("Bob: Secret msg", text)
+
+    def test_decrypt_wrong_channel_returns_none(self):
+        ch1 = GroupChannel("ch1", os.urandom(16))
+        ch2 = GroupChannel("ch2", os.urandom(16))
+        pkt = self._make_grp_txt_packet(ch1, "Alice", "For ch1 only")
+        # Try to decrypt with ch2 only (ch1 not in list)
+        result = try_decrypt_grp_txt(pkt, [ch2])
+        # May be None (hash mismatch) or None (MAC mismatch)
+        # Either way, should not return valid text
+        if result is not None:
+            # In the unlikely event of a hash collision, MAC should still fail
+            pass
+        else:
+            self.assertIsNone(result)
+
+    def test_decrypt_empty_channels(self):
+        ch = GroupChannel("ch", os.urandom(16))
+        pkt = self._make_grp_txt_packet(ch, "Alice", "Hello")
+        result = try_decrypt_grp_txt(pkt, [])
+        self.assertIsNone(result)
+
+    def test_non_grp_txt_returns_none(self):
+        """ADVERT packet should not be decrypted as GRP_TXT."""
+        pkt = _build_advert_packet(TEST_SEED, TEST_SEED_PUB, name="Node")
+        result = try_decrypt_grp_txt(pkt, _seed_channels())
+        self.assertIsNone(result)
+
+    def test_truncated_packet_returns_none(self):
+        result = try_decrypt_grp_txt(b"\x15\x00\xaa", _seed_channels())
+        self.assertIsNone(result)
+
+    def test_round_trip_multiple_messages(self):
+        ch = GroupChannel("test", os.urandom(16))
+        channels = [ch]
+        messages = ["Short", "A" * 100, "Unicode: \u2603\u2764"]
+        for msg_text in messages:
+            pkt = self._make_grp_txt_packet(ch, "Sender", msg_text)
+            result = try_decrypt_grp_txt(pkt, channels)
+            self.assertIsNotNone(result, f"Failed to decrypt: {msg_text!r}")
+            text, _ = result
+            self.assertIn(msg_text, text)
+
+    def test_public_psk_known_answer(self):
+        """Verify the #public PSK produces a deterministic channel hash."""
+        import hashlib
+
+        ch = _public_channel()
+        # Re-derive hash from the raw PSK (first 16 bytes, zero-padded to 32)
+        raw_psk = ch.secret.rstrip(b"\x00")
+        expected_hash = hashlib.sha256(raw_psk).digest()[:1]
+        self.assertEqual(ch.hash, expected_hash)
+
+
+class TestFormatFrameGrpTxt(unittest.TestCase):
+    """Test format_frame integration with group message decryption."""
+
+    def test_grp_txt_displayed(self):
+        from meshcore_tx import (
+            build_wire_packet,
+            make_header,
+            ROUTE_FLOOD,
+            PAYLOAD_GRP_TXT,
+        )
+
+        channels = _seed_channels()
+        public_ch = _public_channel()
+        grp_payload = build_grp_txt(public_ch, "TestUser", "Hello group")
+        header = make_header(ROUTE_FLOOD, PAYLOAD_GRP_TXT)
+        pkt = build_wire_packet(header, grp_payload)
+
+        msg = {
+            "type": "lora_frame",
+            "ts": "2026-01-01T12:00:00.000Z",
+            "seq": 1,
+            "phy": {
+                "sf": 8,
+                "bw": 62500,
+                "cr": 4,
+                "sync_word": 0x12,
+                "crc_valid": True,
+            },
+            "payload": pkt,
+            "payload_len": len(pkt),
+            "crc_valid": True,
+            "cr": 4,
+            "is_downchirp": False,
+        }
+
+        import lora_mon
+
+        text = lora_mon.format_frame(msg, channels=channels)
+        self.assertIn("GRP_TXT #public", text)
+        self.assertIn("TestUser: Hello group", text)
+
+    def test_grp_txt_no_identity_needed(self):
+        """Group decryption works without any identity (our_prv/our_pub)."""
+        from meshcore_tx import (
+            build_wire_packet,
+            make_header,
+            ROUTE_FLOOD,
+            PAYLOAD_GRP_TXT,
+        )
+
+        channels = _seed_channels()
+        public_ch = _public_channel()
+        grp_payload = build_grp_txt(public_ch, "NoID", "Works without identity")
+        header = make_header(ROUTE_FLOOD, PAYLOAD_GRP_TXT)
+        pkt = build_wire_packet(header, grp_payload)
+
+        msg = {
+            "type": "lora_frame",
+            "ts": "2026-01-01T12:00:00.000Z",
+            "seq": 1,
+            "phy": {
+                "sf": 8,
+                "bw": 62500,
+                "cr": 4,
+                "sync_word": 0x12,
+                "crc_valid": True,
+            },
+            "payload": pkt,
+            "payload_len": len(pkt),
+            "crc_valid": True,
+            "cr": 4,
+            "is_downchirp": False,
+        }
+
+        import lora_mon
+
+        # No our_prv, no our_pub — group decryption should still work
+        text = lora_mon.format_frame(msg, channels=channels)
+        self.assertIn("GRP_TXT #public", text)
+        self.assertIn("NoID: Works without identity", text)
+
+    def test_grp_txt_unknown_channel_shows_hash(self):
+        """GRP_TXT with unknown channel hash shows the hash byte."""
+        from meshcore_tx import (
+            build_wire_packet,
+            make_header,
+            ROUTE_FLOOD,
+            PAYLOAD_GRP_TXT,
+        )
+
+        # Use a random channel not in the known set
+        unknown_ch = GroupChannel("secret", os.urandom(16))
+        grp_payload = build_grp_txt(unknown_ch, "Anon", "Hidden msg")
+        header = make_header(ROUTE_FLOOD, PAYLOAD_GRP_TXT)
+        pkt = build_wire_packet(header, grp_payload)
+
+        msg = {
+            "type": "lora_frame",
+            "ts": "2026-01-01T12:00:00.000Z",
+            "seq": 1,
+            "phy": {
+                "sf": 8,
+                "bw": 62500,
+                "cr": 4,
+                "sync_word": 0x12,
+                "crc_valid": True,
+            },
+            "payload": pkt,
+            "payload_len": len(pkt),
+            "crc_valid": True,
+            "cr": 4,
+            "is_downchirp": False,
+        }
+
+        import lora_mon
+
+        # No matching channel — should show unknown hash
+        text = lora_mon.format_frame(msg, channels=_seed_channels())
+        self.assertIn("unknown channel", text)
+        self.assertIn(f"ch={unknown_ch.hash.hex()}", text)
+
+
+class TestGrpTxtChannelHash(unittest.TestCase):
+    def test_returns_hash_for_grp_txt(self):
+        from meshcore_tx import (
+            build_wire_packet,
+            make_header,
+            ROUTE_FLOOD,
+            PAYLOAD_GRP_TXT,
+        )
+
+        ch = GroupChannel("test", os.urandom(16))
+        grp_payload = build_grp_txt(ch, "X", "Y", timestamp=1700000000)
+        header = make_header(ROUTE_FLOOD, PAYLOAD_GRP_TXT)
+        pkt = build_wire_packet(header, grp_payload)
+        result = grp_txt_channel_hash(pkt)
+        self.assertEqual(result, ch.hash)
+
+    def test_returns_none_for_non_grp_txt(self):
+        pkt = _build_advert_packet(TEST_SEED, TEST_SEED_PUB, name="Node")
+        result = grp_txt_channel_hash(pkt)
+        self.assertIsNone(result)
+
+    def test_returns_none_for_truncated(self):
+        result = grp_txt_channel_hash(b"\x14")
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

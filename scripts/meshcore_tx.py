@@ -40,6 +40,7 @@ Crypto:
 from __future__ import annotations
 
 import argparse
+import logging
 import struct
 import sys
 import time
@@ -51,7 +52,15 @@ import cbor2
 import segno
 from nacl.signing import SigningKey
 
+from lora_common import (
+    config_udp_host,
+    config_udp_port,
+    load_config,
+    parse_host_port,
+    setup_logging,
+)
 from meshcore_crypto import (
+    # Crypto primitives
     PUB_KEY_SIZE,
     PRV_KEY_SIZE,
     SIGNATURE_SIZE,
@@ -65,87 +74,41 @@ from meshcore_crypto import (
     meshcore_shared_secret,
     meshcore_encrypt_then_mac,
     meshcore_mac_then_decrypt,
+    # Protocol constants (canonical source)
+    ROUTE_FLOOD,
+    ROUTE_T_FLOOD,
+    ROUTE_DIRECT,
+    ROUTE_T_DIRECT,
+    PAYLOAD_REQ,
+    PAYLOAD_RESP,
+    PAYLOAD_TXT,
+    PAYLOAD_ACK,
+    PAYLOAD_ADVERT,
+    PAYLOAD_GRP_TXT,
+    PAYLOAD_GRP_DATA,
+    PAYLOAD_ANON_REQ,
+    PAYLOAD_PATH,
+    PAYLOAD_TRACE,
+    PAYLOAD_MULTI,
+    PAYLOAD_CTRL,
+    PAYLOAD_RAW_CUSTOM,
+    ADVERT_NODE_CHAT,
+    ADVERT_NODE_REPEATER,
+    ADVERT_NODE_ROOM,
+    ADVERT_NODE_SENSOR,
+    ADVERT_HAS_LOCATION,
+    ADVERT_HAS_FEATURE1,
+    ADVERT_HAS_FEATURE2,
+    ADVERT_HAS_NAME,
 )
 
-# ---- MeshCore protocol constants ----
-
-# Route types (2 LSBs of header byte)
-ROUTE_FLOOD = 0x01
-ROUTE_T_FLOOD = 0x00
-ROUTE_DIRECT = 0x02
-ROUTE_T_DIRECT = 0x03
-
-# Payload types (bits [5:2] of header byte)
-PAYLOAD_REQ = 0x00
-PAYLOAD_RESP = 0x01
-PAYLOAD_TXT = 0x02
-PAYLOAD_ACK = 0x03
-PAYLOAD_ADVERT = 0x04
-PAYLOAD_GRP_TXT = 0x05
-PAYLOAD_GRP_DATA = 0x06
-PAYLOAD_ANON_REQ = 0x07
-PAYLOAD_PATH = 0x08
-PAYLOAD_TRACE = 0x09
-PAYLOAD_MULTI = 0x0A
-PAYLOAD_CTRL = 0x0B
-PAYLOAD_RAW_CUSTOM = 0x0F
-
-# ADVERT flags
-ADVERT_NODE_CHAT = 0x01
-ADVERT_NODE_REPEATER = 0x02
-ADVERT_NODE_ROOM = 0x03
-ADVERT_NODE_SENSOR = 0x04
-ADVERT_HAS_LOCATION = 0x10
-ADVERT_HAS_FEATURE1 = 0x20
-ADVERT_HAS_FEATURE2 = 0x40
-ADVERT_HAS_NAME = 0x80
-
+log = logging.getLogger("gr4.tx")
 
 # ---- MeshCore contact QR code ----
 
-# Two URI formats exist in the MeshCore ecosystem:
-#
-# 1. Mobile app QR format (meshcore://contact/add?...):
-#    Used by the MeshCore companion mobile apps (Android/iOS) for scanning.
-#    Contains name + public_key + type as URL parameters.
-#    Documented in MeshCore/docs/qr_codes.md.
-#
-# 2. CLI "biz card" format (meshcore://<hex-encoded wire packet>):
-#    Used by meshcore-cli import_contact / firmware serial export.
-#    Contains the full signed ADVERT wire packet.
-#
-# We generate format 1 for QR codes (scannable by companion app).
-
-
-def build_contact_uri(
-    pub_key: bytes, name: str, node_type: int = ADVERT_NODE_CHAT
-) -> str:
-    """Build a MeshCore contact URI for QR code scanning by the companion app.
-
-    Format: meshcore://contact/add?name=<name>&public_key=<64hex>&type=<int>
-
-    This is the mobile app QR format documented in MeshCore/docs/qr_codes.md.
-    """
-    from urllib.parse import quote
-
-    params = []
-    if name:
-        params.append(f"name={quote(name, safe='')}")
-    params.append(f"public_key={pub_key.hex()}")
-    params.append(f"type={node_type}")
-    return "meshcore://contact/add?" + "&".join(params)
-
-
-def build_bizcard_uri(advert_packet: bytes) -> str:
-    """Build a MeshCore CLI "biz card" URI from a raw ADVERT wire packet.
-
-    Format: meshcore://<hex-encoded raw ADVERT packet>
-
-    Used by meshcore-cli import_contact and firmware serial/BLE companion
-    protocol. The CLI calls bytes.fromhex(uri[11:]) and feeds the result
-    into importContact() which deserializes it as a Packet.
-    """
-    return "meshcore://" + advert_packet.hex()
+# URI builders live in lora_common.py (shared module). Re-exported here
+# for backward compatibility.
+from lora_common import build_bizcard_uri, build_contact_uri  # noqa: F401
 
 
 def print_qr_code(uri: str) -> None:
@@ -193,6 +156,7 @@ def build_advert(
     lat: float | None = None,
     lon: float | None = None,
     route_type: int = ROUTE_FLOOD,
+    transport_codes: tuple[int, int] | None = None,
 ) -> bytes:
     """Build a MeshCore ADVERT packet payload.
 
@@ -216,7 +180,7 @@ def build_advert(
     app_parts.append(bytes([flags]))
 
     if lat is not None and lon is not None:
-        app_parts.append(struct.pack("<ff", lat, lon))
+        app_parts.append(struct.pack("<ii", int(lat * 1e6), int(lon * 1e6)))
 
     if name:
         app_parts.append(name.encode("utf-8"))
@@ -237,7 +201,7 @@ def build_advert(
 
     # Build wire packet (ADVERT defaults to FLOOD — it's a broadcast)
     header = make_header(route_type, PAYLOAD_ADVERT)
-    return build_wire_packet(header, payload)
+    return build_wire_packet(header, payload, transport_codes=transport_codes)
 
 
 def build_anon_req(
@@ -290,13 +254,15 @@ def build_txt_msg(
     timestamp: int | None = None,
     attempt: int = 0,
     route_type: int = ROUTE_DIRECT,
+    transport_codes: tuple[int, int] | None = None,
 ) -> bytes:
     """Build a MeshCore TXT_MSG packet (encrypted text to a known contact).
 
     Uses the same wire format as REQ/RESPONSE (createDatagram):
     Payload: [dest_hash(1)][src_hash(1)][MAC(2)][encrypted_data(N*16)]
 
-    Encrypted plaintext: [timestamp(4)][attempt(1)][message_text(N)]
+    Encrypted plaintext: [timestamp(4)][txt_type_attempt(1)][message_text(N)]
+    txt_type_attempt: upper 6 bits = txt_type, lower 2 bits = attempt (0-3)
 
     Both parties must know each other's public keys (shared secret via ECDH).
 
@@ -312,9 +278,13 @@ def build_txt_msg(
     # Compute shared secret
     secret = meshcore_shared_secret(expanded_prv, dest_pub)
 
-    # Build plaintext: timestamp(4) + attempt(1) + text
+    # Build plaintext: timestamp(4) + txt_type_attempt(1) + text
+    # txt_type_attempt: upper 6 bits = txt_type (0=plain), lower 2 bits = attempt
     ts_bytes = struct.pack("<I", timestamp)
-    plaintext = ts_bytes + bytes([attempt & 0xFF]) + text.encode("utf-8")
+    txt_type = 0x00  # TXT_TYPE_PLAIN
+    plaintext = (
+        ts_bytes + bytes([(txt_type << 2) | (attempt & 0x03)]) + text.encode("utf-8")
+    )
 
     # Encrypt then MAC
     encrypted = meshcore_encrypt_then_mac(secret, plaintext)
@@ -326,7 +296,7 @@ def build_txt_msg(
 
     # Build wire packet (TXT_MSG defaults to DIRECT)
     header = make_header(route_type, PAYLOAD_TXT)
-    return build_wire_packet(header, payload)
+    return build_wire_packet(header, payload, transport_codes=transport_codes)
 
 
 def make_cbor_tx_request(packet: bytes, **phy_overrides) -> bytes:
@@ -354,12 +324,14 @@ def _parse_dest_pubkey(hex_str: str) -> bytes:
     try:
         dest_pub = bytes.fromhex(hex_str)
     except ValueError:
-        sys.stderr.write(f"ERROR: invalid hex in destination key: {hex_str!r}\n")
+        log.error("invalid hex in destination key: %r", hex_str)
         sys.exit(1)
     if len(dest_pub) != PUB_KEY_SIZE:
-        sys.stderr.write(
-            f"ERROR: destination key must be {PUB_KEY_SIZE * 2} hex chars "
-            f"({PUB_KEY_SIZE} bytes), got {len(hex_str)} chars\n"
+        log.error(
+            "destination key must be %d hex chars (%d bytes), got %d chars",
+            PUB_KEY_SIZE * 2,
+            PUB_KEY_SIZE,
+            len(hex_str),
         )
         sys.exit(1)
     return dest_pub
@@ -386,7 +358,7 @@ def cmd_send(args, expanded_prv: bytes, pub_key: bytes, seed: bytes) -> bytes:
 
     message = " ".join(args.message)
     if not message:
-        sys.stderr.write("ERROR: message cannot be empty\n")
+        log.error("message cannot be empty")
         sys.exit(1)
 
     route = ROUTE_NAMES[args.route]
@@ -399,7 +371,7 @@ def cmd_anon_req(args, expanded_prv: bytes, pub_key: bytes, seed: bytes) -> byte
 
     message = " ".join(args.message).encode("utf-8")
     if not message:
-        sys.stderr.write("ERROR: message cannot be empty\n")
+        log.error("message cannot be empty")
         sys.exit(1)
 
     route = ROUTE_NAMES[args.route]
@@ -455,6 +427,12 @@ def main():
         default=None,
         metavar="HOST:PORT",
         help="Send CBOR TX request via UDP instead of stdout (e.g. 127.0.0.1:5555)",
+    )
+    shared.add_argument(
+        "--config",
+        metavar="PATH",
+        default=None,
+        help="Path to config.toml (auto-detected if omitted)",
     )
 
     parser = argparse.ArgumentParser(
@@ -537,7 +515,20 @@ def main():
     )
     p_anon.add_argument("message", nargs="+", help="Message text")
 
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        default=False,
+        help="Disable ANSI color output (also: NO_COLOR env var)",
+    )
+
     args = parser.parse_args()
+
+    # Configure logging (library-level loggers inherit root config)
+    cfg = load_config(args.config)
+    setup_logging(
+        "gr4.tx", cfg, debug=getattr(args, "debug", False), no_color=args.no_color
+    )
 
     # Load identity
     expanded_prv, pub_key, seed = load_or_create_identity(args.identity)
@@ -554,15 +545,14 @@ def main():
     if args.command == "advert" and args.qr:
         name = args.name or ""
         uri = build_contact_uri(pub_key, name, args.node_type)
-        sys.stderr.write(f"Contact URI: {uri}\n")
-        sys.stderr.write(f"Public key:  {pub_key.hex()}\n")
+        log.info("contact URI: %s", uri)
+        log.info("public key: %s", pub_key.hex())
         if name:
-            sys.stderr.write(f"Name:        {name}\n")
+            log.info("name: %s", name)
         # Also show the CLI biz card URI for reference
         packet = cmd_advert(args, expanded_prv, pub_key, seed)
         biz_uri = build_bizcard_uri(packet)
-        sys.stderr.write(f"Biz card:    {biz_uri}\n")
-        sys.stderr.write("\n")
+        log.info("biz card: %s", biz_uri)
         print_qr_code(uri)
         return
 
@@ -578,11 +568,9 @@ def main():
         sys.exit(1)
 
     # Log
-    sys.stderr.write(f"Packet: {len(packet)} bytes\n")
-    sys.stderr.write(f"  Header: 0x{packet[0]:02X}\n")
-    sys.stderr.write(f"  Hex: {packet.hex()}\n")
+    log.info("packet: %dB header=0x%02X hex=%s", len(packet), packet[0], packet.hex())
     if args.dry_run:
-        sys.stderr.write("  (dry run — CBOR written to stdout, not transmitted)\n")
+        log.info("dry run -- CBOR written to stdout, not transmitted")
 
     # Build CBOR TX request
     phy = {}
@@ -599,15 +587,15 @@ def main():
 
     if args.udp:
         # Send via UDP to lora_trx
-        parts = args.udp.rsplit(":", 1)
-        if len(parts) != 2:
-            sys.stderr.write(f"ERROR: --udp must be host:port, got '{args.udp}'\n")
+        try:
+            host, port = parse_host_port(args.udp)
+        except ValueError as exc:
+            log.error("%s", exc)
             sys.exit(1)
-        host, port = parts[0], int(parts[1])
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(cbor_msg, (host, port))
         sock.close()
-        sys.stderr.write(f"Sent {len(cbor_msg)} bytes to {host}:{port}\n")
+        log.info("sent %dB to %s:%d", len(cbor_msg), host, port)
     else:
         sys.stdout.buffer.write(cbor_msg)
         sys.stdout.buffer.flush()

@@ -16,12 +16,18 @@ Crypto stack:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac as hmac_mod
+import logging
 import os
 import struct
-import sys
+import time
 from pathlib import Path
+
+# NOTE: This module is imported as a library.  It creates a logger but does NOT
+# call logging.basicConfig() — the calling script is responsible for
+# configuring the root logger (via lora_common.setup_logging).
 
 from Crypto.Cipher import AES
 from nacl.signing import SigningKey
@@ -29,6 +35,8 @@ from nacl.bindings import (
     crypto_sign_ed25519_pk_to_curve25519,
     crypto_scalarmult,
 )
+
+log = logging.getLogger("gr4.crypto")
 
 # ---- Constants ----
 
@@ -40,11 +48,41 @@ CIPHER_BLOCK_SIZE = 16
 CIPHER_MAC_SIZE = 2
 PATH_HASH_SIZE = 1
 
-# MeshCore payload types (bits [5:2] of header byte)
+# MeshCore header field masks
+ROUTE_MASK = 0x03  # bits [1:0]
+PTYPE_SHIFT = 2  # bits [5:2]
+PTYPE_MASK = 0x0F
+
+# Route types (2 LSBs of header byte)
+ROUTE_T_FLOOD = 0x00
+ROUTE_FLOOD = 0x01
+ROUTE_DIRECT = 0x02
+ROUTE_T_DIRECT = 0x03
+
+# Payload types (bits [5:2] of header byte)
 PAYLOAD_REQ = 0x00
+PAYLOAD_RESP = 0x01
 PAYLOAD_TXT = 0x02
+PAYLOAD_ACK = 0x03
 PAYLOAD_ADVERT = 0x04
+PAYLOAD_GRP_TXT = 0x05
+PAYLOAD_GRP_DATA = 0x06
 PAYLOAD_ANON_REQ = 0x07
+PAYLOAD_PATH = 0x08
+PAYLOAD_TRACE = 0x09
+PAYLOAD_MULTI = 0x0A
+PAYLOAD_CTRL = 0x0B
+PAYLOAD_RAW_CUSTOM = 0x0F
+
+# ADVERT node type flags
+ADVERT_NODE_CHAT = 0x01
+ADVERT_NODE_REPEATER = 0x02
+ADVERT_NODE_ROOM = 0x03
+ADVERT_NODE_SENSOR = 0x04
+ADVERT_HAS_LOCATION = 0x10
+ADVERT_HAS_FEATURE1 = 0x20
+ADVERT_HAS_FEATURE2 = 0x40
+ADVERT_HAS_NAME = 0x80
 
 # Default paths
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "gr4-lora"
@@ -152,16 +190,15 @@ def load_or_create_identity(path: Path) -> tuple[bytes, bytes, bytes]:
             sk = SigningKey(seed)
             if bytes(sk.verify_key) == pub:
                 expanded = meshcore_expanded_key(seed)
-                sys.stderr.write(f"Loaded identity from {path}\n")
-                sys.stderr.write(f"  Public key: {pub.hex()}\n")
+                log.info("loaded identity from %s pubkey=%s", path, pub.hex())
                 return expanded, pub, seed
             else:
-                sys.stderr.write(
-                    f"WARNING: identity file {path} has mismatched keys, regenerating\n"
-                )
+                log.warning("identity file %s has mismatched keys, regenerating", path)
         else:
-            sys.stderr.write(
-                f"WARNING: identity file {path} has wrong size ({len(data)}), regenerating\n"
+            log.warning(
+                "identity file %s has wrong size (%d), regenerating",
+                path,
+                len(data),
             )
 
     seed = os.urandom(32)
@@ -171,8 +208,7 @@ def load_or_create_identity(path: Path) -> tuple[bytes, bytes, bytes]:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(seed + pub)
     path.chmod(0o600)
-    sys.stderr.write(f"Generated new identity at {path}\n")
-    sys.stderr.write(f"  Public key: {pub.hex()}\n")
+    log.info("generated new identity at %s pubkey=%s", path, pub.hex())
     return expanded, pub, seed
 
 
@@ -288,7 +324,10 @@ def extract_advert_name(data: bytes) -> str | None:
     if flags & 0x40:  # HAS_FEATURE2
         name_off += 2
     if (flags & 0x80) and name_off < len(data):  # HAS_NAME
-        return data[name_off:].decode("utf-8", errors="replace")
+        # MeshCore names are max MAX_ADVERT_DATA_SIZE (32) bytes; bound the
+        # slice to avoid unbounded RF-origin strings.
+        raw = data[name_off : name_off + 32]
+        return raw.decode("utf-8", errors="replace").rstrip("\x00")
     return None
 
 
@@ -298,7 +337,9 @@ def try_decrypt_txt_msg(
     """Try to decrypt a TXT_MSG using all known keys.
 
     TXT_MSG payload: dest_hash(1) + src_hash(1) + MAC(2) + ciphertext
-    Plaintext: timestamp(4) + attempt(1) + text
+    Plaintext: timestamp(4) + txt_type_attempt(1) + text
+    txt_type_attempt: upper 6 bits = txt_type, lower 2 bits = attempt (0-3)
+    txt_type 0x00=plain text, 0x01=CLI command, 0x02=signed (4-byte pubkey prefix before text)
 
     Returns (decrypted_text, matched_pubkey) or None.
     """
@@ -326,15 +367,34 @@ def try_decrypt_txt_msg(
             # Verify hashes match (dest should be us, src should be them)
             their_hash = pubkey_bytes[:PATH_HASH_SIZE]
             if dest_hash == our_hash and src_hash == their_hash:
-                # Extract text: skip timestamp(4) + attempt(1)
+                # Extract text: skip timestamp(4) + txt_type_attempt(1)
                 if len(plaintext) > 5:
-                    text = (
-                        plaintext[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
-                    )
+                    txt_type = plaintext[4] >> 2
+                    if txt_type == 0x02 and len(plaintext) > 9:
+                        # Signed message: skip 4-byte sender pubkey prefix
+                        text = (
+                            plaintext[9:]
+                            .rstrip(b"\x00")
+                            .decode("utf-8", errors="replace")
+                        )
+                    else:
+                        text = (
+                            plaintext[5:]
+                            .rstrip(b"\x00")
+                            .decode("utf-8", errors="replace")
+                        )
                     return text, pubkey_bytes
             # MAC matched but hash didn't — still return (could be for someone else)
             if len(plaintext) > 5:
-                text = plaintext[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
+                txt_type = plaintext[4] >> 2
+                if txt_type == 0x02 and len(plaintext) > 9:
+                    text = (
+                        plaintext[9:].rstrip(b"\x00").decode("utf-8", errors="replace")
+                    )
+                else:
+                    text = (
+                        plaintext[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
+                    )
                 return text, pubkey_bytes
 
     return None
@@ -379,3 +439,189 @@ def try_decrypt_anon_req(
         return text, sender_pub
 
     return None
+
+
+# ---- Group channel support ----
+
+
+# Seed channels bundled with the repo (scripts/channels/*.channel)
+SEED_CHANNELS_DIR = Path(__file__).resolve().parent / "channels"
+
+DEFAULT_CHANNELS_DIR = DEFAULT_CONFIG_DIR / "channels"
+
+
+class GroupChannel:
+    """A MeshCore group channel identified by a pre-shared key."""
+
+    __slots__ = ("name", "secret", "hash")
+
+    def __init__(self, name: str, psk_raw: bytes) -> None:
+        self.name = name
+        # Zero-pad to 32 bytes (MeshCore uses PUB_KEY_SIZE for HMAC key)
+        self.secret = (psk_raw + b"\x00" * PUB_KEY_SIZE)[:PUB_KEY_SIZE]
+        # Channel hash: first byte of SHA-256(psk_raw)
+        self.hash = hashlib.sha256(psk_raw).digest()[:PATH_HASH_SIZE]
+
+
+def load_channels(channels_dir: Path) -> list[GroupChannel]:
+    """Load group channels from a directory.
+
+    Each file is <name>.channel containing 16 or 32 raw PSK bytes.
+    If the directory doesn't exist, seeds it from the bundled seed channels.
+    """
+    _seed_channels(channels_dir)
+    channels: list[GroupChannel] = []
+    if not channels_dir.is_dir():
+        return channels
+    for f in sorted(channels_dir.glob("*.channel")):
+        data = f.read_bytes()
+        if len(data) in (16, 32):
+            channels.append(GroupChannel(f.stem, data))
+    return channels
+
+
+def save_channel(channels_dir: Path, name: str, psk_raw: bytes) -> bool:
+    """Save a channel to the channel store. Returns True if newly saved."""
+    channels_dir.mkdir(parents=True, exist_ok=True)
+    path = channels_dir / f"{name}.channel"
+    if path.exists():
+        return False
+    path.write_bytes(psk_raw)
+    return True
+
+
+def _seed_channels(channels_dir: Path) -> None:
+    """Copy bundled seed channels into the config dir if it has no channels."""
+    if channels_dir.is_dir() and any(channels_dir.glob("*.channel")):
+        return
+    if not SEED_CHANNELS_DIR.is_dir():
+        return
+    channels_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+
+    for src in SEED_CHANNELS_DIR.glob("*.channel"):
+        dest = channels_dir / src.name
+        if not dest.exists():
+            shutil.copy2(src, dest)
+
+
+def try_decrypt_grp_txt(
+    data: bytes, channels: list[GroupChannel]
+) -> tuple[str, str] | None:
+    """Try to decrypt a GRP_TXT using known group channels.
+
+    GRP_TXT payload: channel_hash(1) + MAC(2) + ciphertext(N*16)
+    Plaintext: timestamp(4) + txt_type_attempt(1) + text(UTF-8)
+    txt_type_attempt: upper 6 bits = txt_type, lower 2 bits = attempt (0-3)
+
+    The text is formatted as "SenderName: message" by MeshCore firmware.
+
+    Returns (text, channel_name) or None.
+    """
+    hdr = parse_meshcore_header(data)
+    if hdr is None or hdr["ptype"] != PAYLOAD_GRP_TXT:
+        return None
+    off = hdr["off"]
+    payload = data[off:]
+    if len(payload) < PATH_HASH_SIZE + CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE:
+        return None
+
+    channel_hash = payload[:PATH_HASH_SIZE]
+    encrypted = payload[PATH_HASH_SIZE:]  # MAC(2) + ciphertext
+
+    for ch in channels:
+        if ch.hash != channel_hash:
+            continue
+        plaintext = meshcore_mac_then_decrypt(ch.secret, encrypted)
+        if plaintext is not None and len(plaintext) > 5:
+            txt_type = plaintext[4]
+            if (txt_type >> 2) == 0:  # TXT_TYPE_PLAIN
+                text = plaintext[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
+                return text, ch.name
+    return None
+
+
+def compute_ack_hash(
+    plaintext: bytes,
+    sender_pub: bytes,
+) -> bytes:
+    """Compute the 4-byte MeshCore ACK hash for a received TXT_MSG.
+
+    The ACK hash is SHA-256(plaintext_content, sender_pubkey) truncated to 4 bytes.
+    plaintext_content = timestamp(4) + flags(1) + text (no null terminator).
+
+    For TXT_TYPE_PLAIN (flags>>2 == 0): hash uses sender's pubkey.
+    For TXT_TYPE_SIGNED (flags>>2 == 2): hash uses receiver's own pubkey.
+    We handle only TXT_TYPE_PLAIN here (the common case).
+
+    Args:
+        plaintext: Decrypted message plaintext (timestamp + flags + text + zero padding).
+        sender_pub: Sender's 32-byte Ed25519 public key.
+
+    Returns: 4-byte ACK hash (little-endian uint32 on ARM, but we treat as raw bytes).
+    """
+    # Strip trailing zero padding from AES-ECB
+    # Content is: timestamp(4) + flags(1) + text
+    # Find the end of the text (first null byte after flags, or end of data)
+    if len(plaintext) < 5:
+        return hashlib.sha256(plaintext + sender_pub).digest()[:4]
+
+    # Find text end: skip timestamp(4) + flags(1), then find null or use all
+    flags = plaintext[4]
+    txt_type = flags >> 2
+
+    if txt_type == 0x02:
+        # TXT_TYPE_SIGNED: timestamp(4) + flags(1) + sig_prefix(4) + text
+        text_start = 9
+    else:
+        # TXT_TYPE_PLAIN: timestamp(4) + flags(1) + text
+        text_start = 5
+
+    # Find end of text (first null byte after text_start)
+    text_end = text_start
+    while text_end < len(plaintext) and plaintext[text_end] != 0:
+        text_end += 1
+
+    # Content to hash: everything from start through text (no null)
+    content = plaintext[:text_end]
+
+    h = hashlib.sha256()
+    h.update(content)
+    h.update(sender_pub)
+    return h.digest()[:4]
+
+
+def grp_txt_channel_hash(data: bytes) -> bytes | None:
+    """Extract the channel hash byte from a GRP_TXT packet.
+
+    Returns the 1-byte hash, or None if not a GRP_TXT.
+    """
+    hdr = parse_meshcore_header(data)
+    if hdr is None or hdr["ptype"] != PAYLOAD_GRP_TXT:
+        return None
+    off = hdr["off"]
+    if off >= len(data):
+        return None
+    return data[off : off + PATH_HASH_SIZE]
+
+
+def build_grp_txt(
+    channel: GroupChannel,
+    sender_name: str,
+    text: str,
+    *,
+    timestamp: int | None = None,
+) -> bytes:
+    """Build a GRP_TXT encrypted payload (without wire header).
+
+    Plaintext: timestamp(4 LE) + txt_type(1) + "sender_name: text"
+    Wire payload: channel_hash(1) + MAC(2) + ciphertext(N*16)
+    """
+    if timestamp is None:
+        timestamp = int(time.time())
+
+    ts_bytes = struct.pack("<I", timestamp)
+    body = f"{sender_name}: {text}".encode("utf-8")
+    plaintext = ts_bytes + b"\x00" + body  # txt_type=0 (plain)
+    encrypted = meshcore_encrypt_then_mac(channel.secret, plaintext)
+    return channel.hash + encrypted

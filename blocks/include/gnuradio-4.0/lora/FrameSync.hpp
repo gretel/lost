@@ -3,15 +3,19 @@
 #define GNURADIO_LORA_FRAME_SYNC_HPP
 
 #include <algorithm>
+#include <array>
+#include <cassert>
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <memory>
 #include <numbers>
 #include <unordered_map>
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
+#include <gnuradio-4.0/lora/SpectrumTap.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
 
 namespace gr::lora {
@@ -21,6 +25,7 @@ namespace gr::lora {
 static constexpr int kPreambleBinTolerance = 1;  ///< max FFT bin drift between consecutive upchirps
 static constexpr int kSyncWordBinTolerance = 2;  ///< max bin error for sync word (net ID) verification
 static constexpr uint8_t kMaxAdditionalUpchirps = 3;  ///< extra preamble symbols before rollover
+static constexpr uint8_t kMaxPreambleRotations  = 4;  ///< max buffer rotations after extra upchirps
 
 namespace detail {
 
@@ -78,13 +83,14 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
     uint8_t  os_factor    = 4;
     uint16_t preamble_len = 8;
     float    energy_thresh = 1e-6f;  ///< minimum symbol energy to continue output
+    float    min_snr_db   = -10.0f;  ///< reject bursts below this SNR (dB)
     uint32_t max_symbols  = 256;     ///< safety limit on symbols per burst
     int32_t  rx_channel   = -1;      ///< RX channel index (-1 = not set)
     bool     debug        = false;
 
     GR_MAKE_REFLECTABLE(FrameSync, in, out,
                         center_freq, bandwidth, sf, sync_word, os_factor, preamble_len,
-                        energy_thresh, max_symbols, rx_channel, debug);
+                        energy_thresh, min_snr_db, max_symbols, rx_channel, debug);
 
     // --- Internal state ---
     enum State : uint8_t { DETECT, SYNC, OUTPUT };
@@ -131,6 +137,7 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
     float    _sfo_cum   = 0.f;
     int      _down_val  = 0;
     uint8_t  _additional_upchirps = 0;
+    uint8_t  _preamble_rotations  = 0;  ///< rotation count after max additional upchirps
     std::vector<std::complex<float>> _CFO_frac_correc;
     std::vector<std::complex<float>> _symb_corr;
 
@@ -139,15 +146,27 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
     bool     _burst_tag_published = false;
     float    _snr_db = 0.f;  ///< preamble-based SNR estimate (dB)
 
+    // Stale-burst watchdog: consecutive processBulk calls with insufficient input
+    uint32_t _idle_call_count = 0;
+
     // Noise floor estimation (EMA of mean symbol power during DETECT idle)
     float    _noise_floor_db = -999.f;  ///< dBFS, -999 = not yet estimated
     float    _noise_ema      = 0.f;     ///< exponential moving average of mean |x|^2
     bool     _noise_ema_init = false;   ///< true after first update
 
+    // Peak amplitude estimation (EMA of max |x|^2 per raw input span)
+    float    _peak_db      = -999.f;    ///< dBFS, -999 = not yet estimated
+    float    _peak_ema     = 0.f;       ///< exponential moving average of max |x|^2
+    bool     _peak_ema_init = false;    ///< true after first update
+
+    // Spectrum tap: shared state for waterfall display (optional, set by app)
+    std::shared_ptr<SpectrumState> _spectrum_state;
+
     // Periodic noise floor logging (debug mode)
     uint64_t           _nf_sample_cnt   = 0;       ///< samples processed since last log
     uint64_t           _nf_log_interval = 0;       ///< samples per log interval (set in start)
-    std::vector<float> _nf_history;                 ///< all noise floor dB values for median
+    std::vector<float> _nf_history;                 ///< recent noise floor dB values for median (capped)
+    static constexpr std::size_t kMaxNfHistory = 1024;  ///< max entries (~2.8 hours at 10s interval)
 
     // Pre-allocated scratch buffers (avoid per-call heap allocation)
     std::vector<std::complex<float>> _scratch_N;      ///< N-element scratch for dechirp
@@ -164,14 +183,42 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
     void start() {
         recalculate();
-        // 10-second log interval: sample_rate = bandwidth * os_factor
         _nf_log_interval = static_cast<uint64_t>(bandwidth) * os_factor * 10;
         _nf_sample_cnt = 0;
         _nf_history.clear();
         _nf_history.reserve(1024);
     }
 
+    void settingsChanged(const gr::property_map& /*oldSettings*/,
+                         const gr::property_map& newSettings) {
+        // PHY parameters require full recalculation (rebuilds chirp tables,
+        // resizes buffers, resets state machine to DETECT).
+        static constexpr std::array kPhyKeys = {
+            "sf", "bandwidth", "os_factor", "preamble_len", "sync_word"
+        };
+        bool needRecalc = std::ranges::any_of(kPhyKeys, [&](const char* k) {
+            return newSettings.contains(k);
+        });
+        if (needRecalc && _N > 0) {
+            recalculate();
+            _nf_log_interval = static_cast<uint64_t>(bandwidth) * os_factor * 10;
+            if (debug) {
+                std::fprintf(stderr, "[FrameSync] settingsChanged: recalculated"
+                    " (sf=%u, bw=%u, os=%u, preamble=%u, sync=0x%02X)\n",
+                    sf, bandwidth, os_factor, preamble_len, sync_word);
+            }
+        }
+        // Hot-reconfig parameters (center_freq, energy_thresh, min_snr_db,
+        // max_symbols, debug, rx_channel) are already updated by the
+        // framework before this callback — no action needed.
+    }
+
     void recalculate() {
+        assert(sf >= 7 && sf <= 12 && "SF must be in [7, 12]");
+        assert(bandwidth > 0 && "bandwidth must be > 0");
+        assert(os_factor >= 1 && "os_factor must be >= 1");
+        assert(preamble_len >= 5 && "preamble_len must be >= 5");
+
         _N   = 1u << sf;
         _sps = _N * os_factor;
 
@@ -222,7 +269,9 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         _burst_tag_published = false;
         _cfo_frac_sto_frac_est = false;
         _additional_upchirps = 0;
+        _preamble_rotations  = 0;
         _sync_phase  = NET_ID1;
+        _idle_call_count = 0;
     }
 
     /// Dechirp + FFT -> argmax (uses pre-allocated _scratch_N).
@@ -370,7 +419,7 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
     [[nodiscard]] gr::work::Status processBulk(
             gr::InputSpanLike auto& input,
-            gr::OutputSpanLike auto& output) noexcept {
+            gr::OutputSpanLike auto& output) {
         auto in_span  = std::span(input);
         auto out_span = std::span(output);
 
@@ -383,10 +432,19 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         }
 
         if (in_span.size() < _sps) {
+            _idle_call_count++;
+            if (_idle_call_count > 100 && _state != DETECT) {
+                if (debug) {
+                    std::fprintf(stderr, "[FrameSync] stale burst reset after %u idle calls (state=%d)\n",
+                                 _idle_call_count, static_cast<int>(_state));
+                }
+                resetToDetect();
+            }
             std::ignore = input.consume(0UZ);
             output.publish(0UZ);
             return gr::work::Status::OK;
         }
+        _idle_call_count = 0;
 
         int items_to_output = 0;
         _items_to_consume = static_cast<int>(_sps);
@@ -399,6 +457,14 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
             if (idx < 0) idx += static_cast<int>(_sps);
             if (idx >= static_cast<int>(in_span.size())) idx = static_cast<int>(in_span.size()) - 1;
             _in_down[ii] = in_span[static_cast<std::size_t>(idx)];
+        }
+
+        // Push raw IQ to spectrum tap (if connected) — runs in ALL states
+        // so the waterfall keeps scrolling during frame decode
+        if (_spectrum_state) {
+            const auto raw_len = std::min(in_span.size(),
+                                          static_cast<std::size_t>(_sps));
+            _spectrum_state->push(in_span.data(), raw_len);
         }
 
         switch (_state) {
@@ -424,19 +490,44 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                     _noise_floor_db = 10.f * std::log10(_noise_ema);
                 }
 
+                // Peak amplitude EMA: scan raw input for max |x|^2
+                {
+                    float max_sq = 0.f;
+                    const auto raw_len = std::min(in_span.size(), static_cast<std::size_t>(_sps));
+                    for (std::size_t i = 0; i < raw_len; i++) {
+                        float sq = in_span[i].real() * in_span[i].real()
+                                 + in_span[i].imag() * in_span[i].imag();
+                        if (sq > max_sq) max_sq = sq;
+                    }
+                    if (!_peak_ema_init) {
+                        _peak_ema = max_sq;
+                        _peak_ema_init = true;
+                    } else {
+                        _peak_ema += kNoiseEmaAlpha * (max_sq - _peak_ema);
+                    }
+                    if (_peak_ema > 0.f) {
+                        _peak_db = 10.f * std::log10(_peak_ema);
+                    }
+                }
+
                 // Periodic noise floor log (debug mode, every ~10s)
                 _nf_sample_cnt += _sps;
                 if (debug && _nf_log_interval > 0 && _noise_floor_db > -999.f) {
                     if (_nf_sample_cnt >= _nf_log_interval) {
                         _nf_sample_cnt = 0;
+                        if (_nf_history.size() >= kMaxNfHistory) {
+                            _nf_history.erase(_nf_history.begin());
+                        }
                         _nf_history.push_back(_noise_floor_db);
-                        // Compute median from sorted copy
-                        auto sorted = _nf_history;
-                        std::sort(sorted.begin(), sorted.end());
-                        float median = sorted[sorted.size() / 2];
+                        // Compute median via nth_element (O(n), no full sort)
+                        auto tmp = _nf_history;
+                        auto mid = tmp.begin() + static_cast<std::ptrdiff_t>(tmp.size() / 2);
+                        std::nth_element(tmp.begin(), mid, tmp.end());
+                        float median = *mid;
                         std::fprintf(stderr,
-                            "[FrameSync] noise floor: %.1f dBFS  median: %.1f dBFS  (n=%zu)",
+                            "[FrameSync] noise floor: %.1f dBFS  peak: %.1f dBFS  median: %.1f dBFS  (n=%zu)",
                             static_cast<double>(_noise_floor_db),
+                            static_cast<double>(_peak_db),
                             static_cast<double>(median),
                             _nf_history.size());
                         if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
@@ -525,10 +616,13 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
             items_to_output = 0;
 
             if (!_cfo_frac_sto_frac_est) {
-                auto cfo_offset = static_cast<std::size_t>(
-                    std::max(static_cast<int>(_N) - _k_hat, 0));
+                // Skip slot 0 in _preamble_raw: it contains a non-preamble
+                // sample from the DETECT reset path (line 541).  Start from
+                // slot 1 (_N) which is the first correctly-stored upchirp.
+                auto cfo_offset = static_cast<std::size_t>(_N)
+                    + static_cast<std::size_t>(std::max(static_cast<int>(_N) - _k_hat, 0));
                 if (cfo_offset + _up_symb_to_use * _N > _preamble_raw.size()) {
-                    cfo_offset = 0;
+                    cfo_offset = static_cast<std::size_t>(_N);
                 }
                 _cfo_frac = estimate_CFO_frac_Bernier(&_preamble_raw[cfo_offset]);
                 _sto_frac = estimate_STO_frac();
@@ -564,6 +658,21 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                     }
 
                     if (_additional_upchirps >= kMaxAdditionalUpchirps) {
+                        if (_preamble_rotations >= kMaxPreambleRotations) {
+                            // Still getting upchirp-like bins after max rotations
+                            // — not a real frame. Reset to avoid staying stuck in
+                            // SYNC forever (liveness bug).
+                            if (debug) {
+                                std::fprintf(stderr, "[FrameSync] NET_ID1: stuck on upchirp-like bin=%d after %u rotations, resetting",
+                                             bin_idx, static_cast<unsigned>(_preamble_rotations));
+                                if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
+                                std::fprintf(stderr, "\n");
+                            }
+                            resetToDetect();
+                            _items_to_consume = 0;
+                            items_to_output = 0;
+                            break;
+                        }
                         std::rotate(_preamble_raw_up.begin(),
                                     _preamble_raw_up.begin() + static_cast<std::ptrdiff_t>(_sps),
                                     _preamble_raw_up.end());
@@ -574,6 +683,7 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                             std::copy_n(&in_span[src_off], _sps,
                                         &_preamble_raw_up[dst]);
                         }
+                        _preamble_rotations++;
                     } else {
                         std::size_t dst = static_cast<std::size_t>(
                             _n_up_req + _additional_upchirps) * _sps;
@@ -756,6 +866,18 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 }
 
                 _snr_db = determine_snr();
+                if (_snr_db < min_snr_db) {
+                    if (debug) {
+                        std::fprintf(stderr, "[FrameSync] SYNC rejected: snr=%.1f dB < min %.1f dB",
+                                     static_cast<double>(_snr_db), static_cast<double>(min_snr_db));
+                        if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
+                        std::fprintf(stderr, "\n");
+                    }
+                    resetToDetect();
+                    _items_to_consume = 0;
+                    items_to_output = 0;
+                    break;
+                }
                 _state = OUTPUT;
                 if (debug) {
                     std::fprintf(stderr, "[FrameSync] SYNC->OUTPUT: cfo_int=%d cfo_frac=%.3f sto_frac=%.3f snr=%.1f dB noise=%.1f dBFS",
@@ -810,6 +932,9 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 tag["snr_db"]       = gr::pmt::Value(static_cast<double>(_snr_db));
                 if (_noise_floor_db > -999.f) {
                     tag["noise_floor_db"] = gr::pmt::Value(static_cast<double>(_noise_floor_db));
+                }
+                if (_peak_db > -999.f) {
+                    tag["peak_db"] = gr::pmt::Value(static_cast<double>(_peak_db));
                 }
                 if (rx_channel >= 0) {
                     tag["rx_channel"] = gr::pmt::Value(static_cast<int64_t>(rx_channel));

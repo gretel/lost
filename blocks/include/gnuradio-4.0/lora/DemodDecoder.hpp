@@ -58,6 +58,7 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
     enum State : uint8_t { IDLE, HEADER, PAYLOAD };
 
     State    _state = IDLE;
+    bool     _header_failed = false;  // suppress tag re-delivery after header checksum fail
     uint32_t _N     = 0;
 
     int      _cfo_int  = 0;
@@ -65,6 +66,7 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
     bool     _is_downchirp = false;
     double   _snr_db = 0.0;
     double   _noise_floor_db = -999.0;
+    double   _peak_db = -999.0;
     int64_t  _rx_channel = -1;
 
     std::vector<std::complex<float>> _downchirp;
@@ -84,6 +86,17 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
     gr::algorithm::FFT<std::complex<float>> _fft;
 
     void start() { recalculate(); }
+
+    void settingsChanged(const gr::property_map& /*oldSettings*/,
+                         const gr::property_map& newSettings) {
+        if (_N > 0 && (newSettings.contains("sf") || newSettings.contains("bandwidth"))) {
+            recalculate();
+            if (debug) {
+                std::fprintf(stderr, "[DemodDecoder] settingsChanged: recalculated (sf=%u, bw=%u)\n",
+                             sf, bandwidth);
+            }
+        }
+    }
 
     void recalculate() {
         _N = 1u << sf;
@@ -210,6 +223,9 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
         if (_noise_floor_db > -999.0) {
             out_tag["noise_floor_db"] = gr::pmt::Value(_noise_floor_db);
         }
+        if (_peak_db > -999.0) {
+            out_tag["peak_db"] = gr::pmt::Value(_peak_db);
+        }
         if (_rx_channel >= 0) {
             out_tag["rx_channel"] = gr::pmt::Value(_rx_channel);
         }
@@ -228,11 +244,17 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
 
     [[nodiscard]] gr::work::Status processBulk(
             gr::InputSpanLike auto& input,
-            gr::OutputSpanLike auto& output) noexcept {
+            gr::OutputSpanLike auto& output) {
         auto in_span  = std::span(input);
         auto out_span = std::span(output);
 
         if (_N == 0) recalculate();
+
+        // Reset header-fail suppression when no tag is present (burst is over,
+        // next burst_start tag will be a genuinely new burst).
+        if (!this->inputTagsPresent()) {
+            _header_failed = false;
+        }
 
         // Only check for burst_start when IDLE: tags are re-delivered when
         // processBulk produces 0 output, so checking in other states would
@@ -240,7 +262,7 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
         if (_state == IDLE && this->inputTagsPresent()) {
             const auto& tag = this->mergedInputTag();
             if (auto it = tag.map.find("burst_start"); it != tag.map.end()) {
-                if (it->second.value_or<bool>(false)) {
+                if (it->second.value_or<bool>(false) && !_header_failed) {
                     if (auto sf_it = tag.map.find("sf"); sf_it != tag.map.end()) {
                         auto new_sf = static_cast<uint8_t>(sf_it->second.value_or<int64_t>(sf));
                         if (new_sf != sf) {
@@ -268,6 +290,11 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
                         _noise_floor_db = it2->second.value_or<double>(-999.0);
                     } else {
                         _noise_floor_db = -999.0;
+                    }
+                    if (auto it2 = tag.map.find("peak_db"); it2 != tag.map.end()) {
+                        _peak_db = it2->second.value_or<double>(-999.0);
+                    } else {
+                        _peak_db = -999.0;
                     }
                     if (auto it2 = tag.map.find("rx_channel"); it2 != tag.map.end()) {
                         _rx_channel = it2->second.value_or<int64_t>(-1);
@@ -343,7 +370,8 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
 
                         if (!info.checksum_valid || info.payload_len == 0) {
                             _state = IDLE;
-                            continue;
+                            _header_failed = true;
+                            break;
                         }
 
                         _pay_len = info.payload_len;

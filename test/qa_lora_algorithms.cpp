@@ -12,8 +12,6 @@
 
 using namespace gr::lora::test;
 
-// ---- Tests ----
-
 const boost::ut::suite<"LoRa algorithm utilities"> utilities_tests = [] {
     using namespace boost::ut;
     using namespace gr::lora;

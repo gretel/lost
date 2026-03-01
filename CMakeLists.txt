@@ -36,6 +36,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     add_compile_options(-ftrivial-auto-var-init=zero)
 endif()
 
+# --- toml++ (header-only TOML parser for config file support) ---
+include(FetchContent)
+FetchContent_Declare(
+    tomlplusplus
+    GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+    GIT_TAG        v3.4.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(tomlplusplus)
+
 # --- GR4 (provides gnuradio-core, gnuradio-algorithm, gr-testing, ut, …) ---
 set(GR_ENABLE_HTTP "OFF" CACHE STRING "" FORCE)
 add_subdirectory(gnuradio4)

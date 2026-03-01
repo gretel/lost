@@ -42,3 +42,7 @@ target_compile_definitions(qa_lora_burst PRIVATE
 add_ut_test(qa_lora_channelizer)
 target_compile_definitions(qa_lora_channelizer PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
+
+add_ut_test(qa_lora_diversity)
+target_compile_definitions(qa_lora_diversity PRIVATE
+    TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")

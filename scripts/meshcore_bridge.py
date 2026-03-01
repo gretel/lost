@@ -1,0 +1,1804 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: ISC
+"""
+meshcore_bridge.py -- MeshCore companion protocol bridge.
+
+TCP server speaking the MeshCore companion binary protocol, bridging to
+lora_trx via CBOR/UDP. Compatible with meshcore-cli and other MeshCore
+companion apps.
+
+Usage:
+    meshcore_bridge.py                    # default: TCP 7834, UDP 127.0.0.1:5555
+    meshcore_bridge.py --port 7834 --udp 127.0.0.1:5555
+    meshcore_bridge.py --config apps/config.toml
+
+Architecture:
+    meshcore-cli ──TCP:7834──► meshcore_bridge ──UDP:5555──► lora_trx
+                  companion                      CBOR          (SDR)
+                  protocol
+
+The bridge:
+  - Accepts one TCP client at a time (matches real MeshCore firmware)
+  - Responds to companion protocol commands (APP_START, GET_CONTACTS, etc.)
+  - Translates CMD_SEND_TXT_MSG to CBOR lora_tx requests via UDP
+  - Subscribes to lora_trx for RX frames, queues them for the client
+  - Pushes MESSAGES_WAITING when new frames arrive
+
+Dependencies: cbor2, pynacl, pycryptodome
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import logging
+import selectors
+import socket
+import struct
+import time
+from pathlib import Path
+from typing import Any
+
+import cbor2
+
+from lora_common import (
+    config_region_scope,
+    config_udp_host,
+    config_udp_port,
+    load_config,
+    parse_host_port,
+    sanitize_text,
+    setup_logging,
+    utf8_truncate,
+)
+from meshcore_crypto import (
+    DEFAULT_IDENTITY_FILE,
+    DEFAULT_KEYS_DIR,
+    DEFAULT_CHANNELS_DIR,
+    load_or_create_identity,
+    load_known_keys,
+    save_pubkey,
+    load_channels,
+    save_channel,
+    GroupChannel,
+    meshcore_expanded_key,
+    meshcore_shared_secret,
+    meshcore_encrypt_then_mac,
+    meshcore_mac_then_decrypt,
+    try_decrypt_txt_msg,
+    try_decrypt_anon_req,
+    try_decrypt_grp_txt,
+    extract_advert_pubkey,
+    extract_advert_name,
+    parse_meshcore_header,
+    build_grp_txt,
+    compute_ack_hash,
+    # Protocol constants (canonical source)
+    PUB_KEY_SIZE,
+    CIPHER_MAC_SIZE,
+    CIPHER_BLOCK_SIZE,
+    PATH_HASH_SIZE,
+    ROUTE_MASK,
+    PTYPE_SHIFT,
+    PTYPE_MASK,
+    PAYLOAD_TXT,
+    PAYLOAD_ACK,
+    PAYLOAD_ADVERT,
+    PAYLOAD_GRP_TXT,
+    PAYLOAD_ANON_REQ,
+    ROUTE_DIRECT,
+    ROUTE_FLOOD,
+    ROUTE_T_DIRECT,
+    ROUTE_T_FLOOD,
+)
+
+log = logging.getLogger("gr4.bridge")
+
+# ---- Companion protocol constants ----
+
+BRIDGE_PORT = 7834  # MeshCore companion WiFi port (avoids macOS AirPlay on 5000)
+
+# Framing bytes
+FRAME_TX = 0x3C  # client -> device ('<')
+FRAME_RX = 0x3E  # device -> client ('>')
+MAX_FRAME = 300  # max payload size
+
+# Command codes (client -> bridge)
+CMD_APP_START = 0x01
+CMD_SEND_TXT_MSG = 0x02
+CMD_SEND_CHAN_TXT_MSG = 0x03
+CMD_GET_CONTACTS = 0x04
+CMD_GET_DEVICE_TIME = 0x05
+CMD_SET_DEVICE_TIME = 0x06
+CMD_SEND_SELF_ADVERT = 0x07
+CMD_SET_ADVERT_NAME = 0x08
+CMD_ADD_UPDATE_CONTACT = 0x09
+CMD_SYNC_NEXT_MESSAGE = 0x0A
+CMD_SET_RADIO_PARAMS = 0x0B
+CMD_SET_RADIO_TX_POWER = 0x0C
+CMD_RESET_PATH = 0x0D
+CMD_SET_ADVERT_LATLON = 0x0E
+CMD_REMOVE_CONTACT = 0x0F
+CMD_SHARE_CONTACT = 0x10
+CMD_EXPORT_CONTACT = 0x11
+CMD_IMPORT_CONTACT = 0x12
+CMD_REBOOT = 0x13
+CMD_GET_BATT_AND_STORAGE = 0x14
+CMD_SET_TUNING_PARAMS = 0x15
+CMD_DEVICE_QUERY = 0x16
+CMD_GET_CHANNEL = 0x1F
+CMD_SET_CHANNEL = 0x20
+CMD_GET_STATS = 0x38
+
+# Response codes (bridge -> client)
+RESP_OK = 0x00
+RESP_ERROR = 0x01
+RESP_CONTACT_START = 0x02
+RESP_CONTACT = 0x03
+RESP_CONTACT_END = 0x04
+RESP_SELF_INFO = 0x05
+RESP_MSG_SENT = 0x06
+RESP_CONTACT_MSG_RECV = 0x07
+RESP_CHANNEL_MSG_RECV = 0x08
+RESP_CURRENT_TIME = 0x09
+RESP_NO_MORE_MSGS = 0x0A
+RESP_CONTACT_URI = 0x0B
+RESP_BATTERY = 0x0C
+RESP_DEVICE_INFO = 0x0D
+RESP_CONTACT_MSG_RECV_V3 = 0x10
+RESP_CHANNEL_MSG_RECV_V3 = 0x11
+RESP_CHANNEL_INFO = 0x12
+RESP_STATS = 0x18
+
+# Push codes (bridge -> client, unsolicited)
+PUSH_ADVERTISEMENT = 0x80
+PUSH_PATH_UPDATE = 0x81
+PUSH_ACK = 0x82
+PUSH_MESSAGES_WAITING = 0x83
+PUSH_NEW_ADVERT = 0x8A
+
+# ---- Companion frame codec ----
+
+
+def frame_encode(payload: bytes) -> bytes:
+    """Encode a response frame: 0x3E + len_le16 + payload."""
+    length = len(payload)
+    return bytes([FRAME_RX]) + struct.pack("<H", length) + payload
+
+
+class FrameDecoder:
+    """Streaming decoder for companion protocol frames (0x3C framing)."""
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._expected = 0
+        self._header_done = False
+
+    def feed(self, data: bytes) -> list[bytes]:
+        """Feed raw TCP bytes, return list of complete payloads."""
+        self._buf.extend(data)
+        frames: list[bytes] = []
+        while True:
+            if not self._header_done:
+                # Look for start byte
+                idx = self._buf.find(bytes([FRAME_TX]))
+                if idx < 0:
+                    self._buf.clear()
+                    break
+                if idx > 0:
+                    del self._buf[:idx]  # discard garbage before start
+                if len(self._buf) < 3:
+                    break  # need more header bytes
+                self._expected = int.from_bytes(self._buf[1:3], "little")
+                if self._expected > MAX_FRAME:
+                    # Invalid size, skip this start byte
+                    del self._buf[:1]
+                    continue
+                self._header_done = True
+            # Have header, wait for payload
+            total = 3 + self._expected
+            if len(self._buf) < total:
+                break
+            payload = bytes(self._buf[3:total])
+            del self._buf[:total]
+            self._header_done = False
+            frames.append(payload)
+        return frames
+
+
+# ---- Bridge state ----
+
+
+class BridgeState:
+    """Holds the bridge's identity and config for building responses."""
+
+    def __init__(
+        self,
+        pub_key: bytes,
+        expanded_prv: bytes,
+        seed: bytes,
+        name: str,
+        freq_mhz: float,
+        bw_khz: float,
+        sf: int,
+        cr: int,
+        tx_power: int,
+        *,
+        keys_dir: Path | None = None,
+        channels_dir: Path | None = None,
+        contacts_dir: Path | None = None,
+        region_scope: str = "",
+    ) -> None:
+        self.pub_key = pub_key
+        self.expanded_prv = expanded_prv
+        self.seed = seed
+        self.name = name
+        self.freq_mhz = freq_mhz
+        self.bw_khz = bw_khz
+        self.sf = sf
+        self.cr = cr
+        self.tx_power = tx_power
+
+        # Message queue for inbound RX frames (companion protocol messages)
+        self.msg_queue: collections.deque[bytes] = collections.deque(maxlen=256)
+        self.msg_seq = 0  # TX sequence counter
+
+        # Contact store (pubkey_hex -> contact_bytes for companion protocol)
+        self.contacts: dict[str, bytes] = {}
+        self.contacts_lastmod = 0
+
+        # TX echo filter: hash -> timestamp of recently sent payloads
+        self.recent_tx: dict[bytes, float] = {}
+        self.recent_tx_ttl = 30.0  # seconds before entries expire
+
+        # Pending ACK tracking: ack_tag(4 bytes) -> (timestamp, dest_prefix)
+        self.pending_acks: dict[bytes, tuple[float, bytes]] = {}
+        self.pending_ack_ttl = 60.0  # seconds before entries expire
+
+        # RX dedup: payload_hash -> monotonic timestamp (suppress duplicates
+        # from dual-channel RX or mesh retransmits within a short window)
+        self.recent_rx: dict[bytes, float] = {}
+        self.recent_rx_ttl = 5.0  # seconds
+
+        # Key store and channel store directories
+        self.keys_dir = keys_dir or DEFAULT_KEYS_DIR
+        self.channels_dir = channels_dir or DEFAULT_CHANNELS_DIR
+        self.contacts_dir = contacts_dir
+
+        # Load known public keys from disk
+        self.known_keys: dict[str, bytes] = load_known_keys(self.keys_dir)
+
+        # Region scope for transport codes (hashtag region, e.g. "de-nord")
+        self.region_scope = region_scope
+        self.region_key: bytes = b""  # 16-byte transport key
+        if region_scope:
+            # Key = first 16 bytes of SHA-256("#" + region_name)
+            self.region_key = hashlib.sha256(
+                ("#" + region_scope).encode("utf-8")
+            ).digest()[:16]
+
+        # Load group channels from disk
+        self.channels: list[GroupChannel] = load_channels(self.channels_dir)
+
+    def build_self_info(self) -> bytes:
+        """Build SELF_INFO (0x05) response payload."""
+        # Convert freq/bw to milli-Hz (uint32 LE)
+        freq_mhz_int = int(self.freq_mhz * 1e3)  # MHz -> milli-Hz
+        bw_mhz_int = int(self.bw_khz)  # kHz -> milli-Hz (field is mHz of MHz)
+        # Actually: radio_freq and radio_bw in the companion protocol are in
+        # milli-Hz units where the frequency is in MHz*1000 and BW in kHz*1000
+        # meshcore_py divides by 1000 to get MHz/kHz:
+        #   freq = int.from_bytes(payload[42:46], "little") / 1000  -> MHz
+        #   bw = int.from_bytes(payload[46:50], "little") / 1000    -> kHz
+        freq_field = int(self.freq_mhz * 1000)  # MHz * 1000
+        bw_field = int(self.bw_khz * 1000)  # kHz * 1000
+
+        buf = bytearray()
+        buf.append(RESP_SELF_INFO)
+        buf.append(0x01)  # adv_type: chat
+        buf.append(self.tx_power)  # tx_power
+        buf.append(22)  # max_tx_power (dBm, typical for SX1262)
+        buf.extend(self.pub_key)  # pubkey (32 bytes)
+        buf.extend(struct.pack("<i", 0))  # lat (0 = unknown)
+        buf.extend(struct.pack("<i", 0))  # lon (0 = unknown)
+        buf.append(0)  # multi_acks
+        buf.append(0)  # adv_loc_policy
+        buf.append(0)  # telemetry_mode
+        buf.append(0)  # manual_add_contacts
+        buf.extend(struct.pack("<I", freq_field))  # radio_freq
+        buf.extend(struct.pack("<I", bw_field))  # radio_bw
+        buf.append(self.sf)  # radio_sf
+        buf.append(self.cr)  # radio_cr
+        buf.extend(utf8_truncate(self.name, 32))  # name (bounded)
+        return bytes(buf)
+
+    def build_device_info(self) -> bytes:
+        """Build DEVICE_INFO (0x0D) response payload."""
+        buf = bytearray()
+        buf.append(RESP_DEVICE_INFO)
+        buf.append(9)  # fw_ver (protocol version 9, matches CMD_DEVICE_QUERY ver=3)
+        buf.append(64)  # max_contacts / 2  (128 contacts)
+        buf.append(8)  # max_channels
+        buf.extend(struct.pack("<I", 0))  # ble_pin (0 = no PIN)
+        buf.extend(b"gr4-lora\x00\x00\x00\x00")  # fw_build (12 bytes)
+        buf.extend(b"gr4-lora bridge".ljust(40, b"\x00"))  # model (40 bytes)
+        buf.extend(b"0.1.0".ljust(20, b"\x00"))  # version (20 bytes)
+        return bytes(buf)
+
+    def build_battery(self) -> bytes:
+        """Build BATTERY (0x0C) response."""
+        buf = bytearray()
+        buf.append(RESP_BATTERY)
+        buf.extend(struct.pack("<H", 4200))  # battery mV (fake: full)
+        buf.extend(struct.pack("<I", 0))  # used_kb
+        buf.extend(struct.pack("<I", 1024))  # total_kb
+        return bytes(buf)
+
+    def build_ok(self, value: int = 0) -> bytes:
+        """Build OK (0x00) response."""
+        return bytes([RESP_OK]) + struct.pack("<I", value)
+
+    def build_error(self, code: int = 1) -> bytes:
+        """Build ERROR (0x01) response."""
+        return bytes([RESP_ERROR, code])
+
+    def build_current_time(self) -> bytes:
+        """Build CURRENT_TIME (0x09) response."""
+        return bytes([RESP_CURRENT_TIME]) + struct.pack("<I", int(time.time()))
+
+    def build_contacts_response(self) -> list[bytes]:
+        """Build the full GET_CONTACTS response sequence."""
+        frames = []
+        count = len(self.contacts)
+        frames.append(bytes([RESP_CONTACT_START]) + struct.pack("<I", count))
+        for record in self.contacts.values():
+            # Each record is 147 bytes; prepend RESP_CONTACT code
+            frames.append(bytes([RESP_CONTACT]) + record)
+        frames.append(
+            bytes([RESP_CONTACT_END]) + struct.pack("<I", self.contacts_lastmod)
+        )
+        return frames
+
+    def build_no_more_msgs(self) -> bytes:
+        """Build NO_MORE_MSGS (0x0A) response."""
+        return bytes([RESP_NO_MORE_MSGS])
+
+    def build_msg_sent(self, flood: bool = False) -> bytes:
+        """Build MSG_SENT (0x06) response.
+
+        Byte 1 is routing_type: 1 = sent via flood, 0 = sent via direct route.
+        This matches the firmware's RESP_MSG_SENT semantics (not the command's
+        txt_type).
+        """
+        self.msg_seq += 1
+        ack_tag = struct.pack("<I", self.msg_seq)
+        timeout = struct.pack("<I", 30000)  # 30s suggested timeout
+        routing_type = 1 if flood else 0
+        return bytes([RESP_MSG_SENT, routing_type]) + ack_tag + timeout
+
+    def build_channel_info(self, idx: int) -> bytes:
+        """Build CHANNEL_INFO (0x12) response.
+
+        Returns real channel data if a channel exists at this index,
+        otherwise an empty channel record.
+        """
+        buf = bytearray()
+        buf.append(RESP_CHANNEL_INFO)
+        buf.append(idx)
+        if idx < len(self.channels):
+            ch = self.channels[idx]
+            buf.extend(utf8_truncate(ch.name, 32).ljust(32, b"\x00"))
+            # Secret: first 16 bytes of the zero-padded secret
+            buf.extend(ch.secret[:16])
+        else:
+            buf.extend(b"\x00" * 32)  # channel name (empty)
+            buf.extend(b"\x00" * 16)  # channel secret (empty)
+        return bytes(buf)
+
+    def build_stats(self, stats_type: int) -> bytes:
+        """Build STATS (0x18) response."""
+        buf = bytearray()
+        buf.append(RESP_STATS)
+        buf.append(stats_type)
+        if stats_type == 0:  # core
+            buf.extend(struct.pack("<H", 5000))  # battery_mv
+            buf.extend(struct.pack("<I", 0))  # uptime
+            buf.extend(struct.pack("<H", 0))  # errors
+            buf.append(len(self.msg_queue))  # queue_len
+        elif stats_type == 1:  # radio
+            buf.extend(struct.pack("<h", -100))  # noise_floor
+            buf.extend(struct.pack("<b", -80))  # last_rssi
+            buf.extend(struct.pack("<b", 0))  # last_snr
+            buf.extend(struct.pack("<I", 0))  # tx_air_secs
+            buf.extend(struct.pack("<I", 0))  # rx_air_secs
+        elif stats_type == 2:  # packets
+            buf.extend(b"\x00" * 24)  # all zeros
+        return bytes(buf)
+
+
+# ---- RX frame -> companion message conversion ----
+
+
+def lora_frame_to_companion_msgs(
+    frame: dict[str, Any],
+    state: BridgeState,
+) -> tuple[list[bytes], list[bytes]]:
+    """Convert a CBOR lora_frame to companion protocol messages.
+
+    Returns (companion_msgs, ack_packets):
+      - companion_msgs: list of raw response payloads for the TCP client
+      - ack_packets: list of MeshCore wire packets to TX as RF ACKs
+
+    Decrypts TXT_MSG, ANON_REQ, and GRP_TXT using the bridge's identity,
+    known keys, and group channels — mirroring what real MeshCore firmware
+    does before passing messages to the companion app.
+    """
+    empty: tuple[list[bytes], list[bytes]] = ([], [])
+
+    payload = frame.get("payload", b"")
+    if not payload or len(payload) < 2:
+        return empty
+    if not frame.get("crc_valid", False):
+        return empty
+
+    # Only handle MeshCore frames (sync_word 0x12)
+    phy = frame.get("phy", {})
+    if phy.get("sync_word") != 0x12:
+        return empty
+
+    # Parse MeshCore header
+    hdr = payload[0]
+    ptype = (hdr >> PTYPE_SHIFT) & PTYPE_MASK
+    route = hdr & ROUTE_MASK
+
+    # Determine path_len from wire
+    has_transport = route in (0, 3)
+    off = 1
+    if has_transport:
+        off += 4  # skip transport codes
+    if off >= len(payload):
+        return empty
+    path_len = payload[off]
+
+    # SNR from PHY
+    snr_db = phy.get("snr_db", 0.0)
+    snr_byte = max(-128, min(127, int(snr_db * 4)))  # signed, *4
+
+    # For ADVERT: push as NEW_ADVERT + auto-learn key + auto-add contact
+    if ptype == PAYLOAD_ADVERT:
+        return _handle_advert_rx(payload, off + 1 + path_len, state), []
+
+    # For ACK: check against pending ACKs and push confirmation
+    if ptype == PAYLOAD_ACK:
+        return _handle_ack_rx(payload, off + 1 + path_len, state), []
+
+    # For TXT_MSG: decrypt and produce CONTACT_MSG_RECV_V3 + ACK TX
+    if ptype == PAYLOAD_TXT:
+        return _handle_txt_msg_rx(payload, snr_byte, path_len, state)
+
+    # For ANON_REQ: decrypt and produce CONTACT_MSG_RECV_V3 + ACK TX
+    if ptype == PAYLOAD_ANON_REQ:
+        return _handle_anon_req_rx(payload, snr_byte, path_len, state)
+
+    # For GRP_TXT: decrypt and produce CHANNEL_MSG_RECV_V3 (no ACK for group)
+    if ptype == PAYLOAD_GRP_TXT:
+        return _handle_grp_txt_rx(payload, snr_byte, path_len, state), []
+
+    return empty
+
+
+def _advert_to_push(payload: bytes, advert_start: int) -> bytes | None:
+    """Convert an ADVERT payload to a PUSH_NEW_ADVERT (0x8A) companion message.
+
+    The push uses the same format as CONTACT (0x03): pubkey(32) + type(1) +
+    flags(1) + out_path_len(1) + path(64) + name(32) + last_advert(4) +
+    lat(4) + lon(4) + lastmod(4) = 147 bytes after the response code.
+    """
+    if advert_start + 100 > len(payload):
+        return None  # too short for pubkey + timestamp + signature
+
+    pubkey = payload[advert_start : advert_start + 32]
+    ts_bytes = payload[advert_start + 32 : advert_start + 36]
+    # Skip signature (64 bytes)
+    app_start = advert_start + 100
+    app_data = payload[app_start:] if app_start < len(payload) else b""
+
+    # Parse app_data for name and location
+    name = b""
+    lat = 0
+    lon = 0
+    node_type = 0x01
+    if app_data:
+        flags = app_data[0]
+        node_type = flags & 0x0F
+        off = 1
+        if flags & 0x10:  # has location
+            if off + 8 <= len(app_data):
+                lat, lon = struct.unpack_from("<ii", app_data, off)
+            off += 8
+        if flags & 0x20:
+            off += 2  # feature1
+        if flags & 0x40:
+            off += 2  # feature2
+        if flags & 0x80 and off < len(app_data):
+            name = app_data[off:]
+
+    last_advert = int.from_bytes(ts_bytes, "little") if ts_bytes else 0
+
+    # Build contact record (147 bytes)
+    buf = bytearray()
+    buf.append(PUSH_NEW_ADVERT)
+    buf.extend(pubkey)  # 32
+    buf.append(node_type)  # 1
+    buf.append(0)  # flags: 0
+    buf.extend(struct.pack("<b", -1))  # out_path_len: -1 (flood)
+    buf.extend(b"\x00" * 64)  # path (unused)
+    buf.extend(name[:32].ljust(32, b"\x00"))  # adv_name (32, padded)
+    buf.extend(struct.pack("<I", last_advert))
+    buf.extend(struct.pack("<i", lat))
+    buf.extend(struct.pack("<i", lon))
+    buf.extend(struct.pack("<I", last_advert))  # lastmod
+    return bytes(buf)
+
+
+def _handle_advert_rx(
+    payload: bytes,
+    advert_start: int,
+    state: BridgeState,
+) -> list[bytes]:
+    """Handle received ADVERT: push to companion + auto-learn key + auto-add contact."""
+    push = _advert_to_push(payload, advert_start)
+    if push is None:
+        return []
+
+    # Auto-learn public key (key store only — NOT contacts)
+    pubkey = extract_advert_pubkey(payload)
+    if pubkey is not None and pubkey != state.pub_key:
+        is_new = save_pubkey(state.keys_dir, pubkey)
+        if is_new:
+            state.known_keys[pubkey.hex()] = pubkey
+            name = extract_advert_name(payload) or ""
+            log.info("key learned: %s.. '%s'", pubkey.hex()[:8], sanitize_text(name))
+
+    return [push]
+
+
+def _handle_ack_rx(
+    payload: bytes,
+    ack_start: int,
+    state: BridgeState,
+) -> list[bytes]:
+    """Handle received ACK: match against pending TX ACK tags.
+
+    ACK payload is 4 bytes (checksum) at ack_start.
+    """
+    if ack_start + 4 > len(payload):
+        return []
+
+    ack_bytes = payload[ack_start : ack_start + 4]
+
+    # Check against pending ACKs
+    now = time.monotonic()
+    # Expire old entries
+    expired = [
+        k
+        for k, (ts, _) in state.pending_acks.items()
+        if now - ts > state.pending_ack_ttl
+    ]
+    for k in expired:
+        del state.pending_acks[k]
+
+    if ack_bytes in state.pending_acks:
+        _, dest_prefix = state.pending_acks.pop(ack_bytes)
+        # PUSH_SEND_CONFIRMED: [0x82, ack_code(6)]
+        # ack_code is the first 6 bytes of the destination pubkey prefix
+        push = bytes([PUSH_ACK]) + dest_prefix[:6].ljust(6, b"\x00")
+        log.info("ACK received for %s", ack_bytes.hex())
+        return [push]
+
+    return []
+
+
+def _build_contact_msg_recv_v3(
+    snr_byte: int,
+    src_prefix: bytes,
+    path_len: int,
+    txt_type: int,
+    ts: int,
+    text: bytes,
+) -> bytes:
+    """Build a CONTACT_MSG_RECV_V3 (0x10) response payload."""
+    buf = bytearray()
+    buf.append(RESP_CONTACT_MSG_RECV_V3)
+    buf.extend(struct.pack("<b", snr_byte))  # SNR * 4
+    buf.extend(b"\x00\x00")  # reserved
+    buf.extend(src_prefix[:6].ljust(6, b"\x00"))  # pubkey prefix (6 bytes)
+    buf.append(path_len)
+    buf.append(txt_type)
+    buf.extend(struct.pack("<I", ts))
+    buf.extend(text)
+    return bytes(buf)
+
+
+def _build_ack_wire_packet(ack_hash: bytes) -> bytes:
+    """Build a MeshCore ACK wire packet with direct routing (no path).
+
+    Wire format: header(1) + path_len(1) + ack_hash(4) = 6 bytes.
+    Uses ROUTE_DIRECT with empty path (path_len=0) for point-to-point testing.
+    """
+    from meshcore_tx import build_wire_packet, make_header
+
+    header = make_header(ROUTE_DIRECT, PAYLOAD_ACK)
+    return build_wire_packet(header, ack_hash)
+
+
+def _handle_txt_msg_rx(
+    payload: bytes,
+    snr_byte: int,
+    path_len: int,
+    state: BridgeState,
+) -> tuple[list[bytes], list[bytes]]:
+    """Decrypt TXT_MSG and produce CONTACT_MSG_RECV_V3 + RF ACK packet."""
+    empty: tuple[list[bytes], list[bytes]] = ([], [])
+    result = try_decrypt_txt_msg(
+        payload, state.expanded_prv, state.pub_key, state.known_keys
+    )
+    if result is not None:
+        text, sender_pub = result
+        log.info(">> TXT_MSG from %s..: %s", sender_pub.hex()[:8], sanitize_text(text))
+
+        # Auto-learn sender key
+        if sender_pub.hex() not in state.known_keys:
+            save_pubkey(state.keys_dir, sender_pub)
+            state.known_keys[sender_pub.hex()] = sender_pub
+
+        # Extract timestamp from the plaintext (already decrypted, but we
+        # need the original wire timestamp for the companion message)
+        hdr_info = parse_meshcore_header(payload)
+        if hdr_info is None:
+            return empty
+        off = hdr_info["off"]
+        inner = payload[off:]
+        # TXT_MSG inner: dest_hash(1) + src_hash(1) + MAC(2) + ciphertext
+        # Decrypt to get timestamp from plaintext[0:4]
+        secret = meshcore_shared_secret(state.expanded_prv, sender_pub)
+        plaintext: bytes | None = None
+        if secret is not None:
+            plaintext = meshcore_mac_then_decrypt(secret, inner[2:])
+            if plaintext is not None and len(plaintext) >= 5:
+                ts = struct.unpack_from("<I", plaintext, 0)[0]
+                txt_type = plaintext[4] >> 2
+            else:
+                ts = int(time.time())
+                txt_type = 0
+        else:
+            ts = int(time.time())
+            txt_type = 0
+
+        msg = _build_contact_msg_recv_v3(
+            snr_byte,
+            sender_pub[:6],
+            path_len,
+            txt_type,
+            ts,
+            text.encode("utf-8"),
+        )
+
+        # Build RF ACK packet (direct routing, no path)
+        ack_packets: list[bytes] = []
+        if plaintext is not None and len(plaintext) >= 5:
+            ack_hash = compute_ack_hash(plaintext, sender_pub)
+            ack_packets.append(_build_ack_wire_packet(ack_hash))
+            log.info("ACK hash: %s for %s..", ack_hash.hex(), sender_pub.hex()[:8])
+
+        return ([msg], ack_packets)
+
+    # Decryption failed — pass as opaque (not addressed to us, or unknown sender)
+    log.debug("TXT_MSG: decryption failed (not for us or unknown sender)")
+    return empty
+
+
+def _handle_anon_req_rx(
+    payload: bytes,
+    snr_byte: int,
+    path_len: int,
+    state: BridgeState,
+) -> tuple[list[bytes], list[bytes]]:
+    """Decrypt ANON_REQ and produce CONTACT_MSG_RECV_V3 (no RF ACK).
+
+    MeshCore firmware does NOT ACK ANON_REQ — it sends a RESPONSE instead.
+    We therefore return an empty ack_packets list.
+    """
+    # TODO: implement ANON_REQ RESPONSE (firmware sends a RESPONSE, not an ACK)
+    empty: tuple[list[bytes], list[bytes]] = ([], [])
+    result = try_decrypt_anon_req(payload, state.expanded_prv, state.pub_key)
+    if result is not None:
+        text, sender_pub = result
+        log.info(">> ANON_REQ from %s..: %s", sender_pub.hex()[:8], sanitize_text(text))
+
+        # Auto-learn sender key (key store only — NOT contacts)
+        pk_hex = sender_pub.hex()
+        if pk_hex not in state.known_keys:
+            save_pubkey(state.keys_dir, sender_pub)
+            state.known_keys[pk_hex] = sender_pub
+            log.info("key learned: %s.. (ANON_REQ)", pk_hex[:8])
+
+        ts = int(time.time())
+        msg = _build_contact_msg_recv_v3(
+            snr_byte,
+            sender_pub[:6],
+            path_len,
+            0,  # txt_type: plain text
+            ts,
+            text.encode("utf-8"),
+        )
+
+        return ([msg], [])  # no RF ACK for ANON_REQ
+
+    log.debug("ANON_REQ: decryption failed (not addressed to us)")
+    return empty
+
+
+def _handle_grp_txt_rx(
+    payload: bytes,
+    snr_byte: int,
+    path_len: int,
+    state: BridgeState,
+) -> list[bytes]:
+    """Decrypt GRP_TXT and produce CHANNEL_MSG_RECV_V3."""
+    result = try_decrypt_grp_txt(payload, state.channels)
+    if result is not None:
+        text, channel_name = result
+        log.info(">> GRP_TXT #%s: %s", sanitize_text(channel_name), sanitize_text(text))
+
+        # Find channel index for companion protocol
+        chan_idx = 0
+        for i, ch in enumerate(state.channels):
+            if ch.name == channel_name:
+                chan_idx = i
+                break
+
+        # Extract timestamp from decrypted plaintext
+        hdr_info = parse_meshcore_header(payload)
+        ts = int(time.time())
+        if hdr_info is not None:
+            off = hdr_info["off"]
+            inner = payload[off:]
+            # GRP_TXT inner: channel_hash(1) + MAC(2) + ciphertext
+            ch_obj = (
+                state.channels[chan_idx] if chan_idx < len(state.channels) else None
+            )
+            if ch_obj is not None:
+                plaintext = meshcore_mac_then_decrypt(ch_obj.secret, inner[1:])
+                if plaintext is not None and len(plaintext) >= 4:
+                    ts = struct.unpack_from("<I", plaintext, 0)[0]
+
+        buf = bytearray()
+        buf.append(RESP_CHANNEL_MSG_RECV_V3)
+        buf.extend(struct.pack("<b", snr_byte))
+        buf.extend(b"\x00\x00")  # reserved
+        buf.append(chan_idx)
+        buf.append(path_len)
+        buf.append(0)  # txt_type: text
+        buf.extend(struct.pack("<I", ts))
+        buf.extend(text.encode("utf-8"))
+        return [bytes(buf)]
+
+    log.debug("GRP_TXT: decryption failed (unknown channel)")
+    return []
+
+
+# ---- Contact persistence ----
+
+DEFAULT_CONTACTS_DIR = Path.home() / ".config" / "gr4-lora" / "contacts"
+
+
+def _persist_contacts(state: BridgeState) -> None:
+    """Save all contacts to disk for persistence across restarts."""
+    cdir = state.contacts_dir
+    if cdir is None:
+        cdir = DEFAULT_CONTACTS_DIR
+    cdir.mkdir(parents=True, exist_ok=True)
+    for pk_hex, record in state.contacts.items():
+        path = cdir / f"{pk_hex}.contact"
+        path.write_bytes(record)
+
+
+def _load_persisted_contacts(contacts_dir: Path | None) -> dict[str, bytes]:
+    """Load persisted contacts from disk."""
+    cdir = contacts_dir if contacts_dir is not None else DEFAULT_CONTACTS_DIR
+    contacts: dict[str, bytes] = {}
+    if not cdir.is_dir():
+        return contacts
+    for f in cdir.glob("*.contact"):
+        data = f.read_bytes()
+        if len(data) == 147:
+            # Pubkey is first 32 bytes of the record
+            pk_hex = data[:32].hex()
+            contacts[pk_hex] = data
+    return contacts
+
+
+def _delete_persisted_contact(contacts_dir: Path | None, pk_hex: str) -> None:
+    """Delete a persisted contact file."""
+    cdir = contacts_dir if contacts_dir is not None else DEFAULT_CONTACTS_DIR
+    path = cdir / f"{pk_hex}.contact"
+    if path.exists():
+        path.unlink()
+
+
+# ---- Command handlers ----
+
+
+def _build_contact_record(
+    pubkey: bytes,
+    name: str = "",
+    node_type: int = 0x01,
+    lat: int = 0,
+    lon: int = 0,
+    last_advert: int = 0,
+) -> bytes:
+    """Build a 147-byte contact record (matches CONTACT response format).
+
+    Layout: pubkey(32) + type(1) + flags(1) + path_len(1) + path(64) +
+            name(32) + last_advert(4) + lat(4) + lon(4) + lastmod(4) = 147 bytes.
+    """
+    if last_advert == 0:
+        last_advert = int(time.time())
+    buf = bytearray()
+    buf.extend(pubkey[:32].ljust(32, b"\x00"))
+    buf.append(node_type)
+    buf.append(0)  # flags
+    buf.extend(struct.pack("<b", -1))  # path_len: -1 (flood)
+    buf.extend(b"\x00" * 64)  # path
+    buf.extend(utf8_truncate(name, 32).ljust(32, b"\x00"))
+    buf.extend(struct.pack("<I", last_advert))
+    buf.extend(struct.pack("<i", lat))
+    buf.extend(struct.pack("<i", lon))
+    buf.extend(struct.pack("<I", last_advert))  # lastmod
+    return bytes(buf)
+
+
+def _build_self_advert_push(state: BridgeState) -> bytes | None:
+    """Build a PUSH_NEW_ADVERT (0x8A) for our own identity.
+
+    This lets the companion app auto-learn us as a contact on connect.
+    """
+    record = _build_contact_record(state.pub_key, name=state.name)
+    return bytes([PUSH_NEW_ADVERT]) + record
+
+
+def handle_command(
+    cmd_payload: bytes,
+    state: BridgeState,
+    udp_sock: socket.socket,
+    udp_addr: tuple[str, int],
+) -> list[bytes]:
+    """Handle a companion protocol command, return list of response payloads."""
+    if not cmd_payload:
+        return []
+
+    cmd = cmd_payload[0]
+    data = cmd_payload[1:]
+
+    if cmd == CMD_APP_START:
+        log.info("companion: APP_START")
+        # Send SELF_INFO + push our own ADVERT so companion learns our contact
+        responses = [state.build_self_info()]
+        self_advert = _build_self_advert_push(state)
+        if self_advert is not None:
+            responses.append(self_advert)
+        # Also persist self in contacts so GET_CONTACTS returns us
+        _ensure_self_contact(state)
+        return responses
+
+    if cmd == CMD_DEVICE_QUERY:
+        return [state.build_device_info()]
+
+    if cmd == CMD_GET_CONTACTS:
+        return state.build_contacts_response()
+
+    if cmd == CMD_GET_DEVICE_TIME:
+        return [state.build_current_time()]
+
+    if cmd == CMD_SET_DEVICE_TIME:
+        return [state.build_ok()]
+
+    if cmd == CMD_GET_BATT_AND_STORAGE:
+        return [state.build_battery()]
+
+    if cmd == CMD_GET_CHANNEL:
+        idx = data[0] if data else 0
+        if idx >= 8:  # max_channels (must match build_device_info)
+            return [state.build_error()]
+        return [state.build_channel_info(idx)]
+
+    if cmd == CMD_GET_STATS:
+        stats_type = data[0] if data else 0
+        return [state.build_stats(stats_type)]
+
+    if cmd == CMD_SYNC_NEXT_MESSAGE:
+        if state.msg_queue:
+            msg = state.msg_queue.popleft()
+            return [msg]
+        return [state.build_no_more_msgs()]
+
+    if cmd == CMD_SEND_TXT_MSG:
+        return _handle_send_txt_msg(data, state, udp_sock, udp_addr)
+
+    if cmd == CMD_SEND_CHAN_TXT_MSG:
+        return _handle_send_chan_txt_msg(data, state, udp_sock, udp_addr)
+
+    if cmd == CMD_SEND_SELF_ADVERT:
+        return _handle_send_advert(data, state, udp_sock, udp_addr)
+
+    if cmd == CMD_SET_ADVERT_NAME:
+        name = data.decode("utf-8", errors="replace").rstrip("\x00")
+        state.name = name
+        log.info("companion: SET_ADVERT_NAME '%s'", sanitize_text(name))
+        return [state.build_ok()]
+
+    if cmd == CMD_SET_RADIO_PARAMS:
+        return [state.build_ok()]
+
+    if cmd == CMD_SET_RADIO_TX_POWER:
+        return [state.build_ok()]
+
+    if cmd == CMD_IMPORT_CONTACT:
+        return _handle_import_contact(data, state)
+
+    if cmd == CMD_ADD_UPDATE_CONTACT:
+        return _handle_add_contact(data, state)
+
+    if cmd == CMD_REMOVE_CONTACT:
+        if len(data) >= 32:
+            pk_hex = data[:32].hex()
+            state.contacts.pop(pk_hex, None)
+            _delete_persisted_contact(state.contacts_dir, pk_hex)
+            log.info("companion: REMOVE_CONTACT %s..", pk_hex[:8])
+        return [state.build_ok()]
+
+    if cmd == CMD_EXPORT_CONTACT:
+        # Return raw ADVERT wire packet bytes for the requested contact.
+        # The companion protocol reader hex-encodes these and prepends
+        # "meshcore://" to form the biz card URI.
+        if data and len(data) >= 32:
+            # Exporting a specific contact — look up by pubkey
+            pk_hex = data[:32].hex()
+            # We don't have the original ADVERT packet for stored contacts,
+            # so build a synthetic one from our identity
+            if pk_hex == state.pub_key.hex():
+                return _handle_export_self(state)
+            return [state.build_error()]
+        # Exporting self (no args)
+        return _handle_export_self(state)
+
+    if cmd == CMD_SET_CHANNEL:
+        return _handle_set_channel(data, state)
+
+    if cmd in (
+        CMD_SET_ADVERT_LATLON,
+        CMD_RESET_PATH,
+        CMD_SET_TUNING_PARAMS,
+        CMD_REBOOT,
+    ):
+        return [state.build_ok()]
+
+    # Unknown command — return OK silently
+    return [state.build_ok()]
+
+
+def _hash_payload(payload: bytes) -> bytes:
+    """Hash a payload for TX echo filtering."""
+    return hashlib.sha256(payload).digest()[:8]
+
+
+def _compute_transport_code(
+    region_key: bytes, payload_type: int, payload: bytes
+) -> int:
+    """Compute a 2-byte transport code using HMAC-SHA256.
+
+    Matches MeshCore TransportKey::calcTransportCode():
+      HMAC-SHA256(key, payload_type(1) + payload) truncated to 2 bytes (LE).
+      Values 0x0000 and 0xFFFF are reserved and adjusted.
+    """
+    import hmac
+
+    msg = bytes([payload_type]) + payload
+    mac = hmac.new(region_key, msg, hashlib.sha256).digest()[:2]
+    code = int.from_bytes(mac, "little")
+    if code == 0x0000:
+        code = 0x0001
+    elif code == 0xFFFF:
+        code = 0xFFFE
+    return code
+
+
+def _handle_send_txt_msg(
+    data: bytes,
+    state: BridgeState,
+    udp_sock: socket.socket,
+    udp_addr: tuple[str, int],
+) -> list[bytes]:
+    """Handle CMD_SEND_TXT_MSG: build MeshCore wire packet and TX via UDP."""
+    if len(data) < 12:  # type(1) + attempt(1) + ts(4) + dst(6)
+        return [state.build_error()]
+
+    msg_type = data[0]  # 0=text, 1=command
+    attempt = data[1]
+    ts = struct.unpack_from("<I", data, 2)[0]
+    dst_prefix = data[6:12]
+    text = data[12:]
+
+    log.info(
+        "companion: SEND_TXT_MSG type=%d dst=%s '%s'",
+        msg_type,
+        dst_prefix.hex(),
+        sanitize_text(text.decode("utf-8", errors="replace")),
+    )
+
+    # Look up full destination pubkey from contacts (6-byte prefix match)
+    dest_pub = _resolve_contact(state, dst_prefix)
+    if dest_pub is None:
+        log.error("no contact matching prefix %s", dst_prefix.hex())
+        return [state.build_error(2)]
+
+    # Build encrypted TXT_MSG wire packet
+    from meshcore_tx import build_txt_msg, make_cbor_tx_request
+
+    packet = build_txt_msg(
+        state.expanded_prv,
+        state.pub_key,
+        dest_pub,
+        text.decode("utf-8", errors="replace"),
+        timestamp=ts,
+        attempt=attempt,
+    )
+
+    if state.region_key:
+        # Repackage with T_DIRECT route and transport codes.
+        # Original packet (ROUTE_DIRECT): header(1) + path_len(1) + payload
+        from meshcore_tx import build_wire_packet, make_header
+
+        txt_payload = packet[2:]  # skip header + path_len (both 1 byte)
+        tc1 = _compute_transport_code(state.region_key, PAYLOAD_TXT, txt_payload)
+        header = make_header(ROUTE_T_DIRECT, PAYLOAD_TXT)
+        packet = build_wire_packet(header, txt_payload, transport_codes=(tc1, 0))
+
+    # Track TX hash to filter echo
+    h = _hash_payload(packet)
+    state.recent_tx[h] = time.monotonic()
+    log.debug("echo-filter: track TX hash %s", h.hex())
+
+    # Send via UDP CBOR
+    cbor_msg = make_cbor_tx_request(packet)
+    udp_sock.sendto(cbor_msg, udp_addr)
+    log.info("TX: %dB msg to %s", len(packet), dst_prefix.hex())
+
+    # Build response and register ACK tag for tracking
+    resp = state.build_msg_sent(flood=False)
+    # Extract the ack_tag (4 bytes at offset 2) from the MSG_SENT response
+    ack_tag = resp[2:6]
+    state.pending_acks[ack_tag] = (time.monotonic(), dst_prefix)
+
+    return [resp]
+
+
+def _handle_send_advert(
+    data: bytes,
+    state: BridgeState,
+    udp_sock: socket.socket,
+    udp_addr: tuple[str, int],
+) -> list[bytes]:
+    """Handle CMD_SEND_SELF_ADVERT: broadcast ADVERT via UDP."""
+    from meshcore_tx import build_advert, build_wire_packet, make_cbor_tx_request
+
+    flood = len(data) > 0 and data[0] == 0x01
+
+    if state.region_key:
+        # Build with T_FLOOD route, then compute transport code over the
+        # payload and repackage with transport codes.
+        tmp = build_advert(state.seed, state.pub_key, name=state.name)
+        # Extract payload: skip header(1) + path_len(1) — no transport codes
+        # in the default ROUTE_FLOOD packet.
+        advert_payload = tmp[2:]
+        tc1 = _compute_transport_code(state.region_key, PAYLOAD_ADVERT, advert_payload)
+        from meshcore_tx import make_header
+
+        header = make_header(ROUTE_T_FLOOD, PAYLOAD_ADVERT)
+        packet = build_wire_packet(header, advert_payload, transport_codes=(tc1, 0))
+    else:
+        packet = build_advert(state.seed, state.pub_key, name=state.name)
+
+    # Track TX hash to filter echo
+    h = _hash_payload(packet)
+    state.recent_tx[h] = time.monotonic()
+    log.debug("echo-filter: track TX hash %s", h.hex())
+
+    cbor_msg = make_cbor_tx_request(packet)
+    udp_sock.sendto(cbor_msg, udp_addr)
+    log.info("TX: ADVERT '%s' %dB", state.name, len(packet))
+
+    return [state.build_ok()]
+
+
+def _handle_send_chan_txt_msg(
+    data: bytes,
+    state: BridgeState,
+    udp_sock: socket.socket,
+    udp_addr: tuple[str, int],
+) -> list[bytes]:
+    """Handle CMD_SEND_CHAN_TXT_MSG: build encrypted GRP_TXT and TX via UDP.
+
+    Companion format: [0x03, msg_type(1), chan_idx(1), ts(4 LE), text...]
+    The firmware disambiguates CMD_SEND_TXT_MSG (0x02) vs CMD_SEND_CHAN_TXT_MSG
+    (0x03) by command code. Our bridge separates them at the command dispatch level.
+    """
+    if len(data) < 7:  # msg_type(1) + chan_idx(1) + ts(4) + at least 1 byte text
+        return [state.build_error()]
+
+    _msg_type = data[0]
+    chan_idx = data[1]
+    ts = struct.unpack_from("<I", data, 2)[0]
+    text = data[6:]
+
+    if chan_idx >= len(state.channels):
+        log.error(
+            "channel index %d out of range (%d channels loaded)",
+            chan_idx,
+            len(state.channels),
+        )
+        return [state.build_error(3)]  # channel not found
+
+    channel = state.channels[chan_idx]
+    text_str = text.decode("utf-8", errors="replace")
+
+    log.info(
+        "companion: SEND_CHAN_TXT_MSG ch=%d '%s': '%s'",
+        chan_idx,
+        sanitize_text(channel.name),
+        sanitize_text(text_str),
+    )
+
+    # Build encrypted GRP_TXT payload
+    from meshcore_tx import build_wire_packet, make_header
+
+    grp_payload = build_grp_txt(channel, state.name, text_str, timestamp=ts)
+
+    if state.region_key:
+        # Use T_FLOOD with transport codes
+        tc1 = _compute_transport_code(state.region_key, PAYLOAD_GRP_TXT, grp_payload)
+        header = make_header(ROUTE_T_FLOOD, PAYLOAD_GRP_TXT)
+        packet = build_wire_packet(header, grp_payload, transport_codes=(tc1, 0))
+    else:
+        header = make_header(ROUTE_FLOOD, PAYLOAD_GRP_TXT)
+        packet = build_wire_packet(header, grp_payload)
+
+    # Track TX hash to filter echo
+    h = _hash_payload(packet)
+    state.recent_tx[h] = time.monotonic()
+    log.debug("echo-filter: track TX hash %s", h.hex())
+
+    # Send via UDP CBOR
+    from meshcore_tx import make_cbor_tx_request
+
+    cbor_msg = make_cbor_tx_request(packet)
+    udp_sock.sendto(cbor_msg, udp_addr)
+    log.info("TX: %dB GRP_TXT to #%s", len(packet), channel.name)
+
+    return [state.build_msg_sent(flood=True)]
+
+
+def _handle_set_channel(data: bytes, state: BridgeState) -> list[bytes]:
+    """Handle CMD_SET_CHANNEL: store or clear a channel.
+
+    Format: [idx(1), name(32), secret(32)] = 65 bytes of data.
+    If name is all zeros, the channel is cleared.
+    """
+    if len(data) < 65:
+        return [state.build_error(2)]
+
+    idx = data[0]
+    name_raw = data[1:33].rstrip(b"\x00")
+    secret_raw = data[33:65]
+
+    if idx >= 8:
+        return [state.build_error(5)]  # index out of range
+
+    name = name_raw.decode("utf-8", errors="replace").rstrip("\x00")
+
+    if not name:
+        # Clear channel at this index
+        if idx < len(state.channels):
+            old_name = state.channels[idx].name
+            state.channels[idx : idx + 1] = []
+            log.info("companion: cleared channel %d '%s'", idx, sanitize_text(old_name))
+        return [state.build_ok()]
+
+    # Only first 16 bytes of secret are used (MeshCore 128-bit PSK)
+    psk_16 = secret_raw[:16]
+    ch = GroupChannel(name, psk_16)
+
+    # Store at index (extend list if needed)
+    while len(state.channels) <= idx:
+        state.channels.append(GroupChannel("", b"\x00" * 16))
+    state.channels[idx] = ch
+
+    # Persist to disk
+    save_channel(state.channels_dir, name, psk_16)
+    log.info("companion: SET_CHANNEL %d '%s'", idx, sanitize_text(name))
+
+    return [state.build_ok()]
+
+
+def _handle_add_contact(data: bytes, state: BridgeState) -> list[bytes]:
+    """Handle CMD_ADD_UPDATE_CONTACT."""
+    if len(data) < 32:
+        return [state.build_error()]
+
+    pk = data[:32]
+    pk_hex = pk.hex()
+
+    # Extract name for logging
+    name_offset = 32 + 1 + 1 + 1 + 64  # pubkey + type + flags + path_len + path
+    if name_offset + 32 <= len(data):
+        name = (
+            data[name_offset : name_offset + 32]
+            .rstrip(b"\x00")
+            .decode("utf-8", errors="replace")
+        )
+    else:
+        name = ""
+
+    # CMD_ADD_UPDATE_CONTACT data is 143 bytes (no lastmod), pad to 147
+    now = int(time.time())
+    record = data[:143].ljust(143, b"\x00") + struct.pack("<I", now)
+    state.contacts[pk_hex] = record
+    state.contacts_lastmod = now
+    _persist_contacts(state)
+
+    log.info("contact: %s.. '%s'", pk_hex[:8], sanitize_text(name))
+    return [state.build_ok()]
+
+
+def _parse_advert_wire_packet(data: bytes) -> dict[str, Any] | None:
+    """Parse a raw MeshCore ADVERT wire packet and extract contact info.
+
+    The wire packet format is: [header(1)][opt transport(4)][path_len(1)][path(N)]
+    followed by ADVERT payload: [pubkey(32)][timestamp(4)][signature(64)][app_data(N)].
+
+    Returns dict with pubkey, name, node_type, lat, lon, last_advert or None on failure.
+    """
+    if len(data) < 2:
+        return None
+
+    hdr = data[0]
+    ptype = (hdr >> PTYPE_SHIFT) & PTYPE_MASK
+    route = hdr & ROUTE_MASK
+
+    if ptype != PAYLOAD_ADVERT:
+        return None
+
+    # Skip transport codes if present
+    has_transport = route in (0, 3)
+    off = 1
+    if has_transport:
+        off += 4
+
+    if off >= len(data):
+        return None
+    path_len = data[off]
+    off += 1 + path_len  # skip path_len byte + path
+
+    # ADVERT payload starts here: pubkey(32) + timestamp(4) + signature(64) + app_data
+    advert_start = off
+    if advert_start + 100 > len(data):
+        return None  # too short for pubkey + timestamp + signature
+
+    pubkey = data[advert_start : advert_start + 32]
+    ts_bytes = data[advert_start + 32 : advert_start + 36]
+    # Skip signature (64 bytes)
+    app_start = advert_start + 100
+    app_data = data[app_start:] if app_start < len(data) else b""
+
+    # Parse app_data
+    name = b""
+    lat = 0
+    lon = 0
+    node_type = 0x01
+    if app_data:
+        flags = app_data[0]
+        node_type = flags & 0x0F
+        aoff = 1
+        if flags & 0x10:  # has location
+            if aoff + 8 <= len(app_data):
+                lat, lon = struct.unpack_from("<ii", app_data, aoff)
+            aoff += 8
+        if flags & 0x20:
+            aoff += 2  # feature1
+        if flags & 0x40:
+            aoff += 2  # feature2
+        if flags & 0x80 and aoff < len(app_data):
+            name = app_data[aoff:]
+
+    last_advert = int.from_bytes(ts_bytes, "little") if ts_bytes else 0
+
+    return {
+        "pubkey": pubkey,
+        "name": name.decode("utf-8", errors="replace").rstrip("\x00"),
+        "node_type": node_type,
+        "lat": lat,
+        "lon": lon,
+        "last_advert": last_advert,
+    }
+
+
+def _handle_import_contact(data: bytes, state: BridgeState) -> list[bytes]:
+    """Handle CMD_IMPORT_CONTACT: parse raw ADVERT wire packet and store contact.
+
+    meshcore-cli sends the raw hex-decoded wire packet from a meshcore:// URI.
+    """
+    info = _parse_advert_wire_packet(data)
+    if info is None:
+        log.warning("companion: IMPORT_CONTACT -- failed to parse ADVERT")
+        return [state.build_error()]
+
+    pk_hex = info["pubkey"].hex()
+    record = _build_contact_record(
+        info["pubkey"],
+        name=info["name"],
+        node_type=info["node_type"],
+        lat=info["lat"],
+        lon=info["lon"],
+        last_advert=info["last_advert"],
+    )
+    state.contacts[pk_hex] = record
+    state.contacts_lastmod = int(time.time())
+    _persist_contacts(state)
+
+    log.info(
+        "companion: IMPORT_CONTACT %s.. '%s'", pk_hex[:8], sanitize_text(info["name"])
+    )
+    return [state.build_ok()]
+
+
+def _handle_export_self(state: BridgeState) -> list[bytes]:
+    """Handle CMD_EXPORT_CONTACT for our own identity.
+
+    Builds a raw ADVERT wire packet and returns it as RESP_CONTACT_URI.
+    The companion protocol reader hex-encodes the payload and prepends
+    "meshcore://" to form the biz card URI.
+    """
+    from meshcore_tx import build_advert
+
+    advert_pkt = build_advert(state.seed, state.pub_key, name=state.name)
+    return [bytes([RESP_CONTACT_URI]) + advert_pkt]
+
+
+def _ensure_self_contact(state: BridgeState) -> None:
+    """Add or update our own identity in the contacts store.
+
+    Called on APP_START so that GET_CONTACTS returns our own contact.
+    """
+    pk_hex = state.pub_key.hex()
+    if pk_hex not in state.contacts:
+        record = _build_contact_record(state.pub_key, name=state.name)
+        state.contacts[pk_hex] = record
+        state.contacts_lastmod = int(time.time())
+
+
+def _resolve_contact(state: BridgeState, prefix: bytes) -> bytes | None:
+    """Resolve a 6-byte pubkey prefix to a full 32-byte pubkey from contacts."""
+    for pk_hex in state.contacts:
+        pk_bytes = bytes.fromhex(pk_hex)
+        if pk_bytes[: len(prefix)] == prefix:
+            return pk_bytes
+    return None
+
+
+# ---- Main server loop ----
+
+
+def run_bridge(
+    tcp_port: int,
+    udp_host: str,
+    udp_port: int,
+    state: BridgeState,
+) -> None:
+    """Run the bridge: TCP server + UDP subscriber."""
+    # UDP socket for lora_trx communication
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp_sock.bind(("", 0))
+    udp_sock.setblocking(False)
+    udp_addr = (udp_host, udp_port)
+
+    # Subscribe to lora_trx (sync_word=0x12 for MeshCore)
+    sub_msg = cbor2.dumps({"type": "subscribe", "sync_word": [0x12]})
+    udp_sock.sendto(sub_msg, udp_addr)
+    log.info("subscribed to lora_trx at %s:%d", udp_host, udp_port)
+
+    # TCP server
+    tcp_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp_srv.bind(("0.0.0.0", tcp_port))
+    tcp_srv.listen(1)
+    tcp_srv.setblocking(False)
+    log.info("listening on TCP port %d", tcp_port)
+
+    sel = selectors.DefaultSelector()
+    sel.register(tcp_srv, selectors.EVENT_READ, data="tcp_accept")
+    sel.register(udp_sock, selectors.EVENT_READ, data="udp_rx")
+
+    client_sock: socket.socket | None = None
+    client_decoder: FrameDecoder | None = None
+    last_keepalive = time.monotonic()
+    config_shown = False
+    last_status_total = -1
+
+    try:
+        while True:
+            events = sel.select(timeout=2.0)
+
+            # Periodic UDP keepalive
+            now = time.monotonic()
+            if now - last_keepalive >= 5.0:
+                udp_sock.sendto(sub_msg, udp_addr)
+                last_keepalive = now
+
+            for key, mask in events:
+                # --- TCP accept ---
+                if key.data == "tcp_accept":
+                    conn, addr = tcp_srv.accept()
+                    conn.setblocking(False)
+                    log.info("companion connected: %s:%d", addr[0], addr[1])
+                    # Single client: close previous connection
+                    if client_sock is not None:
+                        sel.unregister(client_sock)
+                        client_sock.close()
+                        log.info("previous client disconnected")
+                    client_sock = conn
+                    client_decoder = FrameDecoder()
+                    sel.register(client_sock, selectors.EVENT_READ, data="tcp_rx")
+                    # Reset message queue for new client
+                    state.msg_queue.clear()
+                    state.msg_seq = 0
+
+                # --- TCP receive ---
+                elif key.data == "tcp_rx":
+                    try:
+                        raw = client_sock.recv(4096)  # type: ignore[union-attr]
+                    except (ConnectionError, OSError):
+                        raw = b""
+                    if not raw:
+                        log.info("companion disconnected")
+                        sel.unregister(client_sock)  # type: ignore[arg-type]
+                        client_sock.close()  # type: ignore[union-attr]
+                        client_sock = None
+                        client_decoder = None
+                        continue
+
+                    frames = client_decoder.feed(raw)  # type: ignore[union-attr]
+                    for cmd_payload in frames:
+                        responses = handle_command(
+                            cmd_payload, state, udp_sock, udp_addr
+                        )
+                        for resp in responses:
+                            _tcp_send(client_sock, resp)  # type: ignore[arg-type]
+
+                # --- UDP receive (RX frames from lora_trx) ---
+                elif key.data == "udp_rx":
+                    try:
+                        dgram, _from = udp_sock.recvfrom(65536)
+                    except (BlockingIOError, OSError):
+                        continue
+                    try:
+                        msg = cbor2.loads(dgram)
+                    except Exception:
+                        continue
+
+                    if not isinstance(msg, dict):
+                        continue
+
+                    msg_type = msg.get("type")
+
+                    # Handle config (log once)
+                    if msg_type == "config":
+                        if not config_shown:
+                            phy = msg.get("phy", {})
+                            freq = phy.get("freq", 0)
+                            log.info(
+                                "config: %.3f MHz SF%s BW %.1fk",
+                                freq / 1e6,
+                                phy.get("sf", "?"),
+                                phy.get("bw", 0) / 1e3,
+                            )
+                            config_shown = True
+                        continue
+
+                    # Handle status (log only when frame count changes)
+                    if msg_type == "status":
+                        frames_info = msg.get("frames", {})
+                        total = frames_info.get("total", 0)
+                        if total != last_status_total:
+                            ok = frames_info.get("crc_ok", 0)
+                            log.info("status: %d frames (%d CRC_OK)", total, ok)
+                            last_status_total = total
+                        continue
+
+                    if msg_type != "lora_frame":
+                        continue
+
+                    # Expire old TX echo hashes
+                    now = time.monotonic()
+                    cutoff = now - state.recent_tx_ttl
+                    expired = [k for k, ts in state.recent_tx.items() if ts < cutoff]
+                    for k in expired:
+                        log.debug("echo-filter: expired hash %s", k.hex())
+                        del state.recent_tx[k]
+
+                    # Filter our own TX echoes
+                    rx_payload = msg.get("payload", b"")
+                    if rx_payload:
+                        h = _hash_payload(rx_payload)
+                        if h in state.recent_tx:
+                            log.debug(
+                                "echo-filter: matched TX hash %s, dropping echo",
+                                h.hex(),
+                            )
+                            del state.recent_tx[h]
+                            continue
+                        log.debug(
+                            "echo-filter: RX hash %s (no match, %d tracked)",
+                            h.hex(),
+                            len(state.recent_tx),
+                        )
+
+                    # RX dedup: suppress duplicate frames from dual-channel RX
+                    # or mesh retransmits (same payload within recent_rx_ttl)
+                    if rx_payload:
+                        rx_h = _hash_payload(rx_payload)
+                        now_rx = time.monotonic()
+                        # Expire old entries
+                        rx_expired = [
+                            k
+                            for k, ts in state.recent_rx.items()
+                            if now_rx - ts > state.recent_rx_ttl
+                        ]
+                        for k in rx_expired:
+                            del state.recent_rx[k]
+                        if rx_h in state.recent_rx:
+                            log.debug("dedup: suppressed duplicate RX %s", rx_h.hex())
+                            continue
+                        state.recent_rx[rx_h] = now_rx
+
+                    # Convert to companion messages and queue
+                    companion_msgs, ack_packets = lora_frame_to_companion_msgs(
+                        msg, state
+                    )
+
+                    # TX RF ACK packets (direct routing, no path)
+                    if ack_packets:
+                        from meshcore_tx import make_cbor_tx_request
+
+                        for ack_pkt in ack_packets:
+                            cbor_msg = make_cbor_tx_request(ack_pkt)
+                            udp_sock.sendto(cbor_msg, udp_addr)
+                            log.info("TX ACK: %s (%dB)", ack_pkt.hex(), len(ack_pkt))
+
+                    for companion_msg in companion_msgs:
+                        # ACK pushes (PUSH_ACK) are sent immediately, not queued
+                        if companion_msg[0] == PUSH_ACK:
+                            if client_sock is not None:
+                                _tcp_send(client_sock, companion_msg)
+                        else:
+                            state.msg_queue.append(companion_msg)
+                    if companion_msgs:
+                        # Push MESSAGES_WAITING if we queued any non-push msgs
+                        queued = [m for m in companion_msgs if m[0] != PUSH_ACK]
+                        if queued and client_sock is not None:
+                            _tcp_send(
+                                client_sock,
+                                bytes([PUSH_MESSAGES_WAITING]),
+                            )
+                        seq = msg.get("seq", "?")
+                        plen = len(rx_payload)
+                        log.info(
+                            "RX #%s: %dB (queue %d)",
+                            seq,
+                            plen,
+                            len(state.msg_queue),
+                        )
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if client_sock is not None:
+            client_sock.close()
+        tcp_srv.close()
+        udp_sock.close()
+        sel.close()
+        log.info("bridge stopped")
+
+
+def _tcp_send(sock: socket.socket, payload: bytes) -> None:
+    """Send a framed companion protocol response."""
+    try:
+        sock.sendall(frame_encode(payload))
+    except (ConnectionError, OSError):
+        pass  # client disconnected, will be cleaned up on next recv
+
+
+# ---- CLI ----
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="MeshCore companion protocol bridge to lora_trx"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=BRIDGE_PORT,
+        help=f"TCP listen port (default: {BRIDGE_PORT})",
+    )
+    parser.add_argument(
+        "--udp",
+        metavar="HOST:PORT",
+        default=None,
+        help="lora_trx UDP address (default from config.toml or 127.0.0.1:5555)",
+    )
+    parser.add_argument(
+        "--identity",
+        type=Path,
+        default=DEFAULT_IDENTITY_FILE,
+        help=f"Identity file (default: {DEFAULT_IDENTITY_FILE})",
+    )
+    parser.add_argument(
+        "--name",
+        default="gr4-lora",
+        help="Node name for SELF_INFO (default: gr4-lora)",
+    )
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        default=None,
+        help="Path to config.toml (auto-detected if omitted)",
+    )
+    parser.add_argument(
+        "--keys-dir",
+        type=Path,
+        default=DEFAULT_KEYS_DIR,
+        help=f"Key store directory (default: {DEFAULT_KEYS_DIR})",
+    )
+    parser.add_argument(
+        "--channels-dir",
+        type=Path,
+        default=DEFAULT_CHANNELS_DIR,
+        help=f"Channel store directory (default: {DEFAULT_CHANNELS_DIR})",
+    )
+    parser.add_argument(
+        "--contacts-dir",
+        type=Path,
+        default=DEFAULT_CONTACTS_DIR,
+        help=f"Contact store directory (default: {DEFAULT_CONTACTS_DIR})",
+    )
+    parser.add_argument(
+        "--region-scope",
+        metavar="NAME",
+        default=None,
+        help="Region scope for transport codes (e.g. 'de-nord'). "
+        "Default from config.toml or empty (disabled).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (echo filter diagnostics, etc.)",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        default=False,
+        help="Disable ANSI color output (also: NO_COLOR env var)",
+    )
+    args = parser.parse_args()
+
+    # Load config and configure logging
+    cfg = load_config(args.config)
+    setup_logging("gr4.bridge", cfg, debug=args.debug, no_color=args.no_color)
+
+    # Resolve UDP address
+    if args.udp:
+        try:
+            udp_host, udp_port = parse_host_port(args.udp)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        udp_host = config_udp_host(cfg)
+        udp_port = config_udp_port(cfg)
+
+    # Load identity
+    expanded_prv, pub_key, seed = load_or_create_identity(args.identity)
+    log.info("identity: %s", pub_key.hex())
+    log.info("name: %s", args.name)
+
+    # Print contact URIs (two incompatible formats — see CLAUDE.md)
+    from lora_common import build_bizcard_uri, build_contact_uri
+    from meshcore_tx import build_advert
+
+    advert_pkt = build_advert(seed, pub_key, name=args.name)
+    # Phone companion app format (QR / paste into app)
+    contact_uri = build_contact_uri(pub_key, args.name)
+    log.info("contact URI: %s", contact_uri)
+    # CLI biz card format (meshcore-cli import_contact)
+    biz_uri = build_bizcard_uri(advert_pkt)
+    log.info("biz card: %s", biz_uri)
+
+    # Extract PHY params from config for SELF_INFO
+    # Find first set and resolve codec + radio
+    freq_mhz = 869.618
+    bw_khz = 62.5
+    sf = 8
+    cr = 4
+    tx_power = 14
+
+    for key, val in cfg.items():
+        if key.startswith("set_") and isinstance(val, dict):
+            codec_name = val.get("codec", "")
+            radio_name = val.get("radio", "")
+            codec = cfg.get(codec_name, {})
+            radio = cfg.get(radio_name, {})
+            if codec:
+                sf = codec.get("sf", sf)
+                bw_khz = codec.get("bw", bw_khz * 1000) / 1000
+                cr = codec.get("cr", cr + 4) - 4  # denominator -> offset
+            if radio:
+                freq_mhz = radio.get("freq", freq_mhz * 1e6) / 1e6
+                tx_power = int(radio.get("tx_gain", tx_power))
+            break
+
+    # Resolve region scope: CLI flag overrides config.toml
+    if args.region_scope is not None:
+        region_scope = args.region_scope
+    else:
+        region_scope = config_region_scope(cfg)
+    if region_scope:
+        log.info("region scope: #%s", region_scope)
+
+    state = BridgeState(
+        pub_key=pub_key,
+        expanded_prv=expanded_prv,
+        seed=seed,
+        name=args.name,
+        freq_mhz=freq_mhz,
+        bw_khz=bw_khz,
+        sf=sf,
+        cr=cr,
+        tx_power=tx_power,
+        keys_dir=args.keys_dir,
+        channels_dir=args.channels_dir,
+        contacts_dir=args.contacts_dir,
+        region_scope=region_scope,
+    )
+
+    # Load persisted contacts from disk
+    persisted = _load_persisted_contacts(args.contacts_dir)
+    if persisted:
+        state.contacts.update(persisted)
+        state.contacts_lastmod = int(time.time())
+        log.info("loaded %d persisted contacts", len(persisted))
+
+    # Log loaded state
+    log.info(
+        "keys: %d, channels: %d, contacts: %d",
+        len(state.known_keys),
+        len(state.channels),
+        len(state.contacts),
+    )
+
+    run_bridge(args.port, udp_host, udp_port, state)
+
+
+if __name__ == "__main__":
+    main()
