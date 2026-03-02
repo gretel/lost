@@ -1317,6 +1317,22 @@ int main(int argc, char* argv[]) {
     std::fprintf(stderr, "  Device:      %s\n", cfg.device.c_str());
     std::fprintf(stderr, "  Params:      %s\n",
                  cfg.device_param.empty() ? "(none)" : cfg.device_param.c_str());
+
+    // Query hardware info (FPGA version, serial) from SoapySDR
+    {
+        auto args = gr::blocks::soapy::detail::buildDeviceArgs(cfg.device, cfg.device_param);
+        auto* dev = SoapySDR::Device::make(args);
+        if (dev) {
+            auto info = dev->getHardwareInfo();
+            if (auto it = info.find("fpga_version"); it != info.end()) {
+                std::fprintf(stderr, "  FPGA:        v%s\n", it->second.c_str());
+            }
+            if (auto it = info.find("serial"); it != info.end()) {
+                std::fprintf(stderr, "  Serial:      %s\n", it->second.c_str());
+            }
+            SoapySDR::Device::unmake(dev);
+        }
+    }
     std::fprintf(stderr, "  Frequency:   %.6f MHz\n", cfg.freq / 1e6);
     std::fprintf(stderr, "  Gain RX:     %.0f dB\n", cfg.gain_rx);
     std::fprintf(stderr, "  Gain TX:     %.0f dB\n", cfg.gain_tx);
