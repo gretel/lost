@@ -9,13 +9,16 @@ companion apps.
 
 Usage:
     meshcore_bridge.py                    # default: TCP 7834, UDP 127.0.0.1:5555
-    meshcore_bridge.py --port 7834 --udp 127.0.0.1:5555
+    meshcore_bridge.py --port 5000 --udp 127.0.0.1:5555
     meshcore_bridge.py --config apps/config.toml
 
 Architecture:
     meshcore-cli ──TCP:7834──► meshcore_bridge ──UDP:5555──► lora_trx
                   companion                      CBOR          (SDR)
                   protocol
+
+Note: port 5000 is occupied by macOS AirPlay/Control Center. Use 7834 (default)
+or configure a different port in [meshcore] port = ... in config.toml.
 
 The bridge:
   - Accepts one TCP client at a time (matches real MeshCore firmware)
@@ -85,19 +88,24 @@ from meshcore_crypto import (
     PAYLOAD_TXT,
     PAYLOAD_ACK,
     PAYLOAD_ADVERT,
+    PAYLOAD_RESP,
     PAYLOAD_GRP_TXT,
     PAYLOAD_ANON_REQ,
     ROUTE_DIRECT,
     ROUTE_FLOOD,
     ROUTE_T_DIRECT,
     ROUTE_T_FLOOD,
+    ADVERT_HAS_LOCATION,
+    ADVERT_HAS_NAME,
 )
 
 log = logging.getLogger("gr4.bridge")
 
 # ---- Companion protocol constants ----
 
-BRIDGE_PORT = 7834  # MeshCore companion WiFi port (avoids macOS AirPlay on 5000)
+BRIDGE_PORT = (
+    7834  # MeshCore companion WiFi port (avoids macOS AirPlay/Control Center on 5000)
+)
 
 # Framing bytes
 FRAME_TX = 0x3C  # client -> device ('<')
@@ -225,6 +233,8 @@ class BridgeState:
         cr: int,
         tx_power: int,
         *,
+        lat_e6: int = 0,
+        lon_e6: int = 0,
         keys_dir: Path | None = None,
         channels_dir: Path | None = None,
         contacts_dir: Path | None = None,
@@ -239,6 +249,16 @@ class BridgeState:
         self.sf = sf
         self.cr = cr
         self.tx_power = tx_power
+
+        # Location (int32 * 1e6 = decimal degrees).  Read from config at startup;
+        # updated at runtime by CMD_SET_ADVERT_LATLON (session-only, no persistence).
+        self.lat_e6: int = lat_e6
+        self.lon_e6: int = lon_e6
+
+        # Real radio stats — updated from received lora_frame and config CBOR messages
+        self.noise_floor_dbm: int = -120
+        self.last_rssi_dbm: int = -128
+        self.last_snr_db: float = 0.0
 
         # Message queue for inbound RX frames (companion protocol messages)
         self.msg_queue: collections.deque[bytes] = collections.deque(maxlen=256)
@@ -300,8 +320,8 @@ class BridgeState:
         buf.append(self.tx_power)  # tx_power
         buf.append(22)  # max_tx_power (dBm, typical for SX1262)
         buf.extend(self.pub_key)  # pubkey (32 bytes)
-        buf.extend(struct.pack("<i", 0))  # lat (0 = unknown)
-        buf.extend(struct.pack("<i", 0))  # lon (0 = unknown)
+        buf.extend(struct.pack("<i", self.lat_e6))  # lat (int32 * 1e6)
+        buf.extend(struct.pack("<i", self.lon_e6))  # lon (int32 * 1e6)
         buf.append(0)  # multi_acks
         buf.append(0)  # adv_loc_policy
         buf.append(0)  # telemetry_mode
@@ -407,9 +427,10 @@ class BridgeState:
             buf.extend(struct.pack("<H", 0))  # errors
             buf.append(len(self.msg_queue))  # queue_len
         elif stats_type == 1:  # radio
-            buf.extend(struct.pack("<h", -100))  # noise_floor
-            buf.extend(struct.pack("<b", -80))  # last_rssi
-            buf.extend(struct.pack("<b", 0))  # last_snr
+            buf.extend(struct.pack("<h", self.noise_floor_dbm))  # noise_floor (int16)
+            buf.extend(struct.pack("<b", self.last_rssi_dbm))  # last_rssi (int8)
+            snr_i8 = max(-128, min(127, int(self.last_snr_db * 4)))
+            buf.extend(struct.pack("<b", snr_i8))  # last_snr (int8, *4)
             buf.extend(struct.pack("<I", 0))  # tx_air_secs
             buf.extend(struct.pack("<I", 0))  # rx_air_secs
         elif stats_type == 2:  # packets
@@ -461,9 +482,13 @@ def lora_frame_to_companion_msgs(
         return empty
     path_len = payload[off]
 
-    # SNR from PHY
+    # SNR/RSSI from PHY — track for real radio stats
     snr_db = phy.get("snr_db", 0.0)
     snr_byte = max(-128, min(127, int(snr_db * 4)))  # signed, *4
+    state.last_snr_db = snr_db
+    rssi = phy.get("rssi_dbm")
+    if rssi is not None:
+        state.last_rssi_dbm = max(-128, min(127, int(rssi)))
 
     # For ADVERT: push as NEW_ADVERT + auto-learn key + auto-add contact
     if ptype == PAYLOAD_ADVERT:
@@ -705,12 +730,16 @@ def _handle_anon_req_rx(
     path_len: int,
     state: BridgeState,
 ) -> tuple[list[bytes], list[bytes]]:
-    """Decrypt ANON_REQ and produce CONTACT_MSG_RECV_V3 (no RF ACK).
+    """Decrypt ANON_REQ, deliver to companion, and send encrypted RESPONSE to sender.
 
-    MeshCore firmware does NOT ACK ANON_REQ — it sends a RESPONSE instead.
-    We therefore return an empty ack_packets list.
+    MeshCore firmware does NOT ACK ANON_REQ — it sends a RESPONSE (ptype 0x01)
+    back to the sender, encrypted with the ECDH shared secret derived from the
+    sender's full public key (embedded in the ANON_REQ payload).  We match
+    this behaviour: the RESPONSE is returned in ack_packets so run_bridge()
+    transmits it as an RF packet.
     """
-    # TODO: implement ANON_REQ RESPONSE (firmware sends a RESPONSE, not an ACK)
+    from meshcore_tx import build_wire_packet, make_header
+
     empty: tuple[list[bytes], list[bytes]] = ([], [])
     result = try_decrypt_anon_req(payload, state.expanded_prv, state.pub_key)
     if result is not None:
@@ -734,7 +763,22 @@ def _handle_anon_req_rx(
             text.encode("utf-8"),
         )
 
-        return ([msg], [])  # no RF ACK for ANON_REQ
+        # Build encrypted RESPONSE (payload_type 0x01) back to sender.
+        # Plaintext: RESP_SERVER_LOGIN_OK (0x00) + our node name.
+        # This mirrors what MeshCore firmware sends in handleAnonMessage().
+        shared = meshcore_shared_secret(state.expanded_prv, sender_pub)
+        if shared is None:
+            log.warning("ANON_REQ: ECDH failed, skipping RESPONSE")
+            return ([msg], [])
+        resp_plaintext = bytes([0x00]) + state.name.encode("utf-8")[:32]
+        resp_enc = meshcore_encrypt_then_mac(shared, resp_plaintext)
+        # RESP payload: dest_hash(1) + src_hash(1) + MAC(2) + ciphertext
+        resp_payload = bytes([sender_pub[0], state.pub_key[0]]) + resp_enc
+        resp_pkt = build_wire_packet(
+            make_header(ROUTE_DIRECT, PAYLOAD_RESP), resp_payload, path=b""
+        )
+        log.debug("ANON_REQ: sending RESPONSE to %s..", pk_hex[:8])
+        return ([msg], [resp_pkt])
 
     log.debug("ANON_REQ: decryption failed (not addressed to us)")
     return empty
@@ -799,10 +843,13 @@ def _persist_contacts(state: BridgeState) -> None:
     cdir = state.contacts_dir
     if cdir is None:
         cdir = DEFAULT_CONTACTS_DIR
-    cdir.mkdir(parents=True, exist_ok=True)
-    for pk_hex, record in state.contacts.items():
-        path = cdir / f"{pk_hex}.contact"
-        path.write_bytes(record)
+    try:
+        cdir.mkdir(parents=True, exist_ok=True)
+        for pk_hex, record in state.contacts.items():
+            path = cdir / f"{pk_hex}.contact"
+            path.write_bytes(record)
+    except OSError as exc:
+        log.warning("could not persist contacts to %s: %s", cdir, exc)
 
 
 def _load_persisted_contacts(contacts_dir: Path | None) -> dict[str, bytes]:
@@ -817,6 +864,12 @@ def _load_persisted_contacts(contacts_dir: Path | None) -> dict[str, bytes]:
             # Pubkey is first 32 bytes of the record
             pk_hex = data[:32].hex()
             contacts[pk_hex] = data
+        else:
+            log.warning(
+                "skipping corrupt contact file %s (%d bytes, expected 147)",
+                f,
+                len(data),
+            )
     return contacts
 
 
@@ -824,8 +877,11 @@ def _delete_persisted_contact(contacts_dir: Path | None, pk_hex: str) -> None:
     """Delete a persisted contact file."""
     cdir = contacts_dir if contacts_dir is not None else DEFAULT_CONTACTS_DIR
     path = cdir / f"{pk_hex}.contact"
-    if path.exists():
-        path.unlink()
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError as exc:
+        log.warning("could not delete contact file %s: %s", path, exc)
 
 
 # ---- Command handlers ----
@@ -940,9 +996,32 @@ def handle_command(
         return [state.build_ok()]
 
     if cmd == CMD_SET_RADIO_PARAMS:
+        # Data: freq_hz(4 LE u32) + bw_hz(4 LE u32) + sf(1) + cr(1)
+        if len(data) >= 10:
+            freq_hz = struct.unpack_from("<I", data, 0)[0]
+            bw_hz = struct.unpack_from("<I", data, 4)[0]
+            sf_new = data[8]
+            cr_new = data[9]
+            state.freq_mhz = freq_hz / 1_000_000.0
+            state.bw_khz = bw_hz / 1_000.0
+            state.sf = sf_new
+            state.cr = cr_new
+            log.warning(
+                "companion: SET_RADIO_PARAMS freq=%.3f MHz bw=%.1f kHz sf=%d cr=%d "
+                "(RX retune requires lora_trx restart)",
+                state.freq_mhz,
+                state.bw_khz,
+                state.sf,
+                state.cr,
+            )
         return [state.build_ok()]
 
     if cmd == CMD_SET_RADIO_TX_POWER:
+        if data:
+            # Byte is unsigned; values ≥ 128 are treated as negative (int8 range)
+            dbm = data[0] if data[0] < 128 else data[0] - 256
+            state.tx_power = dbm
+            log.info("companion: SET_RADIO_TX_POWER %d dBm", dbm)
         return [state.build_ok()]
 
     if cmd == CMD_IMPORT_CONTACT:
@@ -960,29 +1039,30 @@ def handle_command(
         return [state.build_ok()]
 
     if cmd == CMD_EXPORT_CONTACT:
-        # Return raw ADVERT wire packet bytes for the requested contact.
-        # The companion protocol reader hex-encodes these and prepends
-        # "meshcore://" to form the biz card URI.
-        if data and len(data) >= 32:
-            # Exporting a specific contact — look up by pubkey
-            pk_hex = data[:32].hex()
-            # We don't have the original ADVERT packet for stored contacts,
-            # so build a synthetic one from our identity
-            if pk_hex == state.pub_key.hex():
-                return _handle_export_self(state)
-            return [state.build_error()]
-        # Exporting self (no args)
-        return _handle_export_self(state)
+        # Return raw ADVERT wire packet for the requested contact (6-byte prefix).
+        # Response: RESP_CONTACT_URI (0x0B) + wire packet bytes.
+        return _handle_export_contact(data, state)
+
+    if cmd == CMD_SHARE_CONTACT:
+        # Same as EXPORT_CONTACT — returns biz-card URI wire packet.
+        return _handle_export_contact(data, state)
 
     if cmd == CMD_SET_CHANNEL:
         return _handle_set_channel(data, state)
 
-    if cmd in (
-        CMD_SET_ADVERT_LATLON,
-        CMD_RESET_PATH,
-        CMD_SET_TUNING_PARAMS,
-        CMD_REBOOT,
-    ):
+    if cmd == CMD_SET_ADVERT_LATLON:
+        # Data: lat(4 LE i32) + lon(4 LE i32), values are degrees * 1e6
+        if len(data) >= 8:
+            state.lat_e6 = struct.unpack_from("<i", data, 0)[0]
+            state.lon_e6 = struct.unpack_from("<i", data, 4)[0]
+            log.info(
+                "companion: SET_ADVERT_LATLON lat=%.6f lon=%.6f",
+                state.lat_e6 / 1e6,
+                state.lon_e6 / 1e6,
+            )
+        return [state.build_ok()]
+
+    if cmd in (CMD_RESET_PATH, CMD_SET_TUNING_PARAMS, CMD_REBOOT):
         return [state.build_ok()]
 
     # Unknown command — return OK silently
@@ -1096,10 +1176,14 @@ def _handle_send_advert(
 
     flood = len(data) > 0 and data[0] == 0x01
 
+    # Include location in ADVERT when set (CMD_SET_ADVERT_LATLON or config.toml)
+    lat = state.lat_e6 / 1e6 if state.lat_e6 != 0 else None
+    lon = state.lon_e6 / 1e6 if state.lon_e6 != 0 else None
+
     if state.region_key:
         # Build with T_FLOOD route, then compute transport code over the
         # payload and repackage with transport codes.
-        tmp = build_advert(state.seed, state.pub_key, name=state.name)
+        tmp = build_advert(state.seed, state.pub_key, name=state.name, lat=lat, lon=lon)
         # Extract payload: skip header(1) + path_len(1) — no transport codes
         # in the default ROUTE_FLOOD packet.
         advert_payload = tmp[2:]
@@ -1109,7 +1193,9 @@ def _handle_send_advert(
         header = make_header(ROUTE_T_FLOOD, PAYLOAD_ADVERT)
         packet = build_wire_packet(header, advert_payload, transport_codes=(tc1, 0))
     else:
-        packet = build_advert(state.seed, state.pub_key, name=state.name)
+        packet = build_advert(
+            state.seed, state.pub_key, name=state.name, lat=lat, lon=lon
+        )
 
     # Track TX hash to filter echo
     h = _hash_payload(packet)
@@ -1363,17 +1449,72 @@ def _handle_import_contact(data: bytes, state: BridgeState) -> list[bytes]:
     return [state.build_ok()]
 
 
-def _handle_export_self(state: BridgeState) -> list[bytes]:
-    """Handle CMD_EXPORT_CONTACT for our own identity.
+def _handle_export_contact(data: bytes, state: BridgeState) -> list[bytes]:
+    """Handle CMD_EXPORT_CONTACT and CMD_SHARE_CONTACT.
 
-    Builds a raw ADVERT wire packet and returns it as RESP_CONTACT_URI.
-    The companion protocol reader hex-encodes the payload and prepends
-    "meshcore://" to form the biz card URI.
+    Data is a 6-byte pubkey prefix.  Returns RESP_CONTACT_URI (0x0B) + raw
+    ADVERT wire packet bytes.  The companion app hex-encodes these and prepends
+    "meshcore://" to form the biz card URI (compatible with meshcore-cli
+    import_contact).
+
+    For our own identity: returns a fully signed ADVERT from build_advert().
+    For stored contacts: reconstructs an unsigned wire packet from the
+    147-byte contact record (zeroed 64-byte signature — original not stored).
     """
-    from meshcore_tx import build_advert
+    from meshcore_tx import build_advert, build_wire_packet, make_header
 
-    advert_pkt = build_advert(state.seed, state.pub_key, name=state.name)
-    return [bytes([RESP_CONTACT_URI]) + advert_pkt]
+    prefix = data[:6] if len(data) >= 6 else data
+
+    # Check if this is ourselves
+    if not prefix or state.pub_key[: len(prefix)] == prefix:
+        lat = state.lat_e6 / 1e6 if state.lat_e6 != 0 else None
+        lon = state.lon_e6 / 1e6 if state.lon_e6 != 0 else None
+        advert_pkt = build_advert(
+            state.seed, state.pub_key, name=state.name, lat=lat, lon=lon
+        )
+        return [bytes([RESP_CONTACT_URI]) + advert_pkt]
+
+    # Search stored contacts by prefix
+    full_pub = _resolve_contact(state, prefix)
+    if full_pub is None:
+        log.warning("companion: EXPORT_CONTACT prefix not found: %s", prefix.hex())
+        return [state.build_error(2)]
+
+    pk_hex = full_pub.hex()
+    record = state.contacts[pk_hex]  # 147-byte contact record
+
+    # Unpack fields from record layout:
+    # pubkey(32)+node_type(1)+flags(1)+path_len(1)+path(64)+name(32)+
+    # last_advert(4)+lat(4)+lon(4)+lastmod(4)
+    pubkey = record[0:32]
+    node_type = record[32]
+    name_raw = record[99:131].rstrip(b"\x00")
+    last_adv = struct.unpack_from("<I", record, 131)[0]
+    lat_e6 = struct.unpack_from("<i", record, 135)[0]
+    lon_e6 = struct.unpack_from("<i", record, 139)[0]
+
+    # Reconstruct app_data for the ADVERT payload
+    flags = node_type & 0x0F
+    app_data_body = bytearray()
+    if lat_e6 != 0 or lon_e6 != 0:
+        flags |= ADVERT_HAS_LOCATION
+        app_data_body.extend(struct.pack("<ii", lat_e6, lon_e6))
+    if name_raw:
+        flags |= ADVERT_HAS_NAME
+        app_data_body.extend(name_raw)
+    app_data = bytes([flags]) + bytes(app_data_body)
+
+    # Build unsigned ADVERT payload: pubkey(32) + ts(4) + sig(64 zeros) + app_data
+    advert_payload = pubkey + struct.pack("<I", last_adv) + b"\x00" * 64 + app_data
+    wire_pkt = build_wire_packet(
+        make_header(ROUTE_FLOOD, PAYLOAD_ADVERT), advert_payload
+    )
+    log.info(
+        "companion: EXPORT_CONTACT %s.. '%s' (unsigned)",
+        pk_hex[:8],
+        name_raw.decode("utf-8", errors="replace"),
+    )
+    return [bytes([RESP_CONTACT_URI]) + wire_pkt]
 
 
 def _ensure_self_contact(state: BridgeState) -> None:
@@ -1515,6 +1656,10 @@ def run_bridge(
                                 phy.get("bw", 0) / 1e3,
                             )
                             config_shown = True
+                        # Update noise floor from config if provided
+                        noise_floor = msg.get("noise_floor_dbm")
+                        if noise_floor is not None:
+                            state.noise_floor_dbm = int(noise_floor)
                         continue
 
                     # Handle status (log only when frame count changes)
@@ -1640,8 +1785,8 @@ def main() -> None:
     parser.add_argument(
         "--port",
         type=int,
-        default=BRIDGE_PORT,
-        help=f"TCP listen port (default: {BRIDGE_PORT})",
+        default=None,
+        help=f"TCP listen port (overrides config.toml; default: {BRIDGE_PORT})",
     )
     parser.add_argument(
         "--udp",
@@ -1652,13 +1797,13 @@ def main() -> None:
     parser.add_argument(
         "--identity",
         type=Path,
-        default=DEFAULT_IDENTITY_FILE,
-        help=f"Identity file (default: {DEFAULT_IDENTITY_FILE})",
+        default=None,
+        help=f"Identity file (overrides config.toml; default: {DEFAULT_IDENTITY_FILE})",
     )
     parser.add_argument(
         "--name",
-        default="gr4-lora",
-        help="Node name for SELF_INFO (default: gr4-lora)",
+        default=None,
+        help="Node name for SELF_INFO (overrides config.toml; default: gr4-lora)",
     )
     parser.add_argument(
         "--config",
@@ -1669,20 +1814,20 @@ def main() -> None:
     parser.add_argument(
         "--keys-dir",
         type=Path,
-        default=DEFAULT_KEYS_DIR,
-        help=f"Key store directory (default: {DEFAULT_KEYS_DIR})",
+        default=None,
+        help=f"Key store directory (overrides config.toml; default: {DEFAULT_KEYS_DIR})",
     )
     parser.add_argument(
         "--channels-dir",
         type=Path,
-        default=DEFAULT_CHANNELS_DIR,
-        help=f"Channel store directory (default: {DEFAULT_CHANNELS_DIR})",
+        default=None,
+        help=f"Channel store directory (overrides config.toml; default: {DEFAULT_CHANNELS_DIR})",
     )
     parser.add_argument(
         "--contacts-dir",
         type=Path,
-        default=DEFAULT_CONTACTS_DIR,
-        help=f"Contact store directory (default: {DEFAULT_CONTACTS_DIR})",
+        default=None,
+        help=f"Contact store directory (overrides config.toml; default: {DEFAULT_CONTACTS_DIR})",
     )
     parser.add_argument(
         "--region-scope",
@@ -1718,24 +1863,7 @@ def main() -> None:
         udp_host = config_udp_host(cfg)
         udp_port = config_udp_port(cfg)
 
-    # Load identity
-    expanded_prv, pub_key, seed = load_or_create_identity(args.identity)
-    log.info("identity: %s", pub_key.hex())
-    log.info("name: %s", args.name)
-
-    # Print contact URIs (two incompatible formats — see CLAUDE.md)
-    from lora_common import build_bizcard_uri, build_contact_uri
-    from meshcore_tx import build_advert
-
-    advert_pkt = build_advert(seed, pub_key, name=args.name)
-    # Phone companion app format (QR / paste into app)
-    contact_uri = build_contact_uri(pub_key, args.name)
-    log.info("contact URI: %s", contact_uri)
-    # CLI biz card format (meshcore-cli import_contact)
-    biz_uri = build_bizcard_uri(advert_pkt)
-    log.info("biz card: %s", biz_uri)
-
-    # Extract PHY params from config for SELF_INFO
+    # Extract PHY params from config for SELF_INFO (identity loaded after config resolution)
     # Find first set and resolve codec + radio
     freq_mhz = 869.618
     bw_khz = 62.5
@@ -1766,24 +1894,83 @@ def main() -> None:
     if region_scope:
         log.info("region scope: #%s", region_scope)
 
+    # Read optional settings from [meshcore] config section.
+    # Resolution order: CLI flag > config.toml [meshcore] > built-in default.
+    meshcore_cfg = cfg.get("meshcore", {})
+    lat_e6 = int(float(meshcore_cfg.get("lat", 0.0)) * 1e6)
+    lon_e6 = int(float(meshcore_cfg.get("lon", 0.0)) * 1e6)
+
+    # TCP port
+    if args.port is not None:
+        tcp_port = args.port
+    else:
+        tcp_port = int(meshcore_cfg.get("port", BRIDGE_PORT))
+
+    # Node name
+    if args.name is not None:
+        node_name = args.name
+    else:
+        node_name = meshcore_cfg.get("name", "gr4-lora")
+
+    # Identity file
+    if args.identity is not None:
+        identity_file = args.identity
+    else:
+        identity_file = Path(meshcore_cfg.get("identity_file", DEFAULT_IDENTITY_FILE))
+
+    # Store directories
+    if args.keys_dir is not None:
+        keys_dir = args.keys_dir
+    else:
+        keys_dir = Path(meshcore_cfg.get("keys_dir", DEFAULT_KEYS_DIR))
+
+    if args.channels_dir is not None:
+        channels_dir = args.channels_dir
+    else:
+        channels_dir = Path(meshcore_cfg.get("channels_dir", DEFAULT_CHANNELS_DIR))
+
+    if args.contacts_dir is not None:
+        contacts_dir = args.contacts_dir
+    else:
+        contacts_dir = Path(meshcore_cfg.get("contacts_dir", DEFAULT_CONTACTS_DIR))
+
+    # Load identity (now that identity_file is resolved)
+    expanded_prv, pub_key, seed = load_or_create_identity(identity_file)
+    log.info("identity: %s", pub_key.hex())
+    log.info("name: %s", node_name)
+
+    # Print contact URIs (two incompatible formats — see CLAUDE.md)
+    from lora_common import build_bizcard_uri, build_contact_uri
+    from meshcore_tx import build_advert
+
+    advert_pkt = build_advert(seed, pub_key, name=node_name)
+    # Phone companion app format (QR / paste into app)
+    contact_uri = build_contact_uri(pub_key, node_name)
+    log.info("contact URI: %s", contact_uri)
+    # CLI biz card format (meshcore-cli import_contact)
+    biz_uri = build_bizcard_uri(advert_pkt)
+    log.info("biz card: %s", biz_uri)
+
     state = BridgeState(
         pub_key=pub_key,
         expanded_prv=expanded_prv,
         seed=seed,
-        name=args.name,
+        name=node_name,
         freq_mhz=freq_mhz,
         bw_khz=bw_khz,
         sf=sf,
         cr=cr,
         tx_power=tx_power,
-        keys_dir=args.keys_dir,
-        channels_dir=args.channels_dir,
-        contacts_dir=args.contacts_dir,
+        keys_dir=keys_dir,
+        channels_dir=channels_dir,
+        contacts_dir=contacts_dir,
         region_scope=region_scope,
+        lat_e6=lat_e6,
+        lon_e6=lon_e6,
     )
 
     # Load persisted contacts from disk
-    persisted = _load_persisted_contacts(args.contacts_dir)
+    persisted = _load_persisted_contacts(contacts_dir)
     if persisted:
         state.contacts.update(persisted)
         state.contacts_lastmod = int(time.time())
@@ -1797,7 +1984,7 @@ def main() -> None:
         len(state.contacts),
     )
 
-    run_bridge(args.port, udp_host, udp_port, state)
+    run_bridge(tcp_port, udp_host, udp_port, state)
 
 
 if __name__ == "__main__":

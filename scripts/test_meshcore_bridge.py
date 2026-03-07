@@ -915,8 +915,8 @@ class TestRxDecryption(unittest.TestCase):
         self.assertEqual(msg[0], bridge.RESP_CONTACT_MSG_RECV_V3)
         text = msg[16:].decode("utf-8", errors="replace")
         self.assertEqual(text, "anonymous hello")
-        # ANON_REQ does NOT produce RF ACK (firmware sends RESPONSE instead)
-        self.assertEqual(ack_packets, [])
+        # ANON_REQ produces a RESPONSE wire packet (not an ACK) in ack_packets
+        self.assertEqual(len(ack_packets), 1)
 
     def test_anon_req_learns_key_but_not_contact(self):
         """ANON_REQ learns the sender's key but does NOT auto-add to contacts."""
@@ -1288,8 +1288,8 @@ class TestRfAckTx(unittest.TestCase):
         }
         companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
         self.assertEqual(len(companion_msgs), 1)
-        # ANON_REQ does not produce ACK packets (matches MeshCore firmware behavior)
-        self.assertEqual(ack_packets, [])
+        # ANON_REQ does not produce an RF ACK; it produces an encrypted RESPONSE
+        self.assertEqual(len(ack_packets), 1)
 
     def test_grp_txt_produces_no_ack(self):
         """GRP_TXT does not produce an ACK packet (no ACK for group msgs)."""
@@ -1559,6 +1559,522 @@ class TestRxDedup(unittest.TestCase):
         for k in expired:
             del state.recent_rx[k]
         self.assertNotIn(h, state.recent_rx)
+
+
+# ---- Radio parameter command tests ----
+
+
+class TestRadioParamCommands(unittest.TestCase):
+    """Test SET_RADIO_PARAMS, SET_RADIO_TX_POWER, and SET_ADVERT_LATLON commands."""
+
+    def setUp(self):
+        import socket
+
+        self.state = make_state()
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.bind(("127.0.0.1", 0))
+        self.udp_addr = ("127.0.0.1", self.udp_sock.getsockname()[1])
+
+    def tearDown(self):
+        self.udp_sock.close()
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(
+            cmd_bytes, self.state, self.udp_sock, self.udp_addr
+        )
+
+    def test_set_radio_params_updates_state(self):
+        """CMD_SET_RADIO_PARAMS updates freq, bw, sf, cr in state."""
+        freq_hz = struct.pack("<I", 868_500_000)  # 868.5 MHz
+        bw_hz = struct.pack("<I", 125_000)  # 125 kHz
+        sf = bytes([10])
+        cr = bytes([5])
+        cmd = bytes([bridge.CMD_SET_RADIO_PARAMS]) + freq_hz + bw_hz + sf + cr
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        self.assertAlmostEqual(self.state.freq_mhz, 868.5, places=3)
+        self.assertAlmostEqual(self.state.bw_khz, 125.0, places=1)
+        self.assertEqual(self.state.sf, 10)
+        self.assertEqual(self.state.cr, 5)
+
+    def test_set_radio_tx_power_updates_state(self):
+        """CMD_SET_RADIO_TX_POWER updates tx_power in state."""
+        cmd = bytes([bridge.CMD_SET_RADIO_TX_POWER, 20])
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        self.assertEqual(self.state.tx_power, 20)
+
+    def test_set_advert_latlon_updates_state(self):
+        """CMD_SET_ADVERT_LATLON updates lat_e6 and lon_e6, reflected in SELF_INFO."""
+        lat_e6 = int(51.5074 * 1e6)  # London approx
+        lon_e6 = int(-0.1278 * 1e6)
+        lat_bytes = struct.pack("<i", lat_e6)
+        lon_bytes = struct.pack("<i", lon_e6)
+        cmd = bytes([bridge.CMD_SET_ADVERT_LATLON]) + lat_bytes + lon_bytes
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        self.assertEqual(self.state.lat_e6, lat_e6)
+        self.assertEqual(self.state.lon_e6, lon_e6)
+        # Verify reflected in SELF_INFO:
+        # RESP_SELF_INFO(1)+adv_type(1)+tx_power(1)+max_tx_power(1)+pub_key(32) = 36
+        # lat at 36..40, lon at 40..44
+        self_info = self.state.build_self_info()
+        lat_from_info = struct.unpack_from("<i", self_info, 36)[0]
+        lon_from_info = struct.unpack_from("<i", self_info, 40)[0]
+        self.assertEqual(lat_from_info, lat_e6)
+        self.assertEqual(lon_from_info, lon_e6)
+
+
+# ---- Location in ADVERT tests ----
+
+
+class TestLatLonInAdvert(unittest.TestCase):
+    """Test that lat/lon are included in ADVERT when non-zero, omitted when zero."""
+
+    def test_advert_includes_location_when_set(self):
+        """_handle_send_advert includes HAS_LOCATION flag when lat_e6/lon_e6 non-zero."""
+        state = make_state(lat_e6=int(51.5 * 1e6), lon_e6=int(-0.1 * 1e6))
+        from meshcore_tx import build_advert
+
+        # build_advert is what _handle_send_advert calls; verify it includes location
+        lat = state.lat_e6 / 1e6
+        lon = state.lon_e6 / 1e6
+        pkt = build_advert(state.seed, state.pub_key, name=state.name, lat=lat, lon=lon)
+        # app_data flags byte is at pkt[2 + 32 + 4 + 64] = pkt[102]
+        # (hdr=1, path_len=1, pubkey=32, ts=4, sig=64, then app_data starts)
+        app_data_off = 2 + 32 + 4 + 64
+        flags = pkt[app_data_off]
+        self.assertTrue(
+            flags & bridge.ADVERT_HAS_LOCATION,
+            f"HAS_LOCATION not set in flags=0x{flags:02x}",
+        )
+
+    def test_advert_omits_location_when_zero(self):
+        """_handle_send_advert omits HAS_LOCATION flag when lat_e6=lon_e6=0."""
+        state = make_state()  # lat_e6=0, lon_e6=0 by default
+        self.assertEqual(state.lat_e6, 0)
+        self.assertEqual(state.lon_e6, 0)
+        from meshcore_tx import build_advert
+
+        pkt = build_advert(
+            state.seed, state.pub_key, name=state.name, lat=None, lon=None
+        )
+        app_data_off = 2 + 32 + 4 + 64
+        flags = pkt[app_data_off]
+        self.assertFalse(
+            flags & bridge.ADVERT_HAS_LOCATION,
+            f"HAS_LOCATION should be clear, flags=0x{flags:02x}",
+        )
+
+
+# ---- ANON_REQ response tests ----
+
+
+class TestAnonReqResponse(unittest.TestCase):
+    """Test that ANON_REQ produces an encrypted RESPONSE wire packet in ack_packets."""
+
+    def test_anon_req_returns_response_in_ack_packets(self):
+        """ANON_REQ addressed to bridge returns RESPONSE wire packet in ack_packets."""
+        (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
+        state = make_state(pub_key=pub_b, expanded_prv=prv_b, seed=seed_b)
+        packet = build_anon_req(prv_a, pub_a, pub_b, b"ping")
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 3.0},
+            "payload": packet,
+        }
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+        # Should have exactly one RESPONSE packet in ack_packets
+        self.assertEqual(len(ack_packets), 1)
+        # Wire packet starts with MeshCore header byte
+        resp_pkt = ack_packets[0]
+        self.assertGreater(len(resp_pkt), 4, "RESPONSE packet too short")
+
+    def test_anon_req_response_decryptable_by_sender(self):
+        """RESPONSE in ack_packets can be decrypted using sender ECDH shared secret."""
+        from meshcore_crypto import meshcore_shared_secret, meshcore_mac_then_decrypt
+
+        (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
+        state = make_state(
+            pub_key=pub_b, expanded_prv=prv_b, seed=seed_b, name="bridge-node"
+        )
+        packet = build_anon_req(prv_a, pub_a, pub_b, b"hello")
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 3.0},
+            "payload": packet,
+        }
+        _, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(len(ack_packets), 1)
+
+        # The RESPONSE wire packet: header(1) + path_len(1) + payload...
+        # Payload: dest_hash(1) + src_hash(1) + MAC(2) + ciphertext
+        resp_pkt = ack_packets[0]
+        payload_off = 2  # skip hdr + path_len
+        resp_payload = resp_pkt[payload_off:]
+        # MAC+ciphertext starts after dest_hash(1) + src_hash(1)
+        enc_data = resp_payload[2:]
+        shared = meshcore_shared_secret(prv_a, pub_b)
+        self.assertIsNotNone(shared)
+        plaintext = meshcore_mac_then_decrypt(shared, enc_data)
+        self.assertIsNotNone(plaintext, "RESPONSE decryption failed")
+        # Plaintext: 0x00 (RESP_SERVER_LOGIN_OK) + node name
+        self.assertEqual(plaintext[0], 0x00)
+        self.assertIn(b"bridge-node", plaintext)
+
+
+# ---- Contact export/share tests ----
+
+
+class TestContactExport(unittest.TestCase):
+    """Test CMD_EXPORT_CONTACT and CMD_SHARE_CONTACT."""
+
+    def setUp(self):
+        import socket
+
+        self.state = make_state()
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.bind(("127.0.0.1", 0))
+        self.udp_addr = ("127.0.0.1", self.udp_sock.getsockname()[1])
+
+    def tearDown(self):
+        self.udp_sock.close()
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(
+            cmd_bytes, self.state, self.udp_sock, self.udp_addr
+        )
+
+    def test_export_contact_self_returns_contact_uri(self):
+        """CMD_EXPORT_CONTACT with own pubkey prefix returns RESP_CONTACT_URI."""
+        prefix = self.state.pub_key[:6]
+        cmd = bytes([bridge.CMD_EXPORT_CONTACT]) + prefix
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_CONTACT_URI)
+        # Wire packet follows the response code
+        self.assertGreater(len(responses[0]), 4)
+
+    def test_share_contact_self_same_as_export(self):
+        """CMD_SHARE_CONTACT produces same output as CMD_EXPORT_CONTACT for self."""
+        prefix = self.state.pub_key[:6]
+        export_resp = self._handle(bytes([bridge.CMD_EXPORT_CONTACT]) + prefix)
+        share_resp = self._handle(bytes([bridge.CMD_SHARE_CONTACT]) + prefix)
+        self.assertEqual(export_resp[0][0], bridge.RESP_CONTACT_URI)
+        self.assertEqual(share_resp[0][0], bridge.RESP_CONTACT_URI)
+        # Both should contain the same ADVERT data
+        self.assertEqual(export_resp[0][1:], share_resp[0][1:])
+
+
+# ---- Real radio stats tests ----
+
+
+class TestRealRadioStats(unittest.TestCase):
+    """Test that build_stats(1) reflects real RSSI/SNR, and noise_floor updates."""
+
+    def test_radio_stats_reflect_rssi_snr(self):
+        """build_stats(1) uses last_rssi_dbm and last_snr_db from state."""
+        state = make_state()
+        state.last_rssi_dbm = -75
+        state.last_snr_db = 6.0
+        stats = state.build_stats(1)
+        self.assertEqual(stats[0], bridge.RESP_STATS)
+        self.assertEqual(stats[1], 1)  # radio type
+        # noise_floor at bytes 2-4 (int16 LE)
+        noise_floor = struct.unpack_from("<h", stats, 2)[0]
+        self.assertEqual(noise_floor, state.noise_floor_dbm)
+        # last_rssi at byte 4 (int8)
+        last_rssi = struct.unpack_from("<b", stats, 4)[0]
+        self.assertEqual(last_rssi, -75)
+        # last_snr at byte 5 (int8, *4)
+        last_snr_raw = struct.unpack_from("<b", stats, 5)[0]
+        self.assertEqual(last_snr_raw, int(6.0 * 4))
+
+    def test_noise_floor_updates_from_lora_frame(self):
+        """lora_frame_to_companion_msgs tracks RSSI/SNR per frame into state."""
+        state = make_state()
+        # Build a minimal ADVERT frame with RSSI in PHY
+        hdr = (0x04 << 2) | 0x01  # ADVERT + FLOOD
+        pubkey = bytes(range(32))
+        ts = struct.pack("<I", int(time.time()))
+        sig = b"\x00" * 64
+        app_data = bytes([0x81]) + b"Test"
+        payload = bytes([hdr, 0]) + pubkey + ts + sig + app_data
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": -3.5, "rssi_dbm": -90},
+            "payload": payload,
+        }
+        bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertAlmostEqual(state.last_snr_db, -3.5, places=1)
+        self.assertEqual(state.last_rssi_dbm, -90)
+
+
+# ---- Identity edge-case tests ----
+
+
+class TestIdentityLoading(unittest.TestCase):
+    """Test load_or_create_identity edge cases."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmpdir = Path(tempfile.mkdtemp())
+
+    def test_missing_file_creates_identity(self):
+        """Missing identity file is created on first use."""
+        path = self.tmpdir / "new_identity.bin"
+        self.assertFalse(path.exists())
+        expanded, pub, seed = load_or_create_identity(path)
+        self.assertTrue(path.exists())
+        self.assertEqual(len(expanded), 64)
+        self.assertEqual(len(pub), 32)
+        self.assertEqual(len(seed), 32)
+        # File is 64 bytes: seed(32) + pub(32)
+        data = path.read_bytes()
+        self.assertEqual(len(data), 64)
+        self.assertEqual(data[:32], seed)
+        self.assertEqual(data[32:], pub)
+
+    def test_valid_file_loads_correctly(self):
+        """Valid 64-byte identity file loads without regeneration."""
+        path = self.tmpdir / "identity.bin"
+        # Create a valid identity
+        expanded1, pub1, seed1 = load_or_create_identity(path)
+        mtime1 = path.stat().st_mtime
+        # Load it again — should not overwrite
+        expanded2, pub2, seed2 = load_or_create_identity(path)
+        mtime2 = path.stat().st_mtime
+        self.assertEqual(pub1, pub2)
+        self.assertEqual(seed1, seed2)
+        self.assertEqual(mtime1, mtime2)
+
+    def test_zero_length_file_regenerates(self):
+        """Zero-length identity file triggers regeneration."""
+        path = self.tmpdir / "identity.bin"
+        path.write_bytes(b"")
+        expanded, pub, seed = load_or_create_identity(path)
+        self.assertEqual(len(pub), 32)
+        # File should now be 64 bytes
+        self.assertEqual(len(path.read_bytes()), 64)
+
+    def test_wrong_size_file_regenerates(self):
+        """Identity file of wrong size (e.g. 32 bytes) triggers regeneration."""
+        path = self.tmpdir / "identity.bin"
+        path.write_bytes(os.urandom(32))  # too short
+        expanded, pub, seed = load_or_create_identity(path)
+        self.assertEqual(len(pub), 32)
+        self.assertEqual(len(path.read_bytes()), 64)
+
+    def test_mismatched_keys_regenerates(self):
+        """Identity file with mismatched seed/pubkey triggers regeneration."""
+        path = self.tmpdir / "identity.bin"
+        # Write 32 bytes of random seed + 32 bytes of garbage pubkey
+        seed_bytes = os.urandom(32)
+        garbage_pub = os.urandom(32)
+        path.write_bytes(seed_bytes + garbage_pub)
+        # The real pubkey derived from seed_bytes won't match garbage_pub
+        expanded, pub, seed = load_or_create_identity(path)
+        self.assertEqual(len(pub), 32)
+        # New identity should have correct matching keys
+        data = path.read_bytes()
+        self.assertEqual(data[:32], seed)
+        self.assertEqual(data[32:], pub)
+
+
+# ---- Key store edge-case tests ----
+
+
+class TestKeyStoreEdgeCases(unittest.TestCase):
+    """Test load_known_keys and save_pubkey edge cases."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.keys_dir = self.tmpdir / "keys"
+
+    def test_missing_directory_returns_empty(self):
+        """Non-existent keys_dir returns empty dict without error."""
+        from meshcore_crypto import load_known_keys
+
+        keys = load_known_keys(self.keys_dir)
+        self.assertEqual(keys, {})
+
+    def test_valid_key_loaded(self):
+        """32-byte .key file is loaded correctly."""
+        from meshcore_crypto import load_known_keys, save_pubkey
+
+        pubkey = os.urandom(32)
+        save_pubkey(self.keys_dir, pubkey)
+        keys = load_known_keys(self.keys_dir)
+        self.assertIn(pubkey.hex(), keys)
+        self.assertEqual(keys[pubkey.hex()], pubkey)
+
+    def test_corrupt_key_skipped_with_warning(self):
+        """Wrong-size .key file is skipped and a warning is logged."""
+        from meshcore_crypto import load_known_keys
+
+        self.keys_dir.mkdir(parents=True)
+        bad_file = self.keys_dir / "deadbeef.key"
+        bad_file.write_bytes(os.urandom(33))  # wrong size
+        with self.assertLogs("gr4.crypto", level="WARNING") as cm:
+            keys = load_known_keys(self.keys_dir)
+        self.assertEqual(keys, {})
+        self.assertTrue(any("corrupt key file" in msg for msg in cm.output))
+
+    def test_zero_length_key_skipped(self):
+        """Zero-length .key file is skipped."""
+        from meshcore_crypto import load_known_keys
+
+        self.keys_dir.mkdir(parents=True)
+        (self.keys_dir / "empty.key").write_bytes(b"")
+        keys = load_known_keys(self.keys_dir)
+        self.assertEqual(keys, {})
+
+    def test_save_pubkey_read_only_dir_returns_false(self):
+        """save_pubkey returns False and logs warning when dir is not writable."""
+        from meshcore_crypto import save_pubkey
+
+        self.keys_dir.mkdir(parents=True)
+        self.keys_dir.chmod(0o555)  # read+execute only
+        try:
+            pubkey = os.urandom(32)
+            with self.assertLogs("gr4.crypto", level="WARNING") as cm:
+                result = save_pubkey(self.keys_dir, pubkey)
+            self.assertFalse(result)
+            self.assertTrue(any("could not save key" in msg for msg in cm.output))
+        finally:
+            self.keys_dir.chmod(0o755)
+
+
+# ---- Channel store edge-case tests ----
+
+
+class TestChannelStoreEdgeCases(unittest.TestCase):
+    """Test load_channels and save_channel edge cases."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.channels_dir = self.tmpdir / "channels"
+
+    def test_corrupt_channel_skipped_with_warning(self):
+        """Wrong-size .channel file is skipped and a warning is logged."""
+        from meshcore_crypto import load_channels
+
+        self.channels_dir.mkdir(parents=True)
+        bad_file = self.channels_dir / "bad.channel"
+        bad_file.write_bytes(os.urandom(10))  # not 16 or 32 bytes
+        with self.assertLogs("gr4.crypto", level="WARNING") as cm:
+            channels = load_channels(self.channels_dir)
+        # No valid channels (only the bad one)
+        self.assertFalse(any(ch.name == "bad" for ch in channels))
+        self.assertTrue(any("corrupt channel file" in msg for msg in cm.output))
+
+    def test_valid_16_byte_channel_loaded(self):
+        """16-byte .channel file is loaded correctly."""
+        from meshcore_crypto import load_channels
+
+        self.channels_dir.mkdir(parents=True)
+        psk = os.urandom(16)
+        (self.channels_dir / "mytest.channel").write_bytes(psk)
+        channels = load_channels(self.channels_dir)
+        self.assertTrue(any(ch.name == "mytest" for ch in channels))
+
+    def test_valid_32_byte_channel_loaded(self):
+        """32-byte .channel file is loaded correctly."""
+        from meshcore_crypto import load_channels
+
+        self.channels_dir.mkdir(parents=True)
+        psk = os.urandom(32)
+        (self.channels_dir / "bigtest.channel").write_bytes(psk)
+        channels = load_channels(self.channels_dir)
+        self.assertTrue(any(ch.name == "bigtest" for ch in channels))
+
+    def test_save_channel_read_only_dir_returns_false(self):
+        """save_channel returns False and logs warning when dir is not writable."""
+        from meshcore_crypto import save_channel
+
+        self.channels_dir.mkdir(parents=True)
+        self.channels_dir.chmod(0o555)
+        try:
+            with self.assertLogs("gr4.crypto", level="WARNING") as cm:
+                result = save_channel(self.channels_dir, "test", os.urandom(16))
+            self.assertFalse(result)
+            self.assertTrue(any("could not save channel" in msg for msg in cm.output))
+        finally:
+            self.channels_dir.chmod(0o755)
+
+
+# ---- Contact store edge-case tests ----
+
+
+class TestContactStoreEdgeCases(unittest.TestCase):
+    """Test _load_persisted_contacts and _persist_contacts edge cases."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.contacts_dir = self.tmpdir / "contacts"
+
+    def test_missing_directory_returns_empty(self):
+        """Non-existent contacts_dir returns empty dict without error."""
+        contacts = bridge._load_persisted_contacts(self.contacts_dir)
+        self.assertEqual(contacts, {})
+
+    def test_valid_contact_loaded(self):
+        """147-byte .contact file is loaded correctly."""
+        self.contacts_dir.mkdir(parents=True)
+        state = make_state(contacts_dir=self.contacts_dir)
+        # Add a contact and persist it
+        pubkey = os.urandom(32)
+        record = bridge._build_contact_record(pubkey, name="Alice")
+        self.assertEqual(len(record), 147)
+        (self.contacts_dir / f"{pubkey.hex()}.contact").write_bytes(record)
+        contacts = bridge._load_persisted_contacts(self.contacts_dir)
+        self.assertIn(pubkey.hex(), contacts)
+
+    def test_corrupt_contact_skipped_with_warning(self):
+        """Wrong-size .contact file is skipped and a warning is logged."""
+        self.contacts_dir.mkdir(parents=True)
+        bad_file = self.contacts_dir / "deadbeef.contact"
+        bad_file.write_bytes(os.urandom(146))  # one byte short
+        with self.assertLogs("gr4.bridge", level="WARNING") as cm:
+            contacts = bridge._load_persisted_contacts(self.contacts_dir)
+        self.assertEqual(contacts, {})
+        self.assertTrue(any("corrupt contact file" in msg for msg in cm.output))
+
+    def test_zero_length_contact_skipped(self):
+        """Zero-length .contact file is skipped."""
+        self.contacts_dir.mkdir(parents=True)
+        (self.contacts_dir / "empty.contact").write_bytes(b"")
+        contacts = bridge._load_persisted_contacts(self.contacts_dir)
+        self.assertEqual(contacts, {})
+
+    def test_persist_contacts_read_only_dir_logs_warning(self):
+        """_persist_contacts logs warning when contacts_dir is not writable."""
+        self.contacts_dir.mkdir(parents=True)
+        self.contacts_dir.chmod(0o555)
+        try:
+            state = make_state(contacts_dir=self.contacts_dir)
+            pubkey = os.urandom(32)
+            record = bridge._build_contact_record(pubkey, name="Bob")
+            state.contacts[pubkey.hex()] = record
+            with self.assertLogs("gr4.bridge", level="WARNING") as cm:
+                bridge._persist_contacts(state)
+            self.assertTrue(
+                any("could not persist contacts" in msg for msg in cm.output)
+            )
+        finally:
+            self.contacts_dir.chmod(0o755)
 
 
 if __name__ == "__main__":

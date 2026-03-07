@@ -243,17 +243,28 @@ def load_known_keys(keys_dir: Path) -> dict[str, bytes]:
         data = f.read_bytes()
         if len(data) == PUB_KEY_SIZE:
             keys[data.hex()] = data
+        else:
+            log.warning(
+                "skipping corrupt key file %s (%d bytes, expected %d)",
+                f,
+                len(data),
+                PUB_KEY_SIZE,
+            )
     return keys
 
 
 def save_pubkey(keys_dir: Path, pubkey: bytes, name: str | None = None) -> bool:
     """Save a public key to the key store. Returns True if newly saved."""
-    keys_dir.mkdir(parents=True, exist_ok=True)
-    path = keys_dir / f"{pubkey.hex()}.key"
-    if path.exists():
+    try:
+        keys_dir.mkdir(parents=True, exist_ok=True)
+        path = keys_dir / f"{pubkey.hex()}.key"
+        if path.exists():
+            return False
+        path.write_bytes(pubkey)
+        return True
+    except OSError as exc:
+        log.warning("could not save key %s..: %s", pubkey.hex()[:8], exc)
         return False
-    path.write_bytes(pubkey)
-    return True
 
 
 # ---- RX decryption helpers ----
@@ -477,17 +488,27 @@ def load_channels(channels_dir: Path) -> list[GroupChannel]:
         data = f.read_bytes()
         if len(data) in (16, 32):
             channels.append(GroupChannel(f.stem, data))
+        else:
+            log.warning(
+                "skipping corrupt channel file %s (%d bytes, expected 16 or 32)",
+                f,
+                len(data),
+            )
     return channels
 
 
 def save_channel(channels_dir: Path, name: str, psk_raw: bytes) -> bool:
     """Save a channel to the channel store. Returns True if newly saved."""
-    channels_dir.mkdir(parents=True, exist_ok=True)
-    path = channels_dir / f"{name}.channel"
-    if path.exists():
+    try:
+        channels_dir.mkdir(parents=True, exist_ok=True)
+        path = channels_dir / f"{name}.channel"
+        if path.exists():
+            return False
+        path.write_bytes(psk_raw)
+        return True
+    except OSError as exc:
+        log.warning("could not save channel %r: %s", name, exc)
         return False
-    path.write_bytes(psk_raw)
-    return True
 
 
 def _seed_channels(channels_dir: Path) -> None:
@@ -496,13 +517,16 @@ def _seed_channels(channels_dir: Path) -> None:
         return
     if not SEED_CHANNELS_DIR.is_dir():
         return
-    channels_dir.mkdir(parents=True, exist_ok=True)
-    import shutil
+    try:
+        channels_dir.mkdir(parents=True, exist_ok=True)
+        import shutil
 
-    for src in SEED_CHANNELS_DIR.glob("*.channel"):
-        dest = channels_dir / src.name
-        if not dest.exists():
-            shutil.copy2(src, dest)
+        for src in SEED_CHANNELS_DIR.glob("*.channel"):
+            dest = channels_dir / src.name
+            if not dest.exists():
+                shutil.copy2(src, dest)
+    except OSError as exc:
+        log.warning("could not seed channels into %s: %s", channels_dir, exc)
 
 
 def try_decrypt_grp_txt(
