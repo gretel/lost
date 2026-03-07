@@ -608,4 +608,66 @@ const boost::ut::suite<"DiversityCombiner N=3"> n3_tests = [] {
     };
 };
 
+const boost::ut::suite<"DiversityCombiner staggered delivery"> staggered_tests = [] {
+    using namespace boost::ut;
+
+    "One channel decodes, other decodes different frame — emits both as 1-candidate"_test = [] {
+        // ch0 decodes "Alpha", ch1 decodes "Bravo" (different payloads).
+        // Each forms its own pending group. Both channels are active, so
+        // allChannelsActive fires and drains both groups with n_candidates=1.
+        // This verifies incomplete groups are correctly drained when every
+        // channel has had its chance but decoded something different.
+        auto frameCh0 = makeFrame("Alpha!!", true, 6.0, 0);
+        auto frameCh1 = makeFrame("Bravo!!", true, 4.0, 1);
+        auto result = runCombiner(2, {{frameCh0}, {frameCh1}});
+
+        // Both 7-byte frames should be emitted separately
+        expect(ge(result.samples.size(), 14UZ))
+            << "Expected 14 bytes (two 7-byte frames), got "
+            << result.samples.size();
+
+        // Each frame should have diversity_n_candidates=1
+        std::size_t singleCandidateCount = 0;
+        for (const auto& frameTag : result.tags) {
+            if (auto iter = frameTag.map.find("diversity_n_candidates");
+                iter != frameTag.map.end()) {
+                if (iter->second.value_or<int64_t>(0) == 1) {
+                    singleCandidateCount++;
+                }
+            }
+        }
+        expect(eq(singleCandidateCount, 2UZ))
+            << "Both frames should have n_candidates=1 (different payloads)";
+    };
+
+    "One channel decodes, other sends noise — emits via activity drain"_test = [] {
+        // ch0 decodes "Solo!", ch1 sends noise bytes with no pay_len tag.
+        // Both channels are active (ch1 has data), so allChannelsActive
+        // fires. ch0's frame emits with n_candidates=1 since ch1 never
+        // submitted a matching candidate.
+        auto frameCh0 = makeFrame("Solo!", true, 4.0, 0);
+        FakeFrame noiseCh1 = {
+            .payload = {0xAA, 0xBB, 0xCC},
+            .tag = gr::Tag{.index = 0UZ, .map = {
+                {"noise", gr::pmt::Value(true)},
+            }},
+        };
+        auto result = runCombiner(2, {{frameCh0}, {noiseCh1}});
+
+        expect(ge(result.samples.size(), 5UZ))
+            << "Expected 5 bytes, got " << result.samples.size();
+
+        bool foundN = false;
+        for (const auto& frameTag : result.tags) {
+            if (auto iter = frameTag.map.find("diversity_n_candidates");
+                iter != frameTag.map.end()) {
+                expect(eq(iter->second.value_or<int64_t>(0), int64_t{1}))
+                    << "Should have 1 candidate (ch1 sent noise, not a frame)";
+                foundN = true;
+            }
+        }
+        expect(foundN) << "Should have diversity_n_candidates tag";
+    };
+};
+
 int main() { /* boost::ut auto-runs all suites */ }
