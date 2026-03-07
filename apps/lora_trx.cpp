@@ -654,7 +654,7 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
     gr::lora::TxQueueSource* src_ptr = nullptr;
     for (auto& blk : tx_block_list) {
         if (blk->typeName().find("TxQueueSource") != std::string_view::npos) {
-            src_ptr = dynamic_cast<gr::lora::TxQueueSource*>(blk.get());
+            src_ptr = static_cast<gr::lora::TxQueueSource*>(blk->raw()); // BlockWrapper holds block as member, not base
             break;
         }
     }
@@ -682,19 +682,10 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
         return nullptr;
     }
 
-    // After exchange(), the graph is owned by the scheduler. Find TxQueueSource
-    // in the live block list (the pre-exchange reference 'src' is now dangling).
-    source_out = nullptr;
-    for (auto& blk : sched->blocks()) {
-        if (blk->typeName().find("TxQueueSource") != std::string_view::npos) {
-            source_out = dynamic_cast<gr::lora::TxQueueSource*>(blk.get());
-            break;
-        }
-    }
-    if (source_out == nullptr) {
-        std::fprintf(stderr, "ERROR: TxQueueSource not found in live TX scheduler\n");
-        return nullptr;
-    }
+    // src_ptr was captured pre-exchange; the TxQueueSource object is now owned
+    // by the scheduler via shared_ptr but the raw pointer remains valid for the
+    // process lifetime. No need to re-scan sched->blocks() post-exchange.
+    source_out = src_ptr;
 
     std::fprintf(stderr, "  TX: persistent graph started (config ch %u -> soapy ch %u / %s)\n",
                  cfg.tx_channel, tx_map.soapy_channel, tx_map.label);
