@@ -5,7 +5,7 @@
 // 1-ch RX: SoapySimpleSource -> FrameSync -> DemodDecoder -> FrameSink
 // 2-ch RX: SoapyDualSimpleSource -+-> FrameSync -> DemodDecoder -+-> DiversityCombiner -> FrameSink
 //                                 +-> FrameSync -> DemodDecoder -+
-// TX: TagSource<cf32> -> SoapySinkBlock<cf32> (ephemeral graph per request)
+// TX: dispatched to io pool thread (non-blocking); tx_busy flag prevents concurrent TX
 //
 // Dual-RX uses a single MIMO stream (one device handle, two output ports).
 // Full-duplex TX in both modes: RX runs continuously while TX uses an
@@ -1693,6 +1693,10 @@ int main(int argc, char* argv[]) {
     // --- Pre-build config CBOR (sent once on subscribe) ---
     auto config_cbor = build_config_cbor(cfg);
 
+    // TX concurrency guard — only one TX at a time.
+    // Set before dispatching to io pool; cleared when the dispatch completes.
+    std::atomic<bool> tx_busy{false};
+
     // --- Main loop: recv UDP datagrams, dispatch TX requests ---
     std::vector<uint8_t> recv_buf(65536);
     auto last_status = std::chrono::steady_clock::now();
@@ -1750,8 +1754,34 @@ int main(int argc, char* argv[]) {
             auto type = gr::lora::cbor::get_text_or(msg, "type", "");
             if (type == "lora_tx") {
                 udp.subscribe(sender);
-                handle_tx_request(msg, cfg, udp, sender, tx_ptr,
-                                  tx_spectrum.get());
+                if (tx_busy.exchange(true, std::memory_order_acq_rel)) {
+                    // Another TX is already in flight — reject immediately.
+                    uint64_t seq = gr::lora::cbor::get_uint_or(msg, "seq", 0);
+                    std::vector<uint8_t> rej;
+                    rej.reserve(80);
+                    gr::lora::cbor::encode_map_begin(rej, 4);
+                    gr::lora::cbor::kv_text(rej, "type", "lora_tx_ack");
+                    gr::lora::cbor::kv_uint(rej, "seq", seq);
+                    gr::lora::cbor::kv_bool(rej, "ok", false);
+                    gr::lora::cbor::kv_text(rej, "error", "tx_busy");
+                    udp.sendTo(rej, sender);
+                } else {
+                    // Dispatch TX to io pool so the UDP loop stays responsive.
+                    // Captures: msg and sender by value (copies), everything
+                    // else by reference (all outlive the io pool task).
+                    auto msg_copy    = msg;
+                    auto sender_copy = sender;
+                    auto tx_spectrum_ref = tx_spectrum; // keep shared_ptr alive
+                    gr::thread_pool::Manager::defaultIoPool()->execute(
+                        [&cfg, &udp, &tx_busy, tx_ptr,
+                         tx_spectrum_ref,
+                         msg_copy    = std::move(msg_copy),
+                         sender_copy = std::move(sender_copy)]() mutable {
+                            handle_tx_request(msg_copy, cfg, udp, sender_copy,
+                                              tx_ptr, tx_spectrum_ref.get());
+                            tx_busy.store(false, std::memory_order_release);
+                        });
+                }
             } else if (type == "lora_config") {
                 udp.subscribe(sender);
                 handle_lora_config(msg, cfg, rx_blocks, udp, sender);
@@ -1787,6 +1817,15 @@ int main(int argc, char* argv[]) {
         rx_sched.requestStop();
     }
     rx_thread.join();
+
+    // Wait for any in-flight TX (dispatched to io pool) to complete before
+    // closing the SoapySDR device.  The io pool task clears tx_busy on exit.
+    if (tx_busy.load(std::memory_order_acquire)) {
+        std::fprintf(stderr, "  waiting for TX to complete...\n");
+        while (tx_busy.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
 
     if (tx_ptr) {
         tx_state_close(tx_state);
