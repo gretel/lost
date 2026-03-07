@@ -70,20 +70,34 @@ preamble_len = 8
 freq = 869618000
 rx_channel = [1, 2]
 tx_channel = 0
-rx_gain = 42
-tx_gain = 70
+rx_gain = 40
+tx_gain = 50
 
 [radio_433]
 freq = 433650000
 rx_channel = [2]
 tx_channel = 3
-rx_gain = 40
-tx_gain = 60
+rx_gain = 34
+tx_gain = 50
 
 [set_meshcore_868]
 name = "MeshCore 868 MHz"
 codec = "codec_meshcore_868"
 radio = "radio_868"
+# Optional: multiple decode chains per radio channel.
+# Each [[set_meshcore_868.decode]] entry creates a FrameSync+DemodDecoder
+# pair (with a Splitter when >1 entry).  All chains feed one DiversityCombiner.
+# If omitted, uses the codec's sf/sync_word.
+#
+# [[set_meshcore_868.decode]]
+# sf = 8
+# sync_word = 0x12
+# label = "meshcore"
+#
+# [[set_meshcore_868.decode]]
+# sf = 7
+# sync_word = 0x2B
+# label = "meshtastic"
 
 # [set_meshcore_433]
 # name = "MeshCore 433 MHz"

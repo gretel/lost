@@ -46,6 +46,7 @@
 #include <gnuradio-4.0/lora/DiversityCombiner.hpp>
 #include <gnuradio-4.0/lora/FrameSync.hpp>
 #include <gnuradio-4.0/lora/DemodDecoder.hpp>
+#include <gnuradio-4.0/lora/Splitter.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/soapy/Soapy.hpp>
 #include <gnuradio-4.0/soapy/SoapySink.hpp>
@@ -145,6 +146,15 @@ constexpr std::array<ChannelMap, 4> kChannelMap = {{
     {1, "TX/RX", "TX/RX", "TRX_B"},   // config channel 3
 }};
 
+// Per-decode-chain configuration.  Each entry produces one FrameSync +
+// DemodDecoder pair per radio channel.  Multiple DecodeConfig entries on
+// the same radio channel are split via a Splitter block.
+struct DecodeConfig {
+    uint8_t     sf{8};
+    uint16_t    sync_word{0x12};
+    std::string label{};
+};
+
 struct TrxConfig {
     std::string          name{};
     std::string          device{"uhd"};
@@ -154,9 +164,9 @@ struct TrxConfig {
     double               gain_tx{75.0};
     float                rate{250'000.f};
     uint32_t             bw{62'500};
-    uint8_t              sf{8};
+    uint8_t              sf{8};          ///< default SF (also used for TX)
     uint8_t              cr{4};
-    uint16_t             sync{0x12};
+    uint16_t             sync{0x12};     ///< default sync word (also used for TX)
     uint16_t             preamble{8};
     std::string          clock{};
     std::vector<uint32_t> rx_channels{0};
@@ -167,6 +177,7 @@ struct TrxConfig {
     bool                 debug{false};
 
     gr::property_map     block_overrides{};    ///< flat block property overrides from codec section
+    std::vector<DecodeConfig> decode_configs{}; ///< per-chain decode configs (empty = use default sf/sync)
 };
 
 // --- UDP state (owned by main thread) ---
@@ -510,6 +521,30 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
         cfg.sync     = codec.sync;
         cfg.preamble = codec.preamble;
 
+        // Parse optional [[decode]] array for multi-SF / multi-sync-word decode.
+        // If absent, a single DecodeConfig using the codec's sf/sync_word is used.
+        if (auto* decode_arr = section["decode"].as_array()) {
+            for (auto& elem : *decode_arr) {
+                if (!elem.is_table()) continue;
+                auto& dtbl = *elem.as_table();
+                DecodeConfig dc;
+                dc.sf = static_cast<uint8_t>(
+                    dtbl["sf"].value_or(static_cast<int64_t>(codec.sf)));
+                dc.sync_word = static_cast<uint16_t>(
+                    dtbl["sync_word"].value_or(static_cast<int64_t>(codec.sync)));
+                dc.label = dtbl["label"].value_or(std::string(""));
+                cfg.decode_configs.push_back(std::move(dc));
+            }
+        }
+        // If no [[decode]] entries, create one from the codec defaults
+        if (cfg.decode_configs.empty()) {
+            cfg.decode_configs.push_back({
+                .sf = codec.sf,
+                .sync_word = codec.sync,
+                .label = cfg.name,
+            });
+        }
+
         if (g_debug) {
             std::fprintf(stderr, "  Config set '%s' (%s): radio='%s' codec='%s' "
                          "freq=%.3f MHz rx=[",
@@ -521,9 +556,15 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
                 std::fprintf(stderr, "%u/%s", cfg.rx_channels[i],
                              kChannelMap[cfg.rx_channels[i]].label);
             }
-            std::fprintf(stderr, "] tx=%u/%s\n",
-                         cfg.tx_channel,
+            std::fprintf(stderr, "] tx=%u/%s decode=[", cfg.tx_channel,
                          kChannelMap[cfg.tx_channel].label);
+            for (std::size_t i = 0; i < cfg.decode_configs.size(); i++) {
+                if (i > 0) std::fprintf(stderr, ",");
+                const auto& dc = cfg.decode_configs[i];
+                std::fprintf(stderr, "SF%u/0x%02X", dc.sf, dc.sync_word);
+                if (!dc.label.empty()) std::fprintf(stderr, "(%s)", dc.label.c_str());
+            }
+            std::fprintf(stderr, "]\n");
         }
 
         configs.push_back(std::move(cfg));
@@ -786,23 +827,27 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
 
 // Creates FrameSync + DemodDecoder in the graph and returns references to both.
 // Does NOT create a FrameSink — caller is responsible for downstream wiring.
+//
+// `rx_channel`: unique ID for this decode chain (radio_idx * 100 + decode_idx)
+// `dc`: decode config (SF, sync_word) — may differ from the codec defaults
 struct DecodePair {
     gr::lora::FrameSync&    sync;
     gr::lora::DemodDecoder& demod;
 };
 
-DecodePair add_decode_pair(gr::Graph& graph, const TrxConfig& cfg, uint32_t ch,
+DecodePair add_decode_pair(gr::Graph& graph, const TrxConfig& cfg,
+                           int32_t rx_channel, const DecodeConfig& dc,
                            std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr) {
     auto os = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
     gr::property_map sync_props = {
         {"center_freq", static_cast<uint32_t>(cfg.freq)},
         {"bandwidth", cfg.bw},
-        {"sf", cfg.sf},
-        {"sync_word", cfg.sync},
+        {"sf", dc.sf},
+        {"sync_word", dc.sync_word},
         {"os_factor", os},
         {"preamble_len", cfg.preamble},
-        {"rx_channel", static_cast<int32_t>(ch)},
+        {"rx_channel", rx_channel},
         {"debug", cfg.debug},
     };
     merge_properties(sync_props, filter_properties(cfg.block_overrides, kFrameSyncOverrides));
@@ -810,7 +855,7 @@ DecodePair add_decode_pair(gr::Graph& graph, const TrxConfig& cfg, uint32_t ch,
     sync._spectrum_state = std::move(spectrum);
 
     gr::property_map demod_props = {
-        {"sf", cfg.sf},
+        {"sf", dc.sf},
         {"bandwidth", cfg.bw},
         {"debug", cfg.debug},
     };
@@ -819,39 +864,57 @@ DecodePair add_decode_pair(gr::Graph& graph, const TrxConfig& cfg, uint32_t ch,
 
     auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
     if (!ok(graph.connect<"out">(sync).to<"in">(demod))) {
-        std::fprintf(stderr, "ERROR: failed to connect FrameSync -> DemodDecoder for channel %u\n", ch);
+        std::fprintf(stderr, "ERROR: failed to connect FrameSync -> DemodDecoder for rx_channel %d\n", rx_channel);
     }
     return {sync, demod};
 }
 
-// Adds a FrameSync -> DemodDecoder -> FrameSink chain to the graph and returns
-// a reference to the FrameSync input port (for connecting to a source).
-auto& add_decode_chain(gr::Graph& graph, const TrxConfig& cfg, uint32_t ch,
+// Adds FrameSync -> DemodDecoder -> FrameSink chain for the simple case
+// (1 radio channel, 1 decode config, no Splitter/Combiner needed).
+auto& add_decode_chain(gr::Graph& graph, const TrxConfig& cfg,
+                       int32_t rx_channel, const DecodeConfig& dc,
                        std::function<void(const std::vector<uint8_t>&, bool)> callback,
                        std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr) {
-    auto [sync, demod] = add_decode_pair(graph, cfg, ch, std::move(spectrum));
+    auto [sync, demod] = add_decode_pair(graph, cfg, rx_channel, dc, std::move(spectrum));
 
     auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-        {"sync_word", cfg.sync},
-        {"phy_sf", cfg.sf},
+        {"sync_word", dc.sync_word},
+        {"phy_sf", dc.sf},
         {"phy_bw", cfg.bw},
     });
     sink._frame_callback = callback;
 
     auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
     if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
-        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink for channel %u\n", ch);
+        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink for rx_channel %d\n", rx_channel);
     }
     return sync;
 }
 
-// 1 channel: SoapySimpleSource (single stream, one device handle)
-// 2 channels: SoapyDualSimpleSource (MIMO stream, one device handle, two output ports)
+// Generalised RX graph builder.
+//
+// Topology depends on the number of radio channels and decode configs:
+//
+//   1 radio, 1 decode:  Source → FrameSync → DemodDecoder → FrameSink
+//
+//   N radio × M decode (total chains > 1):
+//     Source ─out#r─→ [Splitter(M)] ─out#d─→ FrameSync → DemodDecoder ─→ Combiner.in#i
+//                                                                         Combiner.out → FrameSink
+//
+// Splitter is omitted when M=1 (only one decode config per radio channel).
+// DiversityCombiner is used whenever total chain count > 1.
+//
 // Returns pointer to source block's cumulative overflow counter (valid while graph lives).
 uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                          std::function<void(const std::vector<uint8_t>&, bool)> callback,
                          std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr) {
     auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
+    using namespace std::string_literals;
+
+    const auto& decodes = cfg.decode_configs;
+    const auto nRadio = cfg.rx_channels.size();
+    const auto nDecode = decodes.size();
+    const auto nChains = nRadio * nDecode;
 
     // Translate config channels (0-3) to SoapySDR channels + antennae
     std::vector<gr::Size_t> soapy_channels;
@@ -862,8 +925,8 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
         antennae.emplace_back(map.rx_antenna);
     }
 
-    if (cfg.rx_channels.size() == 1) {
-        auto ch = cfg.rx_channels[0];
+    // --- Simple path: 1 radio, 1 decode, no combiner ---
+    if (nRadio == 1 && nDecode == 1) {
         auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>({
             {"device", cfg.device},
             {"device_parameter", cfg.device_param},
@@ -878,15 +941,109 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
             {"max_consecutive_errors", gr::Size_t{500}},
             {"max_time_out_us", static_cast<uint32_t>(10'000U)},
         });
-        auto& sync = add_decode_chain(graph, cfg, ch, callback, spectrum);
+
+        auto rx_ch = static_cast<int32_t>(cfg.rx_channels[0]) * 100;
+        auto& sync = add_decode_chain(graph, cfg, rx_ch, decodes[0], callback, spectrum);
         if (!ok(graph.connect<"out">(source).to<"in">(sync))) {
             std::fprintf(stderr, "ERROR: failed to connect source -> decode chain\n");
         }
         return &source._totalOverFlowCount;
+    }
+
+    // --- Multi-chain path: Splitter(s) + DiversityCombiner ---
+
+    // DiversityCombiner: groups matching payloads, selects best by CRC/SNR
+    gr::property_map combiner_props = {
+        {"n_inputs", static_cast<gr::Size_t>(nChains)},
+        {"bandwidth", cfg.bw},
+        {"sf", cfg.sf},
+        {"debug", cfg.debug},
+    };
+    merge_properties(combiner_props, filter_properties(cfg.block_overrides, kCombinerOverrides));
+    auto& combiner = graph.emplaceBlock<gr::lora::DiversityCombiner>(std::move(combiner_props));
+
+    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
+        {"sync_word", cfg.sync},
+        {"phy_sf", cfg.sf},
+        {"phy_bw", cfg.bw},
+    });
+    sink._frame_callback = callback;
+
+    // Wire decode chains for a given source block.
+    // connectPort(r, downstream) connects source output `r` to downstream's "in".
+    // Both lambdas preserve concrete types for graph.connect() template deduction.
+    auto wireDecodeChains = [&](auto connectPort) {
+        std::size_t chain_idx = 0;
+        for (std::size_t r = 0; r < nRadio; r++) {
+            bool firstChain = (r == 0);
+
+            if (nDecode == 1) {
+                auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
+                auto [sync, demod] = add_decode_pair(
+                    graph, cfg, rx_ch, decodes[0],
+                    firstChain ? spectrum : nullptr);
+
+                if (!connectPort(r, sync)) {
+                    std::fprintf(stderr, "ERROR: failed to connect source -> FrameSync (radio %zu)\n", r);
+                }
+                auto combinerPort = "in#"s + std::to_string(chain_idx);
+                if (!ok(graph.connect(demod, "out"s, combiner, combinerPort))) {
+                    std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> Combiner (chain %zu)\n", chain_idx);
+                }
+                chain_idx++;
+            } else {
+                auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
+                    {"n_outputs", static_cast<gr::Size_t>(nDecode)},
+                });
+
+                if (!connectPort(r, splitter)) {
+                    std::fprintf(stderr, "ERROR: failed to connect source -> Splitter (radio %zu)\n", r);
+                }
+
+                for (std::size_t d = 0; d < nDecode; d++) {
+                    auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100
+                               + static_cast<int32_t>(d);
+                    auto [sync, demod] = add_decode_pair(
+                        graph, cfg, rx_ch, decodes[d],
+                        (firstChain && d == 0) ? spectrum : nullptr);
+
+                    auto splitterPort = "out#"s + std::to_string(d);
+                    if (!ok(graph.connect(splitter, splitterPort, sync, "in"s))) {
+                        std::fprintf(stderr, "ERROR: failed to connect Splitter -> FrameSync (chain %zu)\n", chain_idx);
+                    }
+                    auto combinerPort = "in#"s + std::to_string(chain_idx);
+                    if (!ok(graph.connect(demod, "out"s, combiner, combinerPort))) {
+                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> Combiner (chain %zu)\n", chain_idx);
+                    }
+                    chain_idx++;
+                }
+            }
+        }
+    };
+
+    // Create source and wire: 1 radio = SoapySimple, 2 radios = SoapyDual
+    uint64_t* overflow_ptr = nullptr;
+
+    if (nRadio == 1) {
+        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>({
+            {"device", cfg.device},
+            {"device_parameter", cfg.device_param},
+            {"sample_rate", cfg.rate},
+            {"rx_center_frequency", gr::Tensor<double>{cfg.freq}},
+            {"rx_gains", gr::Tensor<double>{cfg.gain_rx}},
+            {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
+            {"rx_antennae", antennae},
+            {"clock_source", cfg.clock},
+            {"max_chunck_size", static_cast<uint32_t>(512U << 4U)},
+            {"max_overflow_count", gr::Size_t{1000}},
+            {"max_consecutive_errors", gr::Size_t{500}},
+            {"max_time_out_us", static_cast<uint32_t>(10'000U)},
+        });
+        overflow_ptr = &source._totalOverFlowCount;
+        wireDecodeChains([&graph, &source](std::size_t /*r*/, auto& downstream) {
+            return graph.connect<"out">(source).to<"in">(downstream) == gr::ConnectionResult::SUCCESS;
+        });
     } else {
-        // 2-channel MIMO: single device handle, time-aligned streams
-        // Topology: SoapyDualSource -+-> FrameSync0 -> DemodDecoder0 -+-> DiversityCombiner -> FrameSink
-        //                           +-> FrameSync1 -> DemodDecoder1 -+
         auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapyDualSimpleSource<std::complex<float>>>({
             {"device", cfg.device},
             {"device_parameter", cfg.device_param},
@@ -901,37 +1058,23 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
             {"max_consecutive_errors", gr::Size_t{500}},
             {"max_time_out_us", static_cast<uint32_t>(10'000U)},
         });
-
-        // Only first channel gets spectrum tap (both share the same frequency)
-        auto [sync0, demod0] = add_decode_pair(graph, cfg, cfg.rx_channels[0], spectrum);
-        auto [sync1, demod1] = add_decode_pair(graph, cfg, cfg.rx_channels[1]);
-
-        gr::property_map combiner_props = {
-            {"n_inputs", gr::Size_t{2}},
-            {"bandwidth", cfg.bw},
-            {"sf", cfg.sf},
-            {"debug", cfg.debug},
-        };
-        merge_properties(combiner_props, filter_properties(cfg.block_overrides, kCombinerOverrides));
-        auto& combiner = graph.emplaceBlock<gr::lora::DiversityCombiner>(std::move(combiner_props));
-
-        auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-            {"sync_word", cfg.sync},
-            {"phy_sf", cfg.sf},
-            {"phy_bw", cfg.bw},
+        overflow_ptr = &source._totalOverFlowCount;
+        wireDecodeChains([&graph, &source](std::size_t r, auto& downstream) {
+            auto portName = "out#"s + std::to_string(r);
+            return graph.connect(source, portName, downstream, "in"s) == gr::ConnectionResult::SUCCESS;
         });
-        sink._frame_callback = callback;
-
-        using namespace std::string_literals;
-        if (!ok(graph.connect<"out", 0>(source).to<"in">(sync0)) ||
-            !ok(graph.connect<"out", 1>(source).to<"in">(sync1)) ||
-            !ok(graph.connect(demod0, "out"s, combiner, "in#0"s)) ||
-            !ok(graph.connect(demod1, "out"s, combiner, "in#1"s)) ||
-            !ok(graph.connect<"out">(combiner).to<"in">(sink))) {
-            std::fprintf(stderr, "ERROR: failed to connect MIMO source -> diversity pipeline\n");
-        }
-        return &source._totalOverFlowCount;
     }
+
+    if (!ok(graph.connect<"out">(combiner).to<"in">(sink))) {
+        std::fprintf(stderr, "ERROR: failed to connect Combiner -> FrameSink\n");
+    }
+
+    if (cfg.debug) {
+        std::fprintf(stderr, "  RX graph: %zu radio(s) x %zu decode(s) = %zu chains\n",
+                     nRadio, nDecode, nChains);
+    }
+
+    return overflow_ptr;
 }
 
 // --- Shared status (updated by frame callback, read by main loop) ---
@@ -1069,6 +1212,7 @@ std::vector<uint8_t> build_spectrum_cbor(gr::lora::SpectrumState& spec,
 struct RxBlocks {
     std::vector<std::shared_ptr<gr::BlockModel>> frame_sync;
     std::vector<std::shared_ptr<gr::BlockModel>> demod_decoder;
+    std::vector<std::shared_ptr<gr::BlockModel>> splitters;
     std::shared_ptr<gr::BlockModel>              soapy_source;
     std::shared_ptr<gr::BlockModel>              diversity_combiner;
 };
@@ -1084,6 +1228,8 @@ RxBlocks find_rx_blocks(std::span<std::shared_ptr<gr::BlockModel>> blocks) {
             rx.demod_decoder.push_back(blk);
         } else if (tn.find("DiversityCombiner") != std::string_view::npos) {
             rx.diversity_combiner = blk;
+        } else if (tn.find("Splitter") != std::string_view::npos) {
+            rx.splitters.push_back(blk);
         } else if (tn.find("Soapy") != std::string_view::npos &&
                    tn.find("Source") != std::string_view::npos) {
             rx.soapy_source = blk;
@@ -1344,6 +1490,16 @@ int main(int argc, char* argv[]) {
     for (auto ch : cfg.rx_channels) std::fprintf(stderr, " %u (%s)", ch, kChannelMap[ch].label);
     std::fprintf(stderr, "\n");
     std::fprintf(stderr, "  TX channel:  %u (%s)\n", cfg.tx_channel, kChannelMap[cfg.tx_channel].label);
+    if (cfg.decode_configs.size() > 1) {
+        std::fprintf(stderr, "  Decode:     ");
+        for (std::size_t i = 0; i < cfg.decode_configs.size(); i++) {
+            const auto& dc = cfg.decode_configs[i];
+            if (i > 0) std::fprintf(stderr, ", ");
+            std::fprintf(stderr, "SF%u/0x%02X", dc.sf, dc.sync_word);
+            if (!dc.label.empty()) std::fprintf(stderr, " (%s)", dc.label.c_str());
+        }
+        std::fprintf(stderr, "\n");
+    }
     if (!cfg.clock.empty()) {
         std::fprintf(stderr, "  Clock:       %s\n", cfg.clock.c_str());
     }
@@ -1485,8 +1641,9 @@ int main(int argc, char* argv[]) {
     // After exchange(), the original emplaceBlock references are dangling —
     // we find them by scanning typeName().
     auto rx_blocks = find_rx_blocks(rx_sched.blocks());
-    std::fprintf(stderr, "  blocks: %zu FrameSync, %zu DemodDecoder, combiner=%s, soapy=%s\n",
+    std::fprintf(stderr, "  blocks: %zu FrameSync, %zu DemodDecoder, %zu Splitter, combiner=%s, soapy=%s\n",
                  rx_blocks.frame_sync.size(), rx_blocks.demod_decoder.size(),
+                 rx_blocks.splitters.size(),
                  rx_blocks.diversity_combiner ? "yes" : "no",
                  rx_blocks.soapy_source ? "yes" : "no");
 
