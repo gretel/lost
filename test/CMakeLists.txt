@@ -50,3 +50,7 @@ target_compile_definitions(qa_lora_diversity PRIVATE
 add_ut_test(qa_lora_splitter)
 target_compile_definitions(qa_lora_splitter PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
+
+add_ut_test(qa_lora_cad)
+target_compile_definitions(qa_lora_cad PRIVATE
+    TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
