@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/Message.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
@@ -38,6 +39,7 @@ namespace gr::lora {
 ///   crc_valid, is_downchirp, snr_db, rx_channel} at the first output byte.
 ///
 /// Rate: variable (N*num_symbols cf32 -> pay_len uint8), manual consume/publish.
+GR_REGISTER_BLOCK("gr::lora::DemodDecoder", gr::lora::DemodDecoder)
 struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
     gr::PortIn<std::complex<float>>  in;
     gr::PortOut<uint8_t>             out;

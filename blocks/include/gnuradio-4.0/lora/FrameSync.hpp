@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/SpectrumTap.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
@@ -71,6 +72,7 @@ inline void complex_multiply(std::complex<float>* out, const std::complex<float>
 ///   DETECT -> look for preamble_len-3 consecutive upchirps
 ///   SYNC   -> estimate CFO/STO/SFO, verify sync word, align timing
 ///   OUTPUT -> emit aligned symbols until energy drops or max symbols reached
+GR_REGISTER_BLOCK("gr::lora::FrameSync", gr::lora::FrameSync)
 struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
     gr::PortIn<std::complex<float>>  in;
     gr::PortOut<std::complex<float>> out;

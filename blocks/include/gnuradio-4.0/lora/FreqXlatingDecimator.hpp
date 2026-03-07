@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/BlockRegistry.hpp>
 
 namespace gr::lora {
 
@@ -37,6 +38,7 @@ namespace gr::lora {
 /// The taps are real-valued (symmetric low-pass filter). The frequency
 /// translation is done by complex multiplication with a rotating phasor
 /// before filtering.
+GR_REGISTER_BLOCK("gr::lora::FreqXlatingDecimator", gr::lora::FreqXlatingDecimator)
 struct FreqXlatingDecimator : gr::Block<FreqXlatingDecimator,
                                         gr::NoDefaultTagForwarding> {
     gr::PortIn<std::complex<float>>  in;
