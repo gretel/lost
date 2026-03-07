@@ -1392,7 +1392,10 @@ int main(int argc, char* argv[]) {
 
     auto os = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
-    std::fprintf(stderr, "=== LoRa TRX %s ===\n", GIT_REV);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdate-time"
+    std::fprintf(stderr, "=== LoRa TRX %s (built " __DATE__ " " __TIME__ ") ===\n", GIT_REV);
+#pragma GCC diagnostic pop
     std::fprintf(stderr, "  Config:      %s (%zu set%s)\n",
                  config_path.c_str(), configs.size(),
                  configs.size() > 1 ? "s" : "");
