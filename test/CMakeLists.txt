@@ -54,3 +54,4 @@ target_compile_definitions(qa_lora_splitter PRIVATE
 add_ut_test(qa_lora_cad)
 target_compile_definitions(qa_lora_cad PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
+set_tests_properties(qa_lora_cad PROPERTIES TIMEOUT 60)
