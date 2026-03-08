@@ -85,7 +85,7 @@ ADVERT_HAS_FEATURE2 = 0x40
 ADVERT_HAS_NAME = 0x80
 
 # Default paths — relative to the scripts/ directory so data stays in the project tree
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "meshcore"
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data" / "meshcore"
 DEFAULT_IDENTITY_FILE = DEFAULT_DATA_DIR / "identity.bin"
 DEFAULT_KEYS_DIR = DEFAULT_DATA_DIR / "keys"
 

@@ -20,14 +20,13 @@ __pycache__/
 # Scratch
 tmp/
 
-# Data (DuckDB databases)
-data/
-
-# MeshCore runtime data — ignore generated files, keep directory scaffolding
-scripts/meshcore/identity.bin
-scripts/meshcore/keys/*.pub
-scripts/meshcore/contacts/*.contact
-scripts/meshcore/channels/*.channel
+# Runtime data — ignore generated files, keep directory scaffolding
+scripts/data/*.duckdb
+scripts/data/*.duckdb.wal
+scripts/data/meshcore/identity.bin
+scripts/data/meshcore/keys/*.pub
+scripts/data/meshcore/contacts/*.contact
+scripts/data/meshcore/channels/*.channel
 
 # macOS
 .DS_Store

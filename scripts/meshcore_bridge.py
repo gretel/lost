@@ -914,7 +914,9 @@ def _handle_grp_txt_rx(
 
 # ---- Contact persistence ----
 
-DEFAULT_CONTACTS_DIR = Path(__file__).resolve().parent / "meshcore" / "contacts"
+DEFAULT_CONTACTS_DIR = (
+    Path(__file__).resolve().parent / "data" / "meshcore" / "contacts"
+)
 
 
 def _persist_contacts(state: BridgeState) -> None:
