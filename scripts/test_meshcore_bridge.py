@@ -1277,6 +1277,47 @@ class TestSendChannelMsg(unittest.TestCase):
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0][0], bridge.RESP_ERROR)
 
+    def test_send_chan_txt_msg_too_short_returns_error(self):
+        """CMD_SEND_CHAN_TXT_MSG with < 7 data bytes returns RESP_ERROR."""
+        # Only 4 bytes of data (need msg_type(1)+chan_idx(1)+ts(4)+at least 1 text byte = 7)
+        cmd = bytes([bridge.CMD_SEND_CHAN_TXT_MSG]) + b"\x00" * 4
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+    def test_send_chan_txt_msg_tracks_tx_hash(self):
+        """After a successful send, state.recent_tx is non-empty (echo-filter hash stored)."""
+        ts = struct.pack("<I", int(time.time()))
+        text = b"hello channel"
+        cmd = bytes([bridge.CMD_SEND_CHAN_TXT_MSG, 0x00, 0x00]) + ts + text
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        self.assertGreater(len(self.state.recent_tx), 0)
+
+    def test_send_chan_txt_msg_send_scope_overrides_region(self):
+        """With send_scope set, wire packet header uses ROUTE_T_FLOOD (bits [1:0] == 0)."""
+        import cbor2
+
+        # Set a non-zero 16-byte send_scope key
+        self.state.send_scope = b"\xab" * 16
+
+        ts = struct.pack("<I", int(time.time()))
+        text = b"scoped message"
+        cmd = bytes([bridge.CMD_SEND_CHAN_TXT_MSG, 0x00, 0x00]) + ts + text
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+        # Receive and decode the UDP CBOR TX packet
+        self.udp_sock.settimeout(1.0)
+        raw, _addr = self.udp_sock.recvfrom(65536)
+        msg = cbor2.loads(raw)
+        wire = msg["payload"]
+        # ROUTE_T_FLOOD = 0x00; header byte bits [1:0] must be 0
+        route_type = wire[0] & 0x03
+        self.assertEqual(
+            route_type, 0, f"expected ROUTE_T_FLOOD(0), got route_type={route_type}"
+        )
+
 
 # ---- RF ACK TX generation tests ----
 
@@ -2554,6 +2595,59 @@ class TestSendControlData(unittest.TestCase):
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0][0], bridge.RESP_ERROR)
 
+    def test_send_control_data_tracks_tx_hash(self):
+        """After a successful CTRL send, state.recent_tx is non-empty (echo-filter hash stored)."""
+        tag = struct.pack("<I", 0xDEADBEEF)
+        payload = bytes([0x80, 0x00]) + tag
+        cmd = bytes([bridge.CMD_SEND_CONTROL_DATA]) + payload
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        self.assertGreater(len(self.state.recent_tx), 0)
+
+    def test_send_control_data_uses_plain_flood(self):
+        """CTRL packet always uses ROUTE_FLOOD (bits [1:0] == 1) even with region_scope set."""
+        import cbor2
+
+        # Set a region_scope — CTRL handler should still use plain ROUTE_FLOOD
+        self.state.region_scope = "test"
+
+        tag = struct.pack("<I", 0x12345678)
+        payload = bytes([0x80, 0x00]) + tag
+        cmd = bytes([bridge.CMD_SEND_CONTROL_DATA]) + payload
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+        self.udp_sock.settimeout(1.0)
+        raw, _addr = self.udp_sock.recvfrom(65536)
+        msg = cbor2.loads(raw)
+        wire = msg["payload"]
+        # ROUTE_FLOOD = 0x01; header byte bits [1:0] must be 1
+        route_type = wire[0] & 0x03
+        self.assertEqual(
+            route_type, 1, f"expected ROUTE_FLOOD(1), got route_type={route_type}"
+        )
+
+    def test_send_control_data_payload_preserved(self):
+        """CTRL wire packet contains the full control payload bytes verbatim."""
+        import cbor2
+
+        ctrl_payload = bytes([0x81, 0x02, 0xAA, 0xBB, 0xCC, 0xDD])
+        cmd = bytes([bridge.CMD_SEND_CONTROL_DATA]) + ctrl_payload
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+        self.udp_sock.settimeout(1.0)
+        raw, _addr = self.udp_sock.recvfrom(65536)
+        msg = cbor2.loads(raw)
+        wire = msg["payload"]
+        # Wire packet: header(1) + path_len(1) + payload bytes
+        wire_payload = wire[2:]
+        self.assertEqual(
+            wire_payload,
+            ctrl_payload,
+            f"payload mismatch: expected {ctrl_payload.hex()}, got {wire_payload.hex()}",
+        )
+
 
 # ---- Send TXT message tests ----
 
@@ -2688,6 +2782,77 @@ class TestSendTxtMsg(unittest.TestCase):
         # ROUTE_T_DIRECT = 3; header byte bits [1:0] == 3
         route_type = wire[0] & 0x03
         self.assertEqual(route_type, 3)
+
+
+class TestSendAdvert(unittest.TestCase):
+    """Edge-case tests for CMD_SEND_SELF_ADVERT handler."""
+
+    def setUp(self):
+        import socket
+
+        self.state = make_state()
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.bind(("127.0.0.1", 0))
+        self.udp_addr = ("127.0.0.1", self.udp_sock.getsockname()[1])
+
+    def tearDown(self):
+        self.udp_sock.close()
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(
+            cmd_bytes, self.state, self.udp_sock, self.udp_addr
+        )
+
+    def test_send_advert_no_data_byte(self):
+        """CMD_SEND_SELF_ADVERT with no flood flag byte succeeds and sends UDP."""
+        import cbor2
+
+        cmd = bytes([bridge.CMD_SEND_SELF_ADVERT])  # empty data — no flood flag byte
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+        # A UDP CBOR TX packet must have been sent
+        self.udp_sock.settimeout(1.0)
+        raw, _addr = self.udp_sock.recvfrom(65536)
+        msg = cbor2.loads(raw)
+        self.assertEqual(msg["type"], "lora_tx")
+        self.assertIn("payload", msg)
+
+    def test_send_advert_location_included_when_set(self):
+        """ADVERT payload has HAS_LOCATION flag set when lat_e6/lon_e6 are non-zero."""
+        import cbor2
+
+        self.state.lat_e6 = 53_000_000
+        self.state.lon_e6 = 10_000_000
+
+        cmd = bytes([bridge.CMD_SEND_SELF_ADVERT, 0x01])  # flood flag set
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+        self.udp_sock.settimeout(1.0)
+        raw, _addr = self.udp_sock.recvfrom(65536)
+        msg = cbor2.loads(raw)
+        wire = msg["payload"]
+
+        # Wire packet: header(1) + path_len(1) + pubkey(32) + ts(4) + sig(64) = offset 102
+        # then app_data flags byte
+        app_data_off = 1 + 1 + 32 + 4 + 64  # = 102
+        self.assertGreater(
+            len(wire), app_data_off, "wire packet too short for location flag"
+        )
+        flags = wire[app_data_off]
+        self.assertTrue(
+            flags & bridge.ADVERT_HAS_LOCATION,
+            f"HAS_LOCATION not set in flags=0x{flags:02x}",
+        )
+
+    def test_send_advert_tracks_tx_hash(self):
+        """After sending advert, state.recent_tx is non-empty (echo-filter hash stored)."""
+        cmd = bytes([bridge.CMD_SEND_SELF_ADVERT, 0x01])
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        self.assertGreater(len(self.state.recent_tx), 0)
 
 
 if __name__ == "__main__":
