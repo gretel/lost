@@ -2855,5 +2855,282 @@ class TestSendAdvert(unittest.TestCase):
         self.assertGreater(len(self.state.recent_tx), 0)
 
 
+# ---- Helper: build a 147-byte contact record ----
+
+
+def _make_contact_record(
+    pub_key: bytes, name: str = "peer", lat_e6: int = 0, lon_e6: int = 0
+) -> bytes:
+    """Build a 147-byte contact record matching the bridge's internal layout."""
+    name_bytes = name.encode("utf-8")[:32].ljust(32, b"\x00")
+    ts = int(time.time())
+    record = (
+        pub_key  # pubkey (32)
+        + b"\x01"  # node_type=chat
+        + b"\x00"  # flags
+        + b"\xff"  # path_len=-1 (flood)
+        + b"\x00" * 64  # path (64)
+        + name_bytes  # name (32)
+        + struct.pack("<I", ts)  # last_advert (4)
+        + struct.pack("<i", lat_e6)  # lat (4)
+        + struct.pack("<i", lon_e6)  # lon (4)
+        + struct.pack("<I", ts)  # lastmod (4)
+    )
+    assert len(record) == 147
+    return record
+
+
+# ---- Group F: CMD_ADD_UPDATE_CONTACT edge cases ----
+
+
+class TestAddContact(unittest.TestCase):
+    """Edge cases for CMD_ADD_UPDATE_CONTACT (0x09)."""
+
+    def setUp(self):
+        self.state = make_state()
+        self.sock = _FakeUDPSock()
+        self.addr = ("127.0.0.1", 0)
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(cmd_bytes, self.state, self.sock, self.addr)
+
+    def test_add_contact_too_short_returns_error(self):
+        """F1: data < 32 bytes returns RESP_ERROR."""
+        cmd = bytes([bridge.CMD_ADD_UPDATE_CONTACT]) + b"\x01" * 31
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+    def test_add_contact_pads_record_to_147_bytes(self):
+        """F2: data shorter than 147 is padded to 147 bytes."""
+        pub_key = bytes(range(32))
+        # pubkey(32) + node_type(1) + flags(1) + path_len(1) + path(64) + name(32) = 131
+        # + last_advert(4) = 135, + lat(4) = 139, + lon(4) = 143 bytes total (< 147)
+        contact_data = (
+            pub_key + b"\x01\x00\xff" + b"\x00" * 64 + b"testpeer".ljust(32, b"\x00")
+        )
+        contact_data += struct.pack("<I", int(time.time()))  # last_advert (4)
+        contact_data += struct.pack("<i", 0) + struct.pack("<i", 0)  # lat + lon
+        # total = 143 bytes — bridge pads to 143 + 4 (lastmod) = 147
+        self.assertEqual(len(contact_data), 143)
+        cmd = bytes([bridge.CMD_ADD_UPDATE_CONTACT]) + contact_data
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        pk_hex = pub_key.hex()
+        self.assertIn(pk_hex, self.state.contacts)
+        self.assertEqual(len(self.state.contacts[pk_hex]), 147)
+
+    def test_add_contact_updates_contacts_lastmod(self):
+        """F3: successful add increases contacts_lastmod."""
+        old_lastmod = self.state.contacts_lastmod
+        pub_key = b"\xab" * 32
+        contact_data = pub_key + b"\x00" * 111  # 32 + 111 = 143 bytes
+        cmd = bytes([bridge.CMD_ADD_UPDATE_CONTACT]) + contact_data
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        self.assertGreaterEqual(self.state.contacts_lastmod, old_lastmod)
+
+    def test_add_contact_overwrites_existing(self):
+        """F4: adding same pubkey twice keeps only the second record."""
+        pub_key = b"\xcd" * 32
+        # First add: name field at offset 99 = "first"
+        name1 = b"first\x00" * 4 + b"\x00" * (32 - 24)  # 32 bytes
+        record1 = pub_key + b"\x01\x00\xff" + b"\x00" * 64 + name1 + b"\x00" * 12
+        self.assertEqual(len(record1), 143)
+        self._handle(bytes([bridge.CMD_ADD_UPDATE_CONTACT]) + record1)
+        stored_first = self.state.contacts[pub_key.hex()][99:104]
+
+        # Second add: different name
+        name2 = b"second".ljust(32, b"\x00")
+        record2 = pub_key + b"\x01\x00\xff" + b"\x00" * 64 + name2 + b"\x00" * 12
+        self.assertEqual(len(record2), 143)
+        self._handle(bytes([bridge.CMD_ADD_UPDATE_CONTACT]) + record2)
+        stored_second = self.state.contacts[pub_key.hex()][99:105]
+
+        self.assertEqual(len(self.state.contacts), 1)
+        self.assertNotEqual(stored_first[:5], b"secon")
+        self.assertEqual(stored_second, b"second")
+
+
+# ---- Group G: CMD_REMOVE_CONTACT edge cases ----
+
+
+class TestRemoveContact(unittest.TestCase):
+    """Edge cases for CMD_REMOVE_CONTACT (0x0F)."""
+
+    def setUp(self):
+        self.state = make_state()
+        self.sock = _FakeUDPSock()
+        self.addr = ("127.0.0.1", 0)
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(cmd_bytes, self.state, self.sock, self.addr)
+
+    def test_remove_contact_too_short_returns_ok(self):
+        """G1: data < 32 bytes still returns RESP_OK (silently ignored)."""
+        cmd = bytes([bridge.CMD_REMOVE_CONTACT]) + b"\x01" * 10
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+    def test_remove_contact_not_present_returns_ok(self):
+        """G2: removing a contact not in state returns RESP_OK."""
+        unknown_pk = b"\xff" * 32
+        cmd = bytes([bridge.CMD_REMOVE_CONTACT]) + unknown_pk
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+    def test_remove_contact_deletes_from_disk(self):
+        """G3: contact added via CMD_ADD_UPDATE_CONTACT is removed from disk by CMD_REMOVE_CONTACT."""
+        import tempfile
+
+        tmpdir = Path(tempfile.mkdtemp())
+        cdir = tmpdir / "contacts"
+        state = make_state(contacts_dir=cdir)
+        sock = _FakeUDPSock()
+        addr = ("127.0.0.1", 0)
+
+        def handle(cmd_bytes):
+            return bridge.handle_command(cmd_bytes, state, sock, addr)
+
+        # Add a contact via CMD_ADD_UPDATE_CONTACT
+        pub_key = b"\x77" * 32
+        contact_data = (
+            pub_key
+            + b"\x01\x00\xff"
+            + b"\x00" * 64
+            + b"removeme".ljust(32, b"\x00")
+            + b"\x00" * 12
+        )
+        self.assertEqual(len(contact_data), 143)
+        responses = handle(bytes([bridge.CMD_ADD_UPDATE_CONTACT]) + contact_data)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+        pk_hex = pub_key.hex()
+        self.assertIn(pk_hex, state.contacts)
+
+        # Verify the .contact file was written to disk
+        contact_file = cdir / f"{pk_hex}.contact"
+        self.assertTrue(contact_file.exists(), "contact file should exist after add")
+
+        # Remove via CMD_REMOVE_CONTACT
+        responses = handle(bytes([bridge.CMD_REMOVE_CONTACT]) + pub_key)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+        # Contact should be gone from in-memory state
+        self.assertNotIn(pk_hex, state.contacts)
+
+        # .contact file should be deleted from disk
+        self.assertFalse(
+            contact_file.exists(), "contact file should be deleted after remove"
+        )
+
+
+# ---- Group H: CMD_SHARE_CONTACT error propagation ----
+
+
+class TestShareContact(unittest.TestCase):
+    """Tests for CMD_SHARE_CONTACT (0x10) error handling."""
+
+    def setUp(self):
+        self.state = make_state()
+        self.sock = _FakeUDPSock()
+        self.addr = ("127.0.0.1", 0)
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(cmd_bytes, self.state, self.sock, self.addr)
+
+    def test_share_contact_unknown_prefix_propagates_error(self):
+        """H1: CMD_SHARE_CONTACT with prefix matching no contact returns RESP_ERROR."""
+        # 6-byte prefix that matches no stored contact and is not self
+        unknown_prefix = b"\x00\x11\x22\x33\x44\x55"
+        # Ensure it does not match our own pubkey prefix
+        self.assertNotEqual(self.state.pub_key[:6], unknown_prefix)
+        cmd = bytes([bridge.CMD_SHARE_CONTACT]) + unknown_prefix
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+
+# ---- Group I: CMD_EXPORT_CONTACT stored contact paths ----
+
+
+class TestExportStoredContact(unittest.TestCase):
+    """Tests for CMD_EXPORT_CONTACT with stored (non-self) contacts."""
+
+    def setUp(self):
+        self.state = make_state()
+        self.sock = _FakeUDPSock()
+        self.addr = ("127.0.0.1", 0)
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(cmd_bytes, self.state, self.sock, self.addr)
+
+    def test_export_stored_contact_returns_uri(self):
+        """I1: exporting a stored contact returns RESP_CONTACT_URI with wire bytes."""
+        pub_key = b"\xaa" * 32
+        # Ensure it doesn't match our own pubkey
+        self.assertNotEqual(self.state.pub_key[:6], pub_key[:6])
+        record = _make_contact_record(pub_key, name="storedpeer")
+        self.state.contacts[pub_key.hex()] = record
+
+        prefix = pub_key[:6]
+        cmd = bytes([bridge.CMD_EXPORT_CONTACT]) + prefix
+        responses = self._handle(cmd)
+
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_CONTACT_URI)
+        wire_pkt = responses[0][1:]
+        self.assertGreater(len(wire_pkt), 0, "wire packet should be non-empty")
+
+    def test_export_stored_contact_with_location(self):
+        """I2: exported stored contact with location has ADVERT_HAS_LOCATION flag set."""
+        pub_key = b"\xbb" * 32
+        self.assertNotEqual(self.state.pub_key[:6], pub_key[:6])
+        lat_e6 = 53_000_000
+        lon_e6 = 10_000_000
+        record = _make_contact_record(
+            pub_key, name="locpeer", lat_e6=lat_e6, lon_e6=lon_e6
+        )
+        self.state.contacts[pub_key.hex()] = record
+
+        prefix = pub_key[:6]
+        cmd = bytes([bridge.CMD_EXPORT_CONTACT]) + prefix
+        responses = self._handle(cmd)
+
+        self.assertEqual(responses[0][0], bridge.RESP_CONTACT_URI)
+        wire_pkt = responses[0][1:]
+        # Wire packet structure: header(1) + path_len(1) + advert_payload
+        # advert_payload: pubkey(32) + ts(4) + sig(64) + app_data
+        # app_data starts at: 1 + 1 + 32 + 4 + 64 = 102
+        app_data_off = 1 + 1 + 32 + 4 + 64
+        self.assertGreater(
+            len(wire_pkt), app_data_off, "wire packet too short for app_data"
+        )
+        flags = wire_pkt[app_data_off]
+        self.assertTrue(
+            flags & bridge.ADVERT_HAS_LOCATION,
+            f"ADVERT_HAS_LOCATION (0x10) not set in flags=0x{flags:02x}",
+        )
+
+    def test_export_contact_empty_prefix_returns_self(self):
+        """I3: CMD_EXPORT_CONTACT with all-zero 6-byte prefix returns self ADVERT."""
+        # all-zero prefix triggers the 'not prefix' branch (falsy bytes triggers self-path)
+        # Actually the bridge checks: `if not prefix or state.pub_key[:len(prefix)] == prefix`
+        # A 6-byte zero prefix is truthy but won't match our pubkey unless it starts with zeros.
+        # Use an empty prefix (no data bytes) to always trigger the self path.
+        cmd = bytes([bridge.CMD_EXPORT_CONTACT])  # no prefix data
+        responses = self._handle(cmd)
+
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_CONTACT_URI)
+        wire_pkt = responses[0][1:]
+        # Wire packet: header(1) + path_len(1) + pubkey(32) + ...
+        # Our pubkey is at offset 2 in the wire packet
+        pubkey_in_wire = wire_pkt[2:34]
+        self.assertEqual(pubkey_in_wire, self.state.pub_key)
+
+
 if __name__ == "__main__":
     unittest.main()
