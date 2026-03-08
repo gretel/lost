@@ -1229,7 +1229,7 @@ class TestSendChannelMsg(unittest.TestCase):
         cmd = bytes([bridge.CMD_SEND_CHAN_TXT_MSG, 0x00, 0x00]) + ts + text
         responses = self._handle(cmd)
         self.assertEqual(len(responses), 1)
-        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
 
         # Verify a CBOR TX request was sent via UDP
         self.udp_sock.settimeout(1.0)
@@ -1478,7 +1478,7 @@ class TestRegionScope(unittest.TestCase):
             cmd = bytes([bridge.CMD_SEND_CHAN_TXT_MSG, 0x00, 0x00]) + ts + b"hello"
             responses = bridge.handle_command(cmd, state, sock, addr)
             self.assertEqual(len(responses), 1)
-            self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+            self.assertEqual(responses[0][0], bridge.RESP_OK)
 
             sock.settimeout(1.0)
             data, _ = sock.recvfrom(65536)

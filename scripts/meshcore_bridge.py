@@ -1372,7 +1372,7 @@ def _handle_send_chan_txt_msg(
     udp_sock.sendto(cbor_msg, udp_addr)
     log.info("TX: %dB GRP_TXT to #%s", len(packet), channel.name)
 
-    return [state.build_msg_sent(flood=True)]
+    return [state.build_ok()]
 
 
 def _handle_set_channel(data: bytes, state: BridgeState) -> list[bytes]:
