@@ -368,6 +368,34 @@ class TestCommandHandler(unittest.TestCase):
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0][0], bridge.RESP_STATS)
 
+    def test_login_returns_msg_sent(self):
+        """CMD_LOGIN stub returns RESP_MSG_SENT (mccli awaits MSG_SENT)."""
+        cmd = bytes([bridge.CMD_LOGIN]) + b"payload"
+        responses = bridge.handle_command(cmd, self.state, None, None)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+
+    def test_status_req_returns_msg_sent(self):
+        """CMD_STATUS_REQ stub returns RESP_MSG_SENT."""
+        cmd = bytes([bridge.CMD_STATUS_REQ]) + b"payload"
+        responses = bridge.handle_command(cmd, self.state, None, None)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+
+    def test_trace_returns_msg_sent(self):
+        """CMD_TRACE stub returns RESP_MSG_SENT."""
+        cmd = bytes([bridge.CMD_TRACE]) + b"payload"
+        responses = bridge.handle_command(cmd, self.state, None, None)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+
+    def test_path_discovery_returns_msg_sent(self):
+        """CMD_PATH_DISCOVERY stub returns RESP_MSG_SENT."""
+        cmd = bytes([bridge.CMD_PATH_DISCOVERY]) + b"payload"
+        responses = bridge.handle_command(cmd, self.state, None, None)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+
 
 # ---- RX frame conversion tests ----
 

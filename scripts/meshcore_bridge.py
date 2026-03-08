@@ -136,8 +136,12 @@ CMD_REBOOT = 0x13
 CMD_GET_BATT_AND_STORAGE = 0x14
 CMD_SET_TUNING_PARAMS = 0x15
 CMD_DEVICE_QUERY = 0x16
+CMD_LOGIN = 0x1A
+CMD_STATUS_REQ = 0x1B
 CMD_GET_CHANNEL = 0x1F
 CMD_SET_CHANNEL = 0x20
+CMD_TRACE = 0x24
+CMD_PATH_DISCOVERY = 0x34
 CMD_GET_STATS = 0x38
 CMD_SEND_CONTROL_DATA = 0x37
 CMD_SET_FLOOD_SCOPE = 0x36
@@ -1170,6 +1174,10 @@ def handle_command(
 
     if cmd in (CMD_RESET_PATH, CMD_SET_TUNING_PARAMS, CMD_REBOOT):
         return [state.build_ok()]
+
+    if cmd in (CMD_LOGIN, CMD_STATUS_REQ, CMD_TRACE, CMD_PATH_DISCOVERY):
+        log.debug("companion: unimplemented repeater cmd 0x%02x (stub MSG_SENT)", cmd)
+        return [state.build_msg_sent(flood=True)]
 
     # Unknown command — return OK silently
     return [state.build_ok()]
