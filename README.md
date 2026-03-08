@@ -68,7 +68,7 @@ status_interval  = 10         # seconds between status log lines
 [meshcore]
 region_scope  = "de-nord"     # regional transport-code hashtag (or "" to disable)
 # port         = 7834         # TCP listen port  (default 7834; avoid 5000 on macOS)
-# name         = "gr4-lora"   # node display name shown to companion apps
+name         = "DO2THX 📡"   # node display name shown to companion apps
 # identity_file = "~/.config/gr4-lora/identity.bin"
 # keys_dir     = "~/.config/gr4-lora/keys"
 # channels_dir = "~/.config/gr4-lora/channels"
@@ -173,15 +173,64 @@ meshcore_bridge.py --port 5000       # for apps that require port 5000
 meshcore-cli -p 7834                 # connect with meshcore-cli
 ```
 
-Supported companion commands: `APP_START`, `DEVICE_QUERY`, `GET_CONTACTS`,
-`ADD_UPDATE_CONTACT`, `REMOVE_CONTACT`, `IMPORT_CONTACT`, `EXPORT_CONTACT`,
-`SHARE_CONTACT`, `SEND_TXT_MSG`, `SEND_CHAN_TXT_MSG`, `GET_CHANNEL`,
-`SET_CHANNEL`, `GET_MESSAGE`, `GET_BATTERY`, `GET_DEVICE_TIME`,
-`SET_DEVICE_TIME`, `SET_ADVERT_NAME`, `SEND_ADVERT`, `GET_STATS`,
-`SET_RADIO_PARAMS`, `SET_RADIO_TX_POWER`, `SET_ADVERT_LATLON`.
+#### Companion command matrix
 
-RX frames from `lora_trx` are decrypted (TXT_MSG / ANON_REQ / GRP_TXT) and
-pushed to the connected companion as `CONTACT_MSG_RECV_V3` / `CHANNEL_MSG_RECV_V3`.
+| Code | Command | Status | Notes |
+|------|---------|--------|-------|
+| 0x01 | `CMD_APP_START` | ✅ | Returns `PACKET_SELF_INFO` with radio params + pubkey + name |
+| 0x02 | `CMD_SEND_TXT_MSG` | ✅ | Encrypted TXT_MSG via lora_trx; flood scope / region key priority |
+| 0x03 | `CMD_SEND_CHAN_TXT_MSG` | ✅ | Encrypted GRP_TXT; flood scope / region key priority |
+| 0x04 | `CMD_GET_CONTACTS` | ✅ | Streams 147-byte contact records from contacts dir |
+| 0x05 | `CMD_GET_DEVICE_TIME` | ✅ | Returns current Unix time |
+| 0x06 | `CMD_SET_DEVICE_TIME` | ✅ | Updates in-memory clock offset |
+| 0x07 | `CMD_SEND_SELF_ADVERT` | ✅ | Builds and sends ADVERT via lora_trx |
+| 0x08 | `CMD_SET_ADVERT_NAME` | ✅ | Updates in-memory node name |
+| 0x09 | `CMD_ADD_UPDATE_CONTACT` | ✅ | Stores 147-byte record; persisted to contacts dir |
+| 0x0A | `CMD_SYNC_NEXT_MESSAGE` | ✅ | Dequeues next queued RX message |
+| 0x0B | `CMD_SET_RADIO_PARAMS` | ✅ | In-memory only; optional 5th byte sets repeat mode |
+| 0x0C | `CMD_SET_RADIO_TX_POWER` | ✅ | In-memory only; forwarded in next TX CBOR request |
+| 0x0D | `CMD_RESET_PATH` | ✅ stub | Returns OK; no path table maintained |
+| 0x0E | `CMD_SET_ADVERT_LATLON` | ✅ | In-memory lat/lon; included in next ADVERT TX |
+| 0x0F | `CMD_REMOVE_CONTACT` | ✅ | Deletes by 6-byte pubkey prefix; removes from contacts dir |
+| 0x10 | `CMD_SHARE_CONTACT` | ✅ | Returns `PACKET_EXPORT_CONTACT` with biz-card URI |
+| 0x11 | `CMD_EXPORT_CONTACT` | ✅ | Returns `PACKET_EXPORT_CONTACT` with biz-card URI |
+| 0x12 | `CMD_IMPORT_CONTACT` | ✅ | Decodes ADVERT wire packet, stores contact |
+| 0x13 | `CMD_REBOOT` | ✅ stub | Returns OK; bridge does not restart |
+| 0x14 | `CMD_GET_BATT_AND_STORAGE` | ✅ | Returns `PACKET_BATTERY` (fixed 100%, storage from contacts dir) |
+| 0x15 | `CMD_SET_TUNING_PARAMS` | ✅ stub | Returns OK; tuning params not applied |
+| 0x16 | `CMD_DEVICE_QUERY` | ✅ | Returns `PACKET_DEVICE_INFO` (82 bytes, fw v10) |
+| 0x1F | `CMD_GET_CHANNEL` | ✅ | Returns `PACKET_CHANNEL_INFO` from channels dir |
+| 0x20 | `CMD_SET_CHANNEL` | ✅ | Stores channel; persisted to channels dir |
+| 0x36 | `CMD_SET_FLOOD_SCOPE` | ✅ | Sets 16-byte send_scope key; overrides region_key in TX |
+| 0x38 | `CMD_GET_STATS` | ✅ | Sub-types 0 (core), 1 (radio), 2 (packets) — live values |
+| 0x3A | `CMD_SET_AUTOADD_CONFIG` | ✅ | Bitmask + optional max_hops (clamped to 64) |
+| 0x3B | `CMD_GET_AUTOADD_CONFIG` | ✅ | Returns 3-byte response with bitmask + max_hops |
+| 0x3C | `CMD_GET_ALLOWED_REPEAT_FREQ` | ✅ | Returns 3 freq pairs: 433 / 869 / 918 MHz |
+| 0x3D | `CMD_SET_PATH_HASH_MODE` | ✅ | Mode 0–2; discriminator byte validated |
+
+#### Push / unsolicited responses
+
+| Code | Name | Status | Notes |
+|------|------|--------|-------|
+| 0x82 | `PUSH_SEND_CONFIRMED` | ✅ | Sent when RF ACK matches outbound TX tag |
+| 0x83 | `PUSH_MSG_WAITING` | ✅ | Sent when RX frame queued while companion is idle |
+| 0x8A | `PUSH_NEW_ADVERT` | ✅ | Sent on new ADVERT RX (147-byte contact record) |
+| 0x80 | `PUSH_ADVERTISEMENT` | — | Legacy; bridge emits 0x8A instead |
+| 0x81 | `PUSH_PATH_UPDATE` | — | Not produced (no path table) |
+| 0x88 | `PUSH_LOG_DATA` | — | Not produced |
+
+#### RX frame handling
+
+RX frames from `lora_trx` are decrypted and pushed to the connected companion as
+`CONTACT_MSG_RECV_V3` / `CHANNEL_MSG_RECV_V3`.
+
+| Frame type | Handled | Notes |
+|------------|---------|-------|
+| ADVERT | ✅ | Key learned, contact auto-added, `PUSH_NEW_ADVERT` sent |
+| TXT_MSG | ✅ | ECDH trial decryption; RF ACK TX on success |
+| ANON_REQ | ✅ | Decrypted; RESP sent (no RF ACK) |
+| GRP_TXT | ✅ | PSK decryption using channels dir |
+| Packet forwarding | ✅ | Raw re-TX when `client_repeat != 0` (echo-filtered) |
 Contacts and channels are persisted across restarts.
 
 **Identity and data directories** (all configurable in `[meshcore]` or via CLI):
@@ -215,7 +264,7 @@ Publishes decoded LoRa frames to the letsmesh.net MQTT packet analyzer
 # C++ (7 suites, ~17s)
 ctest --test-dir build -R qa_lora --output-on-failure --timeout 60
 
-# Python (310 tests)
+# Python (373 tests)
 .venv/bin/python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
@@ -225,9 +274,10 @@ ctest --test-dir build -R qa_lora --output-on-failure --timeout 60
 | `test_meshcore_tx.py` | 37 | MeshCore TX packet construction |
 | `test_meshcore_integration.py` | 28 | MeshCore encode-decode round-trips |
 | `test_meshcore_crypto.py` | 41 | ECDH, AES, identity, key store |
-| `test_meshcore_bridge.py` | 124 | Companion protocol, RX conversion, edge cases |
+| `test_meshcore_bridge.py` | 159 | Companion protocol, RX conversion, repeat mode, flood scope, autoadd, path hash mode |
 | `test_meshcore_bridge_integration.py` | 12 | Bridge integration (APP_START→TX round-trip) |
 | `test_lora_mqtt.py` | 27 | MQTT bridge frame conversion |
+| `test_meshcore_tx.py` | 28 | MeshCore TX (already counted above) |
 
 ## License
 
