@@ -138,6 +138,11 @@ CMD_DEVICE_QUERY = 0x16
 CMD_GET_CHANNEL = 0x1F
 CMD_SET_CHANNEL = 0x20
 CMD_GET_STATS = 0x38
+CMD_SET_FLOOD_SCOPE = 0x36
+CMD_SET_AUTOADD_CONFIG = 0x3A
+CMD_GET_AUTOADD_CONFIG = 0x3B
+CMD_GET_ALLOWED_REPEAT_FREQ = 0x3C
+CMD_SET_PATH_HASH_MODE = 0x3D
 
 # Response codes (bridge -> client)
 RESP_OK = 0x00
@@ -158,6 +163,14 @@ RESP_CONTACT_MSG_RECV_V3 = 0x10
 RESP_CHANNEL_MSG_RECV_V3 = 0x11
 RESP_CHANNEL_INFO = 0x12
 RESP_STATS = 0x18
+RESP_CODE_AUTOADD_CONFIG = 0x19
+RESP_ALLOWED_REPEAT_FREQ = 0x1A
+
+# Error codes
+ERR_CODE_ILLEGAL_ARG = 6
+
+# Repeat mode: valid frequencies (kHz) for client_repeat = 1
+REPEAT_FREQ_RANGES = [(433000, 433000), (869000, 869000), (918000, 918000)]
 
 # Push codes (bridge -> client, unsolicited)
 PUSH_ADVERTISEMENT = 0x80
@@ -165,6 +178,14 @@ PUSH_PATH_UPDATE = 0x81
 PUSH_ACK = 0x82
 PUSH_MESSAGES_WAITING = 0x83
 PUSH_NEW_ADVERT = 0x8A
+
+# ---- Helpers ----
+
+
+def _is_valid_repeat_freq(freq_khz: int) -> bool:
+    """Return True if freq_khz is in one of the allowed repeat frequency ranges."""
+    return any(lo <= freq_khz <= hi for lo, hi in REPEAT_FREQ_RANGES)
+
 
 # ---- Companion frame codec ----
 
@@ -239,6 +260,11 @@ class BridgeState:
         channels_dir: Path | None = None,
         contacts_dir: Path | None = None,
         region_scope: str = "",
+        client_repeat: int = 0,
+        path_hash_mode: int = 0,
+        send_scope: bytes = b"\x00" * 16,
+        autoadd_config: int = 0,
+        autoadd_max_hops: int = 0,
     ) -> None:
         self.pub_key = pub_key
         self.expanded_prv = expanded_prv
@@ -301,6 +327,14 @@ class BridgeState:
         # Load group channels from disk
         self.channels: list[GroupChannel] = load_channels(self.channels_dir)
 
+        # Repeat mode state (in-memory; set by companion commands or config at startup)
+        self.client_repeat: int = client_repeat
+        self.path_hash_mode: int = path_hash_mode
+        # send_scope: 16-byte raw TransportKey; all-zero = null (disabled)
+        self.send_scope: bytes = send_scope if len(send_scope) == 16 else b"\x00" * 16
+        self.autoadd_config: int = autoadd_config
+        self.autoadd_max_hops: int = autoadd_max_hops
+
     def build_self_info(self) -> bytes:
         """Build SELF_INFO (0x05) response payload."""
         # Convert freq/bw to milli-Hz (uint32 LE)
@@ -334,7 +368,7 @@ class BridgeState:
         return bytes(buf)
 
     def build_device_info(self) -> bytes:
-        """Build DEVICE_INFO (0x0D) response payload."""
+        """Build DEVICE_INFO (0x0D) response payload (82 bytes total)."""
         buf = bytearray()
         buf.append(RESP_DEVICE_INFO)
         buf.append(9)  # fw_ver (protocol version 9, matches CMD_DEVICE_QUERY ver=3)
@@ -344,6 +378,8 @@ class BridgeState:
         buf.extend(b"gr4-lora\x00\x00\x00\x00")  # fw_build (12 bytes)
         buf.extend(b"gr4-lora bridge".ljust(40, b"\x00"))  # model (40 bytes)
         buf.extend(b"0.1.0".ljust(20, b"\x00"))  # version (20 bytes)
+        buf.append(self.client_repeat)  # byte 80: client_repeat (v9+)
+        buf.append(self.path_hash_mode)  # byte 81: path_hash_mode (v10+)
         return bytes(buf)
 
     def build_battery(self) -> bytes:
@@ -996,23 +1032,35 @@ def handle_command(
         return [state.build_ok()]
 
     if cmd == CMD_SET_RADIO_PARAMS:
-        # Data: freq_hz(4 LE u32) + bw_hz(4 LE u32) + sf(1) + cr(1)
+        # Data: freq_hz(4 LE u32) + bw_hz(4 LE u32) + sf(1) + cr(1) [+ repeat(1)]
         if len(data) >= 10:
             freq_hz = struct.unpack_from("<I", data, 0)[0]
             bw_hz = struct.unpack_from("<I", data, 4)[0]
             sf_new = data[8]
             cr_new = data[9]
+            # Optional 5th byte: repeat flag (firmware v9+)
+            if len(data) >= 11:
+                repeat = data[10]
+                if repeat and not _is_valid_repeat_freq(freq_hz // 1000):
+                    log.warning(
+                        "companion: SET_RADIO_PARAMS repeat=1 rejected: "
+                        "freq %d kHz not in allowed repeat ranges",
+                        freq_hz // 1000,
+                    )
+                    return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
+                state.client_repeat = repeat
             state.freq_mhz = freq_hz / 1_000_000.0
             state.bw_khz = bw_hz / 1_000.0
             state.sf = sf_new
             state.cr = cr_new
             log.warning(
                 "companion: SET_RADIO_PARAMS freq=%.3f MHz bw=%.1f kHz sf=%d cr=%d "
-                "(RX retune requires lora_trx restart)",
+                "repeat=%d (RX retune requires lora_trx restart)",
                 state.freq_mhz,
                 state.bw_khz,
                 state.sf,
                 state.cr,
+                state.client_repeat,
             )
         return [state.build_ok()]
 
@@ -1060,6 +1108,52 @@ def handle_command(
                 state.lat_e6 / 1e6,
                 state.lon_e6 / 1e6,
             )
+        return [state.build_ok()]
+
+    if cmd == CMD_SET_FLOOD_SCOPE:
+        # Frame: [0x36][0x00][key?:16]  (second byte is discriminator, must be 0)
+        if not data or data[0] != 0:
+            return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
+        if len(data) >= 17:  # discriminator(1) + key(16)
+            state.send_scope = bytes(data[1:17])
+            log.info("companion: SET_FLOOD_SCOPE key=%s", state.send_scope.hex())
+        else:
+            state.send_scope = b"\x00" * 16  # clear scope
+            log.info("companion: SET_FLOOD_SCOPE cleared")
+        return [state.build_ok()]
+
+    if cmd == CMD_GET_ALLOWED_REPEAT_FREQ:
+        buf = bytearray([RESP_ALLOWED_REPEAT_FREQ])
+        for lo, hi in REPEAT_FREQ_RANGES:
+            buf += struct.pack("<II", lo, hi)
+        return [bytes(buf)]
+
+    if cmd == CMD_SET_AUTOADD_CONFIG:
+        state.autoadd_config = data[0] if data else 0
+        if len(data) >= 2:
+            state.autoadd_max_hops = min(data[1], 64)
+        log.info(
+            "companion: SET_AUTOADD_CONFIG config=0x%02x max_hops=%d",
+            state.autoadd_config,
+            state.autoadd_max_hops,
+        )
+        return [state.build_ok()]
+
+    if cmd == CMD_GET_AUTOADD_CONFIG:
+        return [
+            bytes(
+                [RESP_CODE_AUTOADD_CONFIG, state.autoadd_config, state.autoadd_max_hops]
+            )
+        ]
+
+    if cmd == CMD_SET_PATH_HASH_MODE:
+        # Frame: [0x3D][0x00][mode(1)]  (second byte is discriminator, must be 0)
+        if len(data) < 2 or data[0] != 0:
+            return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
+        if data[1] >= 3:
+            return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
+        state.path_hash_mode = data[1]
+        log.info("companion: SET_PATH_HASH_MODE mode=%d", state.path_hash_mode)
         return [state.build_ok()]
 
     if cmd in (CMD_RESET_PATH, CMD_SET_TUNING_PARAMS, CMD_REBOOT):
@@ -1136,13 +1230,15 @@ def _handle_send_txt_msg(
         attempt=attempt,
     )
 
-    if state.region_key:
+    # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
+    active_key = state.send_scope if any(state.send_scope) else state.region_key
+    if active_key:
         # Repackage with T_DIRECT route and transport codes.
         # Original packet (ROUTE_DIRECT): header(1) + path_len(1) + payload
         from meshcore_tx import build_wire_packet, make_header
 
         txt_payload = packet[2:]  # skip header + path_len (both 1 byte)
-        tc1 = _compute_transport_code(state.region_key, PAYLOAD_TXT, txt_payload)
+        tc1 = _compute_transport_code(active_key, PAYLOAD_TXT, txt_payload)
         header = make_header(ROUTE_T_DIRECT, PAYLOAD_TXT)
         packet = build_wire_packet(header, txt_payload, transport_codes=(tc1, 0))
 
@@ -1180,14 +1276,15 @@ def _handle_send_advert(
     lat = state.lat_e6 / 1e6 if state.lat_e6 != 0 else None
     lon = state.lon_e6 / 1e6 if state.lon_e6 != 0 else None
 
-    if state.region_key:
-        # Build with T_FLOOD route, then compute transport code over the
-        # payload and repackage with transport codes.
+    # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
+    active_key = state.send_scope if any(state.send_scope) else state.region_key
+    if active_key:
+        # Build with T_FLOOD route + transport codes.
         tmp = build_advert(state.seed, state.pub_key, name=state.name, lat=lat, lon=lon)
         # Extract payload: skip header(1) + path_len(1) — no transport codes
         # in the default ROUTE_FLOOD packet.
         advert_payload = tmp[2:]
-        tc1 = _compute_transport_code(state.region_key, PAYLOAD_ADVERT, advert_payload)
+        tc1 = _compute_transport_code(active_key, PAYLOAD_ADVERT, advert_payload)
         from meshcore_tx import make_header
 
         header = make_header(ROUTE_T_FLOOD, PAYLOAD_ADVERT)
@@ -1252,9 +1349,11 @@ def _handle_send_chan_txt_msg(
 
     grp_payload = build_grp_txt(channel, state.name, text_str, timestamp=ts)
 
-    if state.region_key:
+    # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
+    active_key = state.send_scope if any(state.send_scope) else state.region_key
+    if active_key:
         # Use T_FLOOD with transport codes
-        tc1 = _compute_transport_code(state.region_key, PAYLOAD_GRP_TXT, grp_payload)
+        tc1 = _compute_transport_code(active_key, PAYLOAD_GRP_TXT, grp_payload)
         header = make_header(ROUTE_T_FLOOD, PAYLOAD_GRP_TXT)
         packet = build_wire_packet(header, grp_payload, transport_codes=(tc1, 0))
     else:
@@ -1732,6 +1831,17 @@ def run_bridge(
                             udp_sock.sendto(cbor_msg, udp_addr)
                             log.info("TX ACK: %s (%dB)", ack_pkt.hex(), len(ack_pkt))
 
+                    # Packet forwarding: when client_repeat is enabled, re-transmit
+                    # the raw received wire packet back to the RF medium (repeater mode).
+                    # Excluded: packets we sent ourselves (already filtered by recent_tx
+                    # echo check above) and zero-length payloads.
+                    if state.client_repeat and rx_payload:
+                        from meshcore_tx import make_cbor_tx_request
+
+                        fwd_cbor = make_cbor_tx_request(rx_payload)
+                        udp_sock.sendto(fwd_cbor, udp_addr)
+                        log.info("repeat: forwarded %dB", len(rx_payload))
+
                     for companion_msg in companion_msgs:
                         # ACK pushes (PUSH_ACK) are sent immediately, not queued
                         if companion_msg[0] == PUSH_ACK:
@@ -1934,6 +2044,25 @@ def main() -> None:
     else:
         contacts_dir = Path(meshcore_cfg.get("contacts_dir", DEFAULT_CONTACTS_DIR))
 
+    # Repeat mode settings (config.toml [meshcore] only, no CLI flags)
+    startup_client_repeat = int(meshcore_cfg.get("client_repeat", 0))
+    startup_path_hash_mode = int(meshcore_cfg.get("path_hash_mode", 0))
+    startup_autoadd_config = int(meshcore_cfg.get("autoadd_config", 0))
+    startup_autoadd_max_hops = min(int(meshcore_cfg.get("autoadd_max_hops", 0)), 64)
+    flood_scope_hex = meshcore_cfg.get("flood_scope", "")
+    try:
+        startup_send_scope = (
+            bytes.fromhex(flood_scope_hex) if flood_scope_hex else b"\x00" * 16
+        )
+        if len(startup_send_scope) != 16:
+            log.warning(
+                "[meshcore] flood_scope must be exactly 32 hex chars (16 bytes); ignoring"
+            )
+            startup_send_scope = b"\x00" * 16
+    except ValueError:
+        log.warning("[meshcore] flood_scope is not valid hex; ignoring")
+        startup_send_scope = b"\x00" * 16
+
     # Load identity (now that identity_file is resolved)
     expanded_prv, pub_key, seed = load_or_create_identity(identity_file)
     log.info("identity: %s", pub_key.hex())
@@ -1967,6 +2096,11 @@ def main() -> None:
         region_scope=region_scope,
         lat_e6=lat_e6,
         lon_e6=lon_e6,
+        client_repeat=startup_client_repeat,
+        path_hash_mode=startup_path_hash_mode,
+        send_scope=startup_send_scope,
+        autoadd_config=startup_autoadd_config,
+        autoadd_max_hops=startup_autoadd_max_hops,
     )
 
     # Load persisted contacts from disk

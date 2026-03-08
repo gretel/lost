@@ -72,6 +72,16 @@ def make_state(**kwargs):
     return bridge.BridgeState(**defaults)
 
 
+class _FakeUDPSock:
+    """Minimal UDP socket mock that captures sendto calls."""
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    def sendto(self, data: bytes, addr: object) -> None:
+        self.sent.append(data)
+
+
 # ---- Frame codec tests ----
 
 
@@ -2075,6 +2085,390 @@ class TestContactStoreEdgeCases(unittest.TestCase):
             )
         finally:
             self.contacts_dir.chmod(0o755)
+
+
+# ---- Repeat mode tests ----
+
+
+class TestDeviceInfoRepeatMode(unittest.TestCase):
+    """PACKET_DEVICE_INFO byte layout with repeat-mode fields."""
+
+    def test_device_info_length(self):
+        """build_device_info returns 82 bytes."""
+        state = make_state()
+        info = state.build_device_info()
+        self.assertEqual(len(info), 82)
+
+    def test_device_info_client_repeat_default(self):
+        """Byte 80 of DEVICE_INFO is 0 by default."""
+        state = make_state()
+        info = state.build_device_info()
+        self.assertEqual(info[80], 0)
+
+    def test_device_info_client_repeat_set(self):
+        """Byte 80 of DEVICE_INFO reflects state.client_repeat."""
+        state = make_state()
+        state.client_repeat = 1
+        info = state.build_device_info()
+        self.assertEqual(info[80], 1)
+
+    def test_device_info_path_hash_mode_default(self):
+        """Byte 81 of DEVICE_INFO is 0 by default."""
+        state = make_state()
+        info = state.build_device_info()
+        self.assertEqual(info[81], 0)
+
+    def test_device_info_path_hash_mode_set(self):
+        """Byte 81 of DEVICE_INFO reflects state.path_hash_mode."""
+        state = make_state()
+        state.path_hash_mode = 2
+        info = state.build_device_info()
+        self.assertEqual(info[81], 2)
+
+
+class TestSetFloodScope(unittest.TestCase):
+    """CMD_SET_FLOOD_SCOPE (0x36) handler."""
+
+    def _cmd(self, payload):
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        return state, result
+
+    def test_set_scope_key(self):
+        """18-byte frame sets send_scope to the 16-byte key."""
+        key = bytes(range(16))
+        payload = bytes([bridge.CMD_SET_FLOOD_SCOPE, 0x00]) + key
+        state, result = self._cmd(payload)
+        self.assertEqual(state.send_scope, key)
+        self.assertEqual(result[0][0], bridge.RESP_OK)
+
+    def test_clear_scope_short_frame(self):
+        """Short frame (< 18 bytes) clears send_scope to all-zero."""
+        # First set a key
+        state = make_state()
+        state.send_scope = bytes(range(16))
+        null_sock = _FakeUDPSock()
+        # Send clear command (only discriminator, no key)
+        payload = bytes([bridge.CMD_SET_FLOOD_SCOPE, 0x00])
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(state.send_scope, b"\x00" * 16)
+        self.assertEqual(result[0][0], bridge.RESP_OK)
+
+    def test_bad_discriminator_returns_error(self):
+        """Non-zero discriminator byte returns ERR_CODE_ILLEGAL_ARG."""
+        key = bytes(range(16))
+        payload = bytes([bridge.CMD_SET_FLOOD_SCOPE, 0x01]) + key
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(result[0][0], bridge.RESP_ERROR)
+        self.assertEqual(result[0][1], bridge.ERR_CODE_ILLEGAL_ARG)
+
+    def test_empty_data_returns_error(self):
+        """Empty data (no discriminator) returns ERR_CODE_ILLEGAL_ARG."""
+        payload = bytes([bridge.CMD_SET_FLOOD_SCOPE])
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(result[0][0], bridge.RESP_ERROR)
+
+
+class TestGetAllowedRepeatFreq(unittest.TestCase):
+    """CMD_GET_ALLOWED_REPEAT_FREQ (0x3C) handler."""
+
+    def test_response_length(self):
+        """Response is 1 + 3*8 = 25 bytes."""
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        payload = bytes([bridge.CMD_GET_ALLOWED_REPEAT_FREQ])
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(len(result[0]), 25)
+
+    def test_response_code(self):
+        """First byte is RESP_ALLOWED_REPEAT_FREQ (0x1A)."""
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        payload = bytes([bridge.CMD_GET_ALLOWED_REPEAT_FREQ])
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(result[0][0], bridge.RESP_ALLOWED_REPEAT_FREQ)
+
+    def test_correct_freq_ranges(self):
+        """Response contains the 3 correct (lo, hi) pairs in kHz."""
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        payload = bytes([bridge.CMD_GET_ALLOWED_REPEAT_FREQ])
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        data = result[0][1:]  # skip response code
+        pairs = [struct.unpack_from("<II", data, i * 8) for i in range(3)]
+        self.assertEqual(pairs, list(bridge.REPEAT_FREQ_RANGES))
+
+
+class TestSetRadioParamsRepeat(unittest.TestCase):
+    """CMD_SET_RADIO_PARAMS optional repeat byte (byte 10)."""
+
+    def _radio_params(self, freq_hz, repeat=None):
+        """Build a CMD_SET_RADIO_PARAMS payload."""
+        bw_hz = 62500
+        sf = 8
+        cr = 8
+        payload = (
+            bytes([bridge.CMD_SET_RADIO_PARAMS])
+            + struct.pack("<II", freq_hz, bw_hz)
+            + bytes([sf, cr])
+        )
+        if repeat is not None:
+            payload += bytes([repeat])
+        return payload
+
+    def test_repeat_valid_freq_sets_flag(self):
+        """Valid repeat freq (869000 kHz) + repeat=1 sets client_repeat."""
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        payload = self._radio_params(869000 * 1000, repeat=1)
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(result[0][0], bridge.RESP_OK)
+        self.assertEqual(state.client_repeat, 1)
+
+    def test_repeat_433mhz_valid(self):
+        """433000 kHz is a valid repeat frequency."""
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        payload = self._radio_params(433000 * 1000, repeat=1)
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(result[0][0], bridge.RESP_OK)
+        self.assertEqual(state.client_repeat, 1)
+
+    def test_repeat_918mhz_valid(self):
+        """918000 kHz is a valid repeat frequency."""
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        payload = self._radio_params(918000 * 1000, repeat=1)
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(result[0][0], bridge.RESP_OK)
+        self.assertEqual(state.client_repeat, 1)
+
+    def test_repeat_invalid_freq_returns_error(self):
+        """Invalid freq (868618 kHz) + repeat=1 returns ERR_CODE_ILLEGAL_ARG."""
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        payload = self._radio_params(868618000, repeat=1)
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(result[0][0], bridge.RESP_ERROR)
+        self.assertEqual(result[0][1], bridge.ERR_CODE_ILLEGAL_ARG)
+        self.assertEqual(state.client_repeat, 0)  # unchanged
+
+    def test_repeat_zero_always_ok(self):
+        """repeat=0 is accepted regardless of frequency."""
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        payload = self._radio_params(868618000, repeat=0)
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(result[0][0], bridge.RESP_OK)
+        self.assertEqual(state.client_repeat, 0)
+
+    def test_no_repeat_byte_leaves_client_repeat_unchanged(self):
+        """Missing 5th byte does not change client_repeat."""
+        state = make_state()
+        state.client_repeat = 1  # pre-set
+        null_sock = _FakeUDPSock()
+        payload = self._radio_params(869000 * 1000, repeat=None)
+        bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(state.client_repeat, 1)  # unchanged
+
+
+class TestAutoaddConfig(unittest.TestCase):
+    """CMD_SET_AUTOADD_CONFIG (0x3A) and CMD_GET_AUTOADD_CONFIG (0x3B)."""
+
+    def _cmd(self, payload):
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        return state, result
+
+    def test_set_config_bitmask(self):
+        """SET_AUTOADD_CONFIG stores bitmask."""
+        bitmask = 0x1F  # all bits
+        payload = bytes([bridge.CMD_SET_AUTOADD_CONFIG, bitmask])
+        state, result = self._cmd(payload)
+        self.assertEqual(result[0][0], bridge.RESP_OK)
+        self.assertEqual(state.autoadd_config, bitmask)
+
+    def test_set_config_with_max_hops(self):
+        """SET_AUTOADD_CONFIG stores bitmask and max_hops."""
+        payload = bytes([bridge.CMD_SET_AUTOADD_CONFIG, 0x07, 10])
+        state, result = self._cmd(payload)
+        self.assertEqual(state.autoadd_config, 0x07)
+        self.assertEqual(state.autoadd_max_hops, 10)
+
+    def test_set_config_max_hops_clamped(self):
+        """max_hops > 64 is clamped to 64."""
+        payload = bytes([bridge.CMD_SET_AUTOADD_CONFIG, 0x00, 100])
+        state, result = self._cmd(payload)
+        self.assertEqual(state.autoadd_max_hops, 64)
+
+    def test_get_config(self):
+        """GET_AUTOADD_CONFIG returns RESP_CODE_AUTOADD_CONFIG + bitmask + max_hops."""
+        state = make_state()
+        state.autoadd_config = 0x05
+        state.autoadd_max_hops = 7
+        null_sock = _FakeUDPSock()
+        payload = bytes([bridge.CMD_GET_AUTOADD_CONFIG])
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(len(result[0]), 3)
+        self.assertEqual(result[0][0], bridge.RESP_CODE_AUTOADD_CONFIG)
+        self.assertEqual(result[0][1], 0x05)
+        self.assertEqual(result[0][2], 7)
+
+
+class TestSetPathHashMode(unittest.TestCase):
+    """CMD_SET_PATH_HASH_MODE (0x3D) handler."""
+
+    def _cmd(self, payload):
+        state = make_state()
+        null_sock = _FakeUDPSock()
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        return state, result
+
+    def test_valid_modes(self):
+        """Modes 0, 1, 2 are accepted and stored."""
+        for mode in (0, 1, 2):
+            with self.subTest(mode=mode):
+                payload = bytes([bridge.CMD_SET_PATH_HASH_MODE, 0x00, mode])
+                state, result = self._cmd(payload)
+                self.assertEqual(result[0][0], bridge.RESP_OK)
+                self.assertEqual(state.path_hash_mode, mode)
+
+    def test_invalid_mode_returns_error(self):
+        """Mode >= 3 returns ERR_CODE_ILLEGAL_ARG."""
+        for mode in (3, 10, 255):
+            with self.subTest(mode=mode):
+                payload = bytes([bridge.CMD_SET_PATH_HASH_MODE, 0x00, mode])
+                state, result = self._cmd(payload)
+                self.assertEqual(result[0][0], bridge.RESP_ERROR)
+                self.assertEqual(result[0][1], bridge.ERR_CODE_ILLEGAL_ARG)
+
+    def test_bad_discriminator_returns_error(self):
+        """Non-zero discriminator byte returns ERR_CODE_ILLEGAL_ARG."""
+        payload = bytes([bridge.CMD_SET_PATH_HASH_MODE, 0x01, 0])
+        state, result = self._cmd(payload)
+        self.assertEqual(result[0][0], bridge.RESP_ERROR)
+        self.assertEqual(result[0][1], bridge.ERR_CODE_ILLEGAL_ARG)
+
+    def test_short_frame_returns_error(self):
+        """Frame with < 2 data bytes returns error."""
+        payload = bytes([bridge.CMD_SET_PATH_HASH_MODE, 0x00])
+        state, result = self._cmd(payload)
+        self.assertEqual(result[0][0], bridge.RESP_ERROR)
+
+
+class TestSendScopePriority(unittest.TestCase):
+    """send_scope overrides region_key in TX handlers."""
+
+    def test_send_scope_overrides_region_key_in_advert(self):
+        """Non-null send_scope is used instead of region_key for ADVERT TX."""
+        scope_key = bytes(range(16))
+        state = make_state(region_scope="de-nord")
+        state.send_scope = scope_key
+        # region_key is also set (from "de-nord")
+        self.assertTrue(len(state.region_key) == 16)
+
+        null_sock = _FakeUDPSock()
+        payload = bytes([bridge.CMD_SEND_SELF_ADVERT, 0x01])
+        bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+
+        # The TX packet must have T_FLOOD route (header & 0x03 == 0 = T_FLOOD)
+        self.assertTrue(len(null_sock.sent) > 0, "no UDP packet sent")
+        # Decode CBOR to get the wire packet
+        import cbor2
+
+        cbor_msg = cbor2.loads(null_sock.sent[0])
+        wire = cbor_msg.get("payload", b"")
+        self.assertTrue(len(wire) > 0)
+        # Header byte route type must be T_FLOOD (0) — transport codes present
+        route_type = wire[0] & 0x03
+        self.assertEqual(
+            route_type, 0, f"expected T_FLOOD(0), got route_type={route_type}"
+        )
+
+    def test_null_scope_falls_back_to_region_key(self):
+        """All-zero send_scope falls back to region_key."""
+        state = make_state(region_scope="de-nord")
+        state.send_scope = b"\x00" * 16  # null scope
+
+        null_sock = _FakeUDPSock()
+        payload = bytes([bridge.CMD_SEND_SELF_ADVERT, 0x01])
+        bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+
+        self.assertTrue(len(null_sock.sent) > 0, "no UDP packet sent")
+        import cbor2
+
+        cbor_msg = cbor2.loads(null_sock.sent[0])
+        wire = cbor_msg.get("payload", b"")
+        # region_key is set → T_FLOOD (route_type 0) should still be used
+        route_type = wire[0] & 0x03
+        self.assertEqual(route_type, 0)
+
+    def test_no_key_uses_plain_flood(self):
+        """No send_scope and no region_key → plain FLOOD (route_type 1)."""
+        state = make_state()  # no region_scope
+        state.send_scope = b"\x00" * 16  # null scope
+
+        null_sock = _FakeUDPSock()
+        payload = bytes([bridge.CMD_SEND_SELF_ADVERT, 0x01])
+        bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+
+        self.assertTrue(len(null_sock.sent) > 0, "no UDP packet sent")
+        import cbor2
+
+        cbor_msg = cbor2.loads(null_sock.sent[0])
+        wire = cbor_msg.get("payload", b"")
+        route_type = wire[0] & 0x03
+        self.assertEqual(
+            route_type, 1, f"expected FLOOD(1), got route_type={route_type}"
+        )
+
+
+class TestStartupConfig(unittest.TestCase):
+    """BridgeState fields set from constructor keyword args (config.toml startup values)."""
+
+    def test_client_repeat_startup(self):
+        """client_repeat=1 at construction is reflected in DEVICE_INFO byte 80."""
+        state = make_state(client_repeat=1)
+        info = state.build_device_info()
+        self.assertEqual(info[80], 1)
+
+    def test_path_hash_mode_startup(self):
+        """path_hash_mode=2 at construction is reflected in DEVICE_INFO byte 81."""
+        state = make_state(path_hash_mode=2)
+        info = state.build_device_info()
+        self.assertEqual(info[81], 2)
+
+    def test_send_scope_startup(self):
+        """send_scope set at construction is stored correctly."""
+        key = bytes(range(16))
+        state = make_state(send_scope=key)
+        self.assertEqual(state.send_scope, key)
+
+    def test_send_scope_wrong_length_defaults_to_null(self):
+        """send_scope with wrong length (not 16) is replaced by all-zero."""
+        state = make_state(send_scope=b"\x01\x02")
+        self.assertEqual(state.send_scope, b"\x00" * 16)
+
+    def test_autoadd_config_startup(self):
+        """autoadd_config=0x0F at construction is stored correctly."""
+        state = make_state(autoadd_config=0x0F, autoadd_max_hops=32)
+        self.assertEqual(state.autoadd_config, 0x0F)
+        self.assertEqual(state.autoadd_max_hops, 32)
+
+    def test_is_valid_repeat_freq_helper(self):
+        """_is_valid_repeat_freq correctly accepts/rejects frequencies."""
+        self.assertTrue(bridge._is_valid_repeat_freq(433000))
+        self.assertTrue(bridge._is_valid_repeat_freq(869000))
+        self.assertTrue(bridge._is_valid_repeat_freq(918000))
+        self.assertFalse(bridge._is_valid_repeat_freq(868000))
+        self.assertFalse(bridge._is_valid_repeat_freq(868618))
+        self.assertFalse(bridge._is_valid_repeat_freq(0))
 
 
 if __name__ == "__main__":

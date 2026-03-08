@@ -32,14 +32,20 @@ status_interval = 10
 
 [meshcore]
 region_scope = "de-nord"
-# port         = 7834                              # TCP listen port (avoid 5000 on macOS)
-# name         = "gr4-lora"                        # node display name
-# identity_file = "~/.config/gr4-lora/identity.bin"
-# keys_dir     = "~/.config/gr4-lora/keys"
-# channels_dir = "~/.config/gr4-lora/channels"
-# contacts_dir = "~/.config/gr4-lora/contacts"
-# lat          = 53.55                             # latitude  (decimal degrees)
-# lon          = 9.99                              # longitude (decimal degrees)
+# port              = 7834                         # TCP listen port (avoid 5000 on macOS)
+# name              = "gr4-lora"                   # node display name
+# identity_file     = "~/.config/gr4-lora/identity.bin"
+# keys_dir          = "~/.config/gr4-lora/keys"
+# channels_dir      = "~/.config/gr4-lora/channels"
+# contacts_dir      = "~/.config/gr4-lora/contacts"
+# lat               = 53.55                        # latitude  (decimal degrees)
+# lon               = 9.99                         # longitude (decimal degrees)
+# client_repeat     = 0                            # 0=off, 1=on (only valid at 433/869/918 MHz)
+# path_hash_mode    = 0                            # 0-2 (path hash mode for flood TX)
+# autoadd_config    = 0                            # bitmask: 0x01=overwrite oldest, 0x02=chat,
+#                                                  #   0x04=repeater, 0x08=room, 0x10=sensor
+# autoadd_max_hops  = 0                            # 0-64 (max hops for auto-add contacts)
+# flood_scope       = ""                           # 32 hex chars = 16-byte transport key (empty=off)
 
 [logging]
 level = "INFO"
@@ -78,7 +84,7 @@ preamble_len = 8
 freq = 869618000
 rx_channel = [1, 2]
 tx_channel = 0
-rx_gain = 43
+rx_gain = 45
 tx_gain = 50
 
 [radio_433]
