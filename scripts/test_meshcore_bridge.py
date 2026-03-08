@@ -3665,5 +3665,210 @@ class TestGrpTxtRxEdgeCases(unittest.TestCase):
         )
 
 
+# ---- Group T: Echo filter hash tracking ----
+
+
+class TestEchoFilterTracking(unittest.TestCase):
+    """Test _hash_payload used by TX echo filter."""
+
+    def test_hash_payload_deterministic_and_8_bytes(self):
+        """_hash_payload returns exactly 8 bytes, same result both times."""
+        h1 = bridge._hash_payload(b"hello world")
+        h2 = bridge._hash_payload(b"hello world")
+        self.assertEqual(len(h1), 8)
+        self.assertEqual(h1, h2)
+
+
+# ---- Group U: CMD_SET_RADIO_PARAMS edge cases ----
+# (appended to existing TestRadioParamCommands via monkey-patch below)
+
+
+def _u1_test_set_radio_params_too_short_returns_ok_no_change(self):
+    """CMD_SET_RADIO_PARAMS with < 10 bytes returns RESP_OK, state unchanged."""
+    state = make_state()
+    original_freq = state.freq_mhz
+    cmd = bytes([bridge.CMD_SET_RADIO_PARAMS]) + b"\x01\x02\x03\x04\x05"
+    responses = bridge.handle_command(cmd, state, None, None)
+    self.assertEqual(responses[0][0], bridge.RESP_OK)
+    self.assertEqual(state.freq_mhz, original_freq)
+
+
+def _u2_test_set_radio_tx_power_negative_value(self):
+    """CMD_SET_RADIO_TX_POWER with 0xFF is interpreted as -1 (int8)."""
+    state = make_state()
+    cmd = bytes([bridge.CMD_SET_RADIO_TX_POWER, 0xFF])
+    responses = bridge.handle_command(cmd, state, None, None)
+    self.assertEqual(responses[0][0], bridge.RESP_OK)
+    self.assertEqual(state.tx_power, -1)
+
+
+def _u3_test_set_radio_tx_power_empty_data_ok(self):
+    """CMD_SET_RADIO_TX_POWER with no data byte returns RESP_OK without crashing."""
+    state = make_state()
+    cmd = bytes([bridge.CMD_SET_RADIO_TX_POWER])
+    responses = bridge.handle_command(cmd, state, None, None)
+    self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+
+TestRadioParamCommands.test_set_radio_params_too_short_returns_ok_no_change = (
+    _u1_test_set_radio_params_too_short_returns_ok_no_change
+)
+TestRadioParamCommands.test_set_radio_tx_power_negative_value = (
+    _u2_test_set_radio_tx_power_negative_value
+)
+TestRadioParamCommands.test_set_radio_tx_power_empty_data_ok = (
+    _u3_test_set_radio_tx_power_empty_data_ok
+)
+
+
+# ---- Group V: CMD_SET_ADVERT_LATLON edge cases ----
+
+
+def _v1_test_set_advert_latlon_too_short_returns_ok_no_change(self):
+    """CMD_SET_ADVERT_LATLON with < 8 bytes returns RESP_OK, lat unchanged."""
+    state = make_state()
+    cmd = bytes([bridge.CMD_SET_ADVERT_LATLON]) + b"\x01\x02\x03\x04"
+    original_lat = state.lat_e6
+    responses = bridge.handle_command(cmd, state, None, None)
+    self.assertEqual(responses[0][0], bridge.RESP_OK)
+    self.assertEqual(state.lat_e6, original_lat)
+
+
+TestLatLonInAdvert.test_set_advert_latlon_too_short_returns_ok_no_change = (
+    _v1_test_set_advert_latlon_too_short_returns_ok_no_change
+)
+
+
+# ---- Group W: Stub command details ----
+
+
+def _w1_test_stub_cmds_return_msg_sent_flood_routing(self):
+    """Stub cmds (LOGIN, STATUS_REQ, TRACE, PATH_DISCOVERY) have routing_type=1."""
+    state = make_state()
+    for cmd_byte in [
+        bridge.CMD_LOGIN,
+        bridge.CMD_STATUS_REQ,
+        bridge.CMD_TRACE,
+        bridge.CMD_PATH_DISCOVERY,
+    ]:
+        cmd = bytes([cmd_byte]) + b"payload"
+        responses = bridge.handle_command(cmd, state, None, None)
+        self.assertEqual(
+            responses[0][1],
+            1,
+            f"cmd 0x{cmd_byte:02x} routing_type should be 1 (flood)",
+        )
+
+
+def _w2_test_stub_cmds_increment_msg_seq(self):
+    """Stub cmds increment state.msg_seq."""
+    state = make_state()
+    self.assertEqual(state.msg_seq, 0)
+    bridge.handle_command(bytes([bridge.CMD_LOGIN]) + b"x", state, None, None)
+    self.assertEqual(state.msg_seq, 1)
+    bridge.handle_command(bytes([bridge.CMD_STATUS_REQ]) + b"x", state, None, None)
+    self.assertEqual(state.msg_seq, 2)
+
+
+TestCommandHandler.test_stub_cmds_return_msg_sent_flood_routing = (
+    _w1_test_stub_cmds_return_msg_sent_flood_routing
+)
+TestCommandHandler.test_stub_cmds_increment_msg_seq = (
+    _w2_test_stub_cmds_increment_msg_seq
+)
+
+
+# ---- Group X: Trivial stubs return OK ----
+
+
+def _x1_test_reset_path_returns_ok(self):
+    """CMD_RESET_PATH returns RESP_OK."""
+    state = make_state()
+    cmd = bytes([bridge.CMD_RESET_PATH])
+    responses = bridge.handle_command(cmd, state, None, None)
+    self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+
+def _x2_test_set_tuning_params_returns_ok(self):
+    """CMD_SET_TUNING_PARAMS returns RESP_OK."""
+    state = make_state()
+    cmd = bytes([bridge.CMD_SET_TUNING_PARAMS]) + b"\x01\x02\x03"
+    responses = bridge.handle_command(cmd, state, None, None)
+    self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+
+def _x3_test_reboot_returns_ok(self):
+    """CMD_REBOOT returns RESP_OK."""
+    state = make_state()
+    cmd = bytes([bridge.CMD_REBOOT])
+    responses = bridge.handle_command(cmd, state, None, None)
+    self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+
+TestCommandHandler.test_reset_path_returns_ok = _x1_test_reset_path_returns_ok
+TestCommandHandler.test_set_tuning_params_returns_ok = (
+    _x2_test_set_tuning_params_returns_ok
+)
+TestCommandHandler.test_reboot_returns_ok = _x3_test_reboot_returns_ok
+
+
+# ---- Group Y: handle_command empty payload ----
+
+
+def _y1_test_handle_command_empty_payload_returns_empty(self):
+    """handle_command with empty payload returns empty list."""
+    state = make_state()
+    responses = bridge.handle_command(b"", state, None, None)
+    self.assertEqual(responses, [])
+
+
+TestCommandHandler.test_handle_command_empty_payload_returns_empty = (
+    _y1_test_handle_command_empty_payload_returns_empty
+)
+
+
+# ---- Group A: FrameDecoder recovery ----
+
+
+def _make_tx_frame(payload: bytes) -> bytes:
+    """Build a client→device TX frame (0x3C + len_le16 + payload)."""
+    return bytes([bridge.FRAME_TX]) + len(payload).to_bytes(2, "little") + payload
+
+
+class TestFrameDecoderEdgeCases(unittest.TestCase):
+    """Edge cases for FrameDecoder: oversized frames and sequential decoding."""
+
+    def test_decode_oversize_frame_then_valid(self):
+        """Oversized frame is skipped; subsequent valid frame is decoded."""
+        # Build an oversized payload (> MAX_FRAME=300)
+        oversized_payload = b"\xab" * (bridge.MAX_FRAME + 1)
+        oversized_frame = _make_tx_frame(oversized_payload)
+
+        # Append a valid small frame after the oversized one
+        valid_payload = b"\x42\x43"
+        valid_frame = _make_tx_frame(valid_payload)
+
+        dec = bridge.FrameDecoder()
+        frames = dec.feed(oversized_frame + valid_frame)
+
+        # Only the valid frame should come through
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0], valid_payload)
+
+    def test_decode_two_frames_sequential(self):
+        """Two valid frames fed together are both decoded in order."""
+        p1 = b"\x01\x02\x03"
+        p2 = b"\x04\x05\x06\x07"
+        f1 = _make_tx_frame(p1)
+        f2 = _make_tx_frame(p2)
+
+        dec = bridge.FrameDecoder()
+        frames = dec.feed(f1 + f2)
+
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0], p1)
+        self.assertEqual(frames[1], p2)
+
+
 if __name__ == "__main__":
     unittest.main()
