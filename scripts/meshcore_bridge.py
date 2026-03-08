@@ -91,6 +91,7 @@ from meshcore_crypto import (
     PAYLOAD_RESP,
     PAYLOAD_GRP_TXT,
     PAYLOAD_ANON_REQ,
+    PAYLOAD_CTRL,
     ROUTE_DIRECT,
     ROUTE_FLOOD,
     ROUTE_T_DIRECT,
@@ -138,6 +139,7 @@ CMD_DEVICE_QUERY = 0x16
 CMD_GET_CHANNEL = 0x1F
 CMD_SET_CHANNEL = 0x20
 CMD_GET_STATS = 0x38
+CMD_SEND_CONTROL_DATA = 0x37
 CMD_SET_FLOOD_SCOPE = 0x36
 CMD_SET_AUTOADD_CONFIG = 0x3A
 CMD_GET_AUTOADD_CONFIG = 0x3B
@@ -1022,6 +1024,9 @@ def handle_command(
     if cmd == CMD_SEND_CHAN_TXT_MSG:
         return _handle_send_chan_txt_msg(data, state, udp_sock, udp_addr)
 
+    if cmd == CMD_SEND_CONTROL_DATA:
+        return _handle_send_control_data(data, state, udp_sock, udp_addr)
+
     if cmd == CMD_SEND_SELF_ADVERT:
         return _handle_send_advert(data, state, udp_sock, udp_addr)
 
@@ -1092,8 +1097,15 @@ def handle_command(
         return _handle_export_contact(data, state)
 
     if cmd == CMD_SHARE_CONTACT:
-        # Same as EXPORT_CONTACT — returns biz-card URI wire packet.
-        return _handle_export_contact(data, state)
+        # share_contact: build the wire packet (same as export), log URI, return OK.
+        # mccli's share_contact awaits EventType.OK, not CONTACT_URI.
+        frames = _handle_export_contact(data, state)
+        if frames and frames[0][0] == RESP_CONTACT_URI:
+            wire_pkt = frames[0][1:]
+            log.info("share_contact URI: meshcore://%s", wire_pkt.hex())
+        else:
+            return frames  # propagate errors unchanged
+        return [state.build_ok()]
 
     if cmd == CMD_SET_CHANNEL:
         return _handle_set_channel(data, state)
@@ -1371,6 +1383,40 @@ def _handle_send_chan_txt_msg(
     cbor_msg = make_cbor_tx_request(packet)
     udp_sock.sendto(cbor_msg, udp_addr)
     log.info("TX: %dB GRP_TXT to #%s", len(packet), channel.name)
+
+    return [state.build_ok()]
+
+
+def _handle_send_control_data(
+    data: bytes,
+    state: BridgeState,
+    udp_sock: socket.socket,
+    udp_addr: tuple[str, int],
+) -> list[bytes]:
+    """Handle CMD_SEND_CONTROL_DATA: build CTRL wire packet and TX via UDP.
+
+    Companion format: [0x37, control_type(1), payload...]
+    The data parameter here is everything after the 0x37 command byte.
+    Used by mccli node_discover (control_type=0x80|flags).
+    """
+    if not data:
+        return [state.build_error()]
+
+    from meshcore_tx import build_wire_packet, make_header
+
+    header = make_header(ROUTE_FLOOD, PAYLOAD_CTRL)
+    packet = build_wire_packet(header, data)
+
+    # Track TX hash to filter echo
+    h = _hash_payload(packet)
+    state.recent_tx[h] = time.monotonic()
+    log.debug("echo-filter: track TX hash %s", h.hex())
+
+    from meshcore_tx import make_cbor_tx_request
+
+    cbor_msg = make_cbor_tx_request(packet)
+    udp_sock.sendto(cbor_msg, udp_addr)
+    log.info("TX: %dB CTRL type=0x%02x", len(packet), data[0])
 
     return [state.build_ok()]
 

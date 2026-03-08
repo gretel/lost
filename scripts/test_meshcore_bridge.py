@@ -1769,15 +1769,21 @@ class TestContactExport(unittest.TestCase):
         # Wire packet follows the response code
         self.assertGreater(len(responses[0]), 4)
 
-    def test_share_contact_self_same_as_export(self):
-        """CMD_SHARE_CONTACT produces same output as CMD_EXPORT_CONTACT for self."""
+    def test_share_contact_self_returns_ok(self):
+        """CMD_SHARE_CONTACT returns RESP_OK, not RESP_CONTACT_URI."""
         prefix = self.state.pub_key[:6]
-        export_resp = self._handle(bytes([bridge.CMD_EXPORT_CONTACT]) + prefix)
-        share_resp = self._handle(bytes([bridge.CMD_SHARE_CONTACT]) + prefix)
-        self.assertEqual(export_resp[0][0], bridge.RESP_CONTACT_URI)
-        self.assertEqual(share_resp[0][0], bridge.RESP_CONTACT_URI)
-        # Both should contain the same ADVERT data
-        self.assertEqual(export_resp[0][1:], share_resp[0][1:])
+        cmd = bytes([bridge.CMD_SHARE_CONTACT]) + prefix
+        responses = bridge.handle_command(cmd, self.state, None, None)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+    def test_export_contact_self_still_returns_uri(self):
+        """CMD_EXPORT_CONTACT still returns RESP_CONTACT_URI (unchanged)."""
+        prefix = self.state.pub_key[:6]
+        cmd = bytes([bridge.CMD_EXPORT_CONTACT]) + prefix
+        responses = bridge.handle_command(cmd, self.state, None, None)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_CONTACT_URI)
 
 
 # ---- Real radio stats tests ----
@@ -2469,6 +2475,56 @@ class TestStartupConfig(unittest.TestCase):
         self.assertFalse(bridge._is_valid_repeat_freq(868000))
         self.assertFalse(bridge._is_valid_repeat_freq(868618))
         self.assertFalse(bridge._is_valid_repeat_freq(0))
+
+
+class TestSendControlData(unittest.TestCase):
+    def setUp(self):
+        import socket
+
+        self.state = make_state()
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.bind(("127.0.0.1", 0))
+        self.udp_addr = ("127.0.0.1", self.udp_sock.getsockname()[1])
+
+    def tearDown(self):
+        self.udp_sock.close()
+
+    def _handle(self, cmd_bytes):
+        return bridge.handle_command(
+            cmd_bytes, self.state, self.udp_sock, self.udp_addr
+        )
+
+    def test_ctrl_node_discover_sends_udp(self):
+        """CMD_SEND_CONTROL_DATA floods a CTRL packet via UDP."""
+        tag = struct.pack("<I", 0xDEADBEEF)
+        # control_type=0x80 (NODE_DISCOVER_REQ), filter=0x00 (all types), tag
+        payload = bytes([0x80, 0x00]) + tag
+        cmd = bytes([bridge.CMD_SEND_CONTROL_DATA]) + payload
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+        # Verify UDP CBOR TX was sent
+        self.udp_sock.settimeout(1.0)
+        raw, _addr = self.udp_sock.recvfrom(65536)
+        import cbor2
+
+        msg = cbor2.loads(raw)
+        self.assertEqual(msg["type"], "lora_tx")
+        self.assertIn("payload", msg)
+
+        # Verify the CTRL payload_type in the wire packet
+        wire = msg["payload"]
+        # header byte: payload_type bits [5:2] = (header >> 2) & 0x0F
+        ptype = (wire[0] >> 2) & 0x0F
+        self.assertEqual(ptype, 0x0B)  # PAYLOAD_CTRL
+
+    def test_ctrl_empty_data_returns_error(self):
+        """CMD_SEND_CONTROL_DATA with empty payload returns RESP_ERROR."""
+        cmd = bytes([bridge.CMD_SEND_CONTROL_DATA])
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
 
 
 if __name__ == "__main__":
