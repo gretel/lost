@@ -156,6 +156,7 @@ def format_frame(
     sync_word = phy.get("sync_word", 0)
     sw_label = sync_word_name(sync_word)
     snr_db = phy.get("snr_db")
+    snr_db_td = phy.get("snr_db_td")
     noise_floor_db = phy.get("noise_floor_db")
     peak_db = phy.get("peak_db")
     rx_ch = msg.get("rx_channel")
@@ -167,6 +168,8 @@ def format_frame(
         header += f" ch={rx_ch}"
     if snr_db is not None:
         header += f" SNR={snr_db:.1f}dB"
+    if snr_db_td is not None:
+        header += f" SNR_td={snr_db_td:.1f}dB"
     if noise_floor_db is not None:
         header += f" NF={noise_floor_db:.1f}dBFS"
     if peak_db is not None:

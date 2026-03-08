@@ -54,6 +54,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     bool                 _crc_valid{false};
     bool                 _is_downchirp{false};
     double               _snr_db{0.0};
+    double               _snr_db_td{-999.0};
     double               _noise_floor_db{-999.0};
     double               _peak_db{-999.0};
     int64_t              _rx_channel{-1};
@@ -236,6 +237,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         if (_peak_db > -999.0) {
             std::printf("  peak=%.1f dBFS", _peak_db);
         }
+        if (_snr_db_td > -999.0) {
+            std::printf("  SNR_td=%.1f dB", _snr_db_td);
+        }
         if (_rx_channel >= 0) {
             std::printf("  ch=%d", static_cast<int>(_rx_channel));
         }
@@ -280,6 +284,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         uint32_t phy_fields = 6;
         if (_noise_floor_db > -999.0) phy_fields++;
         if (_peak_db > -999.0) phy_fields++;
+        if (_snr_db_td > -999.0) phy_fields++;
         cbor::encode_map_begin(buf, phy_fields);
         cbor::kv_uint(buf, "sf", phy_sf);
         cbor::kv_uint(buf, "bw", phy_bw);
@@ -292,6 +297,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         }
         if (_peak_db > -999.0) {
             cbor::kv_float64(buf, "peak_db", _peak_db);
+        }
+        if (_snr_db_td > -999.0) {
+            cbor::kv_float64(buf, "snr_db_td", _snr_db_td);
         }
 
         cbor::kv_bytes(buf, "payload", _frame.data(),
@@ -419,6 +427,12 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                     _peak_db = it2->second.value_or<double>(-999.0);
                 } else {
                     _peak_db = -999.0;
+                }
+                if (auto it2 = tag.map.find("snr_db_td");
+                    it2 != tag.map.end()) {
+                    _snr_db_td = it2->second.value_or<double>(-999.0);
+                } else {
+                    _snr_db_td = -999.0;
                 }
                 if (auto it2 = tag.map.find("rx_channel");
                     it2 != tag.map.end()) {

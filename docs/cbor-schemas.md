@@ -35,7 +35,8 @@ python3 scripts/lora_mon.py | python3 scripts/lora_decode_meshcore.py
     "sync_word":  18,                 // uint (0x12 = 18)
     "snr_db":     12.3,               // float64, preamble-based SNR estimate (dB)
     "noise_floor_db": -42.1,           // float64, optional, EMA noise floor (dBFS)
-    "peak_db":    -6.2                 // float64, optional, EMA peak amplitude (dBFS)
+    "peak_db":    -6.2,                // float64, optional, EMA peak amplitude (dBFS)
+    "snr_db_td":  -7.2                 // float64, optional, time-domain SNR estimate (dB)
   },
   "rx_channel":   0,                  // uint, optional, RX channel index
   "payload":      h'48656C6C6F',      // bytes, raw payload
@@ -52,6 +53,13 @@ python3 scripts/lora_mon.py | python3 scripts/lora_decode_meshcore.py
   }
 }
 ```
+
+**SNR fields**: `snr_db` is an FFT-domain estimate (peak-vs-rest energy ratio
+averaged over preamble symbols) and includes ~SF·3 dB of FFT processing gain.
+`snr_db_td` is a time-domain estimate (`signal_db - noise_floor_db`) that
+normalises the FFT peak back to per-sample power, making it comparable to
+RSSI-based SNR values reported by companion devices. Only present when the
+EMA noise floor has been initialised.
 
 ## TX Request
 

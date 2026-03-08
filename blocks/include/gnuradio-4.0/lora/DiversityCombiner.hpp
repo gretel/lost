@@ -82,10 +82,8 @@ struct DiversityCombiner : gr::Block<DiversityCombiner, gr::NoDefaultTagForwardi
 
         // Age all pending groups at the start of each scheduler cycle.
         // Groups created this cycle start at age 0 (set in submitFrame).
-        // A group at age >= 4 has survived multiple full cycles without
-        // completing — a safety fallback for cases where the real-time
-        // deadline hasn't expired. The primary drain mechanism is the
-        // timeout_symbols deadline (condition b).
+        // Used only for debug logging — drain decisions use the real-time
+        // deadline (timeout_symbols) and channel-activity detection.
         for (auto& group : _pending) {
             group.age++;
         }
@@ -150,11 +148,9 @@ struct DiversityCombiner : gr::Block<DiversityCombiner, gr::NoDefaultTagForwardi
         // 2. Emit pending groups that are ready.
         // A group is emitted when any of these conditions is true:
         //   (a) All N candidates have been received (complete)
-        //   (b) The real-time deadline has expired (timeout)
+        //   (b) The real-time deadline has expired (timeout_symbols)
         //   (c) N=1 (single-input passthrough, no combining needed)
-        //   (d) The group's age >= 4 (safety fallback — survived multiple
-        //       cycles; the real-time deadline is the primary drain)
-        //   (e) All input channels were active this cycle but fewer than N
+        //   (d) All input channels were active this cycle but fewer than N
         //       candidates were collected (every channel had its chance this
         //       cycle — channels that were active but didn't contribute a
         //       matching candidate decoded something else or nothing)
@@ -169,10 +165,9 @@ struct DiversityCombiner : gr::Block<DiversityCombiner, gr::NoDefaultTagForwardi
                                >= static_cast<std::size_t>(n_inputs);
             bool expired = now >= it->deadline;
             bool singleInput = (n_inputs == 1U);
-            bool aged = (it->age >= 4);
             bool resolvedByActivity = allChannelsActive && !allReported;
 
-            if (allReported || expired || singleInput || aged || resolvedByActivity) {
+            if (allReported || expired || singleInput || resolvedByActivity) {
                 auto& winner = it->candidates[it->best_idx];
                 std::size_t payLen = winner.payload.size();
 
@@ -186,7 +181,7 @@ struct DiversityCombiner : gr::Block<DiversityCombiner, gr::NoDefaultTagForwardi
                     outAvail -= payLen;
 
                     if (debug && !allReported) {
-                        const char* reason = aged ? "aged" :
+                        const char* reason =
                             resolvedByActivity ? "all-active" :
                             expired ? "timeout" : "drain";
                         std::fprintf(stderr, "[DiversityCombiner] %s: "

@@ -792,4 +792,111 @@ const boost::ut::suite<"Error path tests"> error_path_tests = [] {
     };
 };
 
+// ============================================================================
+// Test 8: Large frame, NET_ID1 watchdog, back-to-back no gap
+// ============================================================================
+
+const boost::ut::suite<"Edge case tests"> edge_case_tests = [] {
+    using namespace boost::ut;
+
+    "Large frame pay_len=126 decodes correctly"_test = [] {
+        // 126-byte payload with CR=4 requires 264 symbols total.
+        // FrameSync max_symbols must be >= 264 for this to work.
+        const std::vector<uint8_t> payload(126, 'X');
+        auto iq = gr::lora::generate_frame_iq(payload, SF, CR, OS_FACTOR,
+                                               SYNC_WORD, PREAMBLE_LEN,
+                                               true, SPS * 5);
+
+        auto result = run_decode(iq);
+
+        std::printf("Large frame: %zu bytes output (expected 126)\n",
+                    result.samples.size());
+
+        expect(eq(result.samples.size(), 126UZ))
+            << "expected 126 decoded bytes, got " << result.samples.size();
+
+        if (result.samples.size() >= 126) {
+            bool match = std::equal(result.samples.begin(),
+                                    result.samples.begin() + 126,
+                                    payload.begin());
+            expect(match) << "payload mismatch";
+        }
+
+        // Verify CRC_OK
+        bool crc_ok = false;
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                crc_ok = it->second.value_or<bool>(false);
+            }
+        }
+        expect(crc_ok) << "expected CRC_OK for 126-byte frame";
+    };
+
+    "NET_ID1 stuck-upchirp watchdog resets cleanly"_test = [] {
+        // Generate a sequence of upchirps that will trigger DETECT→SYNC
+        // (after preamble_len - 3 = 5 consecutive upchirps) but then keep
+        // producing upchirp-like bins in NET_ID1 until the watchdog fires.
+        // kMaxAdditionalUpchirps=3, kMaxPreambleRotations=4 → reset after 12 extra.
+        const uint32_t n_extra = static_cast<uint32_t>(
+            gr::lora::kMaxAdditionalUpchirps + gr::lora::kMaxPreambleRotations + 2);
+        const uint32_t total_chirps = static_cast<uint32_t>(PREAMBLE_LEN) + n_extra;
+
+        std::vector<std::complex<float>> upchirp(SPS);
+        gr::lora::build_upchirp(upchirp.data(), 0, SF, OS_FACTOR);
+
+        std::vector<std::complex<float>> iq;
+        iq.reserve(total_chirps * SPS + SPS * 5);
+        for (uint32_t i = 0; i < total_chirps; i++) {
+            iq.insert(iq.end(), upchirp.begin(), upchirp.end());
+        }
+        // Silence so FrameSync can reset and scheduler can drain
+        iq.insert(iq.end(), SPS * 5, std::complex<float>{0.f, 0.f});
+
+        auto result = run_decode(iq);
+
+        std::printf("NET_ID1 watchdog: %zu bytes output (expected 0)\n",
+                    result.samples.size());
+        expect(eq(result.samples.size(), 0UZ))
+            << "watchdog should reject stuck-upchirp sequence";
+    };
+
+    "Two back-to-back frames with no silence gap"_test = [] {
+        // Frame A: zero_pad=0 (no trailing silence)
+        // Frame B: normal trailing silence
+        auto iq1 = gr::lora::generate_frame_iq(
+            std::vector<uint8_t>{'A', 'B', 'C'}, SF, CR, OS_FACTOR,
+            SYNC_WORD, PREAMBLE_LEN, true, 0);
+        auto iq2 = gr::lora::generate_frame_iq(
+            std::vector<uint8_t>{'D', 'E', 'F'}, SF, CR, OS_FACTOR,
+            SYNC_WORD, PREAMBLE_LEN, true, SPS * 5);
+
+        std::vector<std::complex<float>> iq;
+        iq.reserve(iq1.size() + iq2.size());
+        iq.insert(iq.end(), iq1.begin(), iq1.end());
+        iq.insert(iq.end(), iq2.begin(), iq2.end());
+
+        auto result = run_decode(iq);
+
+        // Count decoded frames from tags
+        int frame_count = 0;
+        for (const auto& t : result.tags) {
+            if (t.map.contains("pay_len")) frame_count++;
+        }
+
+        std::printf("Back-to-back no-gap: %d frames, %zu bytes\n",
+                    frame_count, result.samples.size());
+
+        // Frame A must decode — this is the hard requirement.
+        // Frame B may or may not decode depending on energy-check timing.
+        expect(ge(frame_count, 1)) << "at least Frame A must decode";
+        expect(ge(result.samples.size(), 3UZ)) << "at least 3 bytes from Frame A";
+
+        if (result.samples.size() >= 3) {
+            std::string fa(result.samples.begin(), result.samples.begin() + 3);
+            std::printf("  Frame A: \"%s\"\n", fa.c_str());
+            expect(eq(fa, std::string("ABC"))) << "Frame A payload";
+        }
+    };
+};
+
 int main() { /* boost::ut auto-runs all suites */ }

@@ -17,6 +17,9 @@
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/SpectrumTap.hpp>
+#include <gnuradio-4.0/lora/algorithm/crc.hpp>
+#include <gnuradio-4.0/lora/algorithm/hamming.hpp>
+#include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
 
 namespace gr::lora {
@@ -86,7 +89,7 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
     uint16_t preamble_len = 8;
     float    energy_thresh = 1e-6f;  ///< minimum symbol energy to continue output
     float    min_snr_db   = -10.0f;  ///< reject bursts below this SNR (dB)
-    uint32_t max_symbols  = 256;     ///< safety limit on symbols per burst
+    uint32_t max_symbols  = 600;     ///< safety limit (worst case: SF7/CR4/255B = 600 symbols)
     int32_t  rx_channel   = -1;      ///< RX channel index (-1 = not set)
     bool     debug        = false;
 
@@ -146,7 +149,13 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
     // Output state
     uint32_t _output_symb_cnt = 0;
     bool     _burst_tag_published = false;
-    float    _snr_db = 0.f;  ///< preamble-based SNR estimate (dB)
+    float    _snr_db    = 0.f;    ///< FFT peak-vs-rest SNR estimate (dB)
+    float    _signal_db = -999.f; ///< mean signal power in dBFS, -999 = not yet estimated
+
+    // Header decode in OUTPUT state (for exact symbol count)
+    std::vector<std::complex<float>> _header_symbols;  ///< first 8 symbols (8*N samples)
+    uint32_t _frame_symb_numb = 0;  ///< computed from header (0 = not yet known)
+    bool     _header_decoded  = false;
 
     // Stale-burst watchdog: consecutive processBulk calls with insufficient input
     uint32_t _idle_call_count = 0;
@@ -253,6 +262,7 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
             _n_up_req + kMaxAdditionalUpchirps) * _N;
         _corr_vec.resize(max_corr);
         _fft_val_buf.resize(static_cast<std::size_t>(_up_symb_to_use) * _N);
+        _header_symbols.resize(8UZ * _N);
 
         resetToDetect();
 
@@ -269,6 +279,9 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         _sfo_cum     = 0.f;
         _output_symb_cnt = 0;
         _burst_tag_published = false;
+        _signal_db = -999.f;
+        _frame_symb_numb = 0;
+        _header_decoded  = false;
         _cfo_frac_sto_frac_est = false;
         _additional_upchirps = 0;
         _preamble_rotations  = 0;
@@ -380,13 +393,21 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
     /// Preamble-based SNR estimation (GR3 determine_snr algorithm).
     /// Dechirps each preamble symbol, takes FFT, computes peak-vs-rest ratio.
-    /// Returns average SNR in dB across _up_symb_to_use preamble symbols.
     /// Must be called after CFO/SFO correction (_preamble_upchirps is corrected).
-    [[nodiscard]] float determine_snr() {
-        const auto n_syms = _up_symb_to_use;
-        if (n_syms == 0) return 0.f;
+    struct SnrResult {
+        float snr_db    = 0.f;    ///< FFT peak-vs-rest (in-band SNR)
+        float signal_db = -999.f; ///< signal power in dBFS (FFT peak normalised by N²)
+    };
 
-        float snr_sum = 0.f;
+    [[nodiscard]] SnrResult determine_snr() {
+        const auto n_syms = _up_symb_to_use;
+        if (n_syms == 0) return {};
+
+        float snr_sum    = 0.f;
+        float signal_sum = 0.f;
+        uint32_t signal_cnt = 0;
+        const float n_sq = static_cast<float>(_N) * static_cast<float>(_N);
+
         for (uint32_t i = 0; i < n_syms; i++) {
             detail::complex_multiply(_scratch_N.data(), &_preamble_upchirps[_N * i],
                                      _downchirp.data(), _N);
@@ -394,7 +415,7 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 std::span<const std::complex<float>>(_scratch_N.data(), _N));
 
             float total_energy = 0.f;
-            float peak_energy = 0.f;
+            float peak_energy  = 0.f;
             for (uint32_t j = 0; j < _N; j++) {
                 float mag_sq = fft_out[j].real() * fft_out[j].real()
                              + fft_out[j].imag() * fft_out[j].imag();
@@ -405,8 +426,16 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
             if (noise_energy > 0.f) {
                 snr_sum += 10.f * std::log10(peak_energy / noise_energy);
             }
+            if (peak_energy > 0.f) {
+                signal_sum += 10.f * std::log10(peak_energy / n_sq);
+                signal_cnt++;
+            }
         }
-        return snr_sum / static_cast<float>(n_syms);
+        const float inv_n = 1.f / static_cast<float>(n_syms);
+        float sig_db = (signal_cnt > 0)
+            ? signal_sum / static_cast<float>(signal_cnt)
+            : -999.f;
+        return { snr_sum * inv_n, sig_db };
     }
 
     /// Check if downsampled symbol has sufficient energy.
@@ -417,6 +446,89 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                     + samples[i].imag() * samples[i].imag();
         }
         return energy >= energy_thresh;
+    }
+
+    /// Decode the LoRa explicit header from the first 8 buffered output symbols.
+    /// Sets _frame_symb_numb to the exact number of symbols for the frame.
+    /// Mirrors DemodDecoder's header decode: dechirp→FFT→gray→deinterleave→hamming→parse.
+    void decodeHeader() {
+        _header_decoded = true;
+
+        // Build CFO-corrected downchirp (same as DemodDecoder::buildDownchirpWithCFO)
+        std::vector<std::complex<float>> dc(_N);
+        {
+            std::vector<std::complex<float>> uc(_N);
+            build_upchirp(uc.data(),
+                          static_cast<uint32_t>(mod(_cfo_int, static_cast<int64_t>(_N))),
+                          sf, 1);
+            for (uint32_t n = 0; n < _N; n++) {
+                dc[n] = std::conj(uc[n]);
+            }
+            float frac_scale = -2.f * static_cast<float>(std::numbers::pi)
+                              * _cfo_frac / static_cast<float>(_N);
+            for (uint32_t n = 0; n < _N; n++) {
+                float phase = frac_scale * static_cast<float>(n);
+                dc[n] *= std::complex<float>(std::cos(phase), std::sin(phase));
+            }
+        }
+
+        // Dechirp + FFT + argmax for each of the 8 header symbols
+        std::vector<uint16_t> symbols;
+        symbols.reserve(8);
+        for (uint32_t i = 0; i < 8; i++) {
+            auto idx = dechirp_argmax(&_header_symbols[static_cast<std::size_t>(i) * _N],
+                                      dc.data(), _scratch_N.data(), _N, _fft);
+            auto sym = static_cast<uint16_t>(
+                mod(static_cast<int64_t>(idx) - 1, static_cast<int64_t>(_N)));
+            symbols.push_back(sym);
+        }
+
+        // Gray map + reduce to sf_app = sf - 2 bits (header rate)
+        const uint8_t sf_app = static_cast<uint8_t>(sf - 2);
+        std::vector<uint16_t> gray_syms;
+        gray_syms.reserve(8);
+        for (auto s : symbols) {
+            gray_syms.push_back(static_cast<uint16_t>((s ^ (s >> 1)) >> 2));
+        }
+
+        // Deinterleave + Hamming decode → nibbles
+        auto codewords = deinterleave_block(gray_syms, sf, 8, sf_app);
+        if (codewords.size() < 5) return;  // shouldn't happen
+
+        std::vector<uint8_t> nibbles;
+        nibbles.reserve(codewords.size());
+        for (auto cw : codewords) {
+            nibbles.push_back(hamming_decode_hard(cw, 4));
+        }
+
+        auto info = parse_explicit_header(nibbles[0], nibbles[1], nibbles[2],
+                                           nibbles[3], nibbles[4]);
+        if (!info.checksum_valid || info.payload_len == 0) {
+            if (debug) {
+                std::fprintf(stderr, "[FrameSync] header decode failed: checksum=%s pay_len=%u",
+                             info.checksum_valid ? "OK" : "FAIL", info.payload_len);
+                if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
+                std::fprintf(stderr, "\n");
+            }
+            return;  // fall back to max_symbols safety cap
+        }
+
+        // Compute LDRO (same as DemodDecoder)
+        bool ldro = (static_cast<float>(1u << sf) * 1e3f
+                    / static_cast<float>(bandwidth)) > LDRO_MAX_DURATION_MS;
+
+        _frame_symb_numb = 8 + static_cast<uint32_t>(
+            std::ceil(static_cast<double>(
+                2 * info.payload_len - sf + 2 + 5 + (info.has_crc ? 4 : 0))
+                / (sf - 2 * static_cast<int>(ldro))))
+            * (4 + info.cr);
+
+        if (debug) {
+            std::fprintf(stderr, "[FrameSync] header: pay_len=%u cr=%u has_crc=%d -> %u symbols",
+                         info.payload_len, info.cr, info.has_crc, _frame_symb_numb);
+            if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
+            std::fprintf(stderr, "\n");
+        }
     }
 
     [[nodiscard]] gr::work::Status processBulk(
@@ -867,7 +979,9 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                     break;
                 }
 
-                _snr_db = determine_snr();
+                auto [snr, sig] = determine_snr();
+                _snr_db    = snr;
+                _signal_db = sig;
                 if (_snr_db < min_snr_db) {
                     if (debug) {
                         std::fprintf(stderr, "[FrameSync] SYNC rejected: snr=%.1f dB < min %.1f dB",
@@ -910,11 +1024,13 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         }
 
         case OUTPUT: {
+            // Termination: header-derived exact count, or max_symbols safety cap
+            uint32_t symb_limit = (_frame_symb_numb > 0) ? _frame_symb_numb : max_symbols;
             if (!has_energy(_in_down.data(), _N)
-                || _output_symb_cnt >= max_symbols) {
+                || _output_symb_cnt >= symb_limit) {
                 if (debug) {
-                    std::fprintf(stderr, "[FrameSync] OUTPUT->DETECT: %u symbols emitted",
-                                 _output_symb_cnt);
+                    std::fprintf(stderr, "[FrameSync] OUTPUT->DETECT: %u/%u symbols emitted",
+                                 _output_symb_cnt, symb_limit);
                     if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
                     std::fprintf(stderr, "\n");
                 }
@@ -938,11 +1054,21 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 if (_peak_db > -999.f) {
                     tag["peak_db"] = gr::pmt::Value(static_cast<double>(_peak_db));
                 }
+                if (_signal_db > -999.f && _noise_floor_db > -999.f) {
+                    tag["snr_db_td"] = gr::pmt::Value(
+                        static_cast<double>(_signal_db - _noise_floor_db));
+                }
                 if (rx_channel >= 0) {
                     tag["rx_channel"] = gr::pmt::Value(static_cast<int64_t>(rx_channel));
                 }
                 this->publishTag(tag, 0UZ);
                 _burst_tag_published = true;
+            }
+
+            // Buffer first 8 symbols for header decode
+            if (_output_symb_cnt < 8 && !_header_decoded) {
+                std::copy_n(_in_down.data(), _N,
+                            &_header_symbols[static_cast<std::size_t>(_output_symb_cnt) * _N]);
             }
 
             // Output downsampled signal
@@ -960,6 +1086,11 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
             items_to_output = static_cast<int>(_N);
             _output_symb_cnt++;
+
+            // After 8th symbol: decode header to learn exact frame length
+            if (_output_symb_cnt == 8 && !_header_decoded) {
+                decodeHeader();
+            }
             break;
         }
         }  // switch
