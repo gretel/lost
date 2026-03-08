@@ -1571,8 +1571,9 @@ int main(int argc, char* argv[]) {
     uint64_t* overflow_ptr = build_rx_graph(rx_graph, cfg, frame_callback, spectrum);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> rx_sched;
-    rx_sched.timeout_inactivity_count = 1U;  // sleep after 1 idle cycle; SoapySource notifies progress on data
-    rx_sched.watchdog_max_warnings    = 30U; // 30s of continuous stall → ERROR
+    rx_sched.timeout_inactivity_count  = 1U;  // sleep after 1 idle cycle; SoapySource notifies progress on data
+    rx_sched.watchdog_min_stall_count  = 10U; // suppress watchdog log for ≤10s gaps (normal inter-frame silence at SF8)
+    rx_sched.watchdog_max_warnings     = 30U; // 30s of continuous stall → ERROR
     if (auto ret = rx_sched.exchange(std::move(rx_graph)); !ret) {
         std::fprintf(stderr, "ERROR: RX scheduler init failed\n");
         tx_sched->requestStop();
