@@ -23,7 +23,7 @@ Usage:
   meshcore_tx.py advert --name "MyNode" --dry-run
 
 Key management:
-  Identity is stored in ~/.config/gr4-lora/identity.bin (64 bytes:
+  Identity is stored in scripts/meshcore/identity.bin (64 bytes:
   32-byte seed + 32-byte public key). Generated on first run if
   missing. Use --identity <path> to override.
 

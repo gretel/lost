@@ -84,10 +84,10 @@ ADVERT_HAS_FEATURE1 = 0x20
 ADVERT_HAS_FEATURE2 = 0x40
 ADVERT_HAS_NAME = 0x80
 
-# Default paths
-DEFAULT_CONFIG_DIR = Path.home() / ".config" / "gr4-lora"
-DEFAULT_IDENTITY_FILE = DEFAULT_CONFIG_DIR / "identity.bin"
-DEFAULT_KEYS_DIR = DEFAULT_CONFIG_DIR / "keys"
+# Default paths — relative to the scripts/ directory so data stays in the project tree
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "meshcore"
+DEFAULT_IDENTITY_FILE = DEFAULT_DATA_DIR / "identity.bin"
+DEFAULT_KEYS_DIR = DEFAULT_DATA_DIR / "keys"
 
 
 # ---- Scalar clamping ----
@@ -458,7 +458,7 @@ def try_decrypt_anon_req(
 # Seed channels bundled with the repo (scripts/channels/*.channel)
 SEED_CHANNELS_DIR = Path(__file__).resolve().parent / "channels"
 
-DEFAULT_CHANNELS_DIR = DEFAULT_CONFIG_DIR / "channels"
+DEFAULT_CHANNELS_DIR = DEFAULT_DATA_DIR / "channels"
 
 
 class GroupChannel:

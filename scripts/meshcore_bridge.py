@@ -914,7 +914,7 @@ def _handle_grp_txt_rx(
 
 # ---- Contact persistence ----
 
-DEFAULT_CONTACTS_DIR = Path.home() / ".config" / "gr4-lora" / "contacts"
+DEFAULT_CONTACTS_DIR = Path(__file__).resolve().parent / "meshcore" / "contacts"
 
 
 def _persist_contacts(state: BridgeState) -> None:

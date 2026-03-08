@@ -34,10 +34,10 @@ status_interval = 10
 region_scope = "de-hh"
 # port              = 7834                         # TCP listen port (avoid 5000 on macOS)
 name          = "'DO2THX 📡"                   # node display name
-# identity_file     = "~/.config/gr4-lora/identity.bin"
-# keys_dir          = "~/.config/gr4-lora/keys"
-# channels_dir      = "~/.config/gr4-lora/channels"
-# contacts_dir      = "~/.config/gr4-lora/contacts"
+# identity_file     = "scripts/meshcore/identity.bin"
+# keys_dir          = "scripts/meshcore/keys"
+# channels_dir      = "scripts/meshcore/channels"
+# contacts_dir      = "scripts/meshcore/contacts"
 # lat               = 53.55                        # latitude  (decimal degrees)
 # lon               = 9.99                         # longitude (decimal degrees)
 # client_repeat     = 0                            # 0=off, 1=on (only valid at 433/869/918 MHz)

@@ -23,6 +23,12 @@ tmp/
 # Data (DuckDB databases)
 data/
 
+# MeshCore runtime data — ignore generated files, keep directory scaffolding
+scripts/meshcore/identity.bin
+scripts/meshcore/keys/*.pub
+scripts/meshcore/contacts/*.contact
+scripts/meshcore/channels/*.channel
+
 # macOS
 .DS_Store
 ._*
