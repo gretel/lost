@@ -1,283 +1,119 @@
 # gr4-lora
 
 LoRa PHY for [GNU Radio 4](https://github.com/fair-acc/gnuradio4).
-Receives and transmits MeshCore protocol via USRP B210/B220 or any SoapySDR-supported SDR.
+Full-duplex transceiver targeting USRP B210/B220 (UHD) or any SoapySDR device.
+Receives and transmits MeshCore protocol; includes a full companion protocol bridge.
 
-## Quick start
+## Build
 
 ```sh
-brew bundle                     # install dependencies (see Brewfile)
-direnv allow                    # activate environment (.envrc)
-cmake --preset default          # configure
-cmake --build build -- -j4      # build
-lora_trx                        # run (decodes ambient frames on 869.618 MHz)
+brew bundle
+direnv allow
+cmake --preset default
+cmake --build build -- -j4
 ```
 
-In a second terminal:
+Requires LLVM 21 (see `toolchain.cmake`). Use `-j4` max — template-heavy headers
+use ~4 GB RAM per compilation unit.
+
+## Run
 
 ```sh
-lora_mon.py                     # stream decoded frames from lora_trx
+lora_trx                        # RX on 869.618 MHz, CBOR frames → UDP :5555
+lora_mon.py                     # display frames from lora_trx
+meshcore_bridge.py              # companion protocol bridge on TCP :7834
 ```
 
 ## Architecture
 
 ```
-                  lora_trx (C++)
-                  ┌─────────────────────────────┐
 RF ──► SoapySDR ──► FrameSync ──► DemodDecoder ──► FrameSink ──► UDP :5555
-                  └─────────────────────────────┘        │
-                         ▲                               ▼ CBOR
-                         │                        ┌──────────────┐
-         meshcore_tx.py ─┘ TX request (CBOR UDP)  │  lora_mon.py │
-                                                  └──────────────┘
-                                                         │
-         meshcore-cli ──TCP:7834──► meshcore_bridge.py ──┘
-                        companion       ▲ CBOR/UDP
-                        protocol        │
-                                   config.toml
+                         ▲                                              │
+            TX (CBOR/UDP)│                                         CBOR │
+                         │                                              ▼
+                  meshcore_tx.py                                  lora_mon.py
+                                                                        │
+                  meshcore-cli ──TCP:7834──► meshcore_bridge.py ────────┘
 ```
 
-`lora_trx` binds UDP port 5555. Clients send any datagram to register; frames are
-broadcast as CBOR. TX requests use the same port.
-
-`meshcore_bridge.py` speaks the MeshCore companion binary protocol on TCP 7834,
-bridging to `lora_trx` via CBOR/UDP. Compatible with `meshcore-cli` and other
-companion apps (e.g. the Android app via port forwarding).
+`lora_trx` owns the UDP port (default 5555). Clients register by sending any
+datagram; frames are broadcast as CBOR to all registered clients. TX requests
+use the same port.
 
 ## Configuration
 
-All tools read from a shared `config.toml` (search order: `./config.toml`,
-`./apps/config.toml`, `~/.config/gr4-lora/config.toml`). Override with
-`--config <path>`.
-
-### config.toml reference
+All tools read `config.toml` (search order: `./config.toml`,
+`./apps/config.toml`, `~/.config/gr4-lora/config.toml`).
 
 ```toml
-# ── SDR device ───────────────────────────────────────────────────────────────
-device = "uhd"                # "uhd" or "soapy" driver name
-param  = "type=b200"          # device selector (UHD device args)
-rate   = 250000               # sample rate (Hz); must be 4 × BW or higher
-clock  = "external"           # clock source: "internal", "external", "gpsdo"
+# SDR device
+device = "uhd"
+param  = "type=b200"
+rate   = 250000               # Hz; must be ≥ 4 × BW
+clock  = "internal"           # "internal" | "external" | "gpsdo"
 
-# ── UDP transport (lora_trx ↔ Python scripts) ────────────────────────────────
-udp_listen       = "127.0.0.1"
-udp_port         = 5555
-status_interval  = 10         # seconds between status log lines
+# UDP (lora_trx ↔ scripts)
+udp_listen      = "127.0.0.1"
+udp_port        = 5555
+status_interval = 10          # seconds
 
-# ── MeshCore companion bridge ─────────────────────────────────────────────────
-[meshcore]
-region_scope  = "de-nord"     # regional transport-code hashtag (or "" to disable)
-# port         = 7834         # TCP listen port  (default 7834; avoid 5000 on macOS)
-name         = "DO2THX 📡"   # node display name shown to companion apps
-# identity_file = "~/.config/gr4-lora/identity.bin"
-# keys_dir     = "~/.config/gr4-lora/keys"
-# channels_dir = "~/.config/gr4-lora/channels"
-# contacts_dir = "~/.config/gr4-lora/contacts"
-# lat          = 53.55        # GPS latitude  (decimal degrees, optional)
-# lon          = 9.99         # GPS longitude (decimal degrees, optional)
-
-# ── Logging ──────────────────────────────────────────────────────────────────
 [logging]
 level = "INFO"                # DEBUG | INFO | WARNING | ERROR
 
-# ── LoRa codec ───────────────────────────────────────────────────────────────
+# LoRa codec (MeshCore EU narrow)
 [codec_meshcore_868]
-sf           = 8              # spreading factor 7–12
-bw           = 62500          # bandwidth (Hz)
-cr           = 8              # coding rate denominator 4/N  (5–8)
+sf           = 8
+bw           = 62500          # Hz
+cr           = 8              # coding rate denominator (4/N, N=5–8)
 sync_word    = 0x12           # 0x12 = MeshCore/Reticulum, 0x2B = Meshtastic
 preamble_len = 8
-# min_snr_db     = -12.0      # minimum SNR threshold for frame sync
-# energy_thresh  = 1e-6       # preamble energy threshold
-# timeout_symbols = 30        # inter-chain combining timeout
 
-# ── RF radio ─────────────────────────────────────────────────────────────────
+# Radio
 [radio_868]
-freq       = 869618000        # centre frequency (Hz)
-rx_channel = [1, 2]           # receive channels (B210: 0=TRX_A, 1=RX_A, 2=RX_B, 3=TRX_B)
+freq       = 869618000        # Hz
+rx_channel = [1, 2]           # B210: 0=TRX_A 1=RX_A 2=RX_B 3=TRX_B
 tx_channel = 0
 rx_gain    = 43               # dB
-tx_gain    = 50               # dB  (B220 minimum usable: 70 dB)
+tx_gain    = 50               # dB (B220 minimum usable: 70 dB)
 
-# ── Active set (binds codec + radio) ─────────────────────────────────────────
+# Active set — binds codec + radio
 [set_meshcore_868]
 name  = "MeshCore 868 MHz"
 codec = "codec_meshcore_868"
 radio = "radio_868"
-# Optional: multiple decode chains (one FrameSync+DemodDecoder pair each).
-# If omitted, one chain is created from the codec's sf/sync_word.
-# [[set_meshcore_868.decode]]
-# sf        = 8
-# sync_word = 0x12
-# label     = "meshcore"
+
+# Companion bridge
+[meshcore]
+name         = "MyNode"
+region_scope = "de-nord"      # transport-code hashtag, or "" to disable
+# port         = 7834         # avoid 5000 on macOS (AirPlay)
+# identity_file = "~/.config/gr4-lora/identity.bin"
+# keys_dir      = "~/.config/gr4-lora/keys"
+# channels_dir  = "~/.config/gr4-lora/channels"
+# contacts_dir  = "~/.config/gr4-lora/contacts"
+# lat = 53.55
+# lon = 9.99
+# client_repeat   = 0         # non-zero = forward RX frames back to mesh
+# path_hash_mode  = 0         # 0–2
+# autoadd_config  = 0
+# autoadd_max_hops = 0
+# flood_scope = ""            # 32 hex chars (16 bytes); overrides region_scope
 ```
 
-All `--port`, `--name`, `--identity`, `--keys-dir`, `--channels-dir`,
-`--contacts-dir` CLI flags override the corresponding `[meshcore]` key.
-CLI flags that have no config equivalent (`--udp`, `--config`, `--debug`)
-are CLI-only.
-
-**macOS note:** port 5000 is occupied by AirPlay Receiver / Control Center.
-Use the default 7834 or disable AirPlay in System Settings → General →
-AirDrop & Handoff.
-
-## Python scripts
-
-All scripts live in `scripts/` and use the project venv (`.venv`, managed by `uv`).
-Activate with `direnv allow` or prefix commands with `.venv/bin/python3`.
-
-### lora_mon.py — streaming monitor
-
-Connects to `lora_trx` UDP and displays decoded frames with gain advice.
-
-```sh
-lora_mon.py                             # default: 127.0.0.1:5555
-lora_mon.py --connect 127.0.0.1:5556   # custom port
-```
-
-With an identity, decrypts incoming messages automatically:
-
-| Message type | Decryption | Notes |
-|---|---|---|
-| ADVERT | n/a | Pubkey auto-saved to key store |
-| TXT_MSG | Yes | ECDH shared secret tried for each known key |
-| ANON_REQ | Yes | Only if addressed to us (dest_hash match) |
-| GRP_TXT | Yes | Uses pre-shared channel key from channels_dir |
-
-Key learning: when an ADVERT arrives, its 32-byte Ed25519 public key is saved to
-`~/.config/gr4-lora/keys/<hex>.key`. The key store grows passively over time.
-
-### meshcore_tx.py — MeshCore transmitter
-
-Builds and sends MeshCore packets via `lora_trx`.
-
-```sh
-meshcore_tx.py advert --name "MyNode"                  # broadcast ADVERT
-meshcore_tx.py advert --name "MyNode" --qr             # + print QR code
-meshcore_tx.py send --dest <pubkey_hex> "Hello"        # encrypted TXT_MSG
-meshcore_tx.py anon  --dest <pubkey_hex> "Hello"       # anonymous request
-meshcore_tx.py send --dest <pubkey_hex> "Hi" --dry-run # show packet, don't send
-```
-
-All subcommands accept `--udp HOST:PORT` (default `127.0.0.1:5555`),
-`--identity`, `--freq`, `--sf`, `--bw`.
-
-### meshcore_bridge.py — MeshCore companion bridge
-
-TCP server speaking the MeshCore companion binary protocol, bridging to
-`lora_trx` via CBOR/UDP.
-
-```sh
-meshcore_bridge.py                   # TCP 7834, UDP 127.0.0.1:5555
-meshcore_bridge.py --port 5000       # for apps that require port 5000
-meshcore-cli -p 7834                 # connect with meshcore-cli
-```
-
-#### Companion command matrix
-
-| Code | Command | Status | Notes |
-|------|---------|--------|-------|
-| 0x01 | `CMD_APP_START` | ✅ | Returns `PACKET_SELF_INFO` with radio params + pubkey + name |
-| 0x02 | `CMD_SEND_TXT_MSG` | ✅ | Encrypted TXT_MSG via lora_trx; flood scope / region key priority |
-| 0x03 | `CMD_SEND_CHAN_TXT_MSG` | ✅ | Encrypted GRP_TXT; flood scope / region key priority |
-| 0x04 | `CMD_GET_CONTACTS` | ✅ | Streams 147-byte contact records from contacts dir |
-| 0x05 | `CMD_GET_DEVICE_TIME` | ✅ | Returns current Unix time |
-| 0x06 | `CMD_SET_DEVICE_TIME` | ✅ | Updates in-memory clock offset |
-| 0x07 | `CMD_SEND_SELF_ADVERT` | ✅ | Builds and sends ADVERT via lora_trx |
-| 0x08 | `CMD_SET_ADVERT_NAME` | ✅ | Updates in-memory node name |
-| 0x09 | `CMD_ADD_UPDATE_CONTACT` | ✅ | Stores 147-byte record; persisted to contacts dir |
-| 0x0A | `CMD_SYNC_NEXT_MESSAGE` | ✅ | Dequeues next queued RX message |
-| 0x0B | `CMD_SET_RADIO_PARAMS` | ✅ | In-memory only; optional 5th byte sets repeat mode |
-| 0x0C | `CMD_SET_RADIO_TX_POWER` | ✅ | In-memory only; forwarded in next TX CBOR request |
-| 0x0D | `CMD_RESET_PATH` | ✅ stub | Returns OK; no path table maintained |
-| 0x0E | `CMD_SET_ADVERT_LATLON` | ✅ | In-memory lat/lon; included in next ADVERT TX |
-| 0x0F | `CMD_REMOVE_CONTACT` | ✅ | Deletes by 6-byte pubkey prefix; removes from contacts dir |
-| 0x10 | `CMD_SHARE_CONTACT` | ✅ | Returns `PACKET_EXPORT_CONTACT` with biz-card URI |
-| 0x11 | `CMD_EXPORT_CONTACT` | ✅ | Returns `PACKET_EXPORT_CONTACT` with biz-card URI |
-| 0x12 | `CMD_IMPORT_CONTACT` | ✅ | Decodes ADVERT wire packet, stores contact |
-| 0x13 | `CMD_REBOOT` | ✅ stub | Returns OK; bridge does not restart |
-| 0x14 | `CMD_GET_BATT_AND_STORAGE` | ✅ | Returns `PACKET_BATTERY` (fixed 100%, storage from contacts dir) |
-| 0x15 | `CMD_SET_TUNING_PARAMS` | ✅ stub | Returns OK; tuning params not applied |
-| 0x16 | `CMD_DEVICE_QUERY` | ✅ | Returns `PACKET_DEVICE_INFO` (82 bytes, fw v10) |
-| 0x1F | `CMD_GET_CHANNEL` | ✅ | Returns `PACKET_CHANNEL_INFO` from channels dir |
-| 0x20 | `CMD_SET_CHANNEL` | ✅ | Stores channel; persisted to channels dir |
-| 0x36 | `CMD_SET_FLOOD_SCOPE` | ✅ | Sets 16-byte send_scope key; overrides region_key in TX |
-| 0x38 | `CMD_GET_STATS` | ✅ | Sub-types 0 (core), 1 (radio), 2 (packets) — live values |
-| 0x3A | `CMD_SET_AUTOADD_CONFIG` | ✅ | Bitmask + optional max_hops (clamped to 64) |
-| 0x3B | `CMD_GET_AUTOADD_CONFIG` | ✅ | Returns 3-byte response with bitmask + max_hops |
-| 0x3C | `CMD_GET_ALLOWED_REPEAT_FREQ` | ✅ | Returns 3 freq pairs: 433 / 869 / 918 MHz |
-| 0x3D | `CMD_SET_PATH_HASH_MODE` | ✅ | Mode 0–2; discriminator byte validated |
-
-#### Push / unsolicited responses
-
-| Code | Name | Status | Notes |
-|------|------|--------|-------|
-| 0x82 | `PUSH_SEND_CONFIRMED` | ✅ | Sent when RF ACK matches outbound TX tag |
-| 0x83 | `PUSH_MSG_WAITING` | ✅ | Sent when RX frame queued while companion is idle |
-| 0x8A | `PUSH_NEW_ADVERT` | ✅ | Sent on new ADVERT RX (147-byte contact record) |
-| 0x80 | `PUSH_ADVERTISEMENT` | — | Legacy; bridge emits 0x8A instead |
-| 0x81 | `PUSH_PATH_UPDATE` | — | Not produced (no path table) |
-| 0x88 | `PUSH_LOG_DATA` | — | Not produced |
-
-#### RX frame handling
-
-RX frames from `lora_trx` are decrypted and pushed to the connected companion as
-`CONTACT_MSG_RECV_V3` / `CHANNEL_MSG_RECV_V3`.
-
-| Frame type | Handled | Notes |
-|------------|---------|-------|
-| ADVERT | ✅ | Key learned, contact auto-added, `PUSH_NEW_ADVERT` sent |
-| TXT_MSG | ✅ | ECDH trial decryption; RF ACK TX on success |
-| ANON_REQ | ✅ | Decrypted; RESP sent (no RF ACK) |
-| GRP_TXT | ✅ | PSK decryption using channels dir |
-| Packet forwarding | ✅ | Raw re-TX when `client_repeat != 0` (echo-filtered) |
-Contacts and channels are persisted across restarts.
-
-**Identity and data directories** (all configurable in `[meshcore]` or via CLI):
-
-| Setting | Default |
-|---|---|
-| `identity_file` | `~/.config/gr4-lora/identity.bin` |
-| `keys_dir` | `~/.config/gr4-lora/keys/` |
-| `channels_dir` | `~/.config/gr4-lora/channels/` |
-| `contacts_dir` | `~/.config/gr4-lora/contacts/` |
-
-**Startup robustness:** corrupt or wrong-size identity files are detected and
-regenerated with a warning. Corrupt `.key` / `.channel` / `.contact` files are
-skipped with a log warning rather than silently accepted or crashing. Permission
-errors on data directories are logged and do not crash the bridge.
-
-### meshcore_crypto.py — shared crypto module
-
-ECDH key exchange (X25519 via Ed25519 scalar), AES-128-ECB encryption,
-HMAC-SHA256 MAC, Ed25519 identity management, contact key store, and ACK hash
-computation. Used by `meshcore_tx.py`, `lora_mon.py`, and `meshcore_bridge.py`.
-
-### lora_mqtt.py — LoRa-to-MQTT bridge
-
-Publishes decoded LoRa frames to the letsmesh.net MQTT packet analyzer
-(`meshcore/<IATA>/<pubkey>/packets`, TLS port 443, payload-hex dedup).
+CLI flags (`--port`, `--name`, `--identity`, `--keys-dir`, `--channels-dir`,
+`--contacts-dir`) override the corresponding `[meshcore]` key.
 
 ## Tests
 
 ```sh
-# C++ (7 suites, ~17s)
+# C++ (8 suites)
 ctest --test-dir build -R qa_lora --output-on-failure --timeout 60
 
 # Python (373 tests)
 .venv/bin/python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
-| Suite | Count | What it covers |
-|---|---|---|
-| `test_lora_mon.py` | 41 | Monitor frame parsing and decryption |
-| `test_meshcore_tx.py` | 37 | MeshCore TX packet construction |
-| `test_meshcore_integration.py` | 28 | MeshCore encode-decode round-trips |
-| `test_meshcore_crypto.py` | 41 | ECDH, AES, identity, key store |
-| `test_meshcore_bridge.py` | 159 | Companion protocol, RX conversion, repeat mode, flood scope, autoadd, path hash mode |
-| `test_meshcore_bridge_integration.py` | 12 | Bridge integration (APP_START→TX round-trip) |
-| `test_lora_mqtt.py` | 27 | MQTT bridge frame conversion |
-| `test_meshcore_tx.py` | 28 | MeshCore TX (already counted above) |
+See `scripts/README.md` for the per-suite breakdown.
 
 ## License
 

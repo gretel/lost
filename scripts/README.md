@@ -1,175 +1,172 @@
 # scripts/
 
-Python tools for `lora_trx`. All scripts use the project venv (`.venv`).
-Activate with `direnv allow` or prefix with `.venv/bin/python3`.
+Python tools for gr4-lora. All use the project venv (`.venv`).
+Activate with `direnv allow`, or prefix with `.venv/bin/python3`.
 
-## Scripts
+---
 
-| Script | Role |
-|--------|------|
-| `lora_mon.py` | Streaming monitor — connects to `lora_trx` UDP, decrypts MeshCore frames |
-| `meshcore_bridge.py` | MeshCore companion protocol bridge (TCP ↔ CBOR/UDP) |
-| `meshcore_tx.py` | One-shot MeshCore TX: ADVERT, TXT_MSG, ANON_REQ |
-| `meshcore_crypto.py` | Shared crypto: ECDH, AES-128-ECB, identity, key store |
-| `lora_mqtt.py` | LoRa-to-MQTT bridge for letsmesh.net (TLS, dedup) |
-| `cbor_stream.py` | CBOR Sequence (RFC 8742) stream reader for pipes |
-| `lora_common.py` | Shared constants, formatting, config loading |
-| `lora_decode_meshcore.py` | Offline MeshCore protocol decoder |
-| `lora_decode_meshtastic.py` | Offline Meshtastic protocol decoder |
-| `lora_decode_lorawan.py` | LoRaWAN MAC header decoder |
-| `lora_decode_raw.py` | Offline raw hex/ASCII dump of saved CBOR streams |
-| `lora_duckdb.py` | DuckDB frame storage and query |
+## lora_mon.py
+
+Connects to `lora_trx` UDP and prints decoded frames. With an identity file,
+decrypts TXT_MSG, ANON_REQ, and GRP_TXT in real time. Learned public keys are
+saved to `keys_dir` automatically.
+
+```sh
+lora_mon.py
+lora_mon.py --connect 127.0.0.1:5556
+lora_mon.py --identity ~/.config/gr4-lora/identity.bin
+lora_mon.py --channel "name:BASE64SECRET"
+```
+
+---
+
+## meshcore_bridge.py
+
+MeshCore companion protocol bridge. Listens on TCP (default port 7834) and
+translates between the companion binary protocol and `lora_trx` CBOR/UDP.
+Compatible with `meshcore-cli` and the Android companion app (via port
+forwarding).
+
+```sh
+meshcore_bridge.py
+meshcore_bridge.py --port 5000    # some apps hardcode this
+meshcore-cli -p 7834
+```
+
+Identity, contacts, channels, and public keys are persisted to disk across
+restarts (see `[meshcore]` config keys). Radio parameter changes via companion
+commands are in-memory only — RX retune requires restarting `lora_trx`.
+
+### Command support
+
+| Code | Command | Notes |
+|------|---------|-------|
+| 0x01 | APP_START | Returns SELF_INFO |
+| 0x02 | SEND_TXT_MSG | Encrypted TXT_MSG → lora_trx |
+| 0x03 | SEND_CHAN_TXT_MSG | Encrypted GRP_TXT → lora_trx |
+| 0x04 | GET_CONTACTS | Streams persisted contacts |
+| 0x05 | GET_DEVICE_TIME | |
+| 0x06 | SET_DEVICE_TIME | In-memory |
+| 0x07 | SEND_SELF_ADVERT | Signed ADVERT → lora_trx |
+| 0x08 | SET_ADVERT_NAME | In-memory |
+| 0x09 | ADD_UPDATE_CONTACT | Persisted |
+| 0x0A | SYNC_NEXT_MESSAGE | Dequeues RX |
+| 0x0B | SET_RADIO_PARAMS | In-memory; 5th byte = repeat flag |
+| 0x0C | SET_RADIO_TX_POWER | In-memory |
+| 0x0D | RESET_PATH | Stub (OK) |
+| 0x0E | SET_ADVERT_LATLON | In-memory |
+| 0x0F | REMOVE_CONTACT | Persisted |
+| 0x10 | SHARE_CONTACT | Returns biz-card URI |
+| 0x11 | EXPORT_CONTACT | Returns biz-card URI |
+| 0x12 | IMPORT_CONTACT | Persisted |
+| 0x13 | REBOOT | Stub (OK) |
+| 0x14 | GET_BATT_AND_STORAGE | Fixed 100% battery |
+| 0x15 | SET_TUNING_PARAMS | Stub (OK) |
+| 0x16 | DEVICE_QUERY | Returns DEVICE_INFO (82 bytes) |
+| 0x1F | GET_CHANNEL | From channels_dir |
+| 0x20 | SET_CHANNEL | Persisted |
+| 0x36 | SET_FLOOD_SCOPE | Sets 16-byte send_scope key |
+| 0x38 | GET_STATS | Sub-types 0/1/2 (core/radio/packets) |
+| 0x3A | SET_AUTOADD_CONFIG | |
+| 0x3B | GET_AUTOADD_CONFIG | |
+| 0x3C | GET_ALLOWED_REPEAT_FREQ | Returns 433/869/918 MHz pairs |
+| 0x3D | SET_PATH_HASH_MODE | Mode 0–2 |
+
+Unknown commands return OK silently.
+
+### RX handling
+
+| Frame | Action |
+|-------|--------|
+| ADVERT | Key learned; PUSH_NEW_ADVERT sent |
+| TXT_MSG | ECDH trial-decrypted; RF ACK sent on success |
+| ANON_REQ | Decrypted; RESP sent |
+| GRP_TXT | PSK-decrypted using channels_dir |
+| ACK | Matched to pending TX; PUSH_SEND_CONFIRMED if matched |
+| Any (client_repeat≠0) | Raw payload re-forwarded to mesh (echo-filtered) |
+
+### TX transport key priority
+
+1. `send_scope` (SET_FLOOD_SCOPE or `flood_scope` in config)
+2. `region_key` (derived from `region_scope` hashtag)
+3. No transport codes
+
+---
+
+## meshcore_tx.py
+
+Builds and sends MeshCore wire packets directly to `lora_trx`.
+
+```sh
+meshcore_tx.py advert --name "MyNode"
+meshcore_tx.py advert --name "MyNode" --qr
+meshcore_tx.py send --dest <64hex> "Hello"
+meshcore_tx.py anon-req --dest <64hex> "Hello"
+meshcore_tx.py send --dest <64hex> "Hello" --dry-run
+```
+
+All subcommands: `--udp HOST:PORT`, `--identity`, `--freq`, `--sf`, `--bw`,
+`--route` (flood | direct | tc-flood | tc-direct).
+
+---
+
+## meshcore_crypto.py
+
+Shared crypto used by `lora_mon.py`, `meshcore_tx.py`, and
+`meshcore_bridge.py`. Not a CLI tool.
+
+Provides: Ed25519 identity management, X25519 ECDH (MeshCore-compatible —
+**not** interchangeable with libsodium's `sk_to_curve25519`), AES-128-ECB
+encrypt/decrypt, 2-byte HMAC-SHA256 MAC, ACK hash, key store load/save,
+trial decryption for TXT_MSG / ANON_REQ / GRP_TXT.
+
+---
+
+## lora_mqtt.py
+
+Publishes decoded frames to letsmesh.net MQTT (TLS, port 443). Suppresses
+duplicates from dual-channel RX.
+
+```sh
+lora_mqtt.py --iata HAM
+lora_mqtt.py --iata HAM --connect 127.0.0.1:5555 --mqtt-host mqtt-eu-v1.letsmesh.net
+```
+
+Topic: `meshcore/<IATA>/<pubkey_hex>/packets`
+
+---
+
+## Other scripts
+
+| Script | Purpose |
+|--------|---------|
+| `cbor_stream.py` | CBOR Sequence (RFC 8742) reader for pipes and files |
+| `lora_common.py` | Config loading, constants, format helpers — shared library |
+| `lora_decode_meshcore.py` | Offline MeshCore frame decoder |
+| `lora_decode_meshtastic.py` | Offline Meshtastic frame decoder |
+| `lora_decode_lorawan.py` | Offline LoRaWAN MAC decoder |
+| `lora_decode_raw.py` | Offline raw hex/ASCII dump of CBOR streams |
+| `lora_duckdb.py` | Log decoded frames to DuckDB |
 | `lora_waterfall.py` | Terminal waterfall display |
 | `lora_trx.lua` | Wireshark dissector for lora_trx CBOR UDP frames |
 
 ---
 
-## meshcore_bridge.py — implementation status
-
-TCP server on port 7834 (default) implementing the MeshCore companion binary
-protocol. Bridges to `lora_trx` via CBOR/UDP.
-
-### Companion commands (app → bridge)
-
-Legend: ✅ full · ⚠ stub (returns OK, no effect) · — not implemented
-
-| Code | Command | Status | Notes |
-|------|---------|:------:|-------|
-| 0x01 | `CMD_APP_START` | ✅ | Returns `PACKET_SELF_INFO`: radio params, pubkey, node name |
-| 0x02 | `CMD_SEND_TXT_MSG` | ✅ | Encrypted TXT_MSG via lora_trx; flood scope / region key priority |
-| 0x03 | `CMD_SEND_CHAN_TXT_MSG` | ✅ | Encrypted GRP_TXT via lora_trx; flood scope / region key priority |
-| 0x04 | `CMD_GET_CONTACTS` | ✅ | Streams 147-byte contact records from `contacts_dir` |
-| 0x05 | `CMD_GET_DEVICE_TIME` | ✅ | Returns current Unix timestamp |
-| 0x06 | `CMD_SET_DEVICE_TIME` | ✅ | Updates in-memory clock offset (session-only) |
-| 0x07 | `CMD_SEND_SELF_ADVERT` | ✅ | Builds and transmits signed ADVERT via lora_trx |
-| 0x08 | `CMD_SET_ADVERT_NAME` | ✅ | Updates in-memory node name (session-only) |
-| 0x09 | `CMD_ADD_UPDATE_CONTACT` | ✅ | Parses 147-byte record; persists to `contacts_dir` |
-| 0x0A | `CMD_SYNC_NEXT_MESSAGE` | ✅ | Dequeues next RX message from internal queue |
-| 0x0B | `CMD_SET_RADIO_PARAMS` | ✅ | In-memory only (RX retune needs `lora_trx` restart); optional 5th byte sets `client_repeat`; freq validated against `REPEAT_FREQ_RANGES` |
-| 0x0C | `CMD_SET_RADIO_TX_POWER` | ✅ | In-memory only; forwarded in next TX CBOR request |
-| 0x0D | `CMD_RESET_PATH` | ⚠ | Returns OK; no path table is maintained |
-| 0x0E | `CMD_SET_ADVERT_LATLON` | ✅ | Updates `lat_e6`/`lon_e6` in-memory; reflected in next ADVERT TX and `PACKET_SELF_INFO` |
-| 0x0F | `CMD_REMOVE_CONTACT` | ✅ | Removes by 6-byte pubkey prefix from memory and `contacts_dir` |
-| 0x10 | `CMD_SHARE_CONTACT` | ✅ | Returns `PACKET_EXPORT_CONTACT` with biz-card URI (`meshcore://<hex>`) |
-| 0x11 | `CMD_EXPORT_CONTACT` | ✅ | Same as SHARE; reconstructs unsigned ADVERT for non-self contacts |
-| 0x12 | `CMD_IMPORT_CONTACT` | ✅ | Decodes ADVERT wire packet; stores contact; learns pubkey |
-| 0x13 | `CMD_REBOOT` | ⚠ | Returns OK; bridge process does not restart |
-| 0x14 | `CMD_GET_BATT_AND_STORAGE` | ✅ | Returns `PACKET_BATTERY`: fake 100% (4200 mV); storage from `contacts_dir` |
-| 0x15 | `CMD_SET_TUNING_PARAMS` | ⚠ | Returns OK; tuning params are not applied |
-| 0x16 | `CMD_DEVICE_QUERY` | ✅ | Returns `PACKET_DEVICE_INFO` (82 bytes): `client_repeat` at byte 80, `path_hash_mode` at byte 81 |
-| 0x1F | `CMD_GET_CHANNEL` | ✅ | Returns `PACKET_CHANNEL_INFO` from channels loaded from `channels_dir` |
-| 0x20 | `CMD_SET_CHANNEL` | ✅ | Stores 32-byte channel secret; persists to `channels_dir` |
-| 0x36 | `CMD_SET_FLOOD_SCOPE` | ✅ | Sets 16-byte `send_scope` key (discriminator byte validated); overrides `region_key` in all TX |
-| 0x38 | `CMD_GET_STATS` | ✅ | Sub-type 0 (core uptime/errors), 1 (radio: live RSSI/SNR/noise), 2 (packet counters) |
-| 0x3A | `CMD_SET_AUTOADD_CONFIG` | ✅ | Sets `autoadd_config` bitmask + optional `autoadd_max_hops` (clamped to 64) |
-| 0x3B | `CMD_GET_AUTOADD_CONFIG` | ✅ | Returns `[0x19, autoadd_config, autoadd_max_hops]` (3 bytes) |
-| 0x3C | `CMD_GET_ALLOWED_REPEAT_FREQ` | ✅ | Returns 25-byte response: 3 lo/hi freq pairs (433 / 869 / 918 MHz) |
-| 0x3D | `CMD_SET_PATH_HASH_MODE` | ✅ | Mode 0–2; discriminator byte validated; `ERR_CODE_ILLEGAL_ARG` on bad input |
-
-Unknown commands return `PACKET_OK` silently.
-
-### Push / unsolicited responses (bridge → app)
-
-| Code | Name | Status | Notes |
-|------|------|:------:|-------|
-| 0x82 | `PUSH_SEND_CONFIRMED` | ✅ | Emitted when an RF ACK matches a pending outbound TX tag |
-| 0x83 | `PUSH_MSG_WAITING` | ✅ | Emitted when an RX frame is queued while no companion is connected |
-| 0x8A | `PUSH_NEW_ADVERT` | ✅ | Emitted on ADVERT RX with the full 147-byte contact record |
-| 0x80 | `PUSH_ADVERTISEMENT` | — | Legacy; bridge always uses 0x8A instead |
-| 0x81 | `PUSH_PATH_UPDATE` | — | Not produced (no path table) |
-| 0x88 | `PUSH_LOG_DATA` | — | Not produced |
-
-### RX frame handling (lora_trx → bridge → app)
-
-| Payload type | Status | Notes |
-|--------------|:------:|-------|
-| ADVERT (0x04) | ✅ | Pubkey learned, contact stored, `PUSH_NEW_ADVERT` sent to companion |
-| TXT_MSG (0x02) | ✅ | ECDH trial-decryption against all known keys; RF ACK TX on success; `CONTACT_MSG_RECV_V3` pushed |
-| ANON_REQ (0x07) | ✅ | Decrypts using embedded 32-byte sender pubkey; sends encrypted RESP; contact learned |
-| GRP_TXT (0x05) | ✅ | PSK decryption using channels from `channels_dir`; `CHANNEL_MSG_RECV_V3` pushed |
-| ACK (0x03) | ✅ | Matched against `pending_acks`; `PUSH_SEND_CONFIRMED` emitted on match |
-| Packet forwarding | ✅ | When `client_repeat != 0`: raw RX payload re-transmitted via lora_trx (echo-filtered) |
-| PATH (0x08) | — | Received but not decoded |
-| TRACE (0x09) | — | Received but not decoded |
-| CTRL (0x0B) | — | Received but not decoded |
-
-### TX transport code priority
-
-When building TX packets the bridge selects a transport key in this order:
-
-1. **`send_scope`** — set by `CMD_SET_FLOOD_SCOPE` or `flood_scope` in config (non-zero 16-byte raw key)
-2. **`region_key`** — derived from `region_scope` hashtag: `SHA-256("#" + name)[:16]`
-3. **No transport codes** — plain flood / direct routing
-
-### config.toml `[meshcore]` keys
-
-| Key | Type | Default | Status | Notes |
-|-----|------|---------|:------:|-------|
-| `port` | int | 7834 | ✅ | TCP listen port; avoid 5000 on macOS (AirPlay) |
-| `name` | str | `"gr4-lora"` | ✅ | Node display name shown to companion apps |
-| `identity_file` | path | `~/.config/gr4-lora/identity.bin` | ✅ | Ed25519 seed + expanded key (64 bytes) |
-| `keys_dir` | path | `~/.config/gr4-lora/keys/` | ✅ | Learned pubkeys (`<hex>.key`, 32 bytes each) |
-| `channels_dir` | path | `~/.config/gr4-lora/channels/` | ✅ | Channel PSKs (`<name>.channel`, 16 or 32 bytes) |
-| `contacts_dir` | path | `~/.config/gr4-lora/contacts/` | ✅ | Persisted contacts (`<hex>.contact`, 147 bytes each) |
-| `region_scope` | str | `""` | ✅ | Regional transport-code hashtag (e.g. `"de-nord"`); empty = disabled |
-| `lat` | float | 0 | ✅ | GPS latitude (decimal degrees); included in ADVERT TX when non-zero |
-| `lon` | float | 0 | ✅ | GPS longitude (decimal degrees); included in ADVERT TX when non-zero |
-| `client_repeat` | int | 0 | ✅ | 0 = off; non-zero = forward all RX frames back to the mesh |
-| `path_hash_mode` | int | 0 | ✅ | 0–2; reflected in `PACKET_DEVICE_INFO` byte 81 |
-| `autoadd_config` | int | 0 | ✅ | Bitmask for auto-add behaviour |
-| `autoadd_max_hops` | int | 0 | ✅ | Max hops for auto-add (clamped to 64 at startup) |
-| `flood_scope` | str | `""` | ✅ | 32 hex chars (16 bytes) for `send_scope`; overrides `region_scope` in TX |
-
-### CLI flags
-
-| Flag | Maps to | Notes |
-|------|---------|-------|
-| `--port N` | `[meshcore] port` | Overrides config |
-| `--name STR` | `[meshcore] name` | Overrides config |
-| `--identity PATH` | `[meshcore] identity_file` | Overrides config |
-| `--keys-dir PATH` | `[meshcore] keys_dir` | Overrides config |
-| `--channels-dir PATH` | `[meshcore] channels_dir` | Overrides config |
-| `--contacts-dir PATH` | `[meshcore] contacts_dir` | Overrides config |
-| `--udp HOST:PORT` | UDP connection to lora_trx | Default `127.0.0.1:5555`; CLI-only |
-| `--config PATH` | Config file path | CLI-only |
-| `--debug` | Log level DEBUG | CLI-only |
-
-### State persistence
-
-In-memory only — lost on bridge restart (startup values from `config.toml`):
-
-- `client_repeat`, `path_hash_mode`, `send_scope`, `autoadd_config`, `autoadd_max_hops`
-- Radio params (`freq_mhz`, `bw_khz`, `sf`, `cr`, `tx_power`)
-- Node name, GPS location, clock offset
-- Message queue, TX echo filter, RX dedup table, pending ACK table
-
-Persisted to disk:
-
-- Identity (`identity_file`)
-- Learned pubkeys (`keys_dir/*.key`)
-- Channel PSKs (`channels_dir/*.channel`)
-- Contacts (`contacts_dir/*.contact`)
-
----
-
 ## Tests
-
-Run the full suite from the repo root:
 
 ```sh
 .venv/bin/python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
-| Suite | Tests | Covers |
-|-------|------:|--------|
-| `test_lora_mon.py` | 59 | Monitor frame parsing, decryption, key learning |
-| `test_meshcore_tx.py` | 37 | ADVERT / TXT_MSG / ANON_REQ packet construction |
-| `test_meshcore_integration.py` | 28 | MeshCore encode-decode round-trips |
-| `test_meshcore_crypto.py` | 67 | ECDH, AES-128-ECB, identity management, key store |
-| `test_meshcore_bridge.py` | 159 | Companion protocol commands, RX conversion, repeat mode, flood scope, autoadd, path hash mode |
-| `test_meshcore_bridge_integration.py` | 12 | Bridge integration: APP_START → TX round-trip |
-| `test_lora_mqtt.py` | 11 | MQTT bridge frame conversion and dedup |
-| **Total** | **373** | |
+| Suite | Count |
+|-------|------:|
+| test_lora_mon | 59 |
+| test_meshcore_tx | 37 |
+| test_meshcore_integration | 28 |
+| test_meshcore_crypto | 67 |
+| test_meshcore_bridge | 159 |
+| test_meshcore_bridge_integration | 12 |
+| test_lora_mqtt | 11 |
+| **total** | **373** |
 
-`test_bridge_live.py` requires a running `lora_trx` instance and is excluded
-from the automated suite.
+`test_bridge_live.py` is excluded — it requires a live `lora_trx` instance.
