@@ -49,7 +49,7 @@ log = logging.getLogger("gr4.wav")
 DEFAULT_AUDIO_DIR = "data/audio"
 AUDIO_SAMPLE_RATE = 22050  # Hz — quarter CD rate, smooth phase at low frequency
 CHIRP_AMPLITUDE = 0.4  # 0..1 — keep well below full scale
-SYMBOL_DURATION_S = 0.15  # seconds per chirp — slow enough to sound intentional
+SYMBOL_DURATION_S = 0.08  # seconds per chirp — snappy but audible
 CHIRP_F_LO = 100.0  # Hz — low, gentle register
 CHIRP_F_HI = 900.0  # Hz — stays below 1 kHz for pleasant tone
 
