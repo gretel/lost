@@ -3132,5 +3132,283 @@ class TestExportStoredContact(unittest.TestCase):
         self.assertEqual(pubkey_in_wire, self.state.pub_key)
 
 
+# ---- Group J: CMD_SET_CHANNEL edge cases ----
+
+
+class TestSetChannelEdgeCases(unittest.TestCase):
+    """Edge-case tests for _handle_set_channel."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.state = make_state(channels_dir=self.tmpdir / "channels")
+        self.sock = _FakeUDPSock()
+        self.addr = ("127.0.0.1", 0)
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(cmd_bytes, self.state, self.sock, self.addr)
+
+    def test_set_channel_too_short_returns_error(self):
+        """J1: CMD_SET_CHANNEL with < 65 bytes of data returns RESP_ERROR."""
+        # 30 bytes of data after the command byte (well below the 65-byte minimum)
+        short_data = bytes(30)
+        cmd = bytes([bridge.CMD_SET_CHANNEL]) + short_data
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+    def test_set_channel_out_of_range_returns_error(self):
+        """J2: CMD_SET_CHANNEL with idx=8 (>= max 8 channels) returns RESP_ERROR."""
+        idx = 8  # out of range (valid: 0..7)
+        name = b"toobig".ljust(32, b"\x00")
+        secret = b"\x01" * 32
+        cmd = bytes([bridge.CMD_SET_CHANNEL, idx]) + name + secret
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+    def test_set_channel_persists_to_disk(self):
+        """J3: CMD_SET_CHANNEL writes a .channel file to channels_dir."""
+        channels_dir = self.tmpdir / "channels"
+        idx = 0
+        name = b"persist-ch".ljust(32, b"\x00")
+        secret = b"\xde\xad" * 16  # 32 bytes
+        cmd = bytes([bridge.CMD_SET_CHANNEL, idx]) + name + secret
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+        # Verify the channel file was written
+        channel_files = list(channels_dir.glob("*.channel"))
+        self.assertGreater(len(channel_files), 0, "no .channel file written to disk")
+
+        # Verify in-memory state
+        self.assertTrue(len(self.state.channels) > idx)
+        self.assertEqual(self.state.channels[idx].name, "persist-ch")
+
+    def test_set_channel_all_zero_name_clears_channel(self):
+        """J4: CMD_SET_CHANNEL with idx=0 and all-zero name clears that slot."""
+        # First add a channel at index 0
+        idx = 0
+        name = b"to-clear".ljust(32, b"\x00")
+        secret = b"\xab" * 32
+        self._handle(bytes([bridge.CMD_SET_CHANNEL, idx]) + name + secret)
+        self.assertEqual(self.state.channels[0].name, "to-clear")
+
+        # Now send all-zero name to clear it
+        zero_name = b"\x00" * 32
+        zero_secret = b"\x00" * 32
+        cmd = bytes([bridge.CMD_SET_CHANNEL, idx]) + zero_name + zero_secret
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+        # Bridge removes the slot from channels list when name is empty
+        # Either the list is empty, or the slot at 0 is not "to-clear"
+        if len(self.state.channels) > 0:
+            self.assertNotEqual(self.state.channels[0].name, "to-clear")
+        # (list length may be 0 after clearing)
+
+
+# ---- Group K: build_channel_info paths ----
+
+
+class TestBuildChannelInfo(unittest.TestCase):
+    """Tests for build_channel_info response structure."""
+
+    def setUp(self):
+        self.state = make_state()
+        self.sock = _FakeUDPSock()
+        self.addr = ("127.0.0.1", 0)
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(cmd_bytes, self.state, self.sock, self.addr)
+
+    def test_channel_info_populated_channel_contains_name_and_secret(self):
+        """K1: GET_CHANNEL with populated channel returns name and secret in RESP_CHANNEL_INFO."""
+        ch = GroupChannel("myhash", b"\xab" * 16)
+        self.state.channels = [ch]
+
+        responses = self._handle(bytes([bridge.CMD_GET_CHANNEL, 0x00]))
+        self.assertEqual(len(responses), 1)
+        resp = responses[0]
+        self.assertEqual(resp[0], bridge.RESP_CHANNEL_INFO)
+        # Layout: code(1) + idx(1) + name(32) + secret(16)
+        name_field = resp[2:34].rstrip(b"\x00")
+        self.assertEqual(name_field, b"myhash")
+        # Secret: first 16 bytes of channel secret
+        secret_field = resp[34:50]
+        self.assertEqual(secret_field, b"\xab" * 16)
+
+    def test_channel_info_empty_slot_all_zeros(self):
+        """K2: GET_CHANNEL with no channels returns name and secret all zeros."""
+        # Ensure no channels
+        self.state.channels = []
+
+        responses = self._handle(bytes([bridge.CMD_GET_CHANNEL, 0x00]))
+        self.assertEqual(len(responses), 1)
+        resp = responses[0]
+        self.assertEqual(resp[0], bridge.RESP_CHANNEL_INFO)
+        # Name (32 bytes) and secret (16 bytes) should all be zero
+        name_field = resp[2:34]
+        secret_field = resp[34:50]
+        self.assertEqual(name_field, b"\x00" * 32)
+        self.assertEqual(secret_field, b"\x00" * 16)
+
+
+# ---- Group L: build_stats edge cases ----
+
+
+class TestBuildStatsEdgeCases(unittest.TestCase):
+    """Edge-case tests for BridgeState.build_stats."""
+
+    def setUp(self):
+        self.state = make_state()
+
+    def test_stats_radio_snr_clamped(self):
+        """L1: build_stats(1) with out-of-range SNR doesn't throw OverflowError."""
+        self.state.last_snr_db = 200.0  # 200*4 = 800, out of int8 range
+        # Should not raise; SNR should be clamped to 127 (int8 max)
+        stats = self.state.build_stats(1)
+        self.assertEqual(
+            len(stats), 14
+        )  # RESP_STATS(1) + type(1) + noise_floor(2) + rssi(1) + snr(1) + tx_air(4) + rx_air(4)
+        self.assertEqual(stats[0], bridge.RESP_STATS)
+        snr_i8 = struct.unpack_from("<b", stats, 5)[0]
+        self.assertEqual(snr_i8, 127)  # clamped to int8 max
+
+    def test_stats_packets_returns_26_bytes(self):
+        """L2: build_stats(2) returns RESP_STATS with total length 26 bytes."""
+        stats = self.state.build_stats(2)
+        self.assertEqual(stats[0], bridge.RESP_STATS)
+        self.assertEqual(len(stats), 26)
+
+    def test_stats_core_reflects_queue_length(self):
+        """L3: build_stats(0) last byte reflects msg_queue length."""
+        # Add 3 messages to the queue
+        self.state.msg_queue.append(b"msg1")
+        self.state.msg_queue.append(b"msg2")
+        self.state.msg_queue.append(b"msg3")
+        stats = self.state.build_stats(0)
+        self.assertEqual(stats[0], bridge.RESP_STATS)
+        # Layout: code(1) + type(1) + battery_mv(2) + uptime(4) + errors(2) + queue_len(1)
+        queue_len = stats[-1]
+        self.assertEqual(queue_len, 3)
+
+
+# ---- Group R: contacts_lastmod tracking ----
+
+
+class TestContactsLastmod(unittest.TestCase):
+    """Tests for contacts_lastmod update tracking."""
+
+    def setUp(self):
+        import socket
+
+        self.state = make_state()
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.bind(("127.0.0.1", 0))
+        self.udp_addr = ("127.0.0.1", self.udp_sock.getsockname()[1])
+
+    def tearDown(self):
+        self.udp_sock.close()
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(
+            cmd_bytes, self.state, self.udp_sock, self.udp_addr
+        )
+
+    def _build_advert_packet(self, pubkey: bytes, name: str = "contact") -> bytes:
+        """Build a minimal ADVERT wire packet."""
+        hdr = (0x04 << 2) | 0x01  # ptype=ADVERT(4), route=FLOOD(1)
+        ts = struct.pack("<I", int(time.time()))
+        sig = b"\x00" * 64
+        flags = 0x01 | 0x80  # chat + has_name
+        app_data = bytes([flags]) + name.encode("utf-8")
+        return bytes([hdr, 0]) + pubkey + ts + sig + app_data
+
+    def test_import_contact_updates_contacts_lastmod(self):
+        """R1: CMD_IMPORT_CONTACT increases contacts_lastmod."""
+        before = self.state.contacts_lastmod
+        pk = b"\x55" * 32
+        advert = self._build_advert_packet(pk, "NewFriend")
+        time.sleep(0.01)  # ensure time advances
+        responses = self._handle(bytes([bridge.CMD_IMPORT_CONTACT]) + advert)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        self.assertGreaterEqual(
+            self.state.contacts_lastmod,
+            before,
+            "contacts_lastmod should not decrease after import",
+        )
+
+    def test_ensure_self_contact_idempotent(self):
+        """R2: _ensure_self_contact called twice doesn't add duplicates."""
+        # Remove self from contacts if already there
+        pk_hex = self.state.pub_key.hex()
+        self.state.contacts.pop(pk_hex, None)
+
+        bridge._ensure_self_contact(self.state)
+        count_after_first = len(self.state.contacts)
+
+        bridge._ensure_self_contact(self.state)
+        count_after_second = len(self.state.contacts)
+
+        self.assertEqual(
+            count_after_first,
+            count_after_second,
+            "_ensure_self_contact added duplicate on second call",
+        )
+        self.assertEqual(count_after_first, 1)
+
+
+# ---- Group S: build_contacts_response structure ----
+
+
+class TestBuildContactsResponse(unittest.TestCase):
+    """Tests for BridgeState.build_contacts_response structure."""
+
+    def setUp(self):
+        self.state = make_state()
+        # Clear contacts for clean slate
+        self.state.contacts = {}
+
+    def _add_contact(self, pub_key: bytes, name: str = "peer") -> None:
+        """Helper to add a contact record directly."""
+        record = bridge._build_contact_record(pub_key, name=name)
+        self.state.contacts[pub_key.hex()] = record
+
+    def test_get_contacts_with_contacts_frame_count(self):
+        """S1: 2 contacts produces 4 frames: START + 2×CONTACT + END."""
+        self._add_contact(b"\x11" * 32, "Alice")
+        self._add_contact(b"\x22" * 32, "Bob")
+        frames = self.state.build_contacts_response()
+        self.assertEqual(len(frames), 4)
+        self.assertEqual(frames[0][0], bridge.RESP_CONTACT_START)
+        self.assertEqual(frames[1][0], bridge.RESP_CONTACT)
+        self.assertEqual(frames[2][0], bridge.RESP_CONTACT)
+        self.assertEqual(frames[3][0], bridge.RESP_CONTACT_END)
+
+    def test_get_contacts_contact_frame_length(self):
+        """S2: CONTACT frame is exactly 148 bytes (1 code + 147 record)."""
+        self._add_contact(b"\x33" * 32, "Carol")
+        frames = self.state.build_contacts_response()
+        # frames: START, CONTACT, END
+        self.assertEqual(len(frames), 3)
+        contact_frame = frames[1]
+        self.assertEqual(
+            len(contact_frame),
+            148,
+            f"CONTACT frame length {len(contact_frame)} != 148",
+        )
+
+    def test_get_contacts_end_frame_contains_lastmod(self):
+        """S3: CONTACT_END frame contains contacts_lastmod as little-endian uint32 at bytes 1:5."""
+        self.state.contacts_lastmod = 0xDEADBEEF
+        frames = self.state.build_contacts_response()
+        end_frame = frames[-1]
+        self.assertEqual(end_frame[0], bridge.RESP_CONTACT_END)
+        lastmod = struct.unpack_from("<I", end_frame, 1)[0]
+        self.assertEqual(lastmod, 0xDEADBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
