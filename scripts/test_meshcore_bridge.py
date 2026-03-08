@@ -3870,5 +3870,207 @@ class TestFrameDecoderEdgeCases(unittest.TestCase):
         self.assertEqual(frames[1], p2)
 
 
+class TestParseFloodScope(unittest.TestCase):
+    """Tests for _parse_flood_scope() — human-readable names and hex strings."""
+
+    def test_empty_string_returns_null_scope(self):
+        """Empty string → all-zero (disabled)."""
+        self.assertEqual(bridge._parse_flood_scope(""), b"\x00" * 16)
+
+    def test_zero_string_returns_null_scope(self):
+        """'0' → all-zero (disabled)."""
+        self.assertEqual(bridge._parse_flood_scope("0"), b"\x00" * 16)
+
+    def test_none_string_returns_null_scope(self):
+        """'None' → all-zero (disabled)."""
+        self.assertEqual(bridge._parse_flood_scope("None"), b"\x00" * 16)
+
+    def test_star_returns_null_scope(self):
+        """'*' → all-zero (disabled)."""
+        self.assertEqual(bridge._parse_flood_scope("*"), b"\x00" * 16)
+
+    def test_human_readable_name_hashed(self):
+        """Human-readable name → sha256(name)[:16] (no '#' prefix)."""
+        import hashlib
+
+        name = "de-hh"
+        expected = hashlib.sha256(name.encode("utf-8")).digest()[:16]
+        result = bridge._parse_flood_scope(name)
+        self.assertEqual(result, expected)
+        self.assertEqual(len(result), 16)
+
+    def test_human_readable_differs_from_region_scope(self):
+        """flood_scope('de-hh') != region_scope('de-hh') — different hash prefixes."""
+        import hashlib
+
+        name = "de-hh"
+        flood_key = bridge._parse_flood_scope(name)
+        region_key = hashlib.sha256(("#" + name).encode("utf-8")).digest()[:16]
+        self.assertNotEqual(flood_key, region_key)
+
+    def test_32_hex_chars_decoded_as_raw_key(self):
+        """32-char hex string → decoded as raw 16-byte key."""
+        raw = bytes(range(16))
+        result = bridge._parse_flood_scope(raw.hex())
+        self.assertEqual(result, raw)
+
+    def test_short_hex_string_treated_as_name(self):
+        """12-char hex string (< 32) → treated as a name and hashed."""
+        import hashlib
+
+        name = "abcdef012345"  # 12 hex chars, not 32
+        expected = hashlib.sha256(name.encode("utf-8")).digest()[:16]
+        result = bridge._parse_flood_scope(name)
+        self.assertEqual(result, expected)
+
+    def test_invalid_32_char_non_hex_treated_as_name(self):
+        """32-char string with non-hex characters → hashed as name (not decoded as hex)."""
+        import hashlib
+
+        name = "this-is-exactly-32-chars-xx-yyyy"  # 32 chars, not valid hex
+        expected = hashlib.sha256(name.encode("utf-8")).digest()[:16]
+        result = bridge._parse_flood_scope(name)
+        self.assertEqual(result, expected)
+
+    def test_result_always_16_bytes(self):
+        """Result is always exactly 16 bytes for any input."""
+        for value in ["", "de-nord", "de-hh", "0", "a" * 32, "X" * 8]:
+            with self.subTest(value=value):
+                self.assertEqual(len(bridge._parse_flood_scope(value)), 16)
+
+
+class TestSetOtherParams(unittest.TestCase):
+    """CMD_SET_OTHER_PARAMS (0x26) handler tests."""
+
+    def setUp(self):
+        self.state = make_state()
+
+    def _cmd(self, data: bytes) -> list[bytes]:
+        """Build and dispatch a CMD_SET_OTHER_PARAMS payload."""
+        payload = bytes([bridge.CMD_SET_OTHER_PARAMS]) + data
+        return bridge.handle_command(payload, self.state, None, None)
+
+    def test_legacy_3_byte_payload_returns_ok(self):
+        """3-byte legacy payload (manual, telemetry, adv_loc) → RESP_OK."""
+        resp = self._cmd(bytes([1, 0x05, 2]))
+        self.assertEqual(len(resp), 1)
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+
+    def test_stores_manual_add_contacts(self):
+        """manual_add_contacts is stored in state."""
+        self._cmd(bytes([1, 0, 0]))
+        self.assertEqual(self.state.manual_add_contacts, 1)
+
+    def test_stores_telemetry_mode(self):
+        """telemetry_mode is stored in state."""
+        self._cmd(bytes([0, 0b00001101, 0]))
+        self.assertEqual(self.state.telemetry_mode, 0b00001101)
+
+    def test_stores_adv_loc_policy(self):
+        """adv_loc_policy is stored in state."""
+        self._cmd(bytes([0, 0, 3]))
+        self.assertEqual(self.state.adv_loc_policy, 3)
+
+    def test_4_byte_payload_stores_multi_acks(self):
+        """4-byte payload (with multi_acks) stores all four fields."""
+        self._cmd(bytes([1, 0x09, 2, 3]))
+        self.assertEqual(self.state.manual_add_contacts, 1)
+        self.assertEqual(self.state.telemetry_mode, 0x09)
+        self.assertEqual(self.state.adv_loc_policy, 2)
+        self.assertEqual(self.state.multi_acks, 3)
+
+    def test_missing_multi_acks_defaults_to_zero(self):
+        """3-byte payload leaves multi_acks at 0."""
+        self.state.multi_acks = 99  # pre-set to non-zero
+        self._cmd(bytes([1, 0, 0]))
+        self.assertEqual(self.state.multi_acks, 0)
+
+    def test_too_short_returns_ok_but_does_not_crash(self):
+        """Short payload (< 3 bytes) → RESP_OK + no state change."""
+        self._cmd(bytes([]))  # empty data
+        self.assertEqual(self.state.manual_add_contacts, 0)  # unchanged
+
+    def test_initial_state_values_are_zero(self):
+        """New BridgeState has all other_params fields zeroed."""
+        self.assertEqual(self.state.manual_add_contacts, 0)
+        self.assertEqual(self.state.telemetry_mode, 0)
+        self.assertEqual(self.state.adv_loc_policy, 0)
+        self.assertEqual(self.state.multi_acks, 0)
+
+    def test_multiple_calls_overwrite_state(self):
+        """Successive SET_OTHER_PARAMS calls update state each time."""
+        self._cmd(bytes([1, 0x03, 1, 2]))
+        self.assertEqual(self.state.manual_add_contacts, 1)
+        self._cmd(bytes([0, 0x00, 0, 0]))
+        self.assertEqual(self.state.manual_add_contacts, 0)
+
+
+class TestGetCustomVars(unittest.TestCase):
+    """CMD_GET_CUSTOM_VARS (0x28) handler tests."""
+
+    def setUp(self):
+        self.state = make_state()
+
+    def _cmd(self) -> list[bytes]:
+        payload = bytes([bridge.CMD_GET_CUSTOM_VARS])
+        return bridge.handle_command(payload, self.state, None, None)
+
+    def test_returns_custom_vars_response(self):
+        """GET_CUSTOM_VARS → RESP_CUSTOM_VARS (0x15)."""
+        resp = self._cmd()
+        self.assertEqual(len(resp), 1)
+        self.assertEqual(resp[0][0], bridge.RESP_CUSTOM_VARS)
+
+    def test_response_is_single_byte(self):
+        """Response is exactly 1 byte (empty key=value payload — no sensors)."""
+        resp = self._cmd()
+        self.assertEqual(len(resp[0]), 1)
+
+    def test_response_code_matches_protocol_spec(self):
+        """RESP_CUSTOM_VARS == 0x15 (matches meshcore_py PacketType.CUSTOM_VARS)."""
+        self.assertEqual(bridge.RESP_CUSTOM_VARS, 0x15)
+
+    def test_multiple_calls_return_same_empty_response(self):
+        """Repeated calls always return the same empty RESP_CUSTOM_VARS."""
+        r1 = self._cmd()
+        r2 = self._cmd()
+        self.assertEqual(r1, r2)
+
+
+class TestSetCustomVar(unittest.TestCase):
+    """CMD_SET_CUSTOM_VAR (0x29) handler tests."""
+
+    def setUp(self):
+        self.state = make_state()
+
+    def _cmd(self, data: bytes = b"") -> list[bytes]:
+        payload = bytes([bridge.CMD_SET_CUSTOM_VAR]) + data
+        return bridge.handle_command(payload, self.state, None, None)
+
+    def test_returns_error_response(self):
+        """SET_CUSTOM_VAR → RESP_ERROR."""
+        resp = self._cmd(b"gps:on")
+        self.assertEqual(len(resp), 1)
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+
+    def test_error_code_is_illegal_arg(self):
+        """Error code is ERR_CODE_ILLEGAL_ARG (6)."""
+        resp = self._cmd(b"gps:on")
+        # RESP_ERROR frame: [0x01][error_code]
+        self.assertEqual(resp[0][1], bridge.ERR_CODE_ILLEGAL_ARG)
+
+    def test_any_key_is_rejected(self):
+        """Any key:value is rejected with ILLEGAL_ARG."""
+        for payload in [b"gps:on", b"gps_interval:60", b"sensor:temperature", b""]:
+            with self.subTest(payload=payload):
+                resp = self._cmd(payload)
+                self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+
+    def test_empty_payload_is_rejected(self):
+        """Empty payload also returns RESP_ERROR."""
+        resp = self._cmd(b"")
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+
+
 if __name__ == "__main__":
     unittest.main()

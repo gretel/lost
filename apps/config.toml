@@ -31,9 +31,9 @@ udp_port = 5555
 status_interval = 10
 
 [meshcore]
-region_scope = "de-nord"
+region_scope = "de-hh"
 # port              = 7834                         # TCP listen port (avoid 5000 on macOS)
-# name              = "gr4-lora"                   # node display name
+name          = "'DO2THX 📡"                   # node display name
 # identity_file     = "~/.config/gr4-lora/identity.bin"
 # keys_dir          = "~/.config/gr4-lora/keys"
 # channels_dir      = "~/.config/gr4-lora/channels"
@@ -45,7 +45,7 @@ region_scope = "de-nord"
 # autoadd_config    = 0                            # bitmask: 0x01=overwrite oldest, 0x02=chat,
 #                                                  #   0x04=repeater, 0x08=room, 0x10=sensor
 # autoadd_max_hops  = 0                            # 0-64 (max hops for auto-add contacts)
-# flood_scope       = ""                           # 32 hex chars = 16-byte transport key (empty=off)
+flood_scope       = "de-hh"                           # scope name (hashed) or 32 hex chars; empty=off
 
 [logging]
 level = "INFO"
@@ -56,7 +56,7 @@ bw = 62500
 cr = 8
 sync_word = 0x12
 preamble_len = 8
-# min_snr_db = -12.0
+min_snr_db = -19.0
 # energy_thresh = 1e-6
 # max_symbols = 256
 # ldro_mode = 2

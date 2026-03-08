@@ -141,6 +141,9 @@ CMD_STATUS_REQ = 0x1B
 CMD_GET_CHANNEL = 0x1F
 CMD_SET_CHANNEL = 0x20
 CMD_TRACE = 0x24
+CMD_SET_OTHER_PARAMS = 0x26
+CMD_GET_CUSTOM_VARS = 0x28
+CMD_SET_CUSTOM_VAR = 0x29
 CMD_PATH_DISCOVERY = 0x34
 CMD_GET_STATS = 0x38
 CMD_SEND_CONTROL_DATA = 0x37
@@ -168,6 +171,9 @@ RESP_DEVICE_INFO = 0x0D
 RESP_CONTACT_MSG_RECV_V3 = 0x10
 RESP_CHANNEL_MSG_RECV_V3 = 0x11
 RESP_CHANNEL_INFO = 0x12
+RESP_CUSTOM_VARS = (
+    0x15  # GET_CUSTOM_VARS response (empty payload = no hardware sensors)
+)
 RESP_STATS = 0x18
 RESP_CODE_AUTOADD_CONFIG = 0x19
 RESP_ALLOWED_REPEAT_FREQ = 0x1A
@@ -191,6 +197,31 @@ PUSH_NEW_ADVERT = 0x8A
 def _is_valid_repeat_freq(freq_khz: int) -> bool:
     """Return True if freq_khz is in one of the allowed repeat frequency ranges."""
     return any(lo <= freq_khz <= hi for lo, hi in REPEAT_FREQ_RANGES)
+
+
+def _parse_flood_scope(value: str) -> bytes:
+    """Parse a flood_scope config value into a 16-byte transport key.
+
+    Accepts two formats (matching the companion library's set_flood_scope()):
+      - 32 hex characters (64 nibbles) → decoded as raw 16-byte key
+      - Any other non-empty string → sha256(name)[:16] (human-readable scope name)
+      - Empty string or "*" or "0" or "None" → all-zero key (disabled)
+
+    The hash formula for human-readable names is sha256(name) without a "#" prefix,
+    matching meshcore_py's set_flood_scope() implementation.  This differs from
+    region_scope which uses sha256("#" + name).
+    """
+    if not value or value in ("0", "None", "*"):
+        return b"\x00" * 16
+    # Try 32-char hex first (raw key)
+    if len(value) == 32:
+        try:
+            key = bytes.fromhex(value)
+            return key  # exactly 16 bytes
+        except ValueError:
+            pass  # fall through to name hashing
+    # Human-readable scope name: sha256(name)[:16]
+    return hashlib.sha256(value.encode("utf-8")).digest()[:16]
 
 
 # ---- Companion frame codec ----
@@ -340,6 +371,12 @@ class BridgeState:
         self.send_scope: bytes = send_scope if len(send_scope) == 16 else b"\x00" * 16
         self.autoadd_config: int = autoadd_config
         self.autoadd_max_hops: int = autoadd_max_hops
+
+        # Other params (CMD_SET_OTHER_PARAMS 0x26); stored in-memory only
+        self.manual_add_contacts: int = 0
+        self.telemetry_mode: int = 0
+        self.adv_loc_policy: int = 0
+        self.multi_acks: int = 0
 
     def build_self_info(self) -> bytes:
         """Build SELF_INFO (0x05) response payload."""
@@ -1171,6 +1208,36 @@ def handle_command(
         state.path_hash_mode = data[1]
         log.info("companion: SET_PATH_HASH_MODE mode=%d", state.path_hash_mode)
         return [state.build_ok()]
+
+    if cmd == CMD_SET_OTHER_PARAMS:
+        # Frame: [0x26][manual_add_contacts(1)][telemetry_mode(1)][adv_loc_policy(1)][multi_acks(1)?]
+        # Legacy variant is 3 bytes; new variant adds a 4th byte for multi_acks.
+        if len(data) >= 3:
+            state.manual_add_contacts = data[0]
+            state.telemetry_mode = data[1]
+            state.adv_loc_policy = data[2]
+            state.multi_acks = data[3] if len(data) >= 4 else 0
+            log.info(
+                "companion: SET_OTHER_PARAMS manual_add=%d telemetry=0x%02x adv_loc=%d multi_acks=%d",
+                state.manual_add_contacts,
+                state.telemetry_mode,
+                state.adv_loc_policy,
+                state.multi_acks,
+            )
+        else:
+            log.warning("companion: SET_OTHER_PARAMS too short (%d bytes)", len(data))
+        return [state.build_ok()]
+
+    if cmd == CMD_GET_CUSTOM_VARS:
+        # Bridge has no hardware sensors, so custom vars are always empty.
+        # Response: RESP_CUSTOM_VARS (0x15) with no key=value pairs.
+        log.debug("companion: GET_CUSTOM_VARS → empty (no hardware sensors)")
+        return [bytes([RESP_CUSTOM_VARS])]
+
+    if cmd == CMD_SET_CUSTOM_VAR:
+        # Bridge has no writable custom vars — all keys are illegal.
+        log.debug("companion: SET_CUSTOM_VAR → ILLEGAL_ARG (no hardware sensors)")
+        return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
 
     if cmd in (CMD_RESET_PATH, CMD_SET_TUNING_PARAMS, CMD_REBOOT):
         return [state.build_ok()]
@@ -2103,19 +2170,8 @@ def main() -> None:
     startup_path_hash_mode = int(meshcore_cfg.get("path_hash_mode", 0))
     startup_autoadd_config = int(meshcore_cfg.get("autoadd_config", 0))
     startup_autoadd_max_hops = min(int(meshcore_cfg.get("autoadd_max_hops", 0)), 64)
-    flood_scope_hex = meshcore_cfg.get("flood_scope", "")
-    try:
-        startup_send_scope = (
-            bytes.fromhex(flood_scope_hex) if flood_scope_hex else b"\x00" * 16
-        )
-        if len(startup_send_scope) != 16:
-            log.warning(
-                "[meshcore] flood_scope must be exactly 32 hex chars (16 bytes); ignoring"
-            )
-            startup_send_scope = b"\x00" * 16
-    except ValueError:
-        log.warning("[meshcore] flood_scope is not valid hex; ignoring")
-        startup_send_scope = b"\x00" * 16
+    flood_scope_raw = meshcore_cfg.get("flood_scope", "")
+    startup_send_scope = _parse_flood_scope(flood_scope_raw)
 
     # Load identity (now that identity_file is resolved)
     expanded_prv, pub_key, seed = load_or_create_identity(identity_file)

@@ -65,7 +65,10 @@ commands are in-memory only — RX retune requires restarting `lora_trx`.
 | 0x16 | DEVICE_QUERY | Returns DEVICE_INFO (82 bytes) |
 | 0x1F | GET_CHANNEL | From channels_dir |
 | 0x20 | SET_CHANNEL | Persisted |
-| 0x36 | SET_FLOOD_SCOPE | Sets 16-byte send_scope key |
+| 0x26 | SET_OTHER_PARAMS | Stores manual_add_contacts/telemetry_mode/adv_loc_policy/multi_acks |
+| 0x28 | GET_CUSTOM_VARS | Returns empty RESP_CUSTOM_VARS (no hardware sensors on bridge) |
+| 0x29 | SET_CUSTOM_VAR | Returns RESP_ERROR (no writable vars on bridge) |
+| 0x36 | SET_FLOOD_SCOPE | Sets 16-byte send_scope (name or raw hex; from companion) |
 | 0x38 | GET_STATS | Sub-types 0/1/2 (core/radio/packets) |
 | 0x3A | SET_AUTOADD_CONFIG | |
 | 0x3B | GET_AUTOADD_CONFIG | |
@@ -87,9 +90,13 @@ Unknown commands return OK silently.
 
 ### TX transport key priority
 
-1. `send_scope` (SET_FLOOD_SCOPE or `flood_scope` in config)
-2. `region_key` (derived from `region_scope` hashtag)
+1. `send_scope` (SET_FLOOD_SCOPE or `flood_scope` in config — accepts scope name or 32-char hex)
+2. `region_key` (derived from `region_scope` hashtag via `sha256("#" + name)[:16]`)
 3. No transport codes
+
+Note: `flood_scope` and `region_scope` use different hash formulas and produce different keys,
+even with the same name. `flood_scope` uses `sha256(name)[:16]` (matching the companion
+library); `region_scope` uses `sha256("#" + name)[:16]`.
 
 ---
 
