@@ -676,7 +676,9 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
 
     auto sched = std::make_unique<
         gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>>();
-    sched->timeout_inactivity_count = 1U;
+    sched->timeout_inactivity_count  = 1U;
+    sched->watchdog_min_stall_count  = 10U;  // suppress watchdog log for ≤10s idle gaps (TX waits for requests)
+    sched->watchdog_max_warnings     = 0U;   // TX scheduler: never escalate to ERROR (idle is normal)
     if (auto ret = sched->exchange(std::move(graph)); !ret) {
         std::fprintf(stderr, "ERROR: TX scheduler init failed\n");
         return nullptr;
