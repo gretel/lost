@@ -2555,5 +2555,140 @@ class TestSendControlData(unittest.TestCase):
         self.assertEqual(responses[0][0], bridge.RESP_ERROR)
 
 
+# ---- Send TXT message tests ----
+
+
+def _make_contact_record(pub_key: bytes, name: str = "peer") -> bytes:
+    """Build a minimal 147-byte contact record for testing."""
+    name_bytes = name.encode("utf-8")[:32].ljust(32, b"\x00")
+    record = (
+        pub_key  # pubkey (32)
+        + b"\x01"  # node_type=chat
+        + b"\x00"  # flags
+        + b"\xff"  # path_len=-1 (flood)
+        + b"\x00" * 64  # path
+        + name_bytes  # name (32)
+        + b"\x00" * 16  # last_advert(4) + lat(4) + lon(4) + lastmod(4)
+    )
+    assert len(record) == 147
+    return record
+
+
+class TestSendTxtMsg(unittest.TestCase):
+    def setUp(self):
+        import socket
+
+        (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
+        # Bridge is identity A; peer is B
+        self.state = make_state(pub_key=pub_a, expanded_prv=prv_a, seed=seed_a)
+        self.peer_pub = pub_b
+
+        # Real loopback UDP socket pair so we can receive sent packets
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.bind(("127.0.0.1", 0))
+        self.udp_addr = ("127.0.0.1", self.udp_sock.getsockname()[1])
+
+    def tearDown(self):
+        self.udp_sock.close()
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(
+            cmd_bytes, self.state, self.udp_sock, self.udp_addr
+        )
+
+    def _make_cmd(self, dst_prefix: bytes, text: bytes = b"hello") -> bytes:
+        """Build a CMD_SEND_TXT_MSG command frame."""
+        ts = struct.pack("<I", int(time.time()))
+        data = bytes([0x00, 0x00]) + ts + dst_prefix + text
+        return bytes([bridge.CMD_SEND_TXT_MSG]) + data
+
+    def _add_peer_contact(self) -> bytes:
+        """Add the peer identity as a contact; return the 6-byte dst_prefix."""
+        record = _make_contact_record(self.peer_pub, name="peer")
+        self.state.contacts[self.peer_pub.hex()] = record
+        return self.peer_pub[:6]
+
+    def test_send_txt_msg_too_short_returns_error(self):
+        """CMD_SEND_TXT_MSG with < 12 data bytes returns RESP_ERROR."""
+        # Only 5 bytes of data (need at least 12)
+        cmd = bytes([bridge.CMD_SEND_TXT_MSG]) + b"\x00" * 5
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+    def test_send_txt_msg_unknown_contact_returns_error(self):
+        """CMD_SEND_TXT_MSG with unknown dst_prefix returns RESP_ERROR."""
+        # No contacts registered — prefix won't match anything
+        dst_prefix = b"\xde\xad\xbe\xef\xca\xfe"
+        cmd = self._make_cmd(dst_prefix)
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+    def test_send_txt_msg_success_sends_udp(self):
+        """Successful CMD_SEND_TXT_MSG sends a CBOR lora_tx UDP packet."""
+        import cbor2
+
+        dst_prefix = self._add_peer_contact()
+        cmd = self._make_cmd(dst_prefix)
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+
+        # Verify a CBOR TX packet was sent via UDP
+        self.udp_sock.settimeout(1.0)
+        raw, _addr = self.udp_sock.recvfrom(65536)
+        msg = cbor2.loads(raw)
+        self.assertEqual(msg["type"], "lora_tx")
+        self.assertIn("payload", msg)
+
+    def test_send_txt_msg_returns_msg_sent_direct(self):
+        """CMD_SEND_TXT_MSG response has routing_type byte = 0 (direct, not flood)."""
+        dst_prefix = self._add_peer_contact()
+        cmd = self._make_cmd(dst_prefix)
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        resp = responses[0]
+        self.assertEqual(resp[0], bridge.RESP_MSG_SENT)
+        # byte 1 is routing_type; 0 = direct (flood=False)
+        self.assertEqual(resp[1], 0)
+
+    def test_send_txt_msg_tracks_tx_hash_in_recent_tx(self):
+        """After a successful send, state.recent_tx is non-empty (echo filter)."""
+        dst_prefix = self._add_peer_contact()
+        cmd = self._make_cmd(dst_prefix)
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        self.assertGreater(len(self.state.recent_tx), 0)
+
+    def test_send_txt_msg_registers_pending_ack(self):
+        """After a successful send, state.pending_acks has exactly 1 entry."""
+        dst_prefix = self._add_peer_contact()
+        cmd = self._make_cmd(dst_prefix)
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        self.assertEqual(len(self.state.pending_acks), 1)
+
+    def test_send_txt_msg_send_scope_overrides_region(self):
+        """With send_scope set, wire packet uses ROUTE_T_DIRECT (header bits [1:0] == 3)."""
+        import cbor2
+
+        # Set a non-zero 16-byte send_scope key
+        self.state.send_scope = b"\x01" * 16
+
+        dst_prefix = self._add_peer_contact()
+        cmd = self._make_cmd(dst_prefix)
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+
+        self.udp_sock.settimeout(1.0)
+        raw, _addr = self.udp_sock.recvfrom(65536)
+        msg = cbor2.loads(raw)
+        wire = msg["payload"]
+        # ROUTE_T_DIRECT = 3; header byte bits [1:0] == 3
+        route_type = wire[0] & 0x03
+        self.assertEqual(route_type, 3)
+
+
 if __name__ == "__main__":
     unittest.main()
