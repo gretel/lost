@@ -29,6 +29,7 @@ from meshcore_crypto import (
     PAYLOAD_ANON_REQ,
     PAYLOAD_GRP_TXT,
     PAYLOAD_ACK,
+    PAYLOAD_ADVERT,
     PATH_HASH_SIZE,
 )
 from meshcore_tx import build_txt_msg, build_anon_req, build_wire_packet, make_header
@@ -3408,6 +3409,260 @@ class TestBuildContactsResponse(unittest.TestCase):
         self.assertEqual(end_frame[0], bridge.RESP_CONTACT_END)
         lastmod = struct.unpack_from("<I", end_frame, 1)[0]
         self.assertEqual(lastmod, 0xDEADBEEF)
+
+
+# ---- Group M: _advert_to_push / _handle_advert_rx edge cases ----
+
+
+class TestAdvertToPushEdgeCases(unittest.TestCase):
+    """Group M: edge cases for _advert_to_push and ADVERT RX handling."""
+
+    def _make_advert_frame(self, advert_payload: bytes) -> dict:
+        """Build a minimal ADVERT wire frame (ROUTE_FLOOD + PAYLOAD_ADVERT)."""
+        from meshcore_crypto import ROUTE_FLOOD
+
+        hdr = make_header(ROUTE_FLOOD, PAYLOAD_ADVERT)
+        # Wire: header(1) + path_len(1=0) + advert_payload
+        wire = bytes([hdr, 0]) + advert_payload
+        return {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 3.0},
+            "payload": wire,
+        }
+
+    def test_advert_to_push_too_short_returns_none(self):
+        """M1: _advert_to_push returns None when payload is too short (< advert_start+100)."""
+        # With advert_start=0, need at least 100 bytes. Pass 99 bytes.
+        short_payload = b"\x00" * 99
+        result = bridge._advert_to_push(short_payload, 0)
+        self.assertIsNone(result)
+
+    def test_advert_to_push_minimum_valid_length_returns_result(self):
+        """M1b: _advert_to_push returns non-None at exactly minimum length (100 bytes)."""
+        # Exactly 100 bytes from advert_start=0: pubkey(32)+ts(4)+sig(64)
+        min_payload = b"\x01" * 32 + struct.pack("<I", 0) + b"\x00" * 64
+        self.assertEqual(len(min_payload), 100)
+        result = bridge._advert_to_push(min_payload, 0)
+        self.assertIsNotNone(result)
+
+    def test_advert_push_location_flag_parsed(self):
+        """M2: ADVERT with HAS_LOCATION flag has lat/lon in the push record."""
+        lat_e6, lon_e6 = 53_000_000, 10_000_000
+        flags = 0x01 | 0x10  # node_type=chat | HAS_LOCATION
+        app_data = bytes([flags]) + struct.pack("<ii", lat_e6, lon_e6)
+        advert_payload = b"\x01" * 32 + struct.pack("<I", 0) + b"\x00" * 64 + app_data
+
+        state = make_state()
+        frame = self._make_advert_frame(advert_payload)
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+
+        self.assertEqual(len(companion_msgs), 1)
+        push = companion_msgs[0]
+        self.assertEqual(push[0], bridge.PUSH_NEW_ADVERT)
+        # push layout: code(1)+pubkey(32)+node_type(1)+flags(1)+
+        #   out_path_len(1)+path(64)+adv_name(32)+last_advert(4)+lat(4)+lon(4)
+        lat_off = 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4
+        lon_off = lat_off + 4
+        lat_val = struct.unpack_from("<i", push, lat_off)[0]
+        lon_val = struct.unpack_from("<i", push, lon_off)[0]
+        self.assertEqual(lat_val, lat_e6)
+        self.assertEqual(lon_val, lon_e6)
+
+    def test_advert_push_feature_flags_skipped(self):
+        """M3: ADVERT with feature1/feature2 flags still parses name correctly."""
+        flags = 0x01 | 0x20 | 0x40 | 0x80  # chat + feature1 + feature2 + name
+        app_data = bytes([flags]) + b"\xab\xcd" + b"\xef\x12" + b"Alice"
+        advert_payload = b"\x01" * 32 + struct.pack("<I", 0) + b"\x00" * 64 + app_data
+
+        state = make_state()
+        frame = self._make_advert_frame(advert_payload)
+        companion_msgs, _ = bridge.lora_frame_to_companion_msgs(frame, state)
+
+        self.assertEqual(len(companion_msgs), 1)
+        push = companion_msgs[0]
+        self.assertEqual(push[0], bridge.PUSH_NEW_ADVERT)
+        # adv_name is at offset 1+32+1+1+1+64=100, 32 bytes padded
+        name_off = 1 + 32 + 1 + 1 + 1 + 64
+        adv_name = push[name_off : name_off + 32].rstrip(b"\x00").decode("utf-8")
+        self.assertIn("Alice", adv_name)
+
+    def test_advert_rx_does_not_overwrite_existing_key(self):
+        """M4: receiving ADVERT from already-known pubkey keeps known_keys count unchanged."""
+        known_pub = b"\xcc" * 32
+        state = make_state()
+        state.known_keys[known_pub.hex()] = known_pub
+        initial_count = len(state.known_keys)
+
+        # Build ADVERT payload from the already-known pubkey
+        flags = 0x01  # chat, no name, no location
+        app_data = bytes([flags])
+        advert_payload = (
+            known_pub + struct.pack("<I", 1_700_000_000) + b"\x00" * 64 + app_data
+        )
+        frame = self._make_advert_frame(advert_payload)
+        bridge.lora_frame_to_companion_msgs(frame, state)
+
+        # known_keys should not have grown
+        self.assertEqual(len(state.known_keys), initial_count)
+        self.assertIn(known_pub.hex(), state.known_keys)
+
+
+# ---- Group N: _handle_ack_rx edge cases ----
+
+
+class TestAckRxEdgeCases(unittest.TestCase):
+    """Group N: edge cases for _handle_ack_rx."""
+
+    def test_ack_rx_too_short_payload_ignored(self):
+        """N1: ACK frame with < 4 bytes of checksum returns no msgs and no crash."""
+        from meshcore_crypto import ROUTE_FLOOD
+
+        state = make_state()
+        hdr = make_header(ROUTE_FLOOD, PAYLOAD_ACK)
+        # path_len=0 → ack_start=2. Short ack (2 bytes) makes ack_start+4=6 > len=4.
+        short_ack = b"\xab\xcd"  # only 2 bytes; need 4
+        payload = bytes([hdr, 0]) + short_ack
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0},
+            "payload": payload,
+        }
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(companion_msgs, [])
+        self.assertEqual(ack_packets, [])
+
+
+# ---- Group O: _handle_txt_msg_rx edge cases ----
+
+
+class TestTxtMsgRxEdgeCases(unittest.TestCase):
+    """Group O: edge cases for _handle_txt_msg_rx."""
+
+    def test_txt_msg_rx_auto_learns_sender_key(self):
+        """O1: TXT_MSG successfully decrypted keeps sender key in state.known_keys."""
+        (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
+        state = make_state(pub_key=pub_b, expanded_prv=prv_b, seed=seed_b)
+        # Pre-add sender key so decryption can succeed
+        state.known_keys[pub_a.hex()] = pub_a
+
+        packet = build_txt_msg(prv_a, pub_a, pub_b, "auto-learn test")
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0},
+            "payload": packet,
+        }
+        bridge.lora_frame_to_companion_msgs(frame, state)
+        # Sender key must still be present (auto-learn preserves it)
+        self.assertIn(pub_a.hex(), state.known_keys)
+
+    def test_txt_msg_rx_unknown_sender_no_key_in_state(self):
+        """O1b: TXT_MSG from unknown sender fails decryption; key not added."""
+        (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
+        state = make_state(pub_key=pub_b, expanded_prv=prv_b, seed=seed_b)
+        # Do NOT add A's key — decryption will fail
+
+        packet = build_txt_msg(prv_a, pub_a, pub_b, "hidden")
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0},
+            "payload": packet,
+        }
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(companion_msgs, [])
+        self.assertEqual(ack_packets, [])
+        # Sender key was not learned (decryption failed)
+        self.assertNotIn(pub_a.hex(), state.known_keys)
+
+    def test_txt_msg_rx_no_ack_when_no_shared_secret(self):
+        """O4: TXT_MSG from unknown sender produces no RF ACK packet."""
+        (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
+        state = make_state(pub_key=pub_b, expanded_prv=prv_b, seed=seed_b)
+        # No key for A → decryption fails → no ACK
+
+        packet = build_txt_msg(prv_a, pub_a, pub_b, "no ack please")
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0},
+            "payload": packet,
+        }
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(
+            ack_packets, [], "no RF ACK should be generated for unknown sender"
+        )
+
+
+# ---- Group P: _handle_grp_txt_rx edge cases ----
+
+
+class TestGrpTxtRxEdgeCases(unittest.TestCase):
+    """Group P: edge cases for _handle_grp_txt_rx."""
+
+    def test_grp_txt_rx_channel_index_matches_position(self):
+        """P1: GRP_TXT decrypted with chan1 reports channel index 1 in companion message."""
+        state = make_state()
+        chan0 = GroupChannel("chan0", b"\x01" * 16)
+        chan1 = GroupChannel("chan1", b"\x02" * 16)
+        state.channels = [chan0, chan1]
+
+        from meshcore_crypto import ROUTE_FLOOD
+
+        grp_payload = build_grp_txt(chan1, "Tester", "index test")
+        header = make_header(ROUTE_FLOOD, PAYLOAD_GRP_TXT)
+        packet = build_wire_packet(header, grp_payload)
+
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 4.0},
+            "payload": packet,
+        }
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(len(companion_msgs), 1)
+        msg = companion_msgs[0]
+        self.assertEqual(msg[0], bridge.RESP_CHANNEL_MSG_RECV_V3)
+        # V3 channel format: code(1)+snr(1)+reserved(2)+chan_idx(1)+...
+        chan_idx_in_msg = msg[4]
+        self.assertEqual(
+            chan_idx_in_msg, 1, "companion message should report channel index 1"
+        )
+        self.assertEqual(ack_packets, [])
+
+    def test_grp_txt_rx_uses_plaintext_timestamp(self):
+        """P2: GRP_TXT companion message carries the timestamp from the encrypted plaintext."""
+        state = make_state()
+        known_ts = 1_700_000_000
+        ch = GroupChannel("ts-chan", b"\x05" * 16)
+        state.channels = [ch]
+
+        from meshcore_crypto import ROUTE_FLOOD
+
+        grp_payload = build_grp_txt(ch, "Bob", "timestamp test", timestamp=known_ts)
+        header = make_header(ROUTE_FLOOD, PAYLOAD_GRP_TXT)
+        packet = build_wire_packet(header, grp_payload)
+
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 4.0},
+            "payload": packet,
+        }
+        companion_msgs, _ = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(len(companion_msgs), 1)
+        msg = companion_msgs[0]
+        self.assertEqual(msg[0], bridge.RESP_CHANNEL_MSG_RECV_V3)
+        # V3 channel format: code(1)+snr(1)+reserved(2)+chan_idx(1)+path_len(1)+txt_type(1)+ts(4)
+        ts_off = 1 + 1 + 2 + 1 + 1 + 1
+        ts_in_msg = struct.unpack_from("<I", msg, ts_off)[0]
+        self.assertEqual(
+            ts_in_msg,
+            known_ts,
+            "companion message timestamp must match plaintext timestamp",
+        )
 
 
 if __name__ == "__main__":
