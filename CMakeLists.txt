@@ -47,7 +47,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(tomlplusplus)
 
-# --- GR4 (provides gnuradio-core, gnuradio-algorithm, gr-testing, ut, …) ---
+# --- GR4 (provides gnuradio-core, gnuradio-algorithm, gr-soapy, gr-testing, ut, …) ---
 # When consumed via FetchContent (e.g. by opendigitizer), the parent project
 # already provides gnuradio4 — skip the submodule to avoid double inclusion.
 if(NOT TARGET gnuradio-core)

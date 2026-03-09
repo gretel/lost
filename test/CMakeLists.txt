@@ -55,3 +55,15 @@ add_ut_test(qa_lora_cad)
 target_compile_definitions(qa_lora_cad PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
 set_tests_properties(qa_lora_cad PROPERTIES TIMEOUT 60)
+
+# --- Hardware tests (require SoapySDR + B210/B220) ---
+if(TARGET gr-soapy)
+    add_executable(qa_SoapySink qa_SoapySink.cpp)
+    target_link_libraries(qa_SoapySink PRIVATE
+        gnuradio-options gnuradio-core gnuradio-blocklib-core gr-lora gr-soapy gr-testing ut)
+    add_test(NAME qa_SoapySink
+             COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/qa_SoapySink)
+    set_tests_properties(qa_SoapySink PROPERTIES
+        ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0"
+        TIMEOUT 30)
+endif()
