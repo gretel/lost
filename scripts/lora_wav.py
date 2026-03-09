@@ -8,17 +8,24 @@ a LoRa chirp audio clip (re-mapped to audible frequencies), saves it as
 data/audio/<sha256_16hex>.wav, and optionally plays it via sounddevice.
 
 Each payload produces a deterministic, recognisable audio signature:
-  - 1 generic upchirp cue (or downchirp for CRC_FAIL) as an "attention" tone
+  - 1 generic upchirp cue (or downchirp for CRC_FAIL) as a centred
+    "attention" tone (same for all frames)
   - 3–6 payload-derived chirps with varied frequency range, sweep span,
-    duration, and direction — derived from the SHA-256 of the payload
+    duration, and direction — all derived from SHA-256(payload)
+  - Binaural spatialisation via ITD + ILD: each payload gets a fixed
+    azimuth angle (−90° … +90°) from the hash, creating a convincing
+    left/right headphone position. Interaural time delay (ITD) shifts
+    samples by up to ±MAX_ITD_S; interaural level difference (ILD)
+    attenuates the far ear by up to ILD_MAX_DB.
 
-Identical payloads always produce the same sound. Playback is queued so that
-concurrent frames play sequentially without interruption. Short cosine fades
-and silence padding at each end prevent clicks and clipping.
+Output is 2-channel (stereo) 16-bit PCM WAV.  Works best on headphones.
 
-The WAV filename is derived from SHA-256(payload)[:16] so identical payloads
-map to the same file and are not re-synthesised. PHY metadata is embedded in
-the WAV RIFF INFO chunk (ICMT / INAM) for DuckDB / later aggregation.
+Identical payloads always produce the same sound at the same spatial
+position.  Playback is queued so concurrent frames play sequentially.
+
+The WAV filename is derived from SHA-256(payload)[:16] so identical
+payloads map to the same file and are not re-synthesised.  PHY metadata
+is embedded in the WAV RIFF INFO chunk (ICMT / INAM).
 
 Usage:
     lora_wav.py                           # live UDP, default 127.0.0.1:5555
@@ -86,6 +93,15 @@ SILENCE_PAD_S = 0.010  # 10 ms silence at start and end of each WAV
 FADE_S = 0.005  # 5 ms cosine fade-in and fade-out on each chirp
 INTER_CHIRP_S = 0.012  # 12 ms gap between cue and signature chirps
 
+# Binaural spatialisation (ITD + ILD)
+# ITD — interaural time delay: at 90° azimuth the far ear hears the signal
+# ~650 µs later (head radius ~8.75 cm, speed of sound 343 m/s).
+# ILD — interaural level difference: far ear is attenuated ~6 dB at 90°.
+# Both scale with sin(azimuth), so centre (0°) is always symmetric.
+# The cue chirp is always centred; only signature chirps are spatialised.
+MAX_ITD_S = 0.00065  # seconds — max inter-ear delay at ±90° (~14 samples @22050 Hz)
+ILD_MAX_DB = 6.0  # dB — max level difference at ±90°
+
 
 # ---------------------------------------------------------------------------
 # Chirp synthesis helpers
@@ -133,6 +149,63 @@ def _lerp(lo: float, hi: float, t: float) -> float:
     return lo + (hi - lo) * t
 
 
+def _apply_itd_ild(
+    mono: list[float],
+    azimuth_deg: float,
+) -> tuple[list[float], list[float]]:
+    """Apply interaural time delay (ITD) and level difference (ILD) to *mono*.
+
+    Returns *(left, right)* stereo channels.
+
+    ITD: the near ear receives the signal early; the far ear receives it
+    delayed by MAX_ITD_S * |sin(az)|.  Both channels are shifted by ±half
+    the total delay so the sum stays in sync with the original timeline.
+
+    ILD: the far ear is attenuated by ILD_MAX_DB * |sin(az)| dB.  This
+    models head-shadowing — effective mainly above ~1 kHz but adds a
+    subtle level cue even for lower frequencies.
+
+    azimuth_deg: −90 = hard left, 0 = centre, +90 = hard right.
+    """
+    az_rad = math.radians(azimuth_deg)
+    sin_az = math.sin(az_rad)
+
+    # ITD: total delay in samples, split symmetrically between ears
+    total_delay = MAX_ITD_S * AUDIO_SAMPLE_RATE  # float samples
+    half_delay = int(round(abs(total_delay * sin_az) / 2))
+
+    n = len(mono)
+
+    def _shift(samples: list[float], delay: int) -> list[float]:
+        """Shift samples right by *delay* (positive = later)."""
+        if delay <= 0:
+            return list(samples)
+        pad = [0.0] * delay
+        return pad + samples[: n - delay]
+
+    if sin_az >= 0:
+        # Source to the right: right ear is near (early), left is far (late)
+        left = _shift(mono, half_delay)  # delayed
+        right = _shift(mono, 0)  # early — no shift needed after split
+        # Remove the artificial asymmetry: just delay left by full amount
+        # (simpler and perceptually equivalent for headphones)
+        left = _shift(mono, 2 * half_delay)
+        right = list(mono)
+    else:
+        # Source to the left: left ear is near, right is far
+        left = list(mono)
+        right = _shift(mono, 2 * half_delay)
+
+    # ILD: attenuate far ear
+    ild_linear = 10.0 ** (-ILD_MAX_DB * abs(sin_az) / 20.0)
+    if sin_az >= 0:
+        left = [s * ild_linear for s in left]  # far = left
+    else:
+        right = [s * ild_linear for s in right]  # far = right
+
+    return left, right
+
+
 # ---------------------------------------------------------------------------
 # Signature synthesis
 # ---------------------------------------------------------------------------
@@ -141,13 +214,13 @@ def _lerp(lo: float, hi: float, t: float) -> float:
 def _signature_params(payload: bytes) -> dict[str, Any]:
     """Derive chirp signature parameters from SHA-256(payload).
 
-    Consumes 10 bytes of the hash deterministically:
+    Consumes 8 bytes of the hash deterministically:
       [0,1]   → base frequency (f_lo)
       [2,3]   → sweep span
       [4]     → symbol duration
       [5]     → number of payload chirps (3–6)
       [6]     → direction bitmask (bit i = upchirp for chirp i)
-      [7]     → reserved / future use
+      [7]     → azimuth: 0x00 → −90°, 0x80 → 0° (centre), 0xFF → +90°
     """
     h = hashlib.sha256(payload).digest()
 
@@ -156,6 +229,7 @@ def _signature_params(payload: bytes) -> dict[str, Any]:
     duration_s = _lerp(SIG_DUR_MIN, SIG_DUR_MAX, h[4] / 255)
     n_chirps = SIG_N_MIN + (h[5] % (SIG_N_MAX - SIG_N_MIN + 1))
     dir_mask = h[6]  # bit i: 1 = upchirp, 0 = downchirp
+    azimuth_deg = _lerp(-90.0, 90.0, h[7] / 255)  # −90° … +90°
 
     return {
         "f_lo": f_lo,
@@ -163,33 +237,54 @@ def _signature_params(payload: bytes) -> dict[str, Any]:
         "duration_s": duration_s,
         "n_chirps": n_chirps,
         "dir_mask": dir_mask,
+        "azimuth_deg": azimuth_deg,
     }
 
 
-def synthesise_frame(*, payload: bytes, crc_ok: bool) -> list[float]:
-    """Synthesise audio for a full LoRa frame.
+def synthesise_frame(
+    *, payload: bytes, crc_ok: bool
+) -> tuple[list[float], list[float]]:
+    """Synthesise stereo audio for a full LoRa frame.
 
-    Structure:
+    Returns *(left, right)* sample lists of equal length.
+
+    Structure (mono before spatialisation):
       [silence pad]
-      [cue chirp: 1 upchirp (CRC OK) or 1 downchirp (CRC FAIL)]
+      [cue chirp: 1 upchirp (CRC OK) or 1 downchirp (CRC FAIL)] — centred
       [inter-chirp gap]
-      [payload signature: 3–6 chirps derived from payload hash]
+      [payload signature: 3–6 chirps derived from payload hash]  — spatialised
       [silence pad]
+
+    The cue chirp is always centred (azimuth 0°) — it is payload-independent
+    and serves as a neutral "frame arrived" signal.  The signature chirps are
+    spatialised at the azimuth derived from the payload hash so each distinct
+    payload has a consistent left/right headphone position.
     """
     pad_n = int(SILENCE_PAD_S * AUDIO_SAMPLE_RATE)
     gap_n = int(INTER_CHIRP_S * AUDIO_SAMPLE_RATE)
 
-    # Cue
-    cue = _chirp(CUE_F_LO, CUE_F_HI, CUE_DURATION_S, upchirp=crc_ok)
+    # Cue — centred (ITD=0, ILD=0)
+    cue_mono = _chirp(CUE_F_LO, CUE_F_HI, CUE_DURATION_S, upchirp=crc_ok)
 
-    # Payload signature
+    # Payload signature (mono, then spatialise as a whole)
     p = _signature_params(payload)
-    sig: list[float] = []
+    sig_mono: list[float] = []
     for i in range(p["n_chirps"]):
         upchirp = bool((p["dir_mask"] >> i) & 1)
-        sig += _chirp(p["f_lo"], p["f_hi"], p["duration_s"], upchirp=upchirp)
+        sig_mono += _chirp(p["f_lo"], p["f_hi"], p["duration_s"], upchirp=upchirp)
 
-    return _silence(pad_n) + cue + _silence(gap_n) + sig + _silence(pad_n)
+    # Spatialise signature
+    sig_l, sig_r = _apply_itd_ild(sig_mono, p["azimuth_deg"])
+
+    # Assemble: cue is identical on both channels; signature is spatialised
+    silence = _silence(pad_n)
+    gap = _silence(gap_n)
+    left = silence + cue_mono + gap + sig_l + silence
+    right = silence + cue_mono + gap + sig_r + silence
+
+    # Ensure equal length (ITD shift can cause ±1 sample difference)
+    n = min(len(left), len(right))
+    return left[:n], right[:n]
 
 
 # ---------------------------------------------------------------------------
@@ -211,16 +306,36 @@ def _pack_riff_info(comment: str, name: str) -> bytes:
     return b"LIST" + struct.pack("<I", 4 + len(payload)) + b"INFO" + payload
 
 
-def save_wav(path: Path, samples: list[float], comment: str, name: str) -> None:
-    """Write float32 samples to *path* as 16-bit PCM WAV with INFO metadata."""
-    # Convert to 16-bit signed PCM
-    pcm = struct.pack(f"<{len(samples)}h", *(int(s * 32767) for s in samples))
+def save_wav(
+    path: Path,
+    stereo: tuple[list[float], list[float]],
+    comment: str,
+    name: str,
+) -> None:
+    """Write stereo samples to *path* as 2-channel 16-bit PCM WAV with INFO metadata.
+
+    *stereo* is a *(left, right)* tuple of equal-length float lists.
+    Frames are interleaved as L0 R0 L1 R1 … per the WAV specification.
+    """
+    left, right = stereo
+    assert len(left) == len(right), "left/right channels must be same length"
+
+    # Interleave L/R into a flat 16-bit PCM byte string
+    n_frames = len(left)
+    pcm = struct.pack(
+        f"<{n_frames * 2}h",
+        *(
+            v
+            for lr in zip(left, right)
+            for v in (int(lr[0] * 32767), int(lr[1] * 32767))
+        ),
+    )
 
     import io
 
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
+        wf.setnchannels(2)
         wf.setsampwidth(2)  # 16-bit
         wf.setframerate(AUDIO_SAMPLE_RATE)
         wf.writeframes(pcm)
@@ -251,11 +366,13 @@ def frame_key(payload: bytes) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _playback_worker(play_queue: "queue.Queue[list[float] | None]") -> None:
-    """Background thread: dequeues audio arrays and plays them sequentially.
+def _playback_worker(
+    play_queue: "queue.Queue[tuple[list[float], list[float]] | None]",
+) -> None:
+    """Background thread: dequeues stereo audio and plays sequentially.
 
-    Sending *None* terminates the thread.  Each item plays to completion before
-    the next is dequeued, so concurrent frames never interrupt each other.
+    Each item is a *(left, right)* float-list pair.  Sending *None* terminates
+    the thread.  Each clip plays to completion before the next is dequeued.
     """
     try:
         import sounddevice as sd  # type: ignore[import]
@@ -268,7 +385,14 @@ def _playback_worker(play_queue: "queue.Queue[list[float] | None]") -> None:
         item = play_queue.get()
         if item is None:
             break
-        arr = np.array(item, dtype=np.float32)
+        left, right = item
+        # shape (n_frames, 2) — sounddevice interprets axis-1 as channels
+        arr = np.column_stack(
+            [
+                np.array(left, dtype=np.float32),
+                np.array(right, dtype=np.float32),
+            ]
+        )
         try:
             sd.play(arr, samplerate=AUDIO_SAMPLE_RATE, blocksize=PLAYBACK_BLOCKSIZE)
             sd.wait()
@@ -294,7 +418,7 @@ def run(
     local_port = sock.getsockname()[1]
     log.info("subscribed to lora_trx at %s:%d (local :%d)", host, port, local_port)
 
-    play_queue: queue.Queue[list[float] | None] = queue.Queue()
+    play_queue: queue.Queue[tuple[list[float], list[float]] | None] = queue.Queue()
     player_thread: threading.Thread | None = None
 
     if play:
@@ -376,13 +500,15 @@ def run(
                 # Load from WAV (so cached files are played identically)
                 with wave.open(str(wav_path)) as wf:
                     raw = wf.readframes(wf.getnframes())
-                # Convert 16-bit PCM → float list for the queue
-                n_frames = len(raw) // 2
-                arr = [
+                # Deinterleave 2-ch 16-bit PCM → (left, right) float lists
+                n_samples = len(raw) // 2  # total int16 values (2 bytes each)
+                flat = [
                     struct.unpack_from("<h", raw, i * 2)[0] / 32768.0
-                    for i in range(n_frames)
+                    for i in range(n_samples)
                 ]
-                play_queue.put(arr)
+                left_ch = flat[0::2]
+                right_ch = flat[1::2]
+                play_queue.put((left_ch, right_ch))
 
     except KeyboardInterrupt:
         pass
