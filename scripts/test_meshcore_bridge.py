@@ -3819,6 +3819,71 @@ class TestAckRxEdgeCases(unittest.TestCase):
         self.assertEqual(ack_packets, [])
 
 
+# ---- Group N2: PATH packet carrying ACK (flood TXT_MSG response) ----
+
+
+class TestPathAckRx(unittest.TestCase):
+    """PATH packet from companion device carrying bundled ACK hash.
+
+    When the bridge sends a TXT_MSG via FLOOD, the companion responds with a
+    PATH packet (ptype=0x08) containing the return path + ACK as encrypted extra
+    data — NOT a bare ACK (ptype=0x03). The bridge must decrypt the PATH and
+    extract the ACK to match against pending_acks.
+    """
+
+    def test_path_with_ack_matches_pending_and_pushes_confirmed(self):
+        """End-to-end: send flood TXT_MSG, receive PATH+ACK, get PUSH_SEND_CONFIRMED."""
+        from meshcore_crypto import (
+            ROUTE_FLOOD,
+            PAYLOAD_PATH,
+            PAYLOAD_ACK,
+            compute_ack_hash,
+            meshcore_shared_secret,
+            meshcore_encrypt_then_mac,
+        )
+
+        # Two identities: bridge (A) and companion (B)
+        (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
+        state = make_state(pub_key=pub_a, expanded_prv=prv_a, seed=seed_a)
+        state.known_keys[pub_b.hex()] = pub_b
+
+        # Bridge sends TXT_MSG to B — register the expected ACK
+        text = b"test-path-ack"
+        ts = int(time.time())
+        plaintext_msg = struct.pack("<I", ts) + bytes([0x00]) + text
+        expected_ack = compute_ack_hash(plaintext_msg, pub_a)
+        dst_prefix = pub_b[:6]
+        state.pending_acks[expected_ack] = (time.monotonic(), dst_prefix)
+
+        # Companion B builds a PATH packet back to A with the ACK embedded.
+        # PATH plaintext: path_len(1) + path(N) + extra_type(1) + extra(4)
+        return_path = b""  # zero-hop return
+        path_encoded = 0x00  # hash_size=1 (upper 2 bits=0), count=0 (lower 6 bits=0)
+        path_plaintext = (
+            bytes([path_encoded]) + return_path + bytes([PAYLOAD_ACK]) + expected_ack
+        )
+
+        # Encrypt with shared secret (B encrypts for A)
+        secret = meshcore_shared_secret(prv_b, pub_a)
+        encrypted = meshcore_encrypt_then_mac(secret, path_plaintext)
+
+        # Wire format: header(1) + flood_path_len(1) + dest_hash(1) + src_hash(1) + encrypted
+        hdr = make_header(ROUTE_FLOOD, PAYLOAD_PATH)
+        wire = bytes([hdr, 0x00]) + pub_a[:1] + pub_b[:1] + encrypted
+
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0},
+            "payload": wire,
+        }
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+
+        self.assertEqual(len(companion_msgs), 1, "PATH+ACK should produce PUSH_ACK")
+        self.assertEqual(companion_msgs[0][0], bridge.PUSH_ACK)
+        self.assertEqual(len(state.pending_acks), 0, "pending_acks should be consumed")
+
+
 # ---- Group O: _handle_txt_msg_rx edge cases ----
 
 

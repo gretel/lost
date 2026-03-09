@@ -92,6 +92,7 @@ from meshcore_crypto import (
     PAYLOAD_RESP,
     PAYLOAD_GRP_TXT,
     PAYLOAD_ANON_REQ,
+    PAYLOAD_PATH,
     PAYLOAD_CTRL,
     ROUTE_DIRECT,
     ROUTE_FLOOD,
@@ -645,6 +646,10 @@ def lora_frame_to_companion_msgs(
     if ptype == PAYLOAD_GRP_TXT:
         return _handle_grp_txt_rx(payload, snr_byte, path_len, state), []
 
+    # For PATH: decrypt and extract bundled ACK (response to flood TXT_MSG)
+    if ptype == PAYLOAD_PATH:
+        return _handle_path_rx(payload, path_len, state), []
+
     return empty
 
 
@@ -739,23 +744,14 @@ def _handle_advert_rx(
     return [push]
 
 
-def _handle_ack_rx(
-    payload: bytes,
-    ack_start: int,
-    state: BridgeState,
-) -> list[bytes]:
-    """Handle received ACK: match against pending TX ACK tags.
+def _match_pending_ack(ack_bytes: bytes, state: BridgeState) -> list[bytes]:
+    """Match a 4-byte ACK hash against pending_acks and produce PUSH_ACK.
 
-    ACK payload is 4 bytes (checksum) at ack_start.
+    Shared by _handle_ack_rx (bare ACK packets) and _handle_path_rx (PATH
+    packets carrying a bundled ACK as encrypted extra data).
     """
-    if ack_start + 4 > len(payload):
-        return []
-
-    ack_bytes = payload[ack_start : ack_start + 4]
-
-    # Check against pending ACKs
-    now = time.monotonic()
     # Expire old entries
+    now = time.monotonic()
     expired = [
         k
         for k, (ts, _) in state.pending_acks.items()
@@ -771,6 +767,87 @@ def _handle_ack_rx(
         push = bytes([PUSH_ACK]) + dest_prefix[:6].ljust(6, b"\x00")
         log.info("ACK received for %s", ack_bytes.hex())
         return [push]
+
+    return []
+
+
+def _handle_ack_rx(
+    payload: bytes,
+    ack_start: int,
+    state: BridgeState,
+) -> list[bytes]:
+    """Handle received bare ACK (ptype 0x03): extract 4-byte hash and match."""
+    if ack_start + 4 > len(payload):
+        return []
+    ack_bytes = payload[ack_start : ack_start + 4]
+    return _match_pending_ack(ack_bytes, state)
+
+
+def _handle_path_rx(
+    payload: bytes,
+    path_len: int,
+    state: BridgeState,
+) -> list[bytes]:
+    """Handle received PATH packet: decrypt, extract bundled ACK, match pending.
+
+    When the bridge sends a TXT_MSG via FLOOD, the companion responds with a
+    PAYLOAD_PATH (0x08) packet — NOT a bare ACK. The PATH packet is encrypted
+    with the ECDH shared secret and contains:
+      plaintext: [path_len_enc(1)][return_path(N)][extra_type(1)][extra(M)]
+    If extra_type == PAYLOAD_ACK (0x03), the extra is a 4-byte ACK hash.
+
+    Wire layout after header+flood_path:
+      [dest_hash(1)][src_hash(1)][MAC(2)][ciphertext]
+    """
+    hdr_info = parse_meshcore_header(payload)
+    if hdr_info is None:
+        return []
+    off = hdr_info["off"]
+    inner = payload[off:]
+    if len(inner) < 4:  # need at least dest_hash + src_hash + MAC(2)
+        return []
+
+    dest_hash = inner[0]
+    src_hash = inner[1]
+    encrypted = inner[2:]  # MAC(2) + ciphertext
+
+    # Check if we're the destination
+    if dest_hash != state.pub_key[0]:
+        return []
+
+    # Trial decryption over known keys (match src_hash)
+    candidates = [pub for pub in state.known_keys.values() if pub[0] == src_hash]
+    plaintext: bytes | None = None
+    for peer_pub in candidates:
+        secret = meshcore_shared_secret(state.expanded_prv, peer_pub)
+        if secret is None:
+            continue
+        plaintext = meshcore_mac_then_decrypt(secret, encrypted)
+        if plaintext is not None:
+            break
+
+    if plaintext is None or len(plaintext) < 2:
+        log.debug("PATH: decryption failed (not for us or unknown sender)")
+        return []
+
+    # Parse plaintext: path_len_enc(1) + path(N) + extra_type(1) + extra(M)
+    path_len_enc = plaintext[0]
+    hash_count = path_len_enc & 0x3F
+    hash_size = ((path_len_enc >> 6) & 0x03) + 1
+    path_bytes = hash_count * hash_size
+    idx = 1 + path_bytes
+
+    if idx >= len(plaintext):
+        log.debug("PATH: no extra data after return path")
+        return []
+
+    extra_type = plaintext[idx] & 0x0F
+    extra = plaintext[idx + 1 :]
+
+    if extra_type == PAYLOAD_ACK and len(extra) >= 4:
+        ack_bytes = extra[:4]
+        log.info("PATH+ACK: extracted ACK hash %s", ack_bytes.hex())
+        return _match_pending_ack(ack_bytes, state)
 
     return []
 
