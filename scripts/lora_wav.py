@@ -5,11 +5,20 @@ lora_wav.py -- LoRa chirp audio exporter.
 
 Subscribes to a lora_trx UDP server. For each decoded frame, synthesises
 a LoRa chirp audio clip (re-mapped to audible frequencies), saves it as
-data/audio/<sha256_8hex>.wav, and optionally plays it via sounddevice.
+data/audio/<sha256_16hex>.wav, and optionally plays it via sounddevice.
 
-The WAV filename is derived from SHA-256(payload)[:8] so identical payloads
-map to the same file and are not re-synthesised.  PHY metadata is embedded
-in the WAV RIFF INFO chunk (ICMT / INAM) for DuckDB / later aggregation.
+Each payload produces a deterministic, recognisable audio signature:
+  - 1 generic upchirp cue (or downchirp for CRC_FAIL) as an "attention" tone
+  - 3–6 payload-derived chirps with varied frequency range, sweep span,
+    duration, and direction — derived from the SHA-256 of the payload
+
+Identical payloads always produce the same sound. Playback is queued so that
+concurrent frames play sequentially without interruption. Short cosine fades
+and silence padding at each end prevent clicks and clipping.
+
+The WAV filename is derived from SHA-256(payload)[:16] so identical payloads
+map to the same file and are not re-synthesised. PHY metadata is embedded in
+the WAV RIFF INFO chunk (ICMT / INAM) for DuckDB / later aggregation.
 
 Usage:
     lora_wav.py                           # live UDP, default 127.0.0.1:5555
@@ -26,8 +35,10 @@ import argparse
 import hashlib
 import logging
 import math
+import queue
 import socket
 import struct
+import threading
 import time
 import wave
 from pathlib import Path
@@ -48,57 +59,132 @@ log = logging.getLogger("gr4.wav")
 
 DEFAULT_AUDIO_DIR = "data/audio"
 AUDIO_SAMPLE_RATE = 22050  # Hz — quarter CD rate, smooth phase at low frequency
-CHIRP_AMPLITUDE = 0.4  # 0..1 — keep well below full scale
-SYMBOL_DURATION_S = 0.08  # seconds per chirp — snappy but audible
-CHIRP_F_LO = 100.0  # Hz — low, gentle register
-CHIRP_F_HI = 900.0  # Hz — stays below 1 kHz for pleasant tone
+CHIRP_AMPLITUDE = 0.38  # 0..1 — leave headroom for cosine fade
+
+# Cue chirp (fixed, payload-independent — "attention, frame arrived")
+CUE_F_LO = 200.0  # Hz
+CUE_F_HI = 800.0  # Hz
+CUE_DURATION_S = 0.07  # seconds
+
+# Payload signature chirps (range boundaries — hash bytes select within these)
+SIG_F_LO_MIN = 80.0  # Hz — lowest base frequency
+SIG_F_LO_MAX = 350.0  # Hz — highest base frequency
+SIG_SPAN_MIN = 200.0  # Hz — minimum sweep span
+SIG_SPAN_MAX = 750.0  # Hz — maximum sweep span
+SIG_DUR_MIN = 0.055  # seconds — shortest chirp
+SIG_DUR_MAX = 0.120  # seconds — longest chirp
+SIG_N_MIN = 3  # fewest payload chirps
+SIG_N_MAX = 6  # most payload chirps
+
+# Padding / envelope
+SILENCE_PAD_S = 0.010  # 10 ms silence at start and end of each WAV
+FADE_S = 0.005  # 5 ms cosine fade-in and fade-out on each chirp
+INTER_CHIRP_S = 0.012  # 12 ms gap between cue and signature chirps
 
 
 # ---------------------------------------------------------------------------
-# Chirp synthesis
+# Chirp synthesis helpers
 # ---------------------------------------------------------------------------
 
 
-def _synthesise_chirp(
-    *,
-    upchirp: bool = True,
-    n_symbols: int = 1,
+def _silence(n_samples: int) -> list[float]:
+    return [0.0] * n_samples
+
+
+def _cosine_fade(samples: list[float], fade_n: int) -> list[float]:
+    """Apply cosine fade-in and fade-out to *samples* (in-place clone)."""
+    s = list(samples)
+    n = len(s)
+    fade_n = min(fade_n, n // 2)
+    for i in range(fade_n):
+        t = i / fade_n
+        w = 0.5 - 0.5 * math.cos(math.pi * t)  # 0 → 1 over fade_n samples
+        s[i] *= w
+        s[n - 1 - i] *= w
+    return s
+
+
+def _chirp(
+    f_lo: float, f_hi: float, duration_s: float, *, upchirp: bool = True
 ) -> list[float]:
-    """Return PCM samples for *n_symbols* LoRa-style chirps.
-
-    Symbol duration is fixed at SYMBOL_DURATION_S (not tied to SF) so the
-    sweep is always slow enough to hear clearly.  Frequency range is
-    CHIRP_F_LO..CHIRP_F_HI — a low, gentle register.  Amplitude is
-    CHIRP_AMPLITUDE to avoid clipping.
-    """
-    n = int(SYMBOL_DURATION_S * AUDIO_SAMPLE_RATE)  # samples per symbol
-    f_span = CHIRP_F_HI - CHIRP_F_LO
-
+    """Synthesise one chirp.  Returns samples with cosine fade applied."""
+    n = int(duration_s * AUDIO_SAMPLE_RATE)
+    f_span = f_hi - f_lo
+    fade_n = int(FADE_S * AUDIO_SAMPLE_RATE)
     samples: list[float] = []
-    for _ in range(n_symbols):
-        for k in range(n):
-            frac = k / n
-            t = k / AUDIO_SAMPLE_RATE
-            if upchirp:
-                phi = 2 * math.pi * (CHIRP_F_LO * t + 0.5 * f_span * t * frac)
-            else:
-                phi = 2 * math.pi * (CHIRP_F_HI * t - 0.5 * f_span * t * frac)
-            samples.append(CHIRP_AMPLITUDE * math.sin(phi))
-    return samples
+    for k in range(n):
+        frac = k / n
+        t = k / AUDIO_SAMPLE_RATE
+        if upchirp:
+            phi = 2 * math.pi * (f_lo * t + 0.5 * f_span * t * frac)
+        else:
+            phi = 2 * math.pi * (f_hi * t - 0.5 * f_span * t * frac)
+        samples.append(CHIRP_AMPLITUDE * math.sin(phi))
+    return _cosine_fade(samples, fade_n)
 
 
-def synthesise_frame(*, crc_ok: bool, preamble: int = 8) -> list[float]:
-    """Synthesise audio for a full LoRa frame (preamble + sync word).
+def _lerp(lo: float, hi: float, t: float) -> float:
+    """Linear interpolate: t ∈ [0, 1] → [lo, hi]."""
+    return lo + (hi - lo) * t
 
-    CRC_OK  → preamble upchirps + 2 downchirps (sync word signature)
-    CRC_FAIL → downchirp preamble only (distinctive descending tone)
+
+# ---------------------------------------------------------------------------
+# Signature synthesis
+# ---------------------------------------------------------------------------
+
+
+def _signature_params(payload: bytes) -> dict[str, Any]:
+    """Derive chirp signature parameters from SHA-256(payload).
+
+    Consumes 10 bytes of the hash deterministically:
+      [0,1]   → base frequency (f_lo)
+      [2,3]   → sweep span
+      [4]     → symbol duration
+      [5]     → number of payload chirps (3–6)
+      [6]     → direction bitmask (bit i = upchirp for chirp i)
+      [7]     → reserved / future use
     """
-    if not crc_ok:
-        return _synthesise_chirp(upchirp=False, n_symbols=preamble)
+    h = hashlib.sha256(payload).digest()
 
-    audio = _synthesise_chirp(upchirp=True, n_symbols=preamble)
-    audio += _synthesise_chirp(upchirp=False, n_symbols=2)
-    return audio
+    f_lo = _lerp(SIG_F_LO_MIN, SIG_F_LO_MAX, int.from_bytes(h[0:2], "big") / 65535)
+    span = _lerp(SIG_SPAN_MIN, SIG_SPAN_MAX, int.from_bytes(h[2:4], "big") / 65535)
+    duration_s = _lerp(SIG_DUR_MIN, SIG_DUR_MAX, h[4] / 255)
+    n_chirps = SIG_N_MIN + (h[5] % (SIG_N_MAX - SIG_N_MIN + 1))
+    dir_mask = h[6]  # bit i: 1 = upchirp, 0 = downchirp
+
+    return {
+        "f_lo": f_lo,
+        "f_hi": f_lo + span,
+        "duration_s": duration_s,
+        "n_chirps": n_chirps,
+        "dir_mask": dir_mask,
+    }
+
+
+def synthesise_frame(*, payload: bytes, crc_ok: bool) -> list[float]:
+    """Synthesise audio for a full LoRa frame.
+
+    Structure:
+      [silence pad]
+      [cue chirp: 1 upchirp (CRC OK) or 1 downchirp (CRC FAIL)]
+      [inter-chirp gap]
+      [payload signature: 3–6 chirps derived from payload hash]
+      [silence pad]
+    """
+    pad_n = int(SILENCE_PAD_S * AUDIO_SAMPLE_RATE)
+    gap_n = int(INTER_CHIRP_S * AUDIO_SAMPLE_RATE)
+
+    # Cue
+    cue = _chirp(CUE_F_LO, CUE_F_HI, CUE_DURATION_S, upchirp=crc_ok)
+
+    # Payload signature
+    p = _signature_params(payload)
+    sig: list[float] = []
+    for i in range(p["n_chirps"]):
+        upchirp = bool((p["dir_mask"] >> i) & 1)
+        sig += _chirp(p["f_lo"], p["f_hi"], p["duration_s"], upchirp=upchirp)
+
+    return _silence(pad_n) + cue + _silence(gap_n) + sig + _silence(pad_n)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +211,6 @@ def save_wav(path: Path, samples: list[float], comment: str, name: str) -> None:
     # Convert to 16-bit signed PCM
     pcm = struct.pack(f"<{len(samples)}h", *(int(s * 32767) for s in samples))
 
-    # Build the WAV via stdlib wave, then append the INFO chunk manually
     import io
 
     buf = io.BytesIO()
@@ -157,6 +242,36 @@ def frame_key(payload: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Playback thread
+# ---------------------------------------------------------------------------
+
+
+def _playback_worker(play_queue: "queue.Queue[list[float] | None]") -> None:
+    """Background thread: dequeues audio arrays and plays them sequentially.
+
+    Sending *None* terminates the thread.  Each item plays to completion before
+    the next is dequeued, so concurrent frames never interrupt each other.
+    """
+    try:
+        import sounddevice as sd  # type: ignore[import]
+        import numpy as np  # type: ignore[import]
+    except ImportError:
+        log.warning("sounddevice/numpy unavailable — playback thread exiting")
+        return
+
+    while True:
+        item = play_queue.get()
+        if item is None:
+            break
+        arr = np.array(item, dtype=np.float32)
+        try:
+            sd.play(arr, samplerate=AUDIO_SAMPLE_RATE)
+            sd.wait()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("playback error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -174,13 +289,24 @@ def run(
     local_port = sock.getsockname()[1]
     log.info("subscribed to lora_trx at %s:%d (local :%d)", host, port, local_port)
 
-    sd = None
+    play_queue: queue.Queue[list[float] | None] = queue.Queue()
+    player_thread: threading.Thread | None = None
+
     if play:
         try:
-            import sounddevice as sd  # type: ignore[import]
+            import sounddevice  # type: ignore[import]  # noqa: F401
+            import numpy  # type: ignore[import]  # noqa: F401
+
+            player_thread = threading.Thread(
+                target=_playback_worker,
+                args=(play_queue,),
+                daemon=True,
+                name="lora-wav-player",
+            )
+            player_thread.start()
         except ImportError:
-            log.warning("sounddevice not available — disabling playback")
-            sd = None
+            log.warning("sounddevice/numpy not available — disabling playback")
+            play = False
 
     last_keepalive = time.monotonic()
     waiting = False
@@ -224,7 +350,7 @@ def run(
             wav_path = audio_dir / f"{key}.wav"
 
             if not wav_path.exists():
-                samples = synthesise_frame(crc_ok=crc_ok)
+                samples = synthesise_frame(payload=payload, crc_ok=crc_ok)
                 snr_str = f"{snr:.1f}dB" if snr is not None else "n/a"
                 crc_str = "OK" if crc_ok else "FAIL"
                 comment = (
@@ -241,17 +367,24 @@ def run(
             else:
                 log.debug("skip existing %s", wav_path.name)
 
-            if sd is not None:
-                import numpy as np  # type: ignore[import]  # transitive via sounddevice
-
+            if play:
+                # Load from WAV (so cached files are played identically)
                 with wave.open(str(wav_path)) as wf:
                     raw = wf.readframes(wf.getnframes())
-                arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                sd.play(arr, samplerate=AUDIO_SAMPLE_RATE)  # type: ignore[union-attr]
+                # Convert 16-bit PCM → float list for the queue
+                n_frames = len(raw) // 2
+                arr = [
+                    struct.unpack_from("<h", raw, i * 2)[0] / 32768.0
+                    for i in range(n_frames)
+                ]
+                play_queue.put(arr)
 
     except KeyboardInterrupt:
         pass
     finally:
+        if player_thread is not None:
+            play_queue.put(None)  # signal shutdown
+            player_thread.join(timeout=2.0)
         sock.close()
 
 
