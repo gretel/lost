@@ -2547,6 +2547,95 @@ class TestStartupConfig(unittest.TestCase):
         self.assertFalse(bridge._is_valid_repeat_freq(0))
 
 
+class TestStartupConfigReset(unittest.TestCase):
+    """APP_START re-applies config.toml values, overriding companion-session changes."""
+
+    def setUp(self):
+        import socket
+
+        self.state = make_state(
+            name="config-name",
+            lat_e6=int(53.55 * 1e6),
+            lon_e6=int(9.99 * 1e6),
+            send_scope=bytes(range(16)),
+            client_repeat=1,
+            path_hash_mode=2,
+            autoadd_config=0x03,
+            autoadd_max_hops=5,
+        )
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.bind(("127.0.0.1", 0))
+        self.udp_addr = ("127.0.0.1", self.udp_sock.getsockname()[1])
+
+    def tearDown(self):
+        self.udp_sock.close()
+
+    def _app_start(self):
+        return bridge.handle_command(b"\x01", self.state, self.udp_sock, self.udp_addr)
+
+    def test_app_start_resets_name(self):
+        """Companion SET_ADVERT_NAME is undone by next APP_START."""
+        self.state.name = "companion-changed-name"
+        self._app_start()
+        self.assertEqual(self.state.name, "config-name")
+
+    def test_app_start_resets_send_scope(self):
+        """Companion SET_FLOOD_SCOPE is undone by next APP_START."""
+        self.state.send_scope = b"\xff" * 16
+        self._app_start()
+        self.assertEqual(self.state.send_scope, bytes(range(16)))
+
+    def test_app_start_resets_latlon(self):
+        """Companion SET_ADVERT_LATLON is undone by next APP_START."""
+        self.state.lat_e6 = 0
+        self.state.lon_e6 = 0
+        self._app_start()
+        self.assertEqual(self.state.lat_e6, int(53.55 * 1e6))
+        self.assertEqual(self.state.lon_e6, int(9.99 * 1e6))
+
+    def test_app_start_resets_client_repeat(self):
+        """Companion SET_REPEAT_MODE is undone by next APP_START."""
+        self.state.client_repeat = 0
+        self._app_start()
+        self.assertEqual(self.state.client_repeat, 1)
+
+    def test_app_start_resets_path_hash_mode(self):
+        """Companion SET_PATH_HASH_MODE is undone by next APP_START."""
+        self.state.path_hash_mode = 0
+        self._app_start()
+        self.assertEqual(self.state.path_hash_mode, 2)
+
+    def test_app_start_resets_autoadd(self):
+        """Companion SET_AUTOADD_CONFIG is undone by next APP_START."""
+        self.state.autoadd_config = 0xFF
+        self.state.autoadd_max_hops = 64
+        self._app_start()
+        self.assertEqual(self.state.autoadd_config, 0x03)
+        self.assertEqual(self.state.autoadd_max_hops, 5)
+
+    def test_self_info_reflects_config_name(self):
+        """SELF_INFO returned by APP_START carries the config.toml name."""
+        self.state.name = "companion-changed-name"
+        responses = self._app_start()
+        self_info = responses[0]
+        self.assertEqual(self_info[0], bridge.RESP_SELF_INFO)
+        # name field starts at byte 58:
+        # 1(resp) + 1(adv_type) + 1(tx_power) + 1(max_tx_power)
+        # + 32(pubkey) + 4(lat) + 4(lon)
+        # + 1(multi_acks) + 1(adv_loc_policy) + 1(telemetry_mode) + 1(manual_add_contacts)
+        # + 4(freq) + 4(bw) + 1(sf) + 1(cr) = 58
+        name_bytes = self_info[58:]
+        name_decoded = name_bytes.decode("utf-8", errors="replace").rstrip("\x00")
+        self.assertIn("config-name", name_decoded)
+
+    def test_apply_startup_config_is_idempotent(self):
+        """Calling apply_startup_config() twice leaves state unchanged."""
+        self.state.apply_startup_config()
+        name_after_first = self.state.name
+        self.state.apply_startup_config()
+        self.assertEqual(self.state.name, name_after_first)
+
+
 class TestSendControlData(unittest.TestCase):
     def setUp(self):
         import socket

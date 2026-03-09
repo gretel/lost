@@ -394,11 +394,38 @@ class BridgeState:
         self.autoadd_config: int = autoadd_config
         self.autoadd_max_hops: int = autoadd_max_hops
 
+        # Startup config mirrors (config.toml values) — re-applied on each APP_START
+        # so the bridge's identity is restored after a companion session overwrites it.
+        self._startup_name: str = name
+        self._startup_lat_e6: int = lat_e6
+        self._startup_lon_e6: int = lon_e6
+        self._startup_send_scope: bytes = self.send_scope  # already validated above
+        self._startup_client_repeat: int = client_repeat
+        self._startup_path_hash_mode: int = path_hash_mode
+        self._startup_autoadd_config: int = autoadd_config
+        self._startup_autoadd_max_hops: int = autoadd_max_hops
+
         # Other params (CMD_SET_OTHER_PARAMS 0x26); stored in-memory only
         self.manual_add_contacts: int = 0
         self.telemetry_mode: int = 0
         self.adv_loc_policy: int = 0
         self.multi_acks: int = 0
+
+    def apply_startup_config(self) -> None:
+        """Re-apply config.toml settings to live state.
+
+        Called on each APP_START so the bridge's identity (name, location,
+        flood scope, repeat mode, etc.) is restored to config.toml values
+        after a companion session may have overwritten them.
+        """
+        self.name = self._startup_name
+        self.lat_e6 = self._startup_lat_e6
+        self.lon_e6 = self._startup_lon_e6
+        self.send_scope = self._startup_send_scope
+        self.client_repeat = self._startup_client_repeat
+        self.path_hash_mode = self._startup_path_hash_mode
+        self.autoadd_config = self._startup_autoadd_config
+        self.autoadd_max_hops = self._startup_autoadd_max_hops
 
     def build_self_info(self) -> bytes:
         """Build SELF_INFO (0x05) response payload."""
@@ -1065,6 +1092,8 @@ def handle_command(
 
     if cmd == CMD_APP_START:
         log.info("companion: APP_START")
+        # Re-apply config.toml values so companion session changes don't persist
+        state.apply_startup_config()
         # Send SELF_INFO + push our own ADVERT so companion learns our contact
         responses = [state.build_self_info()]
         self_advert = _build_self_advert_push(state)
