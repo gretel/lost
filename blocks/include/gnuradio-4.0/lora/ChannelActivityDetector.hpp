@@ -3,6 +3,7 @@
 #define GNURADIO_LORA_CHANNEL_ACTIVITY_DETECTOR_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -63,6 +64,11 @@ struct ChannelActivityDetector
     explicit ChannelActivityDetector(gr::property_map init = {})
         : gr::Block<ChannelActivityDetector, gr::NoDefaultTagForwarding>(std::move(init)) {}
 
+    /// Set an external channel-busy flag for listen-before-talk.
+    /// Updated every 2-symbol detection window.  Not a GR4 property
+    /// (atomics aren't serializable); call after graph construction.
+    void set_channel_busy_flag(std::atomic<bool>* flag) { _channel_busy = flag; }
+
     /// Which chirp polarity to use as the dechirp reference.
     /// UpchirpRef  : multiply by conj(upchirp) = downchirp  → detects upchirp signal
     /// DownchirpRef: multiply by conj(downchirp) = upchirp  → detects downchirp signal
@@ -101,6 +107,8 @@ private:
 
     std::vector<std::complex<float>>           _scratch{};  ///< dechirp workspace (length _N)
     gr::algorithm::FFT<std::complex<float>>    _fft{};
+
+    std::atomic<bool>* _channel_busy{nullptr};  ///< external LBT flag (nullable)
 
     void rebuild_refs() {
         _N       = 1U << sf;
@@ -208,6 +216,12 @@ public:
         }
 
         const bool detected = up_detected || dn_detected;
+
+        // Update external LBT flag (if wired)
+        if (_channel_busy != nullptr) {
+            _channel_busy->store(detected, std::memory_order_release);
+        }
+
         uint8_t result = 0U;
         if (up_detected) result |= 0x01U;
         if (dn_detected) result |= 0x02U;
