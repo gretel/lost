@@ -59,6 +59,7 @@
 #include "FrameSink.hpp"
 #include "TxQueueSource.hpp"
 #include "cbor.hpp"
+#include "timestamp.hpp"
 
 namespace {
 
@@ -282,16 +283,20 @@ struct UdpState {
             port = ntohs(s4.sin_port);
         }
         if (entry.sync_words.empty()) {
-            std::fprintf(stderr, "  UDP: client %s:%u subscribed (all frames, %zu total)\n",
-                         addr_str, port, clients.size());
+            gr::lora::log_ts("info ", "lora_trx",
+                "UDP client %s:%u subscribed (all frames, %zu total)",
+                addr_str, port, clients.size());
         } else {
             std::string filter;
             for (auto sw : entry.sync_words) {
                 if (!filter.empty()) filter += ",";
-                filter += std::format("0x{:02x}", sw);
+                char tmp[8];
+                std::snprintf(tmp, sizeof(tmp), "0x%02x", sw);
+                filter += tmp;
             }
-            std::fprintf(stderr, "  UDP: client %s:%u subscribed (sync_word=%s, %zu total)\n",
-                         addr_str, port, filter.c_str(), clients.size());
+            gr::lora::log_ts("info ", "lora_trx",
+                "UDP client %s:%u subscribed (sync_word=%s, %zu total)",
+                addr_str, port, filter.c_str(), clients.size());
         }
     }
 
@@ -364,8 +369,8 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
     try {
         tbl = toml::parse_file(path);
     } catch (const toml::parse_error& err) {
-        std::fprintf(stderr, "ERROR: %s: %s\n",
-                     path.c_str(), err.description().data());
+        gr::lora::log_ts("error", "lora_trx", "%s: %s",
+                         path.c_str(), err.description().data());
         return {};
     }
 
@@ -458,8 +463,9 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
             if (cr_val >= 5 && cr_val <= 8) {
                 c.cr = static_cast<uint8_t>(cr_val - 4);
             } else {
-                std::fprintf(stderr, "ERROR: [%s] cr must be 5-8 (denominator), got %u\n",
-                             skey.c_str(), cr_val);
+                gr::lora::log_ts("error", "lora_trx",
+                    "[%s] cr must be 5-8 (denominator), got %u",
+                    skey.c_str(), cr_val);
                 return {};
             }
 
@@ -475,8 +481,9 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
                 for (auto& elem : *arr) {
                     auto ch = static_cast<uint32_t>(elem.value_or(int64_t{0}));
                     if (ch > 3) {
-                        std::fprintf(stderr, "ERROR: [%s] rx_channel %u out of range (0-3)\n",
-                                     skey.c_str(), ch);
+                        gr::lora::log_ts("error", "lora_trx",
+                            "[%s] rx_channel %u out of range (0-3)",
+                            skey.c_str(), ch);
                         return {};
                     }
                     r.rx_channels.push_back(ch);
@@ -485,14 +492,16 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
             r.tx_channel = static_cast<uint32_t>(
                 section["tx_channel"].value_or(int64_t{0}));
             if (r.tx_channel > 3) {
-                std::fprintf(stderr, "ERROR: [%s] tx_channel %u out of range (0-3)\n",
-                             skey.c_str(), r.tx_channel);
+                gr::lora::log_ts("error", "lora_trx",
+                    "[%s] tx_channel %u out of range (0-3)",
+                    skey.c_str(), r.tx_channel);
                 return {};
             }
             if (kChannelMap[r.tx_channel].tx_antenna == nullptr) {
-                std::fprintf(stderr, "ERROR: [%s] tx_channel %u (%s) is RX-only\n",
-                             skey.c_str(), r.tx_channel,
-                             kChannelMap[r.tx_channel].label);
+                gr::lora::log_ts("error", "lora_trx",
+                    "[%s] tx_channel %u (%s) is RX-only",
+                    skey.c_str(), r.tx_channel,
+                    kChannelMap[r.tx_channel].label);
                 return {};
             }
             radios[skey] = r;
@@ -524,21 +533,23 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
         auto codec_ref = section["codec"].value<std::string>();
         auto radio_ref = section["radio"].value<std::string>();
         if (!codec_ref || !radio_ref) {
-            std::fprintf(stderr, "ERROR: [%s] requires 'codec' and 'radio' keys\n",
-                         skey.c_str());
+            gr::lora::log_ts("error", "lora_trx",
+                "[%s] requires 'codec' and 'radio' keys", skey.c_str());
             return {};
         }
 
         auto cit = codecs.find(*codec_ref);
         if (cit == codecs.end()) {
-            std::fprintf(stderr, "ERROR: [%s] references unknown codec '%s'\n",
-                         skey.c_str(), codec_ref->c_str());
+            gr::lora::log_ts("error", "lora_trx",
+                "[%s] references unknown codec '%s'",
+                skey.c_str(), codec_ref->c_str());
             return {};
         }
         auto rit = radios.find(*radio_ref);
         if (rit == radios.end()) {
-            std::fprintf(stderr, "ERROR: [%s] references unknown radio '%s'\n",
-                         skey.c_str(), radio_ref->c_str());
+            gr::lora::log_ts("error", "lora_trx",
+                "[%s] references unknown radio '%s'",
+                skey.c_str(), radio_ref->c_str());
             return {};
         }
 
@@ -584,24 +595,27 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
 
                 auto sf_opt = dtbl["sf"].value<int64_t>();
                 if (!sf_opt) {
-                    std::fprintf(stderr, "ERROR: [[%s.decode]] entry missing required key 'sf'\n",
-                                 skey.c_str());
+                    gr::lora::log_ts("error", "lora_trx",
+                        "[[%s.decode]] entry missing required key 'sf'",
+                        skey.c_str());
                     return {};
                 }
                 dc.sf = static_cast<uint8_t>(*sf_opt);
 
                 auto sw_opt = dtbl["sync_word"].value<int64_t>();
                 if (!sw_opt) {
-                    std::fprintf(stderr, "ERROR: [[%s.decode]] entry missing required key 'sync_word'\n",
-                                 skey.c_str());
+                    gr::lora::log_ts("error", "lora_trx",
+                        "[[%s.decode]] entry missing required key 'sync_word'",
+                        skey.c_str());
                     return {};
                 }
                 dc.sync_word = static_cast<uint16_t>(*sw_opt);
 
                 auto lbl_opt = dtbl["label"].value<std::string>();
                 if (!lbl_opt || lbl_opt->empty()) {
-                    std::fprintf(stderr, "ERROR: [[%s.decode]] entry missing required key 'label'\n",
-                                 skey.c_str());
+                    gr::lora::log_ts("error", "lora_trx",
+                        "[[%s.decode]] entry missing required key 'label'",
+                        skey.c_str());
                     return {};
                 }
                 dc.label = *lbl_opt;
@@ -622,49 +636,58 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
                 }
 
                 if (g_debug && !dc.block_overrides.empty()) {
-                    std::fprintf(stderr, "  [[%s.decode]] '%s': %zu override(s)\n",
-                                 skey.c_str(), dc.label.c_str(),
-                                 dc.block_overrides.size());
+                    gr::lora::log_ts("debug", "lora_trx",
+                        "[[%s.decode]] '%s': %zu override(s)",
+                        skey.c_str(), dc.label.c_str(),
+                        dc.block_overrides.size());
                 }
 
                 cfg.decode_configs.push_back(std::move(dc));
             }
         }
         if (cfg.decode_configs.empty()) {
-            std::fprintf(stderr,
-                "ERROR: [%s] requires at least one [[%s.decode]] entry "
-                "(sf, sync_word, label are required)\n",
+            gr::lora::log_ts("error", "lora_trx",
+                "[%s] requires at least one [[%s.decode]] entry "
+                "(sf, sync_word, label are required)",
                 skey.c_str(), skey.c_str());
             return {};
         }
 
         if (g_debug) {
-            std::fprintf(stderr, "  Config set '%s' (%s): radio='%s' codec='%s' "
-                         "freq=%.3f MHz rx=[",
-                         skey.c_str(), cfg.name.c_str(),
-                         radio_ref->c_str(), codec_ref->c_str(),
-                         cfg.freq / 1e6);
+            // Build rx channel list string
+            std::string rx_list;
             for (std::size_t i = 0; i < cfg.rx_channels.size(); i++) {
-                if (i > 0) std::fprintf(stderr, ",");
-                std::fprintf(stderr, "%u/%s", cfg.rx_channels[i],
-                             kChannelMap[cfg.rx_channels[i]].label);
+                if (i > 0) rx_list += ",";
+                rx_list += std::to_string(cfg.rx_channels[i]);
+                rx_list += "/";
+                rx_list += kChannelMap[cfg.rx_channels[i]].label;
             }
-            std::fprintf(stderr, "] tx=%u/%s decode=[", cfg.tx_channel,
-                         kChannelMap[cfg.tx_channel].label);
+            // Build decode chain string
+            std::string dec_list;
             for (std::size_t i = 0; i < cfg.decode_configs.size(); i++) {
-                if (i > 0) std::fprintf(stderr, ",");
+                if (i > 0) dec_list += ",";
                 const auto& dc = cfg.decode_configs[i];
-                std::fprintf(stderr, "SF%u/0x%02X", dc.sf, dc.sync_word);
-                if (!dc.label.empty()) std::fprintf(stderr, "(%s)", dc.label.c_str());
+                char tmp[32];
+                std::snprintf(tmp, sizeof(tmp), "SF%u/0x%02X", dc.sf, dc.sync_word);
+                dec_list += tmp;
+                if (!dc.label.empty()) { dec_list += "("; dec_list += dc.label; dec_list += ")"; }
             }
-            std::fprintf(stderr, "]\n");
+            gr::lora::log_ts("debug", "lora_trx",
+                "config set '%s' (%s): radio='%s' codec='%s' freq=%.3f MHz rx=[%s] tx=%u/%s decode=[%s]",
+                skey.c_str(), cfg.name.c_str(),
+                radio_ref->c_str(), codec_ref->c_str(),
+                cfg.freq / 1e6,
+                rx_list.c_str(),
+                cfg.tx_channel, kChannelMap[cfg.tx_channel].label,
+                dec_list.c_str());
         }
 
         configs.push_back(std::move(cfg));
     }
 
     if (configs.empty()) {
-        std::fprintf(stderr, "ERROR: no [set_*] sections found in config\n");
+        gr::lora::log_ts("error", "lora_trx",
+            "no [set_*] sections found in config");
         return {};
     }
 
@@ -751,7 +774,8 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
         }
     }
     if (src_ptr == nullptr) {
-        std::fprintf(stderr, "ERROR: TxQueueSource not found in TX graph\n");
+        gr::lora::log_ts("error", "lora_trx",
+            "TxQueueSource not found in TX graph");
         return nullptr;
     }
     auto& src = *src_ptr;
@@ -772,7 +796,7 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
     sched->watchdog_min_stall_count  = 10U;  // safety margin if max_warnings becomes non-zero
     sched->watchdog_max_warnings     = 0U;   // disable all watchdog logging and escalation (TX idle is normal)
     if (auto ret = sched->exchange(std::move(graph)); !ret) {
-        std::fprintf(stderr, "ERROR: TX scheduler init failed\n");
+        gr::lora::log_ts("error", "lora_trx", "TX scheduler init failed");
         return nullptr;
     }
 
@@ -781,8 +805,9 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
     // process lifetime. No need to re-scan sched->blocks() post-exchange.
     source_out = src_ptr;
 
-    std::fprintf(stderr, "  TX: persistent graph started (config ch %u -> soapy ch %u / %s)\n",
-                 cfg.tx_channel, tx_map.soapy_channel, tx_map.label);
+    gr::lora::log_ts("info ", "lora_trx",
+        "TX graph started: config ch %u -> soapy ch %u / %s",
+        cfg.tx_channel, tx_map.soapy_channel, tx_map.label);
     return sched;
 }
 
@@ -853,7 +878,8 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
 
     auto payload = gr::lora::cbor::get_bytes(msg, "payload");
     if (payload.empty() || payload.size() > 255) {
-        std::fprintf(stderr, "TX: invalid payload size %zu\n", payload.size());
+        gr::lora::log_ts("error", "lora_trx",
+            "TX invalid payload size %zu", payload.size());
         return;
     }
 
@@ -881,10 +907,10 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
     }
 
     double airtime = static_cast<double>(iq.size()) / static_cast<double>(cfg.rate);
-    std::fprintf(stderr, "TX: %zu bytes, SF%u CR4/%u sync=0x%02X repeat=%d "
-                 "%.1f ms airtime%s\n",
-                 payload.size(), cfg.sf, 4u + cr, sync, repeat,
-                 airtime * 1000.0, dry_run ? " (dry run)" : "");
+    gr::lora::log_ts("info ", "lora_trx",
+        "TX %zu bytes SF%u CR4/%u sync=0x%02X repeat=%d %.1f ms airtime%s",
+        payload.size(), cfg.sf, 4u + cr, sync, repeat,
+        airtime * 1000.0, dry_run ? " (dry run)" : "");
 
     // Push TX IQ to spectrum tap (if connected) for waterfall display
     if (tx_spectrum != nullptr) {
@@ -948,7 +974,9 @@ DecodePair add_decode_pair(gr::Graph& graph, const TrxConfig& cfg,
 
     auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
     if (!ok(graph.connect<"out">(sync).to<"in">(demod))) {
-        std::fprintf(stderr, "ERROR: failed to connect FrameSync -> DemodDecoder for rx_channel %d\n", rx_channel);
+        gr::lora::log_ts("error", "lora_trx",
+            "failed to connect FrameSync -> DemodDecoder for rx_channel %d",
+            rx_channel);
     }
     return {sync, demod};
 }
@@ -971,7 +999,9 @@ auto& add_decode_chain(gr::Graph& graph, const TrxConfig& cfg,
 
     auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
     if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
-        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink for rx_channel %d\n", rx_channel);
+        gr::lora::log_ts("error", "lora_trx",
+            "failed to connect DemodDecoder -> FrameSink for rx_channel %d",
+            rx_channel);
     }
     return sync;
 }
@@ -1035,13 +1065,15 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
             {"n_outputs", gr::Size_t{2}},
         });
         if (!ok(graph.connect<"out">(source).to<"in">(splitter))) {
-            std::fprintf(stderr, "ERROR: failed to connect source -> Splitter\n");
+            gr::lora::log_ts("error", "lora_trx",
+                "failed to connect source -> Splitter");
         }
 
         auto rx_ch = static_cast<int32_t>(cfg.rx_channels[0]) * 100;
         auto& sync = add_decode_chain(graph, cfg, rx_ch, decodes[0], callback, spectrum);
         if (!ok(graph.connect(splitter, "out#0"s, sync, "in"s))) {
-            std::fprintf(stderr, "ERROR: failed to connect Splitter -> decode chain\n");
+            gr::lora::log_ts("error", "lora_trx",
+                "failed to connect Splitter -> decode chain");
         }
 
         // CAD block for LBT — NullSink drains the async output to prevent
@@ -1057,11 +1089,13 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
             cad.set_channel_busy_flag(channel_busy);
         }
         if (!ok(graph.connect(splitter, "out#1"s, cad, "in"s))) {
-            std::fprintf(stderr, "ERROR: failed to connect Splitter -> CAD\n");
+            gr::lora::log_ts("error", "lora_trx",
+                "failed to connect Splitter -> CAD");
         }
         auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
         if (!ok(graph.connect<"out">(cad).to<"in">(cad_sink))) {
-            std::fprintf(stderr, "ERROR: failed to connect CAD -> NullSink\n");
+            gr::lora::log_ts("error", "lora_trx",
+                "failed to connect CAD -> NullSink");
         }
 
         return &source._totalOverFlowCount;
@@ -1088,7 +1122,8 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         {"n_outputs", nOut},
                     });
                     if (!connectPort(r, splitter)) {
-                        std::fprintf(stderr, "ERROR: failed to connect source -> Splitter (radio %zu)\n", r);
+                        gr::lora::log_ts("error", "lora_trx",
+                            "failed to connect source -> Splitter (radio %zu)", r);
                     }
 
                     auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
@@ -1096,7 +1131,8 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         graph, cfg, rx_ch, decodes[0],
                         firstChain ? spectrum : nullptr);
                     if (!ok(graph.connect(splitter, "out#0"s, sync, "in"s))) {
-                        std::fprintf(stderr, "ERROR: failed to connect Splitter -> FrameSync (radio %zu)\n", r);
+                        gr::lora::log_ts("error", "lora_trx",
+                            "failed to connect Splitter -> FrameSync (radio %zu)", r);
                     }
 
                     if (addCad) {
@@ -1109,11 +1145,13 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         });
                         cad.set_channel_busy_flag(channel_busy);
                         if (!ok(graph.connect(splitter, "out#1"s, cad, "in"s))) {
-                            std::fprintf(stderr, "ERROR: failed to connect Splitter -> CAD\n");
+                            gr::lora::log_ts("error", "lora_trx",
+                                "failed to connect Splitter -> CAD");
                         }
                         auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
                         if (!ok(graph.connect<"out">(cad).to<"in">(cad_sink))) {
-                            std::fprintf(stderr, "ERROR: failed to connect CAD -> NullSink\n");
+                            gr::lora::log_ts("error", "lora_trx",
+                                "failed to connect CAD -> NullSink");
                         }
                     }
 
@@ -1126,8 +1164,9 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                     });
                     sink._frame_callback = callback;
                     if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
-                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink"
-                                    " (chain %zu)\n", chain_idx);
+                        gr::lora::log_ts("error", "lora_trx",
+                            "failed to connect DemodDecoder -> FrameSink (chain %zu)",
+                            chain_idx);
                     }
                 } else {
                     // No CAD, no splitter needed — direct connection
@@ -1136,8 +1175,8 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         graph, cfg, rx_ch, decodes[0],
                         firstChain ? spectrum : nullptr);
                     if (!connectPort(r, sync)) {
-                        std::fprintf(stderr, "ERROR: failed to connect source -> FrameSync (radio %zu)\n",
-                                    r);
+                        gr::lora::log_ts("error", "lora_trx",
+                            "failed to connect source -> FrameSync (radio %zu)", r);
                     }
 
                     auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
@@ -1148,8 +1187,9 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                     });
                     sink._frame_callback = callback;
                     if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
-                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink"
-                                    " (chain %zu)\n", chain_idx);
+                        gr::lora::log_ts("error", "lora_trx",
+                            "failed to connect DemodDecoder -> FrameSink (chain %zu)",
+                            chain_idx);
                     }
                 }
                 chain_idx++;
@@ -1161,7 +1201,60 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                 });
 
                 if (!connectPort(r, splitter)) {
-                    std::fprintf(stderr, "ERROR: failed to connect source -> Splitter (radio %zu)\n", r);
+                    gr::lora::log_ts("error", "lora_trx",
+                        "failed to connect source -> Splitter (radio %zu)", r);
+                }
+
+                for (std::size_t d = 0; d < nDecode; d++) {
+                    auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100
+                               + static_cast<int32_t>(d);
+                    auto [sync, demod] = add_decode_pair(
+                        graph, cfg, rx_ch, decodes[d],
+                        (firstChain && d == 0) ? spectrum : nullptr);
+
+                    auto splitterPort = "out#"s + std::to_string(d);
+                    if (!ok(graph.connect(splitter, splitterPort, sync, "in"s))) {
+                        gr::lora::log_ts("error", "lora_trx",
+                            "failed to connect Splitter -> FrameSync (chain %zu)",
+                            chain_idx);
+                    }
+
+                    // Per-chain sink
+                    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
+                        {"sync_word", decodes[d].sync_word},
+                        {"phy_sf", decodes[d].sf},
+                        {"phy_bw", cfg.bw},
+                        {"label", decodes[d].label},
+                    });
+                    sink._frame_callback = callback;
+                    if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
+                        gr::lora::log_ts("error", "lora_trx",
+                            "failed to connect DemodDecoder -> FrameSink (chain %zu)",
+                            chain_idx);
+                    }
+                    chain_idx++;
+                }
+
+                // Wire CAD to the extra Splitter output (first radio only)
+                if (addCad) {
+                    auto cadPort = "out#"s + std::to_string(nDecode);
+                    auto& cad = graph.emplaceBlock<gr::lora::ChannelActivityDetector>({
+                        {"sf", cfg.sf},
+                        {"bandwidth", cfg.bw},
+                        {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
+                        {"alpha", 4.16f},
+                        {"dual_chirp", true},
+                    });
+                    cad.set_channel_busy_flag(channel_busy);
+                    if (!ok(graph.connect(splitter, cadPort, cad, "in"s))) {
+                        gr::lora::log_ts("error", "lora_trx",
+                            "failed to connect Splitter -> CAD");
+                    }
+                    auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
+                    if (!ok(graph.connect<"out">(cad).to<"in">(cad_sink))) {
+                        gr::lora::log_ts("error", "lora_trx",
+                            "failed to connect CAD -> NullSink");
+                    }
                 }
 
                 for (std::size_t d = 0; d < nDecode; d++) {
@@ -1260,8 +1353,9 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
     }
 
     if (cfg.debug) {
-        std::fprintf(stderr, "  RX graph: %zu radio(s) x %zu decode(s) = %zu chains\n",
-                     nRadio, nDecode, nChains);
+        gr::lora::log_ts("debug", "lora_trx",
+            "RX graph: %zu radio(s) x %zu decode(s) = %zu chains",
+            nRadio, nDecode, nChains);
     }
 
     return overflow_ptr;
@@ -1426,7 +1520,8 @@ gr::property_map cbor_to_phy_props(const gr::lora::cbor::Map& msg, bool& valid) 
 
     if (sf_val > 0) {
         if (sf_val < 7 || sf_val > 12) {
-            std::fprintf(stderr, "lora_config: sf=%" PRIu64 " out of range [7,12]\n", sf_val);
+            gr::lora::log_ts("error", "lora_trx",
+                "lora_config: sf=%" PRIu64 " out of range [7,12]", sf_val);
             valid = false;
             return {};
         }
@@ -1467,8 +1562,8 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
         for (auto& blk : rx_blocks.frame_sync) {
             auto rejected = blk->settings().set(phy_props);
             if (!rejected.empty()) {
-                std::fprintf(stderr, "lora_config: FrameSync rejected %zu key(s)\n",
-                             rejected.size());
+                gr::lora::log_ts("warn ", "lora_trx",
+                    "lora_config: FrameSync rejected %zu key(s)", rejected.size());
                 any_rejected = true;
             }
         }
@@ -1482,8 +1577,9 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
             for (auto& blk : rx_blocks.demod_decoder) {
                 auto rejected = blk->settings().set(demod_props);
                 if (!rejected.empty()) {
-                    std::fprintf(stderr, "lora_config: DemodDecoder rejected %zu key(s)\n",
-                                 rejected.size());
+                    gr::lora::log_ts("warn ", "lora_trx",
+                        "lora_config: DemodDecoder rejected %zu key(s)",
+                        rejected.size());
                     any_rejected = true;
                 }
             }
@@ -1497,7 +1593,8 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
         freq_props["rx_center_frequency"] = gr::Tensor<double>{new_freq};
         auto rejected = rx_blocks.soapy_source->settings().set(freq_props);
         if (!rejected.empty()) {
-            std::fprintf(stderr, "lora_config: SoapySource rejected freq change\n");
+            gr::lora::log_ts("warn ", "lora_trx",
+                "lora_config: SoapySource rejected freq change");
         }
         // Also update FrameSync center_freq (used for debug/display only)
         for (auto& blk : rx_blocks.frame_sync) {
@@ -1532,8 +1629,9 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
     if (new_tx_gain > 0.0)
         cfg.gain_tx = new_tx_gain;
 
-    std::fprintf(stderr, "lora_config: applied (sf=%u bw=%u sync=0x%02X freq=%.0f)\n",
-                 cfg.sf, cfg.bw, cfg.sync, cfg.freq);
+    gr::lora::log_ts("info ", "lora_trx",
+        "lora_config: applied sf=%u bw=%u sync=0x%02X freq=%.0f",
+        cfg.sf, cfg.bw, cfg.sync, cfg.freq);
 
     // Send ack
     bool ok = !any_rejected;
@@ -1570,7 +1668,8 @@ int main(int argc, char* argv[]) {
     cfg = std::move(configs[0]);
 
     if (cfg.rx_channels.empty()) {
-        std::fprintf(stderr, "ERROR: rx_channel must specify at least one channel\n");
+        gr::lora::log_ts("error", "lora_trx",
+            "rx_channel must specify at least one channel");
         return 1;
     }
     // Validate no SoapySDR channel conflicts: each config channel (0-3) maps to
@@ -1581,20 +1680,22 @@ int main(int argc, char* argv[]) {
         for (auto ch : cfg.rx_channels) {
             auto soapy_ch = kChannelMap[ch].soapy_channel;
             if (soapy_used[soapy_ch] >= 0) {
-                std::fprintf(stderr, "ERROR: rx_channel %u (%s) and %u (%s) both map to "
-                             "SoapySDR channel %u — only one antenna per channel\n",
-                             static_cast<uint32_t>(soapy_used[soapy_ch]),
-                             kChannelMap[static_cast<uint32_t>(soapy_used[soapy_ch])].label,
-                             ch, kChannelMap[ch].label, soapy_ch);
+                gr::lora::log_ts("error", "lora_trx",
+                    "rx_channel %u (%s) and %u (%s) both map to "
+                    "SoapySDR channel %u — only one antenna per channel",
+                    static_cast<uint32_t>(soapy_used[soapy_ch]),
+                    kChannelMap[static_cast<uint32_t>(soapy_used[soapy_ch])].label,
+                    ch, kChannelMap[ch].label, soapy_ch);
                 return 1;
             }
             soapy_used[soapy_ch] = static_cast<int>(ch);
         }
     }
     if (cfg.rx_channels.size() > 2) {
-        std::fprintf(stderr, "ERROR: rx_channel has %zu entries but B210 supports at most "
-                     "2 simultaneous RX streams (one per SoapySDR channel)\n",
-                     cfg.rx_channels.size());
+        gr::lora::log_ts("error", "lora_trx",
+            "rx_channel has %zu entries but B210 supports at most "
+            "2 simultaneous RX streams (one per SoapySDR channel)",
+            cfg.rx_channels.size());
         return 1;
     }
 
@@ -1612,15 +1713,18 @@ int main(int argc, char* argv[]) {
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdate-time"
-    std::fprintf(stderr, "=== LoRa TRX %s (built " __DATE__ " " __TIME__ ") ===\n", GIT_REV);
+    gr::lora::log_ts("info ", "lora_trx",
+        "starting lora_trx %s (built " __DATE__ " " __TIME__ ")", GIT_REV);
 #pragma GCC diagnostic pop
-    std::fprintf(stderr, "  Config:      %s (%zu set%s)\n",
-                 config_path.c_str(), configs.size(),
-                 configs.size() > 1 ? "s" : "");
-    std::fprintf(stderr, "  Active set:  %s\n", cfg.name.c_str());
-    std::fprintf(stderr, "  Device:      %s\n", cfg.device.c_str());
-    std::fprintf(stderr, "  Params:      %s\n",
-                 cfg.device_param.empty() ? "(none)" : cfg.device_param.c_str());
+    gr::lora::log_ts("info ", "lora_trx",
+        "config %s (%zu set%s)  set '%s'",
+        config_path.c_str(), configs.size(),
+        configs.size() > 1 ? "s" : "",
+        cfg.name.c_str());
+    gr::lora::log_ts("info ", "lora_trx",
+        "device %s  param %s",
+        cfg.device.c_str(),
+        cfg.device_param.empty() ? "(none)" : cfg.device_param.c_str());
 
     // Query hardware info (FPGA version, serial) via the GR4 RAII wrapper.
     {
@@ -1628,51 +1732,71 @@ int main(int argc, char* argv[]) {
         gr::blocks::soapy::Device dev(args);
         if (dev.get() != nullptr) {
             auto info = dev.getHardwareInfo();
-            if (auto it = info.find("fpga_version"); it != info.end()) {
-                std::fprintf(stderr, "  FPGA:        v%s\n", it->second.c_str());
-            }
-            if (auto it = info.find("serial"); it != info.end()) {
-                std::fprintf(stderr, "  Serial:      %s\n", it->second.c_str());
+            std::string fpga_ver, serial;
+            if (auto it = info.find("fpga_version"); it != info.end())
+                fpga_ver = it->second;
+            if (auto it = info.find("serial"); it != info.end())
+                serial = it->second;
+            if (!fpga_ver.empty() || !serial.empty()) {
+                gr::lora::log_ts("info ", "lora_trx",
+                    "hardware: FPGA v%s  serial %s",
+                    fpga_ver.empty() ? "?" : fpga_ver.c_str(),
+                    serial.empty() ? "?" : serial.c_str());
             }
         }
     }
-    std::fprintf(stderr, "  Frequency:   %.6f MHz\n", cfg.freq / 1e6);
-    std::fprintf(stderr, "  Gain RX:     %.0f dB\n", cfg.gain_rx);
-    std::fprintf(stderr, "  Gain TX:     %.0f dB\n", cfg.gain_tx);
-    std::fprintf(stderr, "  Sample rate: %.0f S/s  (os_factor=%u)\n",
-                 static_cast<double>(cfg.rate), os);
-    std::fprintf(stderr, "  SF=%u  BW=%u  CR=4/%u  sync=0x%02X  preamble=%u\n",
-                 cfg.sf, cfg.bw, 4u + cfg.cr, cfg.sync, cfg.preamble);
-    std::fprintf(stderr, "  RX channel%s:", cfg.rx_channels.size() > 1 ? "s" : "");
-    for (auto ch : cfg.rx_channels) std::fprintf(stderr, " %u (%s)", ch, kChannelMap[ch].label);
-    std::fprintf(stderr, "\n");
-    std::fprintf(stderr, "  TX channel:  %u (%s)\n", cfg.tx_channel, kChannelMap[cfg.tx_channel].label);
+
+    // Build RX channel string
+    {
+        std::string rx_ch_str;
+        for (auto ch : cfg.rx_channels) {
+            if (!rx_ch_str.empty()) rx_ch_str += " ";
+            char tmp[32];
+            std::snprintf(tmp, sizeof(tmp), "%u(%s)", ch, kChannelMap[ch].label);
+            rx_ch_str += tmp;
+        }
+        std::string lbt_detail;
+        if (cfg.lbt) {
+            char tmp[64];
+            std::snprintf(tmp, sizeof(tmp), " timeout=%ums queue=%u",
+                cfg.lbt_timeout_ms, cfg.tx_queue_depth);
+            lbt_detail = tmp;
+        }
+        gr::lora::log_ts("info ", "lora_trx",
+            "freq %.6f MHz  gain_rx %.0f dB  gain_tx %.0f dB  "
+            "rate %.0f S/s (os=%u)  SF%u BW%u CR4/%u sync=0x%02X pre=%u",
+            cfg.freq / 1e6, cfg.gain_rx, cfg.gain_tx,
+            static_cast<double>(cfg.rate), os,
+            cfg.sf, cfg.bw, 4u + cfg.cr, cfg.sync, cfg.preamble);
+        gr::lora::log_ts("info ", "lora_trx",
+            "rx ch %s  tx ch %u(%s)  LBT %s%s  listen %s:%u",
+            rx_ch_str.c_str(),
+            cfg.tx_channel, kChannelMap[cfg.tx_channel].label,
+            cfg.lbt ? "on" : "off", lbt_detail.c_str(),
+            cfg.listen.c_str(), cfg.port);
+    }
     if (cfg.decode_configs.size() > 1) {
-        std::fprintf(stderr, "  Decode:     ");
+        std::string dec_str;
         for (std::size_t i = 0; i < cfg.decode_configs.size(); i++) {
             const auto& dc = cfg.decode_configs[i];
-            if (i > 0) std::fprintf(stderr, ", ");
-            std::fprintf(stderr, "SF%u/0x%02X", dc.sf, dc.sync_word);
-            if (!dc.label.empty()) std::fprintf(stderr, " (%s)", dc.label.c_str());
+            if (i > 0) dec_str += "  ";
+            char tmp[48];
+            std::snprintf(tmp, sizeof(tmp), "SF%u/0x%02X", dc.sf, dc.sync_word);
+            dec_str += tmp;
+            if (!dc.label.empty()) { dec_str += "("; dec_str += dc.label; dec_str += ")"; }
         }
-        std::fprintf(stderr, "\n");
+        gr::lora::log_ts("info ", "lora_trx", "decode chains: %s", dec_str.c_str());
     }
     if (!cfg.clock.empty()) {
-        std::fprintf(stderr, "  Clock:       %s\n", cfg.clock.c_str());
+        gr::lora::log_ts("info ", "lora_trx", "clock source: %s", cfg.clock.c_str());
     }
     if (cfg.debug) {
-        std::fprintf(stderr, "  Debug:       enabled\n");
+        gr::lora::log_ts("debug", "lora_trx", "debug output enabled");
     }
-    std::fprintf(stderr, "  LBT:         %s", cfg.lbt ? "on" : "off");
-    if (cfg.lbt) {
-        std::fprintf(stderr, " (timeout=%ums, queue=%u)", cfg.lbt_timeout_ms, cfg.tx_queue_depth);
-    }
-    std::fprintf(stderr, "\n");
-    std::fprintf(stderr, "  Listen:      %s:%u\n", cfg.listen.c_str(), cfg.port);
     if (cfg.status_interval > 0) {
-        std::fprintf(stderr, "  Status:      every %u s\n", cfg.status_interval);
+        gr::lora::log_ts("info ", "lora_trx",
+            "status heartbeat every %u s", cfg.status_interval);
     }
-    std::fprintf(stderr, "\n");
 
     // --- Bind UDP socket (dual-stack IPv6, accepts IPv4 via mapped addresses) ---
     UdpState udp;
@@ -1691,14 +1815,15 @@ int main(int argc, char* argv[]) {
     } else if (::inet_pton(AF_INET, cfg.listen.c_str(), &bind4.sin_addr) == 1) {
         use_v6 = false;
     } else {
-        std::fprintf(stderr, "ERROR: invalid listen address '%s'\n",
-                     cfg.listen.c_str());
+        gr::lora::log_ts("error", "lora_trx",
+            "invalid listen address '%s'", cfg.listen.c_str());
         return 1;
     }
 
     udp.fd = ::socket(use_v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
     if (udp.fd < 0) {
-        std::fprintf(stderr, "ERROR: socket(): %s\n", std::strerror(errno));
+        gr::lora::log_ts("error", "lora_trx",
+            "socket(): %s", std::strerror(errno));
         return 1;
     }
 
@@ -1712,8 +1837,9 @@ int main(int argc, char* argv[]) {
         bind6.sin6_port = htons(cfg.port);
         if (::bind(udp.fd, reinterpret_cast<struct sockaddr*>(&bind6),
                    sizeof(bind6)) < 0) {
-            std::fprintf(stderr, "ERROR: bind([%s]:%u): %s\n",
-                         cfg.listen.c_str(), cfg.port, std::strerror(errno));
+            gr::lora::log_ts("error", "lora_trx",
+                "bind([%s]:%u): %s",
+                cfg.listen.c_str(), cfg.port, std::strerror(errno));
             ::close(udp.fd);
             return 1;
         }
@@ -1722,8 +1848,9 @@ int main(int argc, char* argv[]) {
         bind4.sin_port = htons(cfg.port);
         if (::bind(udp.fd, reinterpret_cast<struct sockaddr*>(&bind4),
                    sizeof(bind4)) < 0) {
-            std::fprintf(stderr, "ERROR: bind(%s:%u): %s\n",
-                         cfg.listen.c_str(), cfg.port, std::strerror(errno));
+            gr::lora::log_ts("error", "lora_trx",
+                "bind(%s:%u): %s",
+                cfg.listen.c_str(), cfg.port, std::strerror(errno));
             ::close(udp.fd);
             return 1;
         }
@@ -1733,8 +1860,9 @@ int main(int argc, char* argv[]) {
     int flags = ::fcntl(udp.fd, F_GETFL, 0);
     ::fcntl(udp.fd, F_SETFL, flags | O_NONBLOCK);
 
-    std::fprintf(stderr, "  UDP server bound on %s:%u%s\n",
-                 cfg.listen.c_str(), cfg.port, use_v6 ? " (IPv6 dual-stack)" : "");
+    gr::lora::log_ts("info ", "lora_trx",
+        "UDP bound %s:%u%s",
+        cfg.listen.c_str(), cfg.port, use_v6 ? " (IPv6 dual-stack)" : "");
 
     // --- Shared status for periodic heartbeat ---
     SharedStatus shared_status;
@@ -1757,7 +1885,7 @@ int main(int argc, char* argv[]) {
     gr::lora::TxQueueSource* tx_source_ptr = nullptr;
     auto tx_sched = build_tx_graph(tx_source_ptr, cfg);
     if (!tx_sched || tx_source_ptr == nullptr) {
-        std::fprintf(stderr, "ERROR: failed to build TX graph\n");
+        gr::lora::log_ts("error", "lora_trx", "failed to build TX graph");
         ::close(udp.fd);
         return 1;
     }
@@ -1765,8 +1893,9 @@ int main(int argc, char* argv[]) {
     std::thread tx_thread([&tx_sched]() {
         auto ret = tx_sched->runAndWait();
         if (!ret.has_value()) {
-            std::fprintf(stderr, "TX scheduler stopped: %s\n",
-                         std::format("{}", ret.error()).c_str());
+            gr::lora::log_ts("warn ", "lora_trx",
+                "TX scheduler stopped: %s",
+                std::format("{}", ret.error()).c_str());
         }
     });
 
@@ -1802,7 +1931,7 @@ int main(int argc, char* argv[]) {
     rx_sched.watchdog_min_stall_count  = 10U;  // suppress watchdog for ≤10s gaps (normal inter-frame silence)
     rx_sched.watchdog_max_warnings     = 30U;  // 30s of continuous stall → ERROR
     if (auto ret = rx_sched.exchange(std::move(rx_graph)); !ret) {
-        std::fprintf(stderr, "ERROR: RX scheduler init failed\n");
+        gr::lora::log_ts("error", "lora_trx", "RX scheduler init failed");
         tx_sched->requestStop();
         tx_thread.join();
         ::close(udp.fd);
@@ -1813,11 +1942,12 @@ int main(int argc, char* argv[]) {
     // After exchange(), the original emplaceBlock references are dangling —
     // we find them by scanning typeName().
     auto rx_blocks = find_rx_blocks(rx_sched.blocks());
-    std::fprintf(stderr, "  blocks: %zu FrameSync, %zu DemodDecoder, %zu Splitter, CAD=%s, soapy=%s\n",
-                 rx_blocks.frame_sync.size(), rx_blocks.demod_decoder.size(),
-                 rx_blocks.splitters.size(),
-                 rx_blocks.cad_block ? "yes" : "no",
-                 rx_blocks.soapy_source ? "yes" : "no");
+    gr::lora::log_ts("info ", "lora_trx",
+        "RX blocks: %zu FrameSync  %zu DemodDecoder  %zu Splitter  CAD=%s  soapy=%s",
+        rx_blocks.frame_sync.size(), rx_blocks.demod_decoder.size(),
+        rx_blocks.splitters.size(),
+        rx_blocks.cad_block ? "yes" : "no",
+        rx_blocks.soapy_source ? "yes" : "no");
 
     std::atomic<bool> rx_done{false};
     auto rx_start_time = std::chrono::steady_clock::now();
@@ -1831,36 +1961,39 @@ int main(int argc, char* argv[]) {
             auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - rx_start_time).count();
             auto err = std::format("{}", ret.error());
-            std::fprintf(stderr, "\n--- RX scheduler stopped ---\n");
-            std::fprintf(stderr, "  error:     %s\n", err.c_str());
-            std::fprintf(stderr, "  uptime:    %" PRId64 "s\n", static_cast<int64_t>(uptime));
-            std::fprintf(stderr, "  frames:    %u (crc_ok: %u, crc_fail: %u)\n",
-                         shared_status.frame_count.load(),
-                         shared_status.crc_ok.load(),
-                         shared_status.crc_fail.load());
-            std::fprintf(stderr, "  overflows: %" PRIu64 "\n",
-                         shared_status.overflow_count.load());
+            gr::lora::log_ts("warn ", "lora_trx",
+                "RX scheduler stopped: %s", err.c_str());
+            gr::lora::log_ts("info ", "lora_trx",
+                "uptime %llds  frames %u (crc_ok %u crc_fail %u)  overflows %" PRIu64,
+                static_cast<long long>(uptime),
+                shared_status.frame_count.load(),
+                shared_status.crc_ok.load(),
+                shared_status.crc_fail.load(),
+                shared_status.overflow_count.load());
             if (err.find("OVERFLOW") != std::string::npos) {
-                std::fprintf(stderr, "  hint: sustained USB buffer overflow — "
+                gr::lora::log_ts("info ", "lora_trx",
+                    "hint: sustained USB buffer overflow — "
                     "try increasing num_recv_frames (e.g. device_param="
-                    "\"num_recv_frames=128\") or reducing sample rate\n");
+                    "\"num_recv_frames=128\") or reducing sample rate");
             }
             if (err.find("consecutive errors") != std::string::npos) {
-                std::fprintf(stderr, "  hint: SDR device may be unresponsive — "
-                    "check USB connection and device health\n");
+                gr::lora::log_ts("info ", "lora_trx",
+                    "hint: SDR device may be unresponsive — "
+                    "check USB connection and device health");
             }
             if (err.find("watchdog stall") != std::string::npos) {
-                std::fprintf(stderr, "  hint: RX pipeline stalled — "
-                    "no data processed for extended period\n");
+                gr::lora::log_ts("info ", "lora_trx",
+                    "hint: RX pipeline stalled — "
+                    "no data processed for extended period");
             }
-            std::fprintf(stderr, "---\n");
         }
         rx_done.store(true, std::memory_order_relaxed);
     });
 
-    std::fprintf(stderr, "  RX running (%zu channel%s, full-duplex TX)... Ctrl+C to stop.\n\n",
-                 cfg.rx_channels.size(),
-                 cfg.rx_channels.size() > 1 ? "s" : "");
+    gr::lora::log_ts("info ", "lora_trx",
+        "RX running (%zu channel%s, full-duplex TX) — Ctrl+C to stop",
+        cfg.rx_channels.size(),
+        cfg.rx_channels.size() > 1 ? "s" : "");
 
     // --- Pre-build config CBOR (sent once on subscribe) ---
     auto config_cbor = build_config_cbor(cfg);
@@ -1885,8 +2018,9 @@ int main(int argc, char* argv[]) {
                 }
                 if (timed_out) {
                     uint64_t seq = gr::lora::cbor::get_uint_or(req->msg, "seq", 0);
-                    std::fprintf(stderr, "TX: LBT timeout (channel busy >%ums), rejecting seq=%" PRIu64 "\n",
-                                 cfg.lbt_timeout_ms, seq);
+                    gr::lora::log_ts("warn ", "lora_trx",
+                        "LBT timeout (channel busy >%ums), rejecting seq=%" PRIu64,
+                        cfg.lbt_timeout_ms, seq);
                     std::vector<uint8_t> rej;
                     rej.reserve(80);
                     gr::lora::cbor::encode_map_begin(rej, 4);
@@ -2002,7 +2136,7 @@ int main(int argc, char* argv[]) {
     }
 
     // --- Shutdown (order matters: stop RX first, then TX worker, then TX graph) ---
-    std::fprintf(stderr, "\nStopping...\n");
+    gr::lora::log_ts("info ", "lora_trx", "stopping");
     if (!rx_done.load(std::memory_order_relaxed)) {
         rx_sched.requestStop();
     }
@@ -2019,7 +2153,7 @@ int main(int argc, char* argv[]) {
     tx_thread.join();
 
     ::close(udp.fd);
-    std::fprintf(stderr, "TRX stopped.\n");
+    gr::lora::log_ts("info ", "lora_trx", "stopped");
 
     // Skip static destructors and atexit handlers — GR4 scheduler and/or
     // SoapySDR unloadModules() hang during normal exit()/return-from-main.

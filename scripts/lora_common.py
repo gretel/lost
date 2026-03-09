@@ -209,11 +209,12 @@ def utf8_truncate(s: str, max_bytes: int) -> bytes:
 
 # ---- Logging ----
 
-#: Default syslog-style log format (ISO 8601 timestamp, dotted namespace, level).
-DEFAULT_LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
+#: Default log format (used by plain-text path; color path overrides this).
+DEFAULT_LOG_FORMAT = "%(asctime)s  %(name)s  %(levelname)s  %(message)s"
 
-#: Default ISO 8601 timestamp format (no fractional seconds).
-DEFAULT_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
+#: Timestamp is handled by _ColorFormatter.formatTime() (UTC ms + Z).
+#: None means the formatter produces its own timestamp string.
+DEFAULT_LOG_DATEFMT: str | None = None
 
 
 def _want_color(stream: IO[Any]) -> bool:
@@ -232,8 +233,9 @@ def _want_color(stream: IO[Any]) -> bool:
 class _ColorFormatter(logging.Formatter):
     """Log formatter with ANSI colors keyed on log level.
 
-    Level names are bold; timestamps and logger names are dim.  Messages
-    inherit the level color so the whole line is visually cohesive.
+    Timestamps are UTC ISO-8601 with milliseconds ("2026-03-09T14:33:17.342Z").
+    Level labels are padded full words (e.g. "info   ", "warning").
+    The label is bold+colored; timestamp, logger name, and message are plain.
 
     Falls back to plain text when *use_color* is ``False``.
     """
@@ -243,15 +245,15 @@ class _ColorFormatter(logging.Formatter):
     _DIM = "\033[2m"
     _BOLD = "\033[1m"
 
-    # Per-level: (color code, fixed-width label)
+    # Per-level: (color code, padded full-word label)
     _LEVEL_STYLE: dict[int, tuple[str, str]] = {
-        logging.DEBUG: ("\033[36m", "DBG "),  # cyan
-        logging.INFO: ("\033[32m", "INF "),  # green
-        logging.WARNING: ("\033[33m", "WRN "),  # yellow
-        logging.ERROR: ("\033[31m", "ERR "),  # red
-        logging.CRITICAL: ("\033[1;31m", "CRT "),  # bold red
+        logging.DEBUG: ("\033[36m", "debug  "),  # cyan,     7 chars
+        logging.INFO: ("\033[32m", "info   "),  # green,    7 chars
+        logging.WARNING: ("\033[33m", "warning"),  # yellow,   7 chars
+        logging.ERROR: ("\033[31m", "error  "),  # red,      7 chars
+        logging.CRITICAL: ("\033[1;31m", "critical"),  # bold red, 8 chars
     }
-    _DEFAULT_STYLE = ("\033[37m", "??? ")  # white fallback
+    _DEFAULT_STYLE = ("\033[37m", "???????")  # white fallback, 7 chars
 
     def __init__(
         self,
@@ -265,11 +267,18 @@ class _ColorFormatter(logging.Formatter):
         super().__init__(fmt=fmt, datefmt=datefmt)
         self._use_color = use_color
 
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        """Return UTC ISO-8601 timestamp with milliseconds and Z suffix."""
+        import datetime as _dt
+
+        now = _dt.datetime.fromtimestamp(record.created, tz=_dt.timezone.utc)
+        return now.strftime("%Y-%m-%dT%H:%M:%S") + f".{now.microsecond // 1000:03d}Z"
+
     def format(self, record: logging.LogRecord) -> str:
         if not self._use_color:
             return super().format(record)
 
-        ts = self.formatTime(record, self.datefmt)
+        ts = self.formatTime(record)
         color, label = self._LEVEL_STYLE.get(record.levelno, self._DEFAULT_STYLE)
         name = record.name
         msg = record.getMessage()
@@ -281,25 +290,22 @@ class _ColorFormatter(logging.Formatter):
         if record.exc_text:
             extra = "\n" + record.exc_text
 
-        # Build the prefix (dim timestamp + dim name + bold level label)
+        # Build the prefix: dim timestamp  dim name  bold+colored label  plain message
         prefix = (
-            f"{self._DIM}{ts}{self._RESET} "
-            f"{self._DIM}{name}{self._RESET} "
+            f"{self._DIM}{ts}{self._RESET}  "
+            f"{self._DIM}{name}{self._RESET}  "
             f"{color}{self._BOLD}{label}{self._RESET}"
         )
 
-        # For multiline messages, indent continuation lines to align with the
-        # message text and re-apply level color on each line.
+        # For multiline messages, indent continuation lines to align under
+        # the message text (two spaces after each separator).
         lines = msg.split("\n")
-        first = f"{prefix}{color}{lines[0]}{self._RESET}"
+        first = f"{prefix}  {lines[0]}"
         if len(lines) == 1:
             return first + extra
 
-        # Pad continuation lines to align under the first message character.
-        # Prefix visible width: len("2026-03-01T18:33:17 gr4.mon INF ") ≈ varies,
-        # but we just use a fixed indent matching the hex-dump style.
-        pad = " " * (len(ts) + 1 + len(name) + 1 + len(label))
-        rest = "\n".join(f"{pad}{color}{line}{self._RESET}" for line in lines[1:])
+        pad = " " * (len(ts) + 2 + len(name) + 2 + len(label) + 2)
+        rest = "\n".join(f"{pad}{line}" for line in lines[1:])
         return first + "\n" + rest + extra
 
 

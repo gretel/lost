@@ -21,7 +21,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <format>
 #include <functional>
 #include <mutex>
 #include <random>
@@ -33,6 +32,7 @@
 #include <gnuradio-4.0/Block.hpp>
 
 #include "cbor.hpp"
+#include "timestamp.hpp"
 
 namespace gr::lora {
 
@@ -144,8 +144,8 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                 char addr_str[INET_ADDRSTRLEN];
                 ::inet_ntop(AF_INET, &sender.sin_addr,
                             addr_str, sizeof(addr_str));
-                std::fprintf(stderr,
-                    "  UDP: registered consumer %s:%u (%zu total)\n",
+                gr::lora::log_ts("info ", "framesink",
+                    "UDP consumer %s:%u (%zu total)",
                     addr_str, ntohs(sender.sin_port),
                     _udp_clients.size());
             }
@@ -160,14 +160,15 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         std::string host;
         uint16_t port{0};
         if (!parse_udp_dest(udp_dest, host, port)) {
-            std::fprintf(stderr, "ERROR: invalid udp_dest '%s'\n",
-                         udp_dest.c_str());
+            gr::lora::log_ts("error", "framesink",
+                "invalid udp_dest '%s'", udp_dest.c_str());
             return;
         }
 
         _udp_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (_udp_fd < 0) {
-            std::fprintf(stderr, "ERROR: socket(): %s\n", std::strerror(errno));
+            gr::lora::log_ts("error", "framesink",
+                "socket(): %s", std::strerror(errno));
             return;
         }
 
@@ -179,8 +180,8 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         bind_addr.sin_family = AF_INET;
         bind_addr.sin_port   = htons(port);
         if (::inet_pton(AF_INET, host.c_str(), &bind_addr.sin_addr) != 1) {
-            std::fprintf(stderr, "ERROR: invalid UDP bind address '%s'\n",
-                         host.c_str());
+            gr::lora::log_ts("error", "framesink",
+                "invalid UDP bind address '%s'", host.c_str());
             ::close(_udp_fd);
             _udp_fd = -1;
             return;
@@ -188,8 +189,8 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
         if (::bind(_udp_fd, reinterpret_cast<struct sockaddr*>(&bind_addr),
                    sizeof(bind_addr)) < 0) {
-            std::fprintf(stderr, "ERROR: bind(%s:%u): %s\n",
-                         host.c_str(), port, std::strerror(errno));
+            gr::lora::log_ts("error", "framesink",
+                "bind(%s:%u): %s", host.c_str(), port, std::strerror(errno));
             ::close(_udp_fd);
             _udp_fd = -1;
             return;
@@ -198,9 +199,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         int flags = ::fcntl(_udp_fd, F_GETFL, 0);
         ::fcntl(_udp_fd, F_SETFL, flags | O_NONBLOCK);
 
-        std::fprintf(stderr, "  UDP server: bound %s:%u "
-                     "(consumers register by sending any datagram)\n",
-                     host.c_str(), port);
+        gr::lora::log_ts("info ", "framesink",
+            "UDP bound %s:%u (consumers register by sending any datagram)",
+            host.c_str(), port);
 
         _udp_running = true;
         _udp_listener = std::thread([this] { udpListenerLoop(); });
@@ -215,19 +216,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         if (_udp_listener.joinable()) {
             _udp_listener.join();
         }
-    }
-
-    [[nodiscard]] static std::string timestamp_now() {
-        auto now = std::chrono::system_clock::now();
-        auto t   = std::chrono::system_clock::to_time_t(now);
-        auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
-                       now.time_since_epoch()) % 1000;
-        std::tm tm{};
-        localtime_r(&t, &tm);
-        return std::format("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}.{:03d}Z",
-                           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                           tm.tm_hour, tm.tm_min, tm.tm_sec,
-                           static_cast<int>(ms.count()));
     }
 
     [[nodiscard]] static std::string to_hex(std::span<const uint8_t> data) {
@@ -365,11 +353,12 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
     void emitFrame() {
         _frame_count++;
-        std::fprintf(stderr, "[FrameSink] frame #%u: %u bytes, CR=4/%u, %s%s\n",
-                     _frame_count, _pay_len, 4u + _cr,
-                     _crc_valid ? "CRC_OK" : "CRC_FAIL",
-                     _is_downchirp ? " (downchirp)" : "");
-        auto ts = timestamp_now();
+        gr::lora::log_ts("info ", "framesink",
+            "frame #%u: %u bytes CR=4/%u %s%s",
+            _frame_count, _pay_len, 4u + _cr,
+            _crc_valid ? "CRC_OK" : "CRC_FAIL",
+            _is_downchirp ? " downchirp" : "");
+        auto ts = gr::lora::ts_now();
 
         if (_frame_callback || cbor_stdout || _udp_fd >= 0) {
             auto buf = buildFrameCbor(ts);
