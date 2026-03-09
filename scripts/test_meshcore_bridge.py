@@ -2964,6 +2964,82 @@ class TestSendTxtMsg(unittest.TestCase):
         self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
         self.assertEqual(len(self.state.pending_acks), 1)
 
+    def test_pending_ack_keyed_by_crypto_hash_not_msg_seq(self):
+        """pending_acks must be keyed by compute_ack_hash, not msg_seq counter.
+
+        The companion device ACKs a TXT_MSG with SHA-256(plaintext + sender_pub)[:4].
+        The bridge must store the same hash so the incoming ACK matches.
+        A sequential msg_seq counter (1, 2, 3...) will never match.
+        """
+        from meshcore_crypto import compute_ack_hash
+
+        dst_prefix = self._add_peer_contact()
+        text = b"hello"
+        ts = int(time.time())
+        ts_bytes = struct.pack("<I", ts)
+        cmd = (
+            bytes([bridge.CMD_SEND_TXT_MSG, 0x00, 0x00]) + ts_bytes + dst_prefix + text
+        )
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        self.assertEqual(len(self.state.pending_acks), 1)
+
+        # Compute the expected ACK hash: SHA-256(ts(4) + flags(1) + text + pub_key)[:4]
+        plaintext = ts_bytes + bytes([0x00]) + text  # flags = (0x00 << 2) | (0 & 3) = 0
+        expected_ack = compute_ack_hash(plaintext, self.state.pub_key)
+
+        # The key in pending_acks must be the crypto hash
+        self.assertIn(
+            expected_ack,
+            self.state.pending_acks,
+            f"pending_acks keys {list(self.state.pending_acks.keys())} "
+            f"should contain crypto hash {expected_ack!r}, not msg_seq counter",
+        )
+
+    def test_send_then_receive_ack_produces_push_confirmed(self):
+        """End-to-end: send TXT_MSG, receive matching ACK, get PUSH_SEND_CONFIRMED.
+
+        This simulates the full round-trip: bridge sends a message, companion
+        device receives it and sends back an RF ACK with compute_ack_hash().
+        The bridge must match the ACK and produce PUSH_ACK (0x82).
+        """
+        from meshcore_crypto import compute_ack_hash, ROUTE_FLOOD
+
+        dst_prefix = self._add_peer_contact()
+        text = b"hello"
+        ts = int(time.time())
+        ts_bytes = struct.pack("<I", ts)
+        cmd = (
+            bytes([bridge.CMD_SEND_TXT_MSG, 0x00, 0x00]) + ts_bytes + dst_prefix + text
+        )
+        responses = self._handle(cmd)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+
+        # Compute the ACK hash the companion device would send back
+        plaintext = ts_bytes + bytes([0x00]) + text
+        ack_hash = compute_ack_hash(plaintext, self.state.pub_key)
+
+        # Build an ACK RF frame with that hash
+        hdr = make_header(ROUTE_FLOOD, PAYLOAD_ACK)
+        ack_payload = bytes([hdr, 0]) + ack_hash
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0},
+            "payload": ack_payload,
+        }
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(
+            frame, self.state
+        )
+
+        # Must produce PUSH_ACK (0x82) with the destination prefix
+        self.assertEqual(
+            len(companion_msgs), 1, "ACK should produce exactly one push message"
+        )
+        self.assertEqual(companion_msgs[0][0], bridge.PUSH_ACK)
+        # pending_acks should be consumed
+        self.assertEqual(len(self.state.pending_acks), 0)
+
     def test_send_txt_msg_flood_contact_with_send_scope_uses_t_flood(self):
         """TXT_MSG to a flood contact (out_path_len=-1) with send_scope uses ROUTE_T_FLOOD.
 

@@ -1461,11 +1461,15 @@ def _handle_send_txt_msg(
     cbor_msg = make_cbor_tx_request(packet)
     udp_sock.sendto(cbor_msg, udp_addr)
 
-    # Build response and register ACK tag for tracking.
-    # routing_type byte: 1 = flood, 0 = direct (matches firmware RESP_MSG_SENT semantics).
+    # Build response and register expected ACK hash for tracking.
+    # The companion device ACKs with SHA-256(plaintext + sender_pub)[:4].
+    # We must store the same hash so we can match the incoming ACK.
+    # The RESP_MSG_SENT carries msg_seq (opaque tag for the CLI's tracking),
+    # but pending_acks is keyed by the crypto hash that will arrive over RF.
+    plaintext = struct.pack("<I", ts) + bytes([(0x00 << 2) | (attempt & 0x03)]) + text
+    expected_ack = compute_ack_hash(plaintext, state.pub_key)
     resp = state.build_msg_sent(flood=use_flood)
-    ack_tag = resp[2:6]
-    state.pending_acks[ack_tag] = (time.monotonic(), dst_prefix)
+    state.pending_acks[expected_ack] = (time.monotonic(), dst_prefix)
 
     return [resp]
 
