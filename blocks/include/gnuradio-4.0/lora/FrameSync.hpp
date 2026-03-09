@@ -773,12 +773,17 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
                     if (_additional_upchirps >= kMaxAdditionalUpchirps) {
                         if (_preamble_rotations >= kMaxPreambleRotations) {
-                            // Still getting upchirp-like bins after max rotations
-                            // — not a real frame. Reset to avoid staying stuck in
-                            // SYNC forever (liveness bug).
+                            // Expected %u+%u upchirp-like symbols but never saw
+                            // the sync word. Common cause: preamble detected but
+                            // SNR too low to resolve the sync word offset (single
+                            // symbol, no coherent integration).
                             if (debug) {
-                                std::fprintf(stderr, "[FrameSync] NET_ID1: stuck on upchirp-like bin=%d after %u rotations, resetting",
-                                             bin_idx, static_cast<unsigned>(_preamble_rotations));
+                                std::fprintf(stderr,
+                                    "[FrameSync] NET_ID1: no sync word after %u+%u extra upchirp-like symbols "
+                                    "(bin=%d), SNR too low? resetting",
+                                    static_cast<unsigned>(kMaxAdditionalUpchirps),
+                                    static_cast<unsigned>(_preamble_rotations),
+                                    bin_idx);
                                 if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
                                 std::fprintf(stderr, "\n");
                             }
