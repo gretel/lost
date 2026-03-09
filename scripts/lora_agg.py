@@ -38,6 +38,7 @@ RECV_TIMEOUT = 0.05  # 50ms poll interval for draining groups
 CLIENT_EXPIRY = 60.0  # evict consumers with no keepalive after this
 UPSTREAM_SILENCE_WARN = 30.0  # warn if no upstream data for this long
 UDP_RCVBUF = 512 * 1024  # 512 KB receive buffer for burst resilience
+DEDUP_COOLDOWN = 5.0  # suppress duplicate hashes for this long after emit
 
 log = logging.getLogger("gr4.agg")
 
@@ -313,6 +314,7 @@ def run(args: argparse.Namespace) -> None:
 
     # Aggregation state
     pending: dict[int, PendingGroup] = {}
+    recently_emitted: dict[int, float] = {}  # hash -> emit timestamp (cooldown)
     last_keepalive = time.monotonic()
     last_evict = last_keepalive
     frames_total = 0
@@ -348,6 +350,7 @@ def run(args: argparse.Namespace) -> None:
     def emit_group(group: PendingGroup) -> None:
         nonlocal frames_total, frames_since_log
         log.info(format_ruling(group))
+        recently_emitted[group.payload_hash] = time.monotonic()
         msg = build_aggregated(group)
         data = cbor2.dumps(msg)
         sync_word = msg.get("phy", {}).get("sync_word")
@@ -360,6 +363,10 @@ def run(args: argparse.Namespace) -> None:
         expired = [k for k, g in pending.items() if (now - g.created_at) >= window_s]
         for k in expired:
             emit_group(pending.pop(k))
+        # Purge stale cooldown entries
+        stale = [h for h, t in recently_emitted.items() if (now - t) >= DEDUP_COOLDOWN]
+        for h in stale:
+            del recently_emitted[h]
 
     def handle_upstream_frame(msg: dict[str, Any]) -> None:
         if msg.get("type") != "lora_frame":
@@ -375,6 +382,11 @@ def run(args: argparse.Namespace) -> None:
             server.broadcast(data)
             return
         h = cand.msg["payload_hash"]
+        if h in recently_emitted:
+            log.debug(
+                "dedup hash=%016x (%.0fms late)", h, (now - recently_emitted[h]) * 1000
+            )
+            return
         if h not in pending:
             pending[h] = PendingGroup(payload_hash=h, created_at=now)
         group = pending[h]
