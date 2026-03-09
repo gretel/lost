@@ -2,13 +2,10 @@
 # SPDX-License-Identifier: ISC
 """lora_agg.py — LoRa frame aggregation service.
 
-Subscribes to one or more lora_trx raw ports (default :5556), groups frames
-by payload_hash within a time window, and applies forwarding rules:
-
-  - CRC_OK packet with best SNR wins (forwarded with diversity metadata)
-  - CRC_FAIL packet forwarded only when it is the sole decode
-
-Re-broadcasts winners to consumers on :5555.
+Subscribes to one or more lora_trx raw ports (default :5556), deduplicates
+frames by payload_hash within a time window, and forwards the best candidate
+(CRC_OK preferred, then highest SNR) with diversity metadata to consumers
+on :5555.
 Also proxies TX requests from consumers to the first upstream transceiver.
 """
 
@@ -120,7 +117,7 @@ def build_aggregated(group: PendingGroup) -> dict[str, Any]:
     return msg
 
 
-def format_ruling(group: PendingGroup, forwarded: bool) -> str:
+def format_ruling(group: PendingGroup) -> str:
     """One-line ruling summary for log output."""
     winner = group.candidates[group.best_idx]
     msg = winner.msg
@@ -132,8 +129,7 @@ def format_ruling(group: PendingGroup, forwarded: bool) -> str:
     n = len(group.candidates)
     n_ok = sum(1 for c in group.candidates if c.crc_valid)
 
-    tag = "FWD" if forwarded else "DROP"
-    parts = [f"{tag} #{seq} {len(payload)}B {crc_str}"]
+    parts = [f"FWD #{seq} {len(payload)}B {crc_str}"]
     if snr_db is not None:
         parts.append(f"SNR={snr_db:.1f}dB")
     parts.append(f"ch={winner.rx_channel}")
@@ -142,10 +138,8 @@ def format_ruling(group: PendingGroup, forwarded: bool) -> str:
 
     if n == 1:
         parts.append("[only decode]")
-    elif forwarded:
-        parts.append(f"[best of {n}, {n_ok} CRC_OK]")
     else:
-        parts.append(f"[{n} candidates, none CRC_OK]")
+        parts.append(f"[best of {n}, {n_ok} CRC_OK]")
     return " ".join(parts)
 
 
@@ -354,23 +348,7 @@ def run(args: argparse.Namespace) -> None:
 
     def emit_group(group: PendingGroup) -> None:
         nonlocal frames_total, frames_since_log
-        winner = group.candidates[group.best_idx]
-        n = len(group.candidates)
-
-        # Forwarding rules:
-        # - CRC_OK winner: always forward (best SNR already selected)
-        # - CRC_FAIL winner: only forward if it's the sole decode
-        if winner.crc_valid:
-            forwarded = True
-        elif n == 1:
-            forwarded = True
-        else:
-            forwarded = False
-
-        log.info(format_ruling(group, forwarded))
-        if not forwarded:
-            return
-
+        log.info(format_ruling(group))
         msg = build_aggregated(group)
         data = cbor2.dumps(msg)
         sync_word = msg.get("phy", {}).get("sync_word")
