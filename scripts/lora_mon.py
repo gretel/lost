@@ -20,8 +20,8 @@ Dependencies: cbor2, pynacl, pycryptodome
 from __future__ import annotations
 
 import argparse
+import base64
 import logging
-import socket
 import struct
 import time
 from pathlib import Path
@@ -30,9 +30,11 @@ from typing import Any
 import cbor2
 
 from lora_common import (
+    KEEPALIVE_INTERVAL,
     PAYLOAD_NAMES,
     ROUTE_NAMES,
     config_region_scope,
+    create_udp_subscriber,
     format_hexdump,
     load_config,
     resolve_udp_address,
@@ -60,17 +62,11 @@ from meshcore_crypto import (
 
 log = logging.getLogger("gr4.mon")
 
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 5555
-KEEPALIVE_INTERVAL = 5.0
-RECV_TIMEOUT = 10.0
-
 # Gain advisor thresholds (dBFS / dB)
 GAIN_PEAK_CLIP = -3.0  # peak above this → clipping risk
-GAIN_NOISE_LOW = -65.0  # noise floor below this → gain too low
-GAIN_NOISE_HIGH = -25.0  # noise floor above this → gain too high
-GAIN_SWEET_LOW = -55.0  # ideal noise floor lower bound
-GAIN_SWEET_HIGH = -40.0  # ideal noise floor upper bound
+GAIN_NOISE_HIGH = -25.0  # noise floor above this → gain too high (compression)
+GAIN_NOISE_DEAD = -85.0  # noise floor below this → hardware probably off/broken
+GAIN_SNR_TD_LOW = -5.0  # time-domain SNR below this → link too weak
 
 
 # ---- MeshCore v1 one-line summary ----
@@ -241,28 +237,45 @@ def _try_decrypt(
 # ---- Gain advisor ----
 
 
-def gain_advice(phy: dict[str, Any]) -> str | None:
-    """Return a one-line gain recommendation based on PHY metrics, or None."""
+def gain_advice(
+    phy: dict[str, Any], *, crc_valid: bool = True
+) -> tuple[str | None, str | None]:
+    """Return (state, message) gain recommendation from PHY metrics.
+
+    state is "HIGH", "LOW", or None.  message is a human-readable string or None.
+    Checks in priority order:
+      1. Clipping risk (peak_db > GAIN_PEAK_CLIP)
+      2. ADC compression (noise_floor_db > GAIN_NOISE_HIGH)
+      3. Weak link (snr_db_td < GAIN_SNR_TD_LOW, only when crc_valid)
+      4. Hardware sanity (noise_floor_db < GAIN_NOISE_DEAD)
+    """
     peak = phy.get("peak_db")
     nf = phy.get("noise_floor_db")
-    if peak is None and nf is None:
-        return None
+    snr_td = phy.get("snr_db_td")
 
-    # Clipping takes priority
+    # 1. Clipping risk — takes priority over everything
     if peak is not None and peak > GAIN_PEAK_CLIP:
-        return (
+        msg = (
             f"GAIN HIGH: peak {peak:.1f} dBFS (>{GAIN_PEAK_CLIP:.0f}) — reduce RX gain"
         )
+        return ("HIGH", msg)
 
-    # Noise floor too high (compression without clipping)
+    # 2. Compression without clipping
     if nf is not None and nf > GAIN_NOISE_HIGH:
-        return f"GAIN HIGH: noise floor {nf:.1f} dBFS (>{GAIN_NOISE_HIGH:.0f}) — reduce RX gain"
+        msg = f"GAIN HIGH: noise floor {nf:.1f} dBFS (>{GAIN_NOISE_HIGH:.0f}) — reduce RX gain"
+        return ("HIGH", msg)
 
-    # Noise floor too low
-    if nf is not None and nf < GAIN_NOISE_LOW:
-        return f"GAIN LOW: noise floor {nf:.1f} dBFS (<{GAIN_NOISE_LOW:.0f}) — increase RX gain"
+    # 3. Weak link quality (SNR too low on a decoded frame)
+    if snr_td is not None and crc_valid and snr_td < GAIN_SNR_TD_LOW:
+        msg = f"GAIN LOW: SNR {snr_td:.1f} dB (<{GAIN_SNR_TD_LOW:.0f}) — weak signal, consider increasing RX gain"
+        return ("LOW", msg)
 
-    return None
+    # 4. Hardware sanity check (implausibly low noise floor)
+    if nf is not None and nf < GAIN_NOISE_DEAD:
+        msg = f"GAIN LOW: noise floor {nf:.1f} dBFS (<{GAIN_NOISE_DEAD:.0f}) — implausibly low, check hardware/gain setting"
+        return ("LOW", msg)
+
+    return (None, None)
 
 
 def format_config(msg: dict[str, Any]) -> str:
@@ -341,35 +354,25 @@ def connect_udp(
         names = ", ".join(f"#{sanitize_text(ch.name)}" for ch in channels)
         log.info("channels: %s", names)
 
-    # Resolve address family
-    af = socket.AF_INET
-    if ":" in host:
-        af = socket.AF_INET6
-
-    sock = socket.socket(af, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("" if af == socket.AF_INET else "::", 0))
-    sock.settimeout(RECV_TIMEOUT)
-    local_port = sock.getsockname()[1]
-
     # Subscribe with sync_word filter (0x12 = MeshCore/Reticulum)
-    sub_msg = cbor2.dumps({"type": "subscribe", "sync_word": [0x12]})
-    sock.sendto(sub_msg, (host, port))
+    sock, sub_msg, addr = create_udp_subscriber(host, port, sync_words=[0x12])
+    local_port = sock.getsockname()[1]
     log.info("connected to %s:%d (local port :%d)", host, port, local_port)
 
     total = 0
     crc_ok_count = 0
     last_keepalive = time.monotonic()
     waiting = False  # True after first timeout with no frames received
+    _last_gain_state: str | None = None  # rate-limit gain advisor to state transitions
 
     try:
         while True:
             try:
                 data, _addr = sock.recvfrom(65536)
                 waiting = False
-            except socket.timeout:
+            except TimeoutError:
                 # Re-subscribe on timeout (server may have restarted)
-                sock.sendto(sub_msg, (host, port))
+                sock.sendto(sub_msg, addr)
                 last_keepalive = time.monotonic()
                 if not waiting:
                     log.info("waiting for frames from %s:%d", host, port)
@@ -379,7 +382,7 @@ def connect_udp(
             # Periodic keepalive to maintain registration
             now = time.monotonic()
             if now - last_keepalive >= KEEPALIVE_INTERVAL:
-                sock.sendto(sub_msg, (host, port))
+                sock.sendto(sub_msg, addr)
                 last_keepalive = now
 
             try:
@@ -431,10 +434,12 @@ def connect_udp(
                 ),
             )
 
-            # Gain advisor (per-frame)
-            advice = gain_advice(msg.get("phy", {}))
-            if advice:
-                log.warning("%s", advice)
+            # Gain advisor (state-change rate-limited)
+            gain_state, gain_msg = gain_advice(msg.get("phy", {}), crc_valid=crc_ok)
+            if gain_state != _last_gain_state:
+                _last_gain_state = gain_state
+                if gain_msg:
+                    log.warning("%s", gain_msg)
 
     except KeyboardInterrupt:
         pass
@@ -448,15 +453,13 @@ def connect_udp(
 
 def _parse_channel_arg(spec: str) -> GroupChannel:
     """Parse a --channel NAME:BASE64 argument into a GroupChannel."""
-    import base64 as b64
-
     colon = spec.find(":")
     if colon <= 0:
         raise ValueError(f"invalid channel spec '{spec}' (expected NAME:BASE64_PSK)")
     name = spec[:colon]
     psk_b64 = spec[colon + 1 :]
     try:
-        psk_raw = b64.b64decode(psk_b64)
+        psk_raw = base64.b64decode(psk_b64)
     except Exception as exc:
         raise ValueError(f"invalid base64 in channel '{name}': {exc}") from exc
     if len(psk_raw) not in (16, 32):
@@ -475,12 +478,6 @@ def main() -> None:
         metavar="HOST:PORT",
         default=None,
         help="UDP server address (default from config.toml or 127.0.0.1:5555)",
-    )
-    parser.add_argument(
-        "--config",
-        metavar="PATH",
-        default=None,
-        help="Path to config.toml (auto-detected if omitted)",
     )
     parser.add_argument(
         "--identity",
@@ -514,8 +511,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Load shared config (explicit path or auto-detect)
-    cfg = load_config(args.config)
+    # Load shared config (auto-detect config.toml)
+    cfg = load_config()
     setup_logging("gr4.mon", cfg, no_color=args.no_color)
 
     # Log region scope if configured

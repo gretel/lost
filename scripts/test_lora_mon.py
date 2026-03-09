@@ -580,37 +580,72 @@ class TestFormatFramePeak(unittest.TestCase):
 class TestGainAdvice(unittest.TestCase):
     def test_clipping(self):
         """Peak above -3 dBFS should warn about clipping."""
-        advice = lora_mon.gain_advice({"peak_db": -1.5})
-        self.assertIsNotNone(advice)
-        self.assertIn("GAIN HIGH", advice)
-        self.assertIn("reduce", advice.lower())
+        state, msg = lora_mon.gain_advice({"peak_db": -1.5})
+        self.assertEqual(state, "HIGH")
+        self.assertIn("GAIN HIGH", msg)
+        self.assertIn("reduce", msg.lower())
 
     def test_noise_too_high(self):
         """Noise floor above -25 dBFS should warn."""
-        advice = lora_mon.gain_advice({"noise_floor_db": -20.0})
-        self.assertIsNotNone(advice)
-        self.assertIn("GAIN HIGH", advice)
+        state, msg = lora_mon.gain_advice({"noise_floor_db": -20.0})
+        self.assertEqual(state, "HIGH")
+        self.assertIn("GAIN HIGH", msg)
 
-    def test_noise_too_low(self):
-        """Noise floor below -65 dBFS should warn."""
-        advice = lora_mon.gain_advice({"noise_floor_db": -70.0})
-        self.assertIsNotNone(advice)
-        self.assertIn("GAIN LOW", advice)
-        self.assertIn("increase", advice.lower())
+    def test_normal_noise_no_advice(self):
+        """Healthy noise floor (-70 dBFS) must NOT fire a false alarm."""
+        state, msg = lora_mon.gain_advice({"noise_floor_db": -70.0})
+        self.assertIsNone(state)
+        self.assertIsNone(msg)
+
+    def test_noise_dead_hardware(self):
+        """Noise floor below -85 dBFS indicates hardware problem."""
+        state, msg = lora_mon.gain_advice({"noise_floor_db": -90.0})
+        self.assertEqual(state, "LOW")
+        self.assertIn("GAIN LOW", msg)
+        self.assertIn("hardware", msg.lower())
 
     def test_sweet_spot_no_advice(self):
-        """Normal levels should return None."""
-        advice = lora_mon.gain_advice({"peak_db": -12.0, "noise_floor_db": -45.0})
-        self.assertIsNone(advice)
+        """Normal levels should return (None, None)."""
+        state, msg = lora_mon.gain_advice({"peak_db": -12.0, "noise_floor_db": -45.0})
+        self.assertIsNone(state)
+        self.assertIsNone(msg)
 
     def test_empty_phy_no_advice(self):
-        """No peak or noise floor should return None."""
-        self.assertIsNone(lora_mon.gain_advice({}))
+        """No metrics at all should return (None, None)."""
+        state, msg = lora_mon.gain_advice({})
+        self.assertIsNone(state)
+        self.assertIsNone(msg)
 
     def test_clipping_overrides_noise(self):
-        """Clipping warning takes priority over noise floor."""
-        advice = lora_mon.gain_advice({"peak_db": -1.0, "noise_floor_db": -70.0})
-        self.assertIn("peak", advice)
+        """Clipping warning takes priority over low noise floor."""
+        state, msg = lora_mon.gain_advice({"peak_db": -1.0, "noise_floor_db": -70.0})
+        self.assertEqual(state, "HIGH")
+        self.assertIn("peak", msg)
+
+    def test_snr_td_low_crc_ok(self):
+        """Low time-domain SNR on a CRC_OK frame → GAIN LOW."""
+        state, msg = lora_mon.gain_advice({"snr_db_td": -8.0}, crc_valid=True)
+        self.assertEqual(state, "LOW")
+        self.assertIn("GAIN LOW", msg)
+        self.assertIn("SNR", msg)
+
+    def test_snr_td_low_crc_fail(self):
+        """Low SNR on a CRC_FAIL frame must not advise (cause unknown)."""
+        state, msg = lora_mon.gain_advice({"snr_db_td": -8.0}, crc_valid=False)
+        self.assertIsNone(state)
+        self.assertIsNone(msg)
+
+    def test_snr_td_ok(self):
+        """Healthy time-domain SNR should return (None, None)."""
+        state, msg = lora_mon.gain_advice({"snr_db_td": 5.0}, crc_valid=True)
+        self.assertIsNone(state)
+        self.assertIsNone(msg)
+
+    def test_state_is_none_when_no_data(self):
+        """Only peak_db present but within limits → (None, None)."""
+        state, msg = lora_mon.gain_advice({"peak_db": -30.0})
+        self.assertIsNone(state)
+        self.assertIsNone(msg)
 
 
 # ---- format_config ----
