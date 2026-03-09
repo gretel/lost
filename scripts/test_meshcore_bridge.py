@@ -170,7 +170,7 @@ class TestBridgeState(unittest.TestCase):
         resp = state.build_device_info()
         self.assertEqual(resp[0], bridge.RESP_DEVICE_INFO)
         self.assertEqual(resp[1], 9)  # fw_ver
-        self.assertIn(b"gr4-lora", resp)
+        self.assertIn(b"lora_trx", resp)  # fw_build and model both contain "lora_trx"
 
     def test_ok_response(self):
         """OK response has code 0x00."""
@@ -485,8 +485,8 @@ class TestFrameConversion(unittest.TestCase):
         # Key should be learned
         self.assertIn(pubkey.hex(), self.state.known_keys)
 
-    def test_advert_does_not_auto_add_contact(self):
-        """ADVERT learns key but does NOT auto-add to contacts."""
+    def test_advert_auto_adds_contact(self):
+        """ADVERT learns key AND auto-adds to contacts for persistence across restarts."""
         hdr = (0x04 << 2) | 0x01
         pubkey = bytes(range(32))
         ts = struct.pack("<I", int(time.time()))
@@ -503,8 +503,8 @@ class TestFrameConversion(unittest.TestCase):
         bridge.lora_frame_to_companion_msgs(frame, self.state)
         # Key should be learned
         self.assertIn(pubkey.hex(), self.state.known_keys)
-        # But NOT added to contacts
-        self.assertNotIn(pubkey.hex(), self.state.contacts)
+        # Contact is auto-added so it survives restarts
+        self.assertIn(pubkey.hex(), self.state.contacts)
 
     def test_advert_does_not_learn_self(self):
         """ADVERT with our own pubkey does not add to known_keys."""

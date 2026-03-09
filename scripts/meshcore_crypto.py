@@ -474,11 +474,19 @@ class GroupChannel:
         self.hash = hashlib.sha256(psk_raw).digest()[:PATH_HASH_SIZE]
 
 
+PUBLIC_CHANNEL_PSK = bytes.fromhex("8b3387e9c5cdea6ac9e5edbaa115cd72")
+
+
 def load_channels(channels_dir: Path) -> list[GroupChannel]:
     """Load group channels from a directory.
 
     Each file is <name>.channel containing 16 or 32 raw PSK bytes.
     If the directory doesn't exist, seeds it from the bundled seed channels.
+
+    Channel ordering follows MeshCore firmware convention: the "public" channel
+    (fixed PSK 8b3387e9…) is always at index 0.  Other channels follow in
+    alphabetical order by filename.  This ensures mccli channel indices match
+    what companion apps expect (index 0 = public, index 1+ = named channels).
     """
     _seed_channels(channels_dir)
     channels: list[GroupChannel] = []
@@ -494,6 +502,14 @@ def load_channels(channels_dir: Path) -> list[GroupChannel]:
                 f,
                 len(data),
             )
+    # Ensure public channel (fixed PSK) is always at index 0.
+    # MeshCore firmware hardcodes public at slot 0; mccli relies on this ordering.
+    public_psk_hash = hashlib.sha256(PUBLIC_CHANNEL_PSK).digest()[:PATH_HASH_SIZE]
+    pub_idx = next(
+        (i for i, ch in enumerate(channels) if ch.hash == public_psk_hash), None
+    )
+    if pub_idx is not None and pub_idx != 0:
+        channels.insert(0, channels.pop(pub_idx))
     return channels
 
 

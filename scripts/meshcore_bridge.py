@@ -39,6 +39,7 @@ import logging
 import selectors
 import socket
 import struct
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,25 @@ from meshcore_crypto import (
 )
 
 log = logging.getLogger("gr4.bridge")
+
+
+def _get_git_rev() -> str:
+    """Return the short git SHA of the gr4-lora repo, or 'dev' if unavailable."""
+    try:
+        here = Path(__file__).resolve().parent
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=here,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "dev"
+
 
 # ---- Companion protocol constants ----
 
@@ -302,6 +322,7 @@ class BridgeState:
         send_scope: bytes = b"\x00" * 16,
         autoadd_config: int = 0,
         autoadd_max_hops: int = 0,
+        model: str = "lora_trx",
     ) -> None:
         self.pub_key = pub_key
         self.expanded_prv = expanded_prv
@@ -312,6 +333,7 @@ class BridgeState:
         self.sf = sf
         self.cr = cr
         self.tx_power = tx_power
+        self.model = model
 
         # Location (int32 * 1e6 = decimal degrees).  Read from config at startup;
         # updated at runtime by CMD_SET_ADVERT_LATLON (session-only, no persistence).
@@ -412,15 +434,22 @@ class BridgeState:
 
     def build_device_info(self) -> bytes:
         """Build DEVICE_INFO (0x0D) response payload (82 bytes total)."""
+        git_rev = _get_git_rev()
+        # fw_build (12 bytes): binary name, zero-padded
+        fw_build = utf8_truncate("lora_trx", 12).ljust(12, b"\x00")
+        # model (40 bytes): configurable via [meshcore] model in config.toml
+        model_b = utf8_truncate(self.model, 40).ljust(40, b"\x00")
+        # version (20 bytes): git short SHA
+        version_b = utf8_truncate(git_rev, 20).ljust(20, b"\x00")
         buf = bytearray()
         buf.append(RESP_DEVICE_INFO)
         buf.append(9)  # fw_ver (protocol version 9, matches CMD_DEVICE_QUERY ver=3)
         buf.append(64)  # max_contacts / 2  (128 contacts)
         buf.append(8)  # max_channels
         buf.extend(struct.pack("<I", 0))  # ble_pin (0 = no PIN)
-        buf.extend(b"gr4-lora\x00\x00\x00\x00")  # fw_build (12 bytes)
-        buf.extend(b"gr4-lora bridge".ljust(40, b"\x00"))  # model (40 bytes)
-        buf.extend(b"0.1.0".ljust(20, b"\x00"))  # version (20 bytes)
+        buf.extend(fw_build)  # fw_build (12 bytes)
+        buf.extend(model_b)  # model (40 bytes)
+        buf.extend(version_b)  # version (20 bytes): git rev SHA
         buf.append(self.client_repeat)  # byte 80: client_repeat (v9+)
         buf.append(self.path_hash_mode)  # byte 81: path_hash_mode (v10+)
         return bytes(buf)
@@ -651,19 +680,34 @@ def _handle_advert_rx(
     advert_start: int,
     state: BridgeState,
 ) -> list[bytes]:
-    """Handle received ADVERT: push to companion + auto-learn key + auto-add contact."""
+    """Handle received ADVERT: push to companion + auto-learn key + auto-add contact.
+
+    Contacts are automatically persisted to disk so they survive bridge restarts.
+    This mirrors what real MeshCore firmware does: every received ADVERT is stored
+    as a contact that the companion app can discover via GET_CONTACTS.
+    """
     push = _advert_to_push(payload, advert_start)
     if push is None:
         return []
 
-    # Auto-learn public key (key store only — NOT contacts)
+    # Auto-learn public key into key store
     pubkey = extract_advert_pubkey(payload)
     if pubkey is not None and pubkey != state.pub_key:
         is_new = save_pubkey(state.keys_dir, pubkey)
         if is_new:
             state.known_keys[pubkey.hex()] = pubkey
-            name = extract_advert_name(payload) or ""
-            log.info("key learned: %s.. '%s'", pubkey.hex()[:8], sanitize_text(name))
+
+        # Auto-add to contacts so GET_CONTACTS returns it and it survives restarts.
+        # The contact record is the 147 bytes starting after the push code byte.
+        pk_hex = pubkey.hex()
+        if pk_hex not in state.contacts:
+            record = push[1:]  # strip PUSH_NEW_ADVERT code byte
+            if len(record) == 147:
+                state.contacts[pk_hex] = record
+                state.contacts_lastmod = int(time.time())
+                _persist_contacts(state)
+                name = extract_advert_name(payload) or ""
+                log.info("contact learned: %s.. '%s'", pk_hex[:8], sanitize_text(name))
 
     return [push]
 
@@ -2139,11 +2183,14 @@ def main() -> None:
     else:
         tcp_port = int(meshcore_cfg.get("port", BRIDGE_PORT))
 
-    # Node name
+    # Node name (SET_ADVERT_NAME equivalent)
     if args.name is not None:
         node_name = args.name
     else:
-        node_name = meshcore_cfg.get("name", "gr4-lora")
+        node_name = meshcore_cfg.get("name", "lora_trx")
+
+    # Device model string reported in DEVICE_INFO (CMD_DEVICE_QUERY response)
+    node_model = meshcore_cfg.get("model", "lora_trx")
 
     # Identity file
     if args.identity is not None:
@@ -2213,6 +2260,7 @@ def main() -> None:
         send_scope=startup_send_scope,
         autoadd_config=startup_autoadd_config,
         autoadd_max_hops=startup_autoadd_max_hops,
+        model=node_model,
     )
 
     # Load persisted contacts from disk
