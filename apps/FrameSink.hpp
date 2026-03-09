@@ -24,20 +24,20 @@
 #include <format>
 #include <functional>
 #include <mutex>
+#include <random>
 #include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
-#include <gnuradio-4.0/Tensor.hpp>
 
 #include "cbor.hpp"
 
 namespace gr::lora {
 
 struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
-    using Description = Doc<"LoRa frame output sink — text display, CBOR UDP broadcast, diversity metadata">;
+    using Description = Doc<"LoRa frame output sink — text display, CBOR UDP broadcast with UUID and payload hash">;
 
     gr::PortIn<uint8_t> in;
 
@@ -62,13 +62,8 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     std::vector<uint8_t> _frame;
     uint32_t             _frame_count{0};
 
-    // Diversity combiner metadata (optional, populated from diversity_* tags)
-    int64_t              _diversity_n_candidates{0};
-    int64_t              _diversity_decoded_channel{-1};
-    int64_t              _diversity_crc_mask{0};
-    int64_t              _diversity_gap_us{0};
-    std::vector<int64_t> _diversity_rx_channels;
-    std::vector<double>  _diversity_snr_db;
+    // Per-frame unique ID generation (UUID v4, seeded in start())
+    std::mt19937_64      _rng{};
 
     std::function<void(const std::vector<uint8_t>&, bool crc_valid)> _frame_callback{};
 
@@ -91,6 +86,35 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
             port = static_cast<uint16_t>(std::stoul(spec));
         }
         return port > 0;
+    }
+
+    /// FNV-1a 64-bit hash of payload bytes — used by lora_agg for deduplication.
+    [[nodiscard]] static uint64_t fnv1a64(const uint8_t* data, std::size_t len) noexcept {
+        uint64_t hash = 14695981039346656037ULL;
+        for (std::size_t i = 0; i < len; i++) {
+            hash ^= data[i];
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
+
+    /// Generate a UUID v4 string (RFC 4122) using the instance RNG.
+    [[nodiscard]] std::string generateUUID() {
+        uint64_t hi = _rng();
+        uint64_t lo = _rng();
+        // Set version 4 bits in hi word (bits 12-15 of the third group)
+        hi = (hi & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
+        // Set variant bits in lo word (top 2 bits = 10)
+        lo = (lo & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
+        char out[37];
+        std::snprintf(out, sizeof(out),
+            "%08x-%04x-%04x-%04x-%012llx",
+            static_cast<unsigned>(hi >> 32),
+            static_cast<unsigned>((hi >> 16) & 0xFFFFU),
+            static_cast<unsigned>(hi & 0xFFFFU),
+            static_cast<unsigned>(lo >> 48),
+            static_cast<unsigned long long>(lo & 0x0000FFFFFFFFFFFFULL));
+        return out;
     }
 
     void udpListenerLoop() {
@@ -128,6 +152,8 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     }
 
     void start() {
+        _rng.seed(std::random_device{}());
+
         if (udp_dest.empty()) return;
 
         std::string host;
@@ -246,19 +272,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         if (_is_downchirp) {
             std::printf("  (downchirp)");
         }
-        if (_diversity_n_candidates > 0) {
-            std::printf("  div=%lld",
-                        static_cast<long long>(_diversity_n_candidates));
-            if (_diversity_gap_us > 0) {
-                if (_diversity_gap_us >= 1000) {
-                    std::printf("  gap=%.1f ms",
-                                static_cast<double>(_diversity_gap_us) / 1000.0);
-                } else {
-                    std::printf("  gap=%lld us",
-                                static_cast<long long>(_diversity_gap_us));
-                }
-            }
-        }
         std::printf("\n");
 
         std::printf("  Hex: %s\n", to_hex(frame_span).c_str());
@@ -271,9 +284,16 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         std::vector<uint8_t> buf;
         buf.reserve(128 + _pay_len);
 
-        uint32_t top_fields = 9;
+        // Unique decode-event ID — used by lora_agg to track candidates
+        auto uuid = generateUUID();
+
+        // FNV-1a payload hash — used by lora_agg to group identical payloads
+        auto pay_len_actual = std::min(static_cast<std::size_t>(_pay_len), _frame.size());
+        uint64_t phash = fnv1a64(_frame.data(), pay_len_actual);
+
+        uint32_t top_fields = 11;  // type, ts, seq, phy, payload, payload_len,
+                                   // crc_valid, cr, is_downchirp, id, payload_hash
         if (_rx_channel >= 0) top_fields++;
-        if (_diversity_n_candidates > 0) top_fields++;
 
         cbor::encode_map_begin(buf, top_fields);
         cbor::kv_text(buf, "type", "lora_frame");
@@ -302,9 +322,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
             cbor::kv_float64(buf, "snr_db_td", _snr_db_td);
         }
 
-        cbor::kv_bytes(buf, "payload", _frame.data(),
-                       std::min(static_cast<std::size_t>(_pay_len),
-                                _frame.size()));
+        cbor::kv_bytes(buf, "payload", _frame.data(), pay_len_actual);
         cbor::kv_uint(buf, "payload_len", _pay_len);
         cbor::kv_bool(buf, "crc_valid", _crc_valid);
         cbor::kv_uint(buf, "cr", _cr);
@@ -313,35 +331,11 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
             cbor::kv_uint(buf, "rx_channel", static_cast<uint64_t>(_rx_channel));
         }
 
-        // Diversity combiner metadata (only present when N>1 combiner is active)
-        if (_diversity_n_candidates > 0) {
-            cbor::encode_text(buf, "diversity");
-            cbor::encode_map_begin(buf, 6);
+        // Unique decode event identifier (UUID v4, RFC 4122)
+        cbor::kv_text(buf, "id", uuid);
 
-            // rx_channels: int array
-            cbor::encode_text(buf, "rx_channels");
-            cbor::encode_array_begin(buf, static_cast<uint32_t>(_diversity_rx_channels.size()));
-            for (auto ch : _diversity_rx_channels) {
-                cbor::encode_uint(buf, static_cast<uint64_t>(ch));
-            }
-
-            cbor::kv_uint(buf, "decoded_channel",
-                          static_cast<uint64_t>(_diversity_decoded_channel));
-
-            // snr_db: double array
-            cbor::encode_text(buf, "snr_db");
-            cbor::encode_array_begin(buf, static_cast<uint32_t>(_diversity_snr_db.size()));
-            for (auto snr : _diversity_snr_db) {
-                cbor::encode_float64(buf, snr);
-            }
-
-            cbor::kv_uint(buf, "crc_mask",
-                          static_cast<uint64_t>(_diversity_crc_mask));
-            cbor::kv_uint(buf, "n_candidates",
-                          static_cast<uint64_t>(_diversity_n_candidates));
-            cbor::kv_uint(buf, "gap_us",
-                          static_cast<uint64_t>(_diversity_gap_us));
-        }
+        // Payload hash for aggregation grouping (FNV-1a 64-bit)
+        cbor::kv_uint(buf, "payload_hash", phash);
 
         return buf;
     }
@@ -439,45 +433,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                     _rx_channel = it2->second.value_or<int64_t>(-1);
                 } else {
                     _rx_channel = -1;
-                }
-
-                // Diversity combiner metadata (optional — only present
-                // when DiversityCombiner is in the pipeline with N>1)
-                _diversity_n_candidates = 0;
-                _diversity_decoded_channel = -1;
-                _diversity_crc_mask = 0;
-                _diversity_gap_us = 0;
-                _diversity_rx_channels.clear();
-                _diversity_snr_db.clear();
-                if (auto it2 = tag.map.find("diversity_n_candidates");
-                    it2 != tag.map.end()) {
-                    _diversity_n_candidates = it2->second.value_or<int64_t>(0);
-                }
-                if (_diversity_n_candidates > 0) {
-                    if (auto it2 = tag.map.find("diversity_decoded_channel");
-                        it2 != tag.map.end()) {
-                        _diversity_decoded_channel = it2->second.value_or<int64_t>(-1);
-                    }
-                    if (auto it2 = tag.map.find("diversity_crc_mask");
-                        it2 != tag.map.end()) {
-                        _diversity_crc_mask = it2->second.value_or<int64_t>(0);
-                    }
-                    if (auto it2 = tag.map.find("diversity_gap_us");
-                        it2 != tag.map.end()) {
-                        _diversity_gap_us = it2->second.value_or<int64_t>(0);
-                    }
-                    if (auto it2 = tag.map.find("diversity_rx_channels");
-                        it2 != tag.map.end()) {
-                        if (auto* tensor = it2->second.get_if<gr::Tensor<int64_t>>()) {
-                            _diversity_rx_channels.assign(tensor->begin(), tensor->end());
-                        }
-                    }
-                    if (auto it2 = tag.map.find("diversity_snr_db");
-                        it2 != tag.map.end()) {
-                        if (auto* tensor = it2->second.get_if<gr::Tensor<double>>()) {
-                            _diversity_snr_db.assign(tensor->begin(), tensor->end());
-                        }
-                    }
                 }
 
                 _frame.clear();
