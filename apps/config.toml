@@ -9,7 +9,7 @@
 # The first [set_*] (by file order) is used at runtime.
 # CR is the denominator (5–8) of the LoRa coding rate 4/N.
 #
-# Block property overrides (FrameSync, DemodDecoder, DiversityCombiner)
+# Block property overrides (FrameSync, DemodDecoder)
 # go flat in the codec section. Each block applies only the keys it
 # recognises and silently ignores the rest.
 #
@@ -27,13 +27,13 @@ clock = "external"
 
 # TODO: add "network" block
 udp_listen = "127.0.0.1"
-udp_port = 5555
+udp_port = 5556    # raw port; lora_agg subscribes here and serves consumers on 5555
 status_interval = 10
 
 [meshcore]
-region_scope = "de-hh"
 # port              = 7834                         # TCP listen port (avoid 5000 on macOS)
-name          = "'DO2THX 📡"                   # node display name
+name          = "'DO2THX 📡"                   # node display name (SET_ADVERT_NAME)
+# model             = "lora_trx"                   # device model string in DEVICE_INFO
 # identity_file     = "scripts/data/meshcore/identity.bin"
 # keys_dir          = "scripts/data/meshcore/keys"
 # channels_dir      = "scripts/data/meshcore/channels"
@@ -45,7 +45,7 @@ name          = "'DO2THX 📡"                   # node display name
 # autoadd_config    = 0                            # bitmask: 0x01=overwrite oldest, 0x02=chat,
 #                                                  #   0x04=repeater, 0x08=room, 0x10=sensor
 # autoadd_max_hops  = 0                            # 0-64 (max hops for auto-add contacts)
-flood_scope       = "de-hh"                           # scope name (hashed) or 32 hex chars; empty=off
+flood_scope       = "de-hh"                        # flood scope (SET_FLOOD_SCOPE)
 
 [logging]
 level = "INFO"
@@ -84,7 +84,7 @@ preamble_len = 8
 freq = 869618000
 rx_channel = [1, 2]
 tx_channel = 0
-rx_gain = 45
+rx_gain = 42
 tx_gain = 50
 
 [radio_433]
@@ -101,7 +101,7 @@ radio = "radio_868"
 
 # Optional: multiple decode chains per radio channel.
 # Each [[set_meshcore_868.decode]] entry creates a FrameSync+DemodDecoder
-# pair (with a Splitter when >1 entry).  All chains feed one DiversityCombiner.
+# pair (with a Splitter when >1 entry).  Each chain has its own FrameSink.
 # If omitted, uses the codec's sf/sync_word.
 #
 # [[set_meshcore_868.decode]]

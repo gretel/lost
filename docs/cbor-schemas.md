@@ -8,25 +8,28 @@ Python: `pip install cbor2`, then `cbor2.loads(datagram)`.
 ## RX Output
 
 `lora_trx` outputs decoded frames as CBOR `lora_frame` maps via UDP (default
-port 5555). Clients send a 1-byte registration datagram to
-join the broadcast.
+port 5556, "raw"). Each decode chain has its own FrameSink and emits all
+frames independently. `lora_agg.py` subscribes to lora_trx on 5556,
+deduplicates, and re-broadcasts aggregated frames on port 5555.
 
 ```bash
-# Monitor lora_trx via UDP (default port 5555)
+# Start aggregator (subscribes to lora_trx:5556, serves consumers on :5555)
+python3 scripts/lora_agg.py
+
+# Monitor aggregated frames (default port 5555)
 python3 scripts/lora_mon.py
 
-# Monitor with custom address
-python3 scripts/lora_mon.py --connect 192.168.1.10:5555
-
-# Pipe to offline decoder
-python3 scripts/lora_mon.py | python3 scripts/lora_decode_meshcore.py
+# Monitor raw frames directly from lora_trx
+python3 scripts/lora_mon.py --connect 127.0.0.1:5556
 ```
+
+### Raw frame (from lora_trx on :5556)
 
 ```
 {
   "type":         "lora_frame",       // text, always "lora_frame"
   "ts":           "2026-02-17T...",   // text, ISO 8601 timestamp
-  "seq":          1,                  // uint, 1-based frame counter
+  "seq":          1,                  // uint, 1-based frame counter (per FrameSink)
   "phy": {                            // map, PHY-layer metadata
     "sf":         8,                  // uint, spreading factor
     "bw":         62500,              // uint, bandwidth in Hz
@@ -44,12 +47,26 @@ python3 scripts/lora_mon.py | python3 scripts/lora_decode_meshcore.py
   "crc_valid":    true,               // bool (top-level duplicate for convenience)
   "cr":           4,                  // uint (top-level duplicate)
   "is_downchirp": false,              // bool
-  "diversity": {                      // map, optional, only present in dual-RX mode
-    "rx_channels":    [0, 1],         // uint array, channels that decoded the frame
-    "decoded_channel": 1,             // uint, channel selected as best decode
-    "snr_db":         [3.2, 5.1],     // float64 array, per-channel SNR
-    "crc_mask":       3,              // uint, bitmask of CRC-OK channels (bit 0 = ch 0)
-    "n_candidates":   2               // uint, number of decode candidates
+  "id":           "550e8400-...",     // text, UUIDv4, unique per decode event
+  "payload_hash": 12345678901234      // uint64, FNV-1a hash for aggregation grouping
+}
+```
+
+### Aggregated frame (from lora_agg on :5555)
+
+Same as raw frame, plus a `diversity` sub-map added by `lora_agg.py`:
+
+```
+{
+  // ... all raw frame fields ...
+  "diversity": {                      // map, added by lora_agg
+    "n_candidates":   2,              // uint, decode chains that decoded this frame
+    "decoded_channel": 1,             // uint, rx_channel of the winning decode
+    "rx_channels":    [0, 1],         // uint array, per-candidate rx_channel
+    "snr_db":         [3.2, 5.1],     // float64 array, per-candidate SNR
+    "crc_mask":       3,              // uint, bitmask of CRC-OK candidates
+    "gap_us":         20000,          // uint, microseconds from first to last candidate
+    "source_ids":     ["uuid1", ...]  // text array, UUID of each raw candidate
   }
 }
 ```

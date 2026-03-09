@@ -36,6 +36,9 @@ scripts/data/meshcore/channels/*.channel
 CLAUDE.md
 GR4LORA_REVIEW.md
 
+# Plans and design docs (local only)
+docs/plans/
+
 # GR4 reference docs (not our code)
 docs/GR4_CORE_*
 
