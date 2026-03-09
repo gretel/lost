@@ -292,8 +292,14 @@ def synthesise_frame(
 # ---------------------------------------------------------------------------
 
 
-def _pack_riff_info(comment: str, name: str) -> bytes:
-    """Pack a RIFF LIST INFO chunk with ICMT and INAM sub-chunks."""
+def _pack_riff_info(comment: str, name: str, keywords: str) -> bytes:
+    """Pack a RIFF LIST INFO chunk with ICMT, INAM, and IKEY sub-chunks.
+
+    ICMT — human-readable PHY summary (SF, BW, CRC, SNR, seq, sync)
+    INAM — 16-hex filename stem (SHA-256 of payload)
+    IKEY — machine-readable key=value pairs for resynthesis:
+             payload_hex=<hex> crc_ok=<0|1>
+    """
 
     def subchunk(fcc: bytes, text: str) -> bytes:
         data = text.encode("utf-8", errors="replace")
@@ -302,8 +308,38 @@ def _pack_riff_info(comment: str, name: str) -> bytes:
             data += b"\x00"
         return fcc + struct.pack("<I", len(data)) + data
 
-    payload = subchunk(b"ICMT", comment) + subchunk(b"INAM", name)
-    return b"LIST" + struct.pack("<I", 4 + len(payload)) + b"INFO" + payload
+    body = (
+        subchunk(b"ICMT", comment)
+        + subchunk(b"INAM", name)
+        + subchunk(b"IKEY", keywords)
+    )
+    return b"LIST" + struct.pack("<I", 4 + len(body)) + b"INFO" + body
+
+
+def read_wav_keywords(path: Path) -> dict[str, str]:
+    """Parse the IKEY sub-chunk from a WAV file written by save_wav().
+
+    Returns a dict of key=value pairs, e.g.
+      {"payload_hex": "48656c6c6f", "crc_ok": "1"}
+    Returns an empty dict if the chunk is absent or malformed.
+    """
+    raw = path.read_bytes()
+    # Scan for the b"IKEY" four-character code
+    pos = raw.find(b"IKEY")
+    if pos < 0:
+        return {}
+    chunk_size = struct.unpack_from("<I", raw, pos + 4)[0]
+    text = (
+        raw[pos + 8 : pos + 8 + chunk_size]
+        .rstrip(b"\x00")
+        .decode("utf-8", errors="replace")
+    )
+    result: dict[str, str] = {}
+    for token in text.split():
+        if "=" in token:
+            k, _, v = token.partition("=")
+            result[k] = v
+    return result
 
 
 def save_wav(
@@ -311,11 +347,17 @@ def save_wav(
     stereo: tuple[list[float], list[float]],
     comment: str,
     name: str,
+    keywords: str,
 ) -> None:
     """Write stereo samples to *path* as 2-channel 16-bit PCM WAV with INFO metadata.
 
     *stereo* is a *(left, right)* tuple of equal-length float lists.
     Frames are interleaved as L0 R0 L1 R1 … per the WAV specification.
+
+    Three RIFF INFO sub-chunks are embedded:
+      ICMT — human-readable PHY summary
+      INAM — 16-hex filename stem (SHA-256 of payload)
+      IKEY — machine-readable key=value pairs for resynthesis
     """
     left, right = stereo
     assert len(left) == len(right), "left/right channels must be same length"
@@ -343,7 +385,7 @@ def save_wav(
     wav_bytes = buf.getvalue()
 
     # Append RIFF INFO chunk after the data chunk and fix RIFF size
-    info_chunk = _pack_riff_info(comment, name)
+    info_chunk = _pack_riff_info(comment, name, keywords)
     new_body = wav_bytes[8:] + info_chunk  # strip "RIFF????WAVE" header
     riff_size = 4 + len(new_body)
     final = b"RIFF" + struct.pack("<I", riff_size) + b"WAVE" + new_body[4:]
@@ -486,7 +528,10 @@ def run(
                     f"SF={sf} BW={bw} CRC={crc_str} "
                     f"SNR={snr_str} seq={seq} sync=0x{sync_word:02X}"
                 )
-                save_wav(wav_path, samples, comment=comment, name=key)
+                keywords = f"payload_hex={payload.hex()} crc_ok={1 if crc_ok else 0}"
+                save_wav(
+                    wav_path, samples, comment=comment, name=key, keywords=keywords
+                )
                 log.info(
                     "saved %s (%dB payload, CRC_%s)",
                     wav_path.name,
