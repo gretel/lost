@@ -1384,29 +1384,73 @@ def _handle_send_txt_msg(
         sanitize_text(text.decode("utf-8", errors="replace")),
     )
 
-    # Look up full destination pubkey from contacts (6-byte prefix match)
-    dest_pub = _resolve_contact(state, dst_prefix)
-    if dest_pub is None:
+    # Look up full destination pubkey and contact record (6-byte prefix match)
+    resolved = _resolve_contact(state, dst_prefix)
+    if resolved is None:
         log.error("no contact matching prefix %s", dst_prefix.hex())
         return [state.build_error(2)]
+    dest_pub, contact_record = resolved
 
-    # Build encrypted TXT_MSG wire packet
-    from meshcore_tx import build_txt_msg, make_cbor_tx_request
+    # Determine routing: replicate firmware BaseChatMesh::sendMessage() logic.
+    # out_path_len == -1 (0xFF) → no known direct path → send as FLOOD.
+    # out_path_len == 0         → zero-hop direct → ROUTE_DIRECT, path_len=0.
+    # out_path_len  > 0         → multi-hop direct → ROUTE_DIRECT + stored path.
+    out_path_len = struct.unpack_from("<b", contact_record, 34)[0]  # signed byte
+    use_flood = out_path_len < 0
 
-    packet = build_txt_msg(
-        state.expanded_prv,
-        state.pub_key,
-        dest_pub,
-        text.decode("utf-8", errors="replace"),
-        timestamp=ts,
-        attempt=attempt,
+    # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
+    active_key = state.send_scope if any(state.send_scope) else state.region_key
+
+    from meshcore_tx import (
+        build_txt_msg,
+        build_wire_packet,
+        make_cbor_tx_request,
+        make_header,
     )
 
-    # Direct TXT_MSG is always sent as ROUTE_DIRECT — transport codes are a flood
-    # routing concept (they control which region repeaters forward a packet) and
-    # have no meaning on a direct peer-to-peer message.  Adding T_DIRECT here was
-    # breaking delivery: the remote device received the packet but the changed
-    # wire format confused its mesh layer.
+    text_str = text.decode("utf-8", errors="replace")
+
+    if use_flood:
+        # Build encrypted payload first (ROUTE_FLOOD, no transport codes).
+        # Then optionally repackage with ROUTE_T_FLOOD + transport codes.
+        tmp = build_txt_msg(
+            state.expanded_prv,
+            state.pub_key,
+            dest_pub,
+            text_str,
+            timestamp=ts,
+            attempt=attempt,
+            route_type=ROUTE_FLOOD,
+        )
+        if active_key:
+            # Extract payload: skip header(1) + path_len(1) — no transport codes
+            # in the plain ROUTE_FLOOD packet built above.
+            txt_payload = tmp[2:]
+            tc1 = _compute_transport_code(active_key, PAYLOAD_TXT, txt_payload)
+            header = make_header(ROUTE_T_FLOOD, PAYLOAD_TXT)
+            packet = build_wire_packet(header, txt_payload, transport_codes=(tc1, 0))
+        else:
+            packet = tmp
+        log.info("TX: %dB TXT_MSG (flood) to %s", len(packet), dst_prefix.hex())
+    else:
+        # Zero-hop direct (out_path_len == 0) or known multi-hop path (out_path_len > 0).
+        # Multi-hop path routing (ROUTE_T_DIRECT with stored_path) is not yet implemented;
+        # for now fall through to zero-hop ROUTE_DIRECT which works for both cases.
+        packet = build_txt_msg(
+            state.expanded_prv,
+            state.pub_key,
+            dest_pub,
+            text_str,
+            timestamp=ts,
+            attempt=attempt,
+            route_type=ROUTE_DIRECT,
+        )
+        log.info(
+            "TX: %dB TXT_MSG (direct, path_len=%d) to %s",
+            len(packet),
+            out_path_len,
+            dst_prefix.hex(),
+        )
 
     # Track TX hash to filter echo
     h = _hash_payload(packet)
@@ -1416,11 +1460,10 @@ def _handle_send_txt_msg(
     # Send via UDP CBOR
     cbor_msg = make_cbor_tx_request(packet)
     udp_sock.sendto(cbor_msg, udp_addr)
-    log.info("TX: %dB msg to %s", len(packet), dst_prefix.hex())
 
-    # Build response and register ACK tag for tracking
-    resp = state.build_msg_sent(flood=False)
-    # Extract the ack_tag (4 bytes at offset 2) from the MSG_SENT response
+    # Build response and register ACK tag for tracking.
+    # routing_type byte: 1 = flood, 0 = direct (matches firmware RESP_MSG_SENT semantics).
+    resp = state.build_msg_sent(flood=use_flood)
     ack_tag = resp[2:6]
     state.pending_acks[ack_tag] = (time.monotonic(), dst_prefix)
 
@@ -1774,13 +1817,12 @@ def _handle_export_contact(data: bytes, state: BridgeState) -> list[bytes]:
         return [bytes([RESP_CONTACT_URI]) + advert_pkt]
 
     # Search stored contacts by prefix
-    full_pub = _resolve_contact(state, prefix)
-    if full_pub is None:
+    resolved = _resolve_contact(state, prefix)
+    if resolved is None:
         log.warning("companion: EXPORT_CONTACT prefix not found: %s", prefix.hex())
         return [state.build_error(2)]
 
-    pk_hex = full_pub.hex()
-    record = state.contacts[pk_hex]  # 147-byte contact record
+    full_pub, record = resolved  # 147-byte contact record
 
     # Unpack fields from record layout:
     # pubkey(32)+node_type(1)+flags(1)+path_len(1)+path(64)+name(32)+
@@ -1810,7 +1852,7 @@ def _handle_export_contact(data: bytes, state: BridgeState) -> list[bytes]:
     )
     log.info(
         "companion: EXPORT_CONTACT %s.. '%s' (unsigned)",
-        pk_hex[:8],
+        full_pub.hex()[:8],
         name_raw.decode("utf-8", errors="replace"),
     )
     return [bytes([RESP_CONTACT_URI]) + wire_pkt]
@@ -1828,12 +1870,15 @@ def _ensure_self_contact(state: BridgeState) -> None:
         state.contacts_lastmod = int(time.time())
 
 
-def _resolve_contact(state: BridgeState, prefix: bytes) -> bytes | None:
-    """Resolve a 6-byte pubkey prefix to a full 32-byte pubkey from contacts."""
-    for pk_hex in state.contacts:
+def _resolve_contact(state: BridgeState, prefix: bytes) -> tuple[bytes, bytes] | None:
+    """Resolve a pubkey prefix to (pubkey, record) from contacts.
+
+    Returns (32-byte pubkey, 147-byte contact record) or None if not found.
+    """
+    for pk_hex, record in state.contacts.items():
         pk_bytes = bytes.fromhex(pk_hex)
         if pk_bytes[: len(prefix)] == prefix:
-            return pk_bytes
+            return pk_bytes, record
     return None
 
 

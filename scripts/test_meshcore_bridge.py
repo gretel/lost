@@ -1564,21 +1564,22 @@ class TestRegionScope(unittest.TestCase):
         finally:
             sock.close()
 
-    def test_txt_msg_always_uses_route_direct(self):
-        """TXT_MSG TX always uses plain ROUTE_DIRECT even when region scope is set.
+    def test_txt_msg_flood_contact_uses_t_flood_with_region(self):
+        """TXT_MSG to a flood contact (out_path_len=-1) uses ROUTE_T_FLOOD when
+        region scope is active.
 
-        Transport codes are a flood routing concept — they control which region
-        repeaters forward a flood packet.  Direct messages are peer-to-peer and
-        must never carry transport codes, regardless of send_scope or region_scope.
-        Adding T_DIRECT breaks delivery on real firmware.
+        Transport codes are a flood concept — they apply to flood routing.
+        A contact with out_path_len=-1 has no known direct path, so the
+        firmware would send via flood (BaseChatMesh::sendMessage, line 399).
+        The bridge must replicate this: use ROUTE_T_FLOOD when scope is set.
         """
         import socket
 
         state = make_state(region_scope="de-nord")
 
-        # Create a contact to send to
+        # Create a flood contact (out_path_len=-1, the default from ADVERTs)
         _peer_prv, peer_pub, _peer_seed = make_identity()
-        state.contacts[peer_pub.hex()] = peer_pub + b"\x00" * 100
+        state.contacts[peer_pub.hex()] = _make_contact_record(peer_pub)
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("127.0.0.1", 0))
@@ -1602,7 +1603,54 @@ class TestRegionScope(unittest.TestCase):
             msg = cbor2.loads(data)
             packet = msg["payload"]
             route = packet[0] & 0x03
-            self.assertEqual(route, 0x02)  # ROUTE_DIRECT — never T_DIRECT
+            self.assertEqual(route, 0x00)  # ROUTE_T_FLOOD — flood contact + scope
+            # Transport codes present (4 bytes after header)
+            tc1 = int.from_bytes(packet[1:3], "little")
+            self.assertGreater(tc1, 0)
+        finally:
+            sock.close()
+
+    def test_txt_msg_zero_hop_contact_uses_route_direct(self):
+        """TXT_MSG to a zero-hop contact (out_path_len=0) uses ROUTE_DIRECT.
+
+        A contact with out_path_len=0 has a known zero-hop direct path
+        (device is in direct radio range). The bridge sends ROUTE_DIRECT.
+        """
+        import socket
+
+        state = make_state(region_scope="de-nord")
+
+        # Create a zero-hop direct contact (out_path_len=0)
+        _peer_prv, peer_pub, _peer_seed = make_identity()
+        record = _make_contact_record(peer_pub)
+        # Patch out_path_len byte (offset 34) to 0 (zero-hop direct)
+        record_bytes = bytearray(record)
+        record_bytes[34] = 0x00
+        state.contacts[peer_pub.hex()] = bytes(record_bytes)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        addr = ("127.0.0.1", sock.getsockname()[1])
+        try:
+            ts = struct.pack("<I", int(time.time()))
+            cmd = (
+                bytes([bridge.CMD_SEND_TXT_MSG, 0x00, 0x00])
+                + ts
+                + peer_pub[:6]
+                + b"hello"
+            )
+            responses = bridge.handle_command(cmd, state, sock, addr)
+            self.assertEqual(len(responses), 1)
+            self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+
+            sock.settimeout(1.0)
+            data, _ = sock.recvfrom(65536)
+            import cbor2
+
+            msg = cbor2.loads(data)
+            packet = msg["payload"]
+            route = packet[0] & 0x03
+            self.assertEqual(route, 0x02)  # ROUTE_DIRECT for zero-hop
         finally:
             sock.close()
 
@@ -2868,15 +2916,36 @@ class TestSendTxtMsg(unittest.TestCase):
         self.assertEqual(msg["type"], "lora_tx")
         self.assertIn("payload", msg)
 
-    def test_send_txt_msg_returns_msg_sent_direct(self):
-        """CMD_SEND_TXT_MSG response has routing_type byte = 0 (direct, not flood)."""
+    def test_send_txt_msg_returns_msg_sent_flood(self):
+        """CMD_SEND_TXT_MSG to a flood contact returns routing_type=1 (flood).
+
+        Contacts imported from ADVERTs have out_path_len=-1 (no known direct
+        path). The firmware sends these via flood; the bridge must match.
+        PACKET_MSG_SENT byte 1: 1=flood, 0=direct.
+        """
         dst_prefix = self._add_peer_contact()
         cmd = self._make_cmd(dst_prefix)
         responses = self._handle(cmd)
         self.assertEqual(len(responses), 1)
         resp = responses[0]
         self.assertEqual(resp[0], bridge.RESP_MSG_SENT)
-        # byte 1 is routing_type; 0 = direct (flood=False)
+        # byte 1 is routing_type; 1 = flood (out_path_len=-1)
+        self.assertEqual(resp[1], 1)
+
+    def test_send_txt_msg_zero_hop_returns_msg_sent_direct(self):
+        """CMD_SEND_TXT_MSG to a zero-hop contact returns routing_type=0 (direct)."""
+        # Create a zero-hop contact (out_path_len=0)
+        record = _make_contact_record(self.peer_pub, name="peer")
+        record_bytes = bytearray(record)
+        record_bytes[34] = 0x00  # out_path_len=0 (zero-hop direct)
+        self.state.contacts[self.peer_pub.hex()] = bytes(record_bytes)
+        dst_prefix = self.peer_pub[:6]
+        cmd = self._make_cmd(dst_prefix)
+        responses = self._handle(cmd)
+        self.assertEqual(len(responses), 1)
+        resp = responses[0]
+        self.assertEqual(resp[0], bridge.RESP_MSG_SENT)
+        # byte 1 is routing_type; 0 = direct (out_path_len=0)
         self.assertEqual(resp[1], 0)
 
     def test_send_txt_msg_tracks_tx_hash_in_recent_tx(self):
@@ -2895,19 +2964,20 @@ class TestSendTxtMsg(unittest.TestCase):
         self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
         self.assertEqual(len(self.state.pending_acks), 1)
 
-    def test_send_txt_msg_route_direct_even_with_send_scope(self):
-        """TXT_MSG always uses ROUTE_DIRECT even when send_scope is non-zero.
+    def test_send_txt_msg_flood_contact_with_send_scope_uses_t_flood(self):
+        """TXT_MSG to a flood contact (out_path_len=-1) with send_scope uses ROUTE_T_FLOOD.
 
-        Transport codes are for flood routing only.  Direct messages must use
-        plain ROUTE_DIRECT regardless of send_scope — adding T_DIRECT breaks
-        delivery on real firmware.
+        Transport codes apply to flood routing. A contact with out_path_len=-1
+        has no known direct path; the firmware would send it as flood. With a
+        non-zero send_scope, the bridge must use ROUTE_T_FLOOD (with transport
+        codes), not ROUTE_DIRECT or ROUTE_T_DIRECT.
         """
         import cbor2
 
         # Set a non-zero 16-byte send_scope key
         self.state.send_scope = b"\x01" * 16
 
-        dst_prefix = self._add_peer_contact()
+        dst_prefix = self._add_peer_contact()  # out_path_len=-1 (flood contact)
         cmd = self._make_cmd(dst_prefix)
         responses = self._handle(cmd)
         self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
@@ -2916,9 +2986,12 @@ class TestSendTxtMsg(unittest.TestCase):
         raw, _addr = self.udp_sock.recvfrom(65536)
         msg = cbor2.loads(raw)
         wire = msg["payload"]
-        # ROUTE_DIRECT = 2; must never be T_DIRECT (3)
+        # ROUTE_T_FLOOD = 0; flood contact + scope → T_FLOOD with transport codes
         route_type = wire[0] & 0x03
-        self.assertEqual(route_type, 2)
+        self.assertEqual(route_type, 0)
+        # Transport codes present after header (4 bytes)
+        tc1 = int.from_bytes(wire[1:3], "little")
+        self.assertGreater(tc1, 0)
 
 
 class TestSendAdvert(unittest.TestCase):
