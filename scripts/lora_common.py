@@ -357,14 +357,18 @@ def setup_logging(
 # ---- Shared TOML configuration ----
 
 # Search path for config.toml (first match wins):
-#   1. ./config.toml           (CWD, e.g. when running from apps/)
-#   2. ./apps/config.toml      (project root)
-#   3. ~/.config/gr4-lora/config.toml  (user config)
+#   1. ./config.toml                         (CWD, e.g. when running from apps/)
+#   2. ./apps/config.toml                    (CWD = project root)
+#   3. <script-dir>/../apps/config.toml      (script-relative, works from scripts/)
+#   4. ~/.config/gr4-lora/config.toml        (user config)
 _CONFIG_SEARCH = [
     Path("config.toml"),
     Path("apps/config.toml"),
+    Path(__file__).parent.parent / "apps" / "config.toml",
     Path.home() / ".config" / "gr4-lora" / "config.toml",
 ]
+
+_log = logging.getLogger(__name__)
 
 
 def find_config(explicit: str | Path | None = None) -> Path | None:
@@ -379,10 +383,24 @@ def find_config(explicit: str | Path | None = None) -> Path | None:
 
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
-    """Load config.toml and return the raw dict. Returns {} if not found."""
+    """Load config.toml and return the raw dict. Returns {} if not found.
+
+    Logs a warning when no config file is found so the failure is visible.
+    An explicit path that doesn't exist is also warned about.
+    """
+    if path is not None:
+        p = Path(path)
+        if not p.is_file():
+            _log.warning("config file not found: %s — using defaults", p)
+            return {}
     p = find_config(path)
     if p is None:
+        _log.warning(
+            "config.toml not found (searched: %s) — using defaults",
+            ", ".join(str(s) for s in _CONFIG_SEARCH),
+        )
         return {}
+    _log.debug("loaded config: %s", p)
     with open(p, "rb") as f:
         return tomllib.load(f)
 
