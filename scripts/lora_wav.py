@@ -64,17 +64,22 @@ CHIRP_AMPLITUDE = 0.38  # 0..1 — leave headroom for cosine fade
 # Cue chirp (fixed, payload-independent — "attention, frame arrived")
 CUE_F_LO = 200.0  # Hz
 CUE_F_HI = 800.0  # Hz
-CUE_DURATION_S = 0.07  # seconds
+CUE_DURATION_S = 0.091  # seconds (~70ms × 1.3)
 
 # Payload signature chirps (range boundaries — hash bytes select within these)
 SIG_F_LO_MIN = 80.0  # Hz — lowest base frequency
 SIG_F_LO_MAX = 350.0  # Hz — highest base frequency
 SIG_SPAN_MIN = 200.0  # Hz — minimum sweep span
 SIG_SPAN_MAX = 750.0  # Hz — maximum sweep span
-SIG_DUR_MIN = 0.055  # seconds — shortest chirp
-SIG_DUR_MAX = 0.120  # seconds — longest chirp
+SIG_DUR_MIN = 0.072  # seconds — shortest chirp (~55ms × 1.3)
+SIG_DUR_MAX = 0.156  # seconds — longest chirp (~120ms × 1.3)
 SIG_N_MIN = 3  # fewest payload chirps
 SIG_N_MAX = 6  # most payload chirps
+
+# Playback buffering — pre-fill this many frames into the audio device before
+# starting output. Larger values absorb CPU spikes (e.g. during TX bursts)
+# at the cost of a small constant latency increase. 4096 ≈ 185 ms at 22050 Hz.
+PLAYBACK_BLOCKSIZE = 4096  # samples
 
 # Padding / envelope
 SILENCE_PAD_S = 0.010  # 10 ms silence at start and end of each WAV
@@ -265,7 +270,7 @@ def _playback_worker(play_queue: "queue.Queue[list[float] | None]") -> None:
             break
         arr = np.array(item, dtype=np.float32)
         try:
-            sd.play(arr, samplerate=AUDIO_SAMPLE_RATE)
+            sd.play(arr, samplerate=AUDIO_SAMPLE_RATE, blocksize=PLAYBACK_BLOCKSIZE)
             sd.wait()
         except Exception as exc:  # noqa: BLE001
             log.debug("playback error: %s", exc)
