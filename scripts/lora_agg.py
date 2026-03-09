@@ -3,9 +3,12 @@
 """lora_agg.py — LoRa frame aggregation service.
 
 Subscribes to one or more lora_trx raw ports (default :5556), groups frames
-by payload_hash within a time window, selects the best decode (CRC_OK > SNR),
-and re-broadcasts the winner with diversity metadata to consumers on :5555.
+by payload_hash within a time window, and applies forwarding rules:
 
+  - CRC_OK packet with best SNR wins (forwarded with diversity metadata)
+  - CRC_FAIL packet forwarded only when it is the sole decode
+
+Re-broadcasts winners to consumers on :5555.
 Also proxies TX requests from consumers to the first upstream transceiver.
 """
 
@@ -14,11 +17,9 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
-import os
 import selectors
 import signal
 import socket
-import sys
 import time
 from typing import Any
 
@@ -27,12 +28,9 @@ import cbor2
 from lora_common import (
     config_agg_listen,
     config_agg_upstream,
-    config_agg_window_ms,
-    format_hex,
     load_config,
     parse_host_port,
     setup_logging,
-    sync_word_name,
 )
 
 DEFAULT_UPSTREAM = "127.0.0.1:5556"
@@ -58,6 +56,7 @@ class Candidate:
     rx_channel: int
     snr_db: float
     crc_valid: bool
+    decode_label: str  # from "decode_label" field
     frame_id: str  # UUID from "id" field
     arrived_at: float  # time.monotonic()
 
@@ -92,6 +91,7 @@ def extract_candidate(msg: dict[str, Any], arrived_at: float) -> Candidate | Non
         rx_channel=msg.get("rx_channel") or 0,
         snr_db=_snr_db(msg),
         crc_valid=msg.get("crc_valid", False),
+        decode_label=msg.get("decode_label", ""),
         frame_id=frame_id,
         arrived_at=arrived_at,
     )
@@ -120,39 +120,33 @@ def build_aggregated(group: PendingGroup) -> dict[str, Any]:
     return msg
 
 
-def format_frame_simple(msg: dict[str, Any]) -> str:
-    """Format a lora_frame message as a single-line summary for console logging."""
+def format_ruling(group: PendingGroup, forwarded: bool) -> str:
+    """One-line ruling summary for log output."""
+    winner = group.candidates[group.best_idx]
+    msg = winner.msg
     payload = msg.get("payload", b"")
     phy = msg.get("phy", {})
-    crc_ok = msg.get("crc_valid", False)
-    crc_str = "CRC_OK" if crc_ok else "CRC_FAIL"
+    crc_str = "CRC_OK" if winner.crc_valid else "CRC_FAIL"
     seq = msg.get("seq", 0)
-    cr = phy.get("cr", 0)
-    sync_word = phy.get("sync_word", 0)
-    sw_label = sync_word_name(sync_word)
     snr_db = phy.get("snr_db")
-    rx_ch = msg.get("rx_channel")
+    n = len(group.candidates)
+    n_ok = sum(1 for c in group.candidates if c.crc_valid)
 
-    header = f"#{seq} {len(payload)}B {crc_str} SF{phy.get('sf', '?')}/CR4:{4 + cr} {sw_label}"
-    if rx_ch is not None:
-        header += f" ch={rx_ch}"
+    tag = "FWD" if forwarded else "DROP"
+    parts = [f"{tag} #{seq} {len(payload)}B {crc_str}"]
     if snr_db is not None:
-        header += f" SNR={snr_db:.1f}dB"
+        parts.append(f"SNR={snr_db:.1f}dB")
+    parts.append(f"ch={winner.rx_channel}")
+    if winner.decode_label:
+        parts.append(f"[{winner.decode_label}]")
 
-    div = msg.get("diversity", {})
-    n_cand = div.get("n_candidates", 0)
-    if n_cand > 0:
-        header += f" div={n_cand}"
-        gap_us = div.get("gap_us", 0)
-        if gap_us >= 1000:
-            header += f" gap={gap_us / 1000:.1f}ms"
-        elif gap_us > 0:
-            header += f" gap={gap_us}us"
-
-    lines = [header]
-    if payload:
-        lines.append("  " + format_hex(payload, max_bytes=48))
-    return "\n".join(lines)
+    if n == 1:
+        parts.append("[only decode]")
+    elif forwarded:
+        parts.append(f"[best of {n}, {n_ok} CRC_OK]")
+    else:
+        parts.append(f"[{n} candidates, none CRC_OK]")
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +285,7 @@ class ConsumerServer:
 
 
 def run(args: argparse.Namespace) -> None:
-    window_s = args.window_ms / 1000.0
+    window_s = DEFAULT_WINDOW_MS / 1000.0
 
     # Parse upstream addresses
     upstreams: list[tuple[str, int]] = []
@@ -320,7 +314,9 @@ def run(args: argparse.Namespace) -> None:
 
     # Consumer-facing server
     server = ConsumerServer(listen_host, listen_port)
-    log.info("listening: %s:%d (window=%dms)", listen_host, listen_port, args.window_ms)
+    log.info(
+        "listening: %s:%d (window=%dms)", listen_host, listen_port, DEFAULT_WINDOW_MS
+    )
 
     # Aggregation state
     pending: dict[int, PendingGroup] = {}
@@ -359,13 +355,26 @@ def run(args: argparse.Namespace) -> None:
     def emit_group(group: PendingGroup) -> None:
         nonlocal frames_total, frames_since_log
         winner = group.candidates[group.best_idx]
-        if not winner.crc_valid and args.skip_failed_crc:
+        n = len(group.candidates)
+
+        # Forwarding rules:
+        # - CRC_OK winner: always forward (best SNR already selected)
+        # - CRC_FAIL winner: only forward if it's the sole decode
+        if winner.crc_valid:
+            forwarded = True
+        elif n == 1:
+            forwarded = True
+        else:
+            forwarded = False
+
+        log.info(format_ruling(group, forwarded))
+        if not forwarded:
             return
+
         msg = build_aggregated(group)
         data = cbor2.dumps(msg)
         sync_word = msg.get("phy", {}).get("sync_word")
         server.broadcast(data, sync_word)
-        print(format_frame_simple(msg), flush=True)
         frames_total += 1
         frames_since_log += 1
 
@@ -522,7 +531,6 @@ def main() -> None:
     )
     default_upstream = config_agg_upstream(cfg)
     default_listen = config_agg_listen(cfg)
-    default_window = config_agg_window_ms(cfg)
 
     parser.add_argument(
         "--upstream",
@@ -536,18 +544,6 @@ def main() -> None:
         default=default_listen,
         metavar="HOST:PORT",
         help=f"Consumer-facing bind address (default: {default_listen})",
-    )
-    parser.add_argument(
-        "--window-ms",
-        type=int,
-        default=default_window,
-        dest="window_ms",
-        help=f"Aggregation window in milliseconds (default: {default_window})",
-    )
-    parser.add_argument(
-        "--skip-failed-crc",
-        action="store_true",
-        help="Drop frames where all candidates have CRC_FAIL",
     )
     parser.add_argument(
         "--debug",

@@ -50,6 +50,7 @@ def _make_candidate(
         rx_channel=rx_channel,
         snr_db=snr_db,
         crc_valid=crc_valid,
+        decode_label=msg.get("decode_label", ""),
         frame_id=frame_id,
         arrived_at=arrived_at,
     )
