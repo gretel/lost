@@ -20,6 +20,8 @@ Usage:
     lora_waterfall.py --bw-factor 1.5          # show 1.5x bandwidth
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 import os
@@ -30,6 +32,7 @@ import termios
 import time
 import tty
 from collections import deque
+from typing import Any
 
 import cbor2
 
@@ -43,6 +46,8 @@ from lora_common import (
     sync_word_name,
 )
 
+log = logging.getLogger("gr4.waterfall")
+
 
 # ---- xterm-256color palette for waterfall ----
 # Map dB range to color ramp: dark navy -> teal -> green -> yellow -> warm orange
@@ -50,7 +55,7 @@ from lora_common import (
 # Avoids purple/violet tones for a more eye-soothing display.
 
 
-def _cube(r: int, g: int, b: int) -> int:  # noqa: E741
+def _cube(r: int, g: int, b: int) -> int:
     """xterm-256 6x6x6 cube index from r,g,b (each 0-5)."""
     return 16 + 36 * r + 6 * g + b
 
@@ -495,8 +500,8 @@ def format_header(
     fft_size: int,
     total_width: int,
     rx_gain: float | None,
-    last_decode: dict | None,
-    last_status: dict | None,
+    last_decode: dict[str, Any] | None,
+    last_status: dict[str, Any] | None,
     *,
     paused: bool = False,
     scroll_offset: int = 0,
@@ -542,7 +547,7 @@ def format_header(
     return "".join(buf)
 
 
-def _format_decode_line(decode: dict, width: int) -> str:
+def _format_decode_line(decode: dict[str, Any], width: int) -> str:
     """Format last-decode metadata + ASCII payload preview for header line 3."""
     crc_ok = decode.get("crc_valid", False)
     if crc_ok:
@@ -697,6 +702,17 @@ def redraw_from_history(
     return "".join(buf)
 
 
+def _compute_gain_scale(rx_gain: float, db_range: float) -> tuple[float, float]:
+    """Compute dB scale from RX gain.
+
+    Higher gain raises the noise floor in dBFS. At 0 dB gain the thermal
+    noise floor sits around -100 dBFS; each dB of gain lifts it ~1 dB.
+    """
+    db_min = -100.0 + rx_gain
+    db_max = db_min + db_range
+    return db_min, db_max
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Console waterfall display for lora_trx"
@@ -706,12 +722,6 @@ def main() -> None:
         metavar="HOST:PORT",
         default=None,
         help="lora_trx UDP address (default from config.toml or 127.0.0.1:5555)",
-    )
-    parser.add_argument(
-        "--config",
-        metavar="PATH",
-        default=None,
-        help="Path to config.toml",
     )
     parser.add_argument(
         "--bw-factor",
@@ -758,8 +768,8 @@ def main() -> None:
     args = parser.parse_args()
 
     # Resolve address
-    cfg = load_config(args.config)
-    log = setup_logging("gr4.waterfall", cfg, no_color=args.no_color)
+    cfg = load_config()
+    setup_logging("gr4.waterfall", cfg, no_color=args.no_color)
 
     host, port = resolve_udp_address(args.connect, cfg)
 
@@ -1201,17 +1211,6 @@ def main() -> None:
         termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
         sock.close()
         log.info("stopped (%d rendered, %d skipped)", frame_count, skip_count)
-
-
-def _compute_gain_scale(rx_gain: float, db_range: float) -> tuple[float, float]:
-    """Compute dB scale from RX gain.
-
-    Higher gain raises the noise floor in dBFS. At 0 dB gain the thermal
-    noise floor sits around -100 dBFS; each dB of gain lifts it ~1 dB.
-    """
-    db_min = -100.0 + rx_gain
-    db_max = db_min + db_range
-    return db_min, db_max
 
 
 if __name__ == "__main__":

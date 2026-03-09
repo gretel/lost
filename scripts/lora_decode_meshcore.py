@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cbor_stream import read_cbor_seq
-from lora_common import PAYLOAD_NAMES, ROUTE_NAMES, format_hex
+from lora_common import PAYLOAD_NAMES, ROUTE_NAMES, format_hex, sanitize_text
 
 NODE_TYPE_NAMES = {
     0x01: "chat",
@@ -141,7 +141,8 @@ def _parse_advert(pkt: MeshCorePacket) -> None:
         off += 2  # feature 2
 
     if (pkt.advert_flags & 0x80) and off < len(appdata):
-        pkt.advert_name = appdata[off:].decode("utf-8", errors="replace")
+        raw_name = appdata[off:].rstrip(b"\x00").decode("utf-8", errors="replace")
+        pkt.advert_name = sanitize_text(raw_name)
 
 
 def format_path(path: bytes) -> str:

@@ -24,7 +24,13 @@ from typing import Any
 
 import cbor2
 
-import lora_common
+from lora_common import (
+    format_hex,
+    load_config,
+    parse_host_port,
+    setup_logging,
+    sync_word_name,
+)
 
 DEFAULT_UPSTREAM = "127.0.0.1:5556"
 DEFAULT_LISTEN = "127.0.0.1:5555"
@@ -120,7 +126,7 @@ def format_frame_simple(msg: dict[str, Any]) -> str:
     seq = msg.get("seq", 0)
     cr = phy.get("cr", 0)
     sync_word = phy.get("sync_word", 0)
-    sw_label = lora_common.sync_word_name(sync_word)
+    sw_label = sync_word_name(sync_word)
     snr_db = phy.get("snr_db")
     rx_ch = msg.get("rx_channel")
 
@@ -142,7 +148,7 @@ def format_frame_simple(msg: dict[str, Any]) -> str:
 
     lines = [header]
     if payload:
-        lines.append("  " + lora_common.format_hex(payload, max_bytes=48))
+        lines.append("  " + format_hex(payload, max_bytes=48))
     return "\n".join(lines)
 
 
@@ -287,15 +293,18 @@ def run(args: argparse.Namespace) -> None:
     # Parse upstream addresses
     upstreams: list[tuple[str, int]] = []
     for up in args.upstream:
-        parts = up.rsplit(":", 1)
-        host = parts[0]
-        port = int(parts[1]) if len(parts) == 2 else 5556
-        upstreams.append((host, port))
+        try:
+            upstreams.append(parse_host_port(up, default_port=5556))
+        except ValueError as exc:
+            log.error("invalid upstream address %r: %s", up, exc)
+            raise SystemExit(1) from exc
 
     # Parse listen address
-    listen_parts = args.listen.rsplit(":", 1)
-    listen_host = listen_parts[0]
-    listen_port = int(listen_parts[1]) if len(listen_parts) == 2 else 5555
+    try:
+        listen_host, listen_port = parse_host_port(args.listen, default_port=5555)
+    except ValueError as exc:
+        log.error("invalid listen address %r: %s", args.listen, exc)
+        raise SystemExit(1) from exc
 
     # Create upstream sockets
     up_socks: list[socket.socket] = []
@@ -503,7 +512,7 @@ def run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    cfg = lora_common.load_config()
+    cfg = load_config()
 
     parser = argparse.ArgumentParser(
         description="LoRa frame aggregation — dedup multi-decoder output",
@@ -549,7 +558,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    lora_common.setup_logging("gr4.agg", cfg, debug=args.debug, no_color=args.no_color)
+    setup_logging("gr4.agg", cfg, debug=args.debug, no_color=args.no_color)
     run(args)
 
 

@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import socket
 import time
 from pathlib import Path
 from typing import Any
@@ -56,7 +55,6 @@ import duckdb
 
 from lora_common import (
     KEEPALIVE_INTERVAL,
-    RECV_TIMEOUT,
     create_udp_subscriber,
     load_config,
     resolve_udp_address,
@@ -123,7 +121,7 @@ def insert_frame(con: duckdb.DuckDBPyConnection, msg: dict[str, Any]) -> None:
             phy.get("snr_db"),
             phy.get("noise_floor_db"),
             len(payload),
-            payload.hex().upper() if payload else None,
+            payload.hex() if payload else None,
         ],
     )
 
@@ -159,7 +157,7 @@ def run_collector(host: str, port: int, db_path: str) -> None:
             try:
                 data, _addr = sock.recvfrom(65536)
                 waiting = False
-            except socket.timeout:
+            except TimeoutError:
                 sock.sendto(sub_msg, addr)
                 last_keepalive = time.monotonic()
                 if not waiting:
@@ -223,12 +221,6 @@ def main() -> None:
         help="lora_trx UDP server address (default from config.toml or 127.0.0.1:5555)",
     )
     parser.add_argument(
-        "--config",
-        metavar="PATH",
-        default=None,
-        help="Path to config.toml (auto-detected if omitted)",
-    )
-    parser.add_argument(
         "--db",
         metavar="PATH",
         default=DEFAULT_DB_PATH,
@@ -242,7 +234,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config()
     setup_logging("gr4.duckdb", cfg, no_color=args.no_color)
 
     try:

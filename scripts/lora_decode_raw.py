@@ -35,7 +35,7 @@ def decode_frame(msg: dict[str, Any]) -> dict[str, Any]:
         "payload": payload,
         "payload_len": msg.get("payload_len", len(payload)),
         "crc_valid": msg.get("crc_valid", False),
-        "cr": phy.get("cr", msg.get("cr", 0)),
+        "cr": phy.get("cr", 0),
         "sf": phy.get("sf", 0),
         "bw": phy.get("bw", 0),
         "sync_word": phy.get("sync_word", 0),

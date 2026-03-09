@@ -67,7 +67,7 @@ def print_json(msg: dict[str, Any]) -> None:
         "ts": msg.get("ts", ""),
         "crc_valid": msg.get("crc_valid", False),
         "is_downchirp": msg.get("is_downchirp", False),
-        "sync_word": 0x2B,
+        "sync_word": msg.get("phy", {}).get("sync_word", MESHTASTIC_SYNC_WORD),
         "payload_hex": format_hex(payload, sep=""),
         "payload_len": len(payload),
     }

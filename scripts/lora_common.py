@@ -20,7 +20,8 @@ import socket
 import sys
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
+from urllib.parse import quote
 
 import cbor2
 
@@ -215,7 +216,7 @@ DEFAULT_LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
 DEFAULT_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
 
 
-def _want_color(stream: Any) -> bool:
+def _want_color(stream: IO[Any]) -> bool:
     """Determine whether to use ANSI color on *stream*.
 
     Priority: ``NO_COLOR`` (off) > ``FORCE_COLOR`` (on) > ``isatty()``.
@@ -513,8 +514,6 @@ def build_contact_uri(
 
     This is the mobile app QR format documented in MeshCore/docs/qr_codes.md.
     """
-    from urllib.parse import quote
-
     params = []
     if name:
         params.append(f"name={quote(name, safe='')}")

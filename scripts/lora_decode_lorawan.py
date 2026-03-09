@@ -240,7 +240,7 @@ def print_text(msg: dict[str, Any], frame: LoRaWANFrame) -> None:
         print(f"  DevEUI:   {format_eui(frame.dev_eui)}")
         print(f"  DevNonce: {frame.dev_nonce}")
     elif frame.mtype == 1:  # JoinAccept
-        print(f"  (JoinAccept payload is encrypted)")
+        print("  (JoinAccept payload is encrypted)")
     elif frame.is_data:
         flags = []
         if frame.adr:

@@ -100,46 +100,14 @@ library); `region_scope` uses `sha256("#" + name)[:16]`.
 
 ---
 
-## meshcore_tx.py
-
-Builds and sends MeshCore wire packets directly to `lora_trx`.
-
-```sh
-meshcore_tx.py advert --name "MyNode"
-meshcore_tx.py advert --name "MyNode" --qr
-meshcore_tx.py send --dest <64hex> "Hello"
-meshcore_tx.py anon-req --dest <64hex> "Hello"
-meshcore_tx.py send --dest <64hex> "Hello" --dry-run
-```
-
-All subcommands: `--udp HOST:PORT`, `--identity`, `--freq`, `--sf`, `--bw`,
-`--route` (flood | direct | tc-flood | tc-direct).
-
----
-
 ## meshcore_crypto.py
 
-Shared crypto used by `lora_mon.py`, `meshcore_tx.py`, and
-`meshcore_bridge.py`. Not a CLI tool.
+Shared crypto used by `lora_mon.py` and `meshcore_bridge.py`. Not a CLI tool.
 
 Provides: Ed25519 identity management, X25519 ECDH (MeshCore-compatible —
 **not** interchangeable with libsodium's `sk_to_curve25519`), AES-128-ECB
 encrypt/decrypt, 2-byte HMAC-SHA256 MAC, ACK hash, key store load/save,
 trial decryption for TXT_MSG / ANON_REQ / GRP_TXT.
-
----
-
-## lora_mqtt.py
-
-Publishes decoded frames to letsmesh.net MQTT (TLS, port 443). Suppresses
-duplicates from dual-channel RX.
-
-```sh
-lora_mqtt.py --iata HAM
-lora_mqtt.py --iata HAM --connect 127.0.0.1:5555 --mqtt-host mqtt-eu-v1.letsmesh.net
-```
-
-Topic: `meshcore/<IATA>/<pubkey_hex>/packets`
 
 ---
 
@@ -149,12 +117,14 @@ Topic: `meshcore/<IATA>/<pubkey_hex>/packets`
 |--------|---------|
 | `cbor_stream.py` | CBOR Sequence (RFC 8742) reader for pipes and files |
 | `lora_common.py` | Config loading, constants, format helpers — shared library |
+| `lora_agg.py` | Frame aggregation service — dedup multi-decoder output, re-serve on :5555 |
 | `lora_decode_meshcore.py` | Offline MeshCore frame decoder |
 | `lora_decode_meshtastic.py` | Offline Meshtastic frame decoder |
 | `lora_decode_lorawan.py` | Offline LoRaWAN MAC decoder |
 | `lora_decode_raw.py` | Offline raw hex/ASCII dump of CBOR streams |
 | `lora_duckdb.py` | Log decoded frames to DuckDB |
 | `lora_waterfall.py` | Terminal waterfall display |
+| `lora_wav.py` | Synthesise chirp audio from frames, save as WAV |
 | `lora_trx.lua` | Wireshark dissector for lora_trx CBOR UDP frames |
 
 ---

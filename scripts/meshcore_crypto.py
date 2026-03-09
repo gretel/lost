@@ -21,6 +21,7 @@ import hashlib
 import hmac as hmac_mod
 import logging
 import os
+import shutil
 import struct
 import time
 from pathlib import Path
@@ -300,7 +301,7 @@ def parse_meshcore_header(data: bytes) -> dict | None:
         "ptype": ptype,
         "version": version,
         "off": off,
-        "path_len": data[off - path_len - 1] if path_len >= 0 else 0,
+        "path_len": path_len,
         "has_transport": has_transport,
     }
 
@@ -369,43 +370,24 @@ def try_decrypt_txt_msg(
     # Try our own pubkey hash as dest
     our_hash = our_pub[:PATH_HASH_SIZE]
 
+    def _extract_text(plaintext: bytes) -> str | None:
+        """Extract text from decrypted TXT_MSG plaintext."""
+        if len(plaintext) <= 5:
+            return None
+        txt_type = plaintext[4] >> 2
+        if txt_type == 0x02 and len(plaintext) > 9:
+            # Signed message: skip 4-byte sender pubkey prefix
+            return plaintext[9:].rstrip(b"\x00").decode("utf-8", errors="replace")
+        return plaintext[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
+
     for hex_key, pubkey_bytes in known_keys.items():
         secret = meshcore_shared_secret(our_prv, pubkey_bytes)
         if secret is None:
             continue
         plaintext = meshcore_mac_then_decrypt(secret, encrypted)
         if plaintext is not None:
-            # Verify hashes match (dest should be us, src should be them)
-            their_hash = pubkey_bytes[:PATH_HASH_SIZE]
-            if dest_hash == our_hash and src_hash == their_hash:
-                # Extract text: skip timestamp(4) + txt_type_attempt(1)
-                if len(plaintext) > 5:
-                    txt_type = plaintext[4] >> 2
-                    if txt_type == 0x02 and len(plaintext) > 9:
-                        # Signed message: skip 4-byte sender pubkey prefix
-                        text = (
-                            plaintext[9:]
-                            .rstrip(b"\x00")
-                            .decode("utf-8", errors="replace")
-                        )
-                    else:
-                        text = (
-                            plaintext[5:]
-                            .rstrip(b"\x00")
-                            .decode("utf-8", errors="replace")
-                        )
-                    return text, pubkey_bytes
-            # MAC matched but hash didn't — still return (could be for someone else)
-            if len(plaintext) > 5:
-                txt_type = plaintext[4] >> 2
-                if txt_type == 0x02 and len(plaintext) > 9:
-                    text = (
-                        plaintext[9:].rstrip(b"\x00").decode("utf-8", errors="replace")
-                    )
-                else:
-                    text = (
-                        plaintext[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
-                    )
+            text = _extract_text(plaintext)
+            if text is not None:
                 return text, pubkey_bytes
 
     return None
@@ -473,6 +455,9 @@ class GroupChannel:
         # Channel hash: first byte of SHA-256(psk_raw)
         self.hash = hashlib.sha256(psk_raw).digest()[:PATH_HASH_SIZE]
 
+    def __repr__(self) -> str:
+        return f"GroupChannel(name={self.name!r}, hash={self.hash.hex()})"
+
 
 PUBLIC_CHANNEL_PSK = bytes.fromhex("8b3387e9c5cdea6ac9e5edbaa115cd72")
 
@@ -535,8 +520,6 @@ def _seed_channels(channels_dir: Path) -> None:
         return
     try:
         channels_dir.mkdir(parents=True, exist_ok=True)
-        import shutil
-
         for src in SEED_CHANNELS_DIR.glob("*.channel"):
             dest = channels_dir / src.name
             if not dest.exists():

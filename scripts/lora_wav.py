@@ -40,10 +40,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import logging
 import math
 import queue
-import socket
 import struct
 import threading
 import time
@@ -55,7 +55,6 @@ import cbor2
 
 from lora_common import (
     KEEPALIVE_INTERVAL,
-    RECV_TIMEOUT,
     create_udp_subscriber,
     load_config,
     resolve_udp_address,
@@ -113,7 +112,7 @@ def _silence(n_samples: int) -> list[float]:
 
 
 def _cosine_fade(samples: list[float], fade_n: int) -> list[float]:
-    """Apply cosine fade-in and fade-out to *samples* (in-place clone)."""
+    """Apply cosine fade-in and fade-out to *samples*. Returns a new list."""
     s = list(samples)
     n = len(s)
     fade_n = min(fade_n, n // 2)
@@ -360,7 +359,10 @@ def save_wav(
       IKEY — machine-readable key=value pairs for resynthesis
     """
     left, right = stereo
-    assert len(left) == len(right), "left/right channels must be same length"
+    if len(left) != len(right):
+        raise ValueError(
+            f"left/right channels must be same length ({len(left)} vs {len(right)})"
+        )
 
     # Interleave L/R into a flat 16-bit PCM byte string
     n_frames = len(left)
@@ -372,8 +374,6 @@ def save_wav(
             for v in (int(lr[0] * 32767), int(lr[1] * 32767))
         ),
     )
-
-    import io
 
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -487,7 +487,7 @@ def run(
             try:
                 data, _addr = sock.recvfrom(65536)
                 waiting = False
-            except socket.timeout:
+            except TimeoutError:
                 sock.sendto(sub_msg, addr)
                 last_keepalive = time.monotonic()
                 if not waiting:
@@ -580,12 +580,6 @@ def main() -> None:
         help="lora_trx UDP server (default from config.toml or 127.0.0.1:5555)",
     )
     parser.add_argument(
-        "--config",
-        metavar="PATH",
-        default=None,
-        help="Path to config.toml (auto-detected if omitted)",
-    )
-    parser.add_argument(
         "--audio-dir",
         metavar="PATH",
         default=DEFAULT_AUDIO_DIR,
@@ -605,7 +599,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config()
     setup_logging("gr4.wav", cfg, no_color=args.no_color)
 
     try:
