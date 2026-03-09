@@ -520,15 +520,21 @@ class BridgeState:
         """Build NO_MORE_MSGS (0x0A) response."""
         return bytes([RESP_NO_MORE_MSGS])
 
-    def build_msg_sent(self, flood: bool = False) -> bytes:
+    def build_msg_sent(
+        self, flood: bool = False, ack_hash: bytes | None = None
+    ) -> bytes:
         """Build MSG_SENT (0x06) response.
 
         Byte 1 is routing_type: 1 = sent via flood, 0 = sent via direct route.
-        This matches the firmware's RESP_MSG_SENT semantics (not the command's
-        txt_type).
+        Bytes 2-5 are expected_ack: the 4-byte ACK hash the companion device
+        will send back (SHA-256(plaintext + sender_pub)[:4]).  meshcore-cli
+        uses this to match against PUSH_SEND_CONFIRMED.
         """
-        self.msg_seq += 1
-        ack_tag = struct.pack("<I", self.msg_seq)
+        if ack_hash is not None:
+            ack_tag = ack_hash[:4]
+        else:
+            self.msg_seq += 1
+            ack_tag = struct.pack("<I", self.msg_seq)
         timeout = struct.pack("<I", 30000)  # 30s suggested timeout
         routing_type = 1 if flood else 0
         return bytes([RESP_MSG_SENT, routing_type]) + ack_tag + timeout
@@ -762,9 +768,12 @@ def _match_pending_ack(ack_bytes: bytes, state: BridgeState) -> list[bytes]:
 
     if ack_bytes in state.pending_acks:
         _, dest_prefix = state.pending_acks.pop(ack_bytes)
-        # PUSH_SEND_CONFIRMED: [0x82, ack_code(6)]
-        # ack_code is the first 6 bytes of the destination pubkey prefix
-        push = bytes([PUSH_ACK]) + dest_prefix[:6].ljust(6, b"\x00")
+        # PUSH_SEND_CONFIRMED: [0x82, ack_code(4), trip_time(4)] = 9 bytes
+        # ack_code is the 4-byte ACK hash (same as expected_ack in MSG_SENT).
+        # meshcore_py reader.py reads bytes 1-4 as "code" and matches against
+        # the expected_ack from MSG_SENT. trip_time is zero (we don't track it).
+        trip_time = struct.pack("<I", 0)
+        push = bytes([PUSH_ACK]) + ack_bytes[:4] + trip_time
         log.info("ACK received for %s", ack_bytes.hex())
         return [push]
 
@@ -1540,12 +1549,12 @@ def _handle_send_txt_msg(
 
     # Build response and register expected ACK hash for tracking.
     # The companion device ACKs with SHA-256(plaintext + sender_pub)[:4].
-    # We must store the same hash so we can match the incoming ACK.
-    # The RESP_MSG_SENT carries msg_seq (opaque tag for the CLI's tracking),
-    # but pending_acks is keyed by the crypto hash that will arrive over RF.
+    # Both RESP_MSG_SENT (expected_ack field) and pending_acks must use the
+    # same crypto hash — meshcore-cli matches PUSH_ACK.code against
+    # MSG_SENT.expected_ack to confirm delivery.
     plaintext = struct.pack("<I", ts) + bytes([(0x00 << 2) | (attempt & 0x03)]) + text
     expected_ack = compute_ack_hash(plaintext, state.pub_key)
-    resp = state.build_msg_sent(flood=use_flood)
+    resp = state.build_msg_sent(flood=use_flood, ack_hash=expected_ack)
     state.pending_acks[expected_ack] = (time.monotonic(), dst_prefix)
 
     return [resp]

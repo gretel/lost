@@ -3040,6 +3040,68 @@ class TestSendTxtMsg(unittest.TestCase):
         # pending_acks should be consumed
         self.assertEqual(len(self.state.pending_acks), 0)
 
+    def test_push_ack_code_matches_msg_sent_expected_ack(self):
+        """CLI compatibility: PUSH_ACK ack_code must equal MSG_SENT expected_ack.
+
+        meshcore_py's reader parses PUSH_ACK (0x82) as:
+          [0x82] [ack_code(4)] [trip_time(4)]   # 9 bytes
+        send_msg_with_retry() waits for EventType.ACK with
+          attribute_filters={"code": expected_ack_hex}
+        where expected_ack is bytes 2-5 of RESP_MSG_SENT (0x06).
+
+        Both must carry the same 4-byte crypto ACK hash.
+        """
+        from meshcore_crypto import compute_ack_hash, ROUTE_FLOOD
+
+        dst_prefix = self._add_peer_contact()
+        text = b"ack-match"
+        ts = int(time.time())
+        ts_bytes = struct.pack("<I", ts)
+        cmd = (
+            bytes([bridge.CMD_SEND_TXT_MSG, 0x00, 0x00]) + ts_bytes + dst_prefix + text
+        )
+        responses = self._handle(cmd)
+        resp = responses[0]
+        self.assertEqual(resp[0], bridge.RESP_MSG_SENT)
+
+        # Extract expected_ack from MSG_SENT (bytes 2-5)
+        expected_ack = resp[2:6]
+
+        # Compute the crypto ACK hash the companion would send
+        plaintext = ts_bytes + bytes([0x00]) + text
+        crypto_ack = compute_ack_hash(plaintext, self.state.pub_key)
+
+        # MSG_SENT expected_ack must be the crypto hash (not msg_seq)
+        self.assertEqual(
+            expected_ack,
+            crypto_ack,
+            f"MSG_SENT expected_ack {expected_ack!r} must be "
+            f"crypto hash {crypto_ack!r}, not a sequential counter",
+        )
+
+        # Now simulate receiving the ACK and verify PUSH_ACK format
+        hdr = make_header(ROUTE_FLOOD, PAYLOAD_ACK)
+        ack_payload = bytes([hdr, 0]) + crypto_ack
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0},
+            "payload": ack_payload,
+        }
+        companion_msgs, _ = bridge.lora_frame_to_companion_msgs(frame, self.state)
+        self.assertEqual(len(companion_msgs), 1)
+        push = companion_msgs[0]
+
+        # PUSH_ACK format: [0x82] [ack_code(4)] [trip_time(4)] = 9 bytes
+        self.assertEqual(len(push), 9, f"PUSH_ACK must be 9 bytes, got {len(push)}")
+        self.assertEqual(push[0], bridge.PUSH_ACK)
+        push_ack_code = push[1:5]
+        self.assertEqual(
+            push_ack_code,
+            crypto_ack,
+            f"PUSH_ACK code {push_ack_code!r} must match crypto hash {crypto_ack!r}",
+        )
+
     def test_send_txt_msg_flood_contact_with_send_scope_uses_t_flood(self):
         """TXT_MSG to a flood contact (out_path_len=-1) with send_scope uses ROUTE_T_FLOOD.
 
