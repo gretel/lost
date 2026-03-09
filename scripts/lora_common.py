@@ -388,13 +388,38 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
 
 
 def config_udp_host(cfg: dict[str, Any]) -> str:
-    """Extract UDP host from config, defaulting to 127.0.0.1."""
-    return str(cfg.get("udp_listen", "127.0.0.1"))
+    """Extract UDP host from config (checks [network] section first, then flat keys)."""
+    net = cfg.get("network", {})
+    return str(net.get("udp_listen", cfg.get("udp_listen", "127.0.0.1")))
 
 
 def config_udp_port(cfg: dict[str, Any]) -> int:
-    """Extract UDP port from config, defaulting to 5555."""
-    return int(cfg.get("udp_port", 5555))
+    """Extract UDP port from config (checks [network] section first, then flat keys).
+
+    Returns the raw lora_trx port (default 5555 for empty config / legacy configs,
+    5556 for new sectioned configs that run lora_agg).  Scripts that want the
+    aggregated consumer stream should use config_agg_listen() instead.
+    """
+    net = cfg.get("network", {})
+    return int(net.get("udp_port", cfg.get("udp_port", 5555)))
+
+
+def config_agg_upstream(cfg: dict[str, Any]) -> str:
+    """Extract lora_agg upstream address (lora_trx raw port) from [aggregator] section."""
+    agg = cfg.get("aggregator", {})
+    return str(agg.get("upstream", cfg.get("agg_upstream", "127.0.0.1:5556")))
+
+
+def config_agg_listen(cfg: dict[str, Any]) -> str:
+    """Extract lora_agg consumer listen address from [aggregator] section."""
+    agg = cfg.get("aggregator", {})
+    return str(agg.get("listen", cfg.get("agg_listen", "127.0.0.1:5555")))
+
+
+def config_agg_window_ms(cfg: dict[str, Any]) -> int:
+    """Extract lora_agg diversity combining window (ms) from [aggregator] section."""
+    agg = cfg.get("aggregator", {})
+    return int(agg.get("window_ms", cfg.get("agg_window_ms", 200)))
 
 
 def config_region_scope(cfg: dict[str, Any]) -> str:

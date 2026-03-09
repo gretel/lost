@@ -25,6 +25,9 @@ from typing import Any
 import cbor2
 
 from lora_common import (
+    config_agg_listen,
+    config_agg_upstream,
+    config_agg_window_ms,
     format_hex,
     load_config,
     parse_host_port,
@@ -517,9 +520,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="LoRa frame aggregation — dedup multi-decoder output",
     )
-    default_upstream = cfg.get("agg_upstream", DEFAULT_UPSTREAM)
-    default_listen = cfg.get("agg_listen", DEFAULT_LISTEN)
-    default_window = int(cfg.get("agg_window_ms", DEFAULT_WINDOW_MS))
+    default_upstream = config_agg_upstream(cfg)
+    default_listen = config_agg_listen(cfg)
+    default_window = config_agg_window_ms(cfg)
 
     parser.add_argument(
         "--upstream",

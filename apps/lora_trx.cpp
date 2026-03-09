@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -126,8 +127,9 @@ gr::property_map filter_properties(const gr::property_map& src,
 // Override keys each block accepts (beyond the PHY keys already set explicitly).
 // FrameSync: energy_thresh, min_snr_db, max_symbols
 // DemodDecoder: impl_head, impl_cr, impl_pay_len, impl_has_crc, ldro_mode
-static constexpr std::array kFrameSyncOverrides    = {"energy_thresh", "min_snr_db", "max_symbols"};
-static constexpr std::array kDemodDecoderOverrides = {"impl_head", "impl_cr", "impl_pay_len", "impl_has_crc", "ldro_mode"};
+static constexpr std::array kFrameSyncOverrides = {"energy_thresh", "min_snr_db", "max_symbols"};
+static constexpr std::array kDemodDecoderOverrides = {
+    "impl_head", "impl_cr", "impl_pay_len", "impl_has_crc", "ldro_mode"};  // NOLINT(whitespace/indent_namespace)
 
 // Channel mapping: follows physical connector order on B210/B220 case.
 //   0 = TRX_A (chain A, TX/RX)   TX + RX
@@ -151,10 +153,14 @@ constexpr std::array<ChannelMap, 4> kChannelMap = {{
 // Per-decode-chain configuration.  Each entry produces one FrameSync +
 // DemodDecoder pair per radio channel.  Multiple DecodeConfig entries on
 // the same radio channel are split via a Splitter block.
+// All three identity keys (sf, sync_word, label) are required.
+// Block-level overrides (min_snr_db, energy_thresh, ldro_mode, impl_*)
+// are collected here from [[set_*.decode]] entries.
 struct DecodeConfig {
-    uint8_t     sf{8};
-    uint16_t    sync_word{0x12};
-    std::string label{};
+    uint8_t          sf{8};
+    uint16_t         sync_word{0x12};
+    std::string      label{};
+    gr::property_map block_overrides{};  ///< per-chain FrameSync/DemodDecoder overrides
 };
 
 struct TrxConfig {
@@ -183,8 +189,7 @@ struct TrxConfig {
     uint32_t             lbt_timeout_ms{2000};  ///< max wait for channel clear before rejecting TX
     uint32_t             tx_queue_depth{4};     ///< max queued TX requests (rejects when full)
 
-    gr::property_map     block_overrides{};    ///< flat block property overrides from codec section
-    std::vector<DecodeConfig> decode_configs{}; ///< per-chain decode configs (empty = use default sf/sync)
+    std::vector<DecodeConfig> decode_configs{};  ///< per-chain decode configs (at least one required)
 };
 
 // --- UDP state (owned by main thread) ---
@@ -216,7 +221,7 @@ struct UdpState {
         sendToAll(buf, nullptr);
     }
 
-private:
+ private:
     void sendToAll(const std::vector<uint8_t>& buf, const uint16_t* filter_sw) {
         std::lock_guard<std::mutex> lock(mutex);
         std::erase_if(clients, [](const auto& c) {
@@ -237,8 +242,7 @@ private:
         }
     }
 
-public:
-
+ public:
     static bool sockaddr_equal(const struct sockaddr_storage& a,
                                const struct sockaddr_storage& b) {
         if (a.ss_family != b.ss_family) return false;
@@ -323,14 +327,26 @@ void print_usage() {
 int parse_args(int argc, char* argv[], TrxConfig& cfg, std::string& config_path) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") { print_usage(); return 2; }
+        if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 2;
+        }
         if (arg == "--version") {
             std::fprintf(stderr, "lora_trx %s\n", GIT_REV);
             return 2;
         }
-        if (arg == "--config" && i + 1 < argc) { config_path = argv[++i]; continue; }
-        if (arg == "--debug") { cfg.debug = true; continue; }
-        if (arg == "--no-lbt") { cfg.lbt = false; continue; }
+        if (arg == "--config" && i + 1 < argc) {
+            config_path = argv[++i];
+            continue;
+        }
+        if (arg == "--debug") {
+            cfg.debug = true;
+            continue;
+        }
+        if (arg == "--no-lbt") {
+            cfg.lbt = false;
+            continue;
+        }
         std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
         print_usage();
         return 1;
@@ -353,29 +369,65 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
         return {};
     }
 
-    // --- Global defaults ---
-    std::string g_device     = tbl["device"].value_or<std::string>("uhd");
-    std::string g_param      = tbl["param"].value_or<std::string>("type=b200");
-    auto        g_rate       = static_cast<float>(tbl["rate"].value_or(250'000.0));
-    std::string g_clock      = tbl["clock"].value_or<std::string>("");
-    std::string g_listen     = tbl["udp_listen"].value_or<std::string>("127.0.0.1");
-    int64_t     g_port       = tbl["udp_port"].value_or(int64_t{5556});
-    int64_t     g_status_int = tbl["status_interval"].value_or(int64_t{10});
-    bool        g_debug      = debug;
+    // --- [device] section (falls back to flat top-level keys for compatibility) ---
+    auto* dev_tbl = tbl["device"].as_table();
+    auto dev_or_s = [&](std::string_view key, std::string def) -> std::string {
+        if (dev_tbl) {
+            if (auto v = dev_tbl->at_path(key).value<std::string>()) return *v;
+        }
+        if (auto v = tbl[key].value<std::string>()) return *v;
+        return def;
+    };
+    auto dev_or_d = [&](std::string_view key, double def) -> double {
+        if (dev_tbl) {
+            if (auto v = dev_tbl->at_path(key).value<double>()) return *v;
+        }
+        if (auto v = tbl[key].value<double>()) return *v;
+        return def;
+    };
+    std::string g_device = dev_or_s("driver", dev_or_s("device", "uhd"));
+    std::string g_param  = dev_or_s("param", "type=b200");
+    auto        g_rate   = static_cast<float>(dev_or_d("rate", 250'000.0));
+    std::string g_clock  = dev_or_s("clock", "");
 
-    // LBT defaults (global level in TOML)
-    bool        g_lbt        = tbl["lbt"].value_or(true);
-    int64_t     g_lbt_tmo    = tbl["lbt_timeout_ms"].value_or(int64_t{2000});
-    int64_t     g_tx_qdepth  = tbl["tx_queue_depth"].value_or(int64_t{4});
+    // --- [network] section (falls back to flat top-level keys for compatibility) ---
+    auto* net_tbl = tbl["network"].as_table();
+    auto net_or_s = [&](std::string_view key, std::string def) -> std::string {
+        if (net_tbl) {
+            if (auto v = net_tbl->at_path(key).value<std::string>()) return *v;
+        }
+        if (auto v = tbl[key].value<std::string>()) return *v;
+        return def;
+    };
+    auto net_or_i = [&](std::string_view key, int64_t def) -> int64_t {
+        if (net_tbl) {
+            if (auto v = net_tbl->at_path(key).value<int64_t>()) return *v;
+        }
+        if (auto v = tbl[key].value<int64_t>()) return *v;
+        return def;
+    };
+    auto net_or_b = [&](std::string_view key, bool def) -> bool {
+        if (net_tbl) {
+            if (auto v = net_tbl->at_path(key).value<bool>()) return *v;
+        }
+        if (auto v = tbl[key].value<bool>()) return *v;
+        return def;
+    };
+    std::string g_listen     = net_or_s("udp_listen", "127.0.0.1");
+    int64_t     g_port       = net_or_i("udp_port", int64_t{5556});
+    int64_t     g_status_int = net_or_i("status_interval", int64_t{10});
+    bool        g_lbt        = net_or_b("lbt", true);
+    int64_t     g_lbt_tmo    = net_or_i("lbt_timeout_ms", int64_t{2000});
+    int64_t     g_tx_qdepth  = net_or_i("tx_queue_depth", int64_t{4});
+    bool        g_debug      = debug;
 
     // --- Collect codec and radio sections ---
     struct CodecCfg {
-        uint8_t          sf{8};
-        uint32_t         bw{62'500};
-        uint8_t          cr{4};        // stored as offset (1-4) internally
-        uint16_t         sync{0x12};
-        uint16_t         preamble{8};
-        gr::property_map block_overrides{};
+        uint8_t  sf{8};         ///< TX spreading factor (decode chains specify their own)
+        uint32_t bw{62'500};
+        uint8_t  cr{4};         ///< stored as offset (1-4) internally
+        uint16_t sync{0x12};
+        uint16_t preamble{8};
     };
     struct RadioCfg {
         double               freq{869'618'000.0};
@@ -395,6 +447,7 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
 
         if (skey.starts_with("codec_")) {
             CodecCfg c;
+            // sf is optional in [codec_*] — used for TX only; decode chains set their own
             c.sf       = static_cast<uint8_t>(section["sf"].value_or(int64_t{8}));
             c.bw       = static_cast<uint32_t>(section["bw"].value_or(int64_t{62'500}));
             c.preamble = static_cast<uint16_t>(section["preamble_len"].value_or(int64_t{8}));
@@ -408,28 +461,6 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
                 std::fprintf(stderr, "ERROR: [%s] cr must be 5-8 (denominator), got %u\n",
                              skey.c_str(), cr_val);
                 return {};
-            }
-            // Collect flat block property overrides (all non-PHY keys).
-            // Each block applies only the keys it recognises; unknown keys
-            // are silently ignored by GR4's applyStagedParameters().
-            static constexpr std::array kPhyKeys = {
-                "sf", "bw", "cr", "sync_word", "preamble_len",
-            };
-            for (const auto& [okey, oval] : section) {
-                std::string ok_str(okey.str());
-                if (std::ranges::find(kPhyKeys, ok_str) != kPhyKeys.end()) continue;
-                if (oval.is_table()) continue;  // skip unknown sub-tables
-                // Re-use toml_to_property_map's type logic via a single-entry table
-                toml::table tmp;
-                tmp.insert(okey, oval);
-                auto single = toml_to_property_map(tmp);
-                for (auto& [pk, pv] : single) {
-                    c.block_overrides.insert_or_assign(pk, pv);
-                }
-            }
-            if (g_debug && !c.block_overrides.empty()) {
-                std::fprintf(stderr, "  [%s] %zu block override(s)\n",
-                             skey.c_str(), c.block_overrides.size());
             }
 
             codecs[skey] = c;
@@ -482,6 +513,11 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
 
     std::vector<TrxConfig> configs;
 
+    // Keys that identify a decode chain entry — not block property overrides.
+    static constexpr std::array kDecodeIdentityKeys = {
+        std::string_view{"sf"}, std::string_view{"sync_word"}, std::string_view{"label"},
+    };
+
     for (const auto& [skey, _pos] : set_keys) {
         auto& section = *tbl[skey].as_table();
 
@@ -522,7 +558,6 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
         cfg.lbt          = g_lbt;
         cfg.lbt_timeout_ms  = static_cast<uint32_t>(g_lbt_tmo);
         cfg.tx_queue_depth  = static_cast<uint32_t>(g_tx_qdepth);
-        cfg.block_overrides = codec.block_overrides;
         // Set-level
         cfg.name    = section["name"].value_or(std::string(skey));
         // Radio
@@ -538,28 +573,69 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
         cfg.sync     = codec.sync;
         cfg.preamble = codec.preamble;
 
-        // Parse optional [[decode]] array for multi-SF / multi-sync-word decode.
-        // If absent, a single DecodeConfig using the codec's sf/sync_word is used.
+        // Parse [[set_X.decode]] array — required, at least one entry.
+        // Each entry specifies a decode chain with sf, sync_word, label (all required)
+        // plus optional block property overrides (min_snr_db, energy_thresh, etc.).
         if (auto* decode_arr = section["decode"].as_array()) {
             for (auto& elem : *decode_arr) {
                 if (!elem.is_table()) continue;
                 auto& dtbl = *elem.as_table();
                 DecodeConfig dc;
-                dc.sf = static_cast<uint8_t>(
-                    dtbl["sf"].value_or(static_cast<int64_t>(codec.sf)));
-                dc.sync_word = static_cast<uint16_t>(
-                    dtbl["sync_word"].value_or(static_cast<int64_t>(codec.sync)));
-                dc.label = dtbl["label"].value_or(std::string(""));
+
+                auto sf_opt = dtbl["sf"].value<int64_t>();
+                if (!sf_opt) {
+                    std::fprintf(stderr, "ERROR: [[%s.decode]] entry missing required key 'sf'\n",
+                                 skey.c_str());
+                    return {};
+                }
+                dc.sf = static_cast<uint8_t>(*sf_opt);
+
+                auto sw_opt = dtbl["sync_word"].value<int64_t>();
+                if (!sw_opt) {
+                    std::fprintf(stderr, "ERROR: [[%s.decode]] entry missing required key 'sync_word'\n",
+                                 skey.c_str());
+                    return {};
+                }
+                dc.sync_word = static_cast<uint16_t>(*sw_opt);
+
+                auto lbl_opt = dtbl["label"].value<std::string>();
+                if (!lbl_opt || lbl_opt->empty()) {
+                    std::fprintf(stderr, "ERROR: [[%s.decode]] entry missing required key 'label'\n",
+                                 skey.c_str());
+                    return {};
+                }
+                dc.label = *lbl_opt;
+
+                // Collect remaining keys as block property overrides
+                for (const auto& [okey, oval] : dtbl) {
+                    std::string ok_str(okey.str());
+                    if (std::ranges::any_of(kDecodeIdentityKeys,
+                                            [&](auto k) { return k == ok_str; })) {
+                        continue;
+                    }
+                    if (oval.is_table()) continue;
+                    toml::table tmp;
+                    tmp.insert(okey, oval);
+                    auto single = toml_to_property_map(tmp);
+                    for (auto& [pk, pv] : single)
+                        dc.block_overrides.insert_or_assign(pk, pv);
+                }
+
+                if (g_debug && !dc.block_overrides.empty()) {
+                    std::fprintf(stderr, "  [[%s.decode]] '%s': %zu override(s)\n",
+                                 skey.c_str(), dc.label.c_str(),
+                                 dc.block_overrides.size());
+                }
+
                 cfg.decode_configs.push_back(std::move(dc));
             }
         }
-        // If no [[decode]] entries, create one from the codec defaults
         if (cfg.decode_configs.empty()) {
-            cfg.decode_configs.push_back({
-                .sf = codec.sf,
-                .sync_word = codec.sync,
-                .label = cfg.name,
-            });
+            std::fprintf(stderr,
+                "ERROR: [%s] requires at least one [[%s.decode]] entry "
+                "(sf, sync_word, label are required)\n",
+                skey.c_str(), skey.c_str());
+            return {};
         }
 
         if (g_debug) {
@@ -670,7 +746,7 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
     gr::lora::TxQueueSource* src_ptr = nullptr;
     for (auto& blk : tx_block_list) {
         if (blk->typeName().find("TxQueueSource") != std::string_view::npos) {
-            src_ptr = static_cast<gr::lora::TxQueueSource*>(blk->raw()); // BlockWrapper holds block as member, not base
+            src_ptr = static_cast<gr::lora::TxQueueSource*>(blk->raw());  // BlockWrapper holds block as member
             break;
         }
     }
@@ -858,7 +934,7 @@ DecodePair add_decode_pair(gr::Graph& graph, const TrxConfig& cfg,
         {"rx_channel", rx_channel},
         {"debug", cfg.debug},
     };
-    merge_properties(sync_props, filter_properties(cfg.block_overrides, kFrameSyncOverrides));
+    merge_properties(sync_props, filter_properties(dc.block_overrides, kFrameSyncOverrides));
     auto& sync = graph.emplaceBlock<gr::lora::FrameSync>(std::move(sync_props));
     sync._spectrum_state = std::move(spectrum);
 
@@ -867,7 +943,7 @@ DecodePair add_decode_pair(gr::Graph& graph, const TrxConfig& cfg,
         {"bandwidth", cfg.bw},
         {"debug", cfg.debug},
     };
-    merge_properties(demod_props, filter_properties(cfg.block_overrides, kDemodDecoderOverrides));
+    merge_properties(demod_props, filter_properties(dc.block_overrides, kDemodDecoderOverrides));
     auto& demod = graph.emplaceBlock<gr::lora::DemodDecoder>(std::move(demod_props));
 
     auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
@@ -889,6 +965,7 @@ auto& add_decode_chain(gr::Graph& graph, const TrxConfig& cfg,
         {"sync_word", dc.sync_word},
         {"phy_sf", dc.sf},
         {"phy_bw", cfg.bw},
+        {"label", dc.label},
     });
     sink._frame_callback = callback;
 
@@ -920,7 +997,7 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                          std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
                          std::atomic<bool>* channel_busy = nullptr) {
     auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
-    using namespace std::string_literals;
+    using std::string_literals::operator""s;
 
     const auto& decodes = cfg.decode_configs;
     const auto nRadio = cfg.rx_channels.size();
@@ -1042,13 +1119,15 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
 
                     // Per-chain sink
                     auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-                        {"sync_word", cfg.sync},
-                        {"phy_sf", cfg.sf},
+                        {"sync_word", decodes[0].sync_word},
+                        {"phy_sf", decodes[0].sf},
                         {"phy_bw", cfg.bw},
+                        {"label", decodes[0].label},
                     });
                     sink._frame_callback = callback;
                     if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
-                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink (chain %zu)\n", chain_idx);
+                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink"
+                                    " (chain %zu)\n", chain_idx);
                     }
                 } else {
                     // No CAD, no splitter needed — direct connection
@@ -1057,17 +1136,20 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         graph, cfg, rx_ch, decodes[0],
                         firstChain ? spectrum : nullptr);
                     if (!connectPort(r, sync)) {
-                        std::fprintf(stderr, "ERROR: failed to connect source -> FrameSync (radio %zu)\n", r);
+                        std::fprintf(stderr, "ERROR: failed to connect source -> FrameSync (radio %zu)\n",
+                                    r);
                     }
 
                     auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-                        {"sync_word", cfg.sync},
-                        {"phy_sf", cfg.sf},
+                        {"sync_word", decodes[0].sync_word},
+                        {"phy_sf", decodes[0].sf},
                         {"phy_bw", cfg.bw},
+                        {"label", decodes[0].label},
                     });
                     sink._frame_callback = callback;
                     if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
-                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink (chain %zu)\n", chain_idx);
+                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink"
+                                    " (chain %zu)\n", chain_idx);
                     }
                 }
                 chain_idx++;
@@ -1091,18 +1173,21 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
 
                     auto splitterPort = "out#"s + std::to_string(d);
                     if (!ok(graph.connect(splitter, splitterPort, sync, "in"s))) {
-                        std::fprintf(stderr, "ERROR: failed to connect Splitter -> FrameSync (chain %zu)\n", chain_idx);
+                        std::fprintf(stderr, "ERROR: failed to connect Splitter -> FrameSync (chain %zu)\n",
+                                    chain_idx);
                     }
 
                     // Per-chain sink
                     auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-                        {"sync_word", cfg.sync},
-                        {"phy_sf", cfg.sf},
+                        {"sync_word", decodes[d].sync_word},
+                        {"phy_sf", decodes[d].sf},
                         {"phy_bw", cfg.bw},
+                        {"label", decodes[d].label},
                     });
                     sink._frame_callback = callback;
                     if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
-                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink (chain %zu)\n", chain_idx);
+                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink"
+                                    " (chain %zu)\n", chain_idx);
                     }
                     chain_idx++;
                 }
@@ -1191,35 +1276,13 @@ struct SharedStatus {
     std::atomic<uint64_t> overflow_count{0};
 };
 
-// Encode a property_map as a CBOR sub-map (key: text, value: typed).
-void encode_property_map(std::vector<uint8_t>& buf, const gr::property_map& props) {
-    namespace cbor = gr::lora::cbor;
-    cbor::encode_map_begin(buf, static_cast<uint32_t>(props.size()));
-    for (const auto& [key, val] : props) {
-        std::string k(key);
-        [&] {
-            if (auto* pf  = val.get_if<float>())    { cbor::kv_float64(buf, k, static_cast<double>(*pf)); return; }
-            if (auto* pd  = val.get_if<double>())    { cbor::kv_float64(buf, k, *pd); return; }
-            if (auto* pb  = val.get_if<bool>())      { cbor::kv_uint(buf, k, *pb ? 1U : 0U); return; }
-            if (auto* pu8 = val.get_if<uint8_t>())   { cbor::kv_uint(buf, k, *pu8); return; }
-            if (auto* pu16= val.get_if<uint16_t>())  { cbor::kv_uint(buf, k, *pu16); return; }
-            if (auto* pu32= val.get_if<uint32_t>())  { cbor::kv_uint(buf, k, *pu32); return; }
-            if (auto* pi32= val.get_if<int32_t>())   { cbor::kv_uint(buf, k, static_cast<uint64_t>(*pi32)); return; }
-            if (auto* pi64= val.get_if<int64_t>())   { cbor::kv_uint(buf, k, static_cast<uint64_t>(*pi64)); return; }
-            cbor::kv_text(buf, k, "?");
-        }();
-    }
-}
-
 /// Build a CBOR "config" message — sent once on subscribe.
 std::vector<uint8_t> build_config_cbor(const TrxConfig& cfg) {
     namespace cbor = gr::lora::cbor;
     std::vector<uint8_t> buf;
     buf.reserve(256);
 
-    uint32_t top_keys = 3;
-    if (!cfg.block_overrides.empty()) top_keys++;
-    cbor::encode_map_begin(buf, top_keys);
+    cbor::encode_map_begin(buf, 4);
     cbor::kv_text(buf, "type", "config");
 
     cbor::encode_text(buf, "phy");
@@ -1239,9 +1302,14 @@ std::vector<uint8_t> build_config_cbor(const TrxConfig& cfg) {
     cbor::kv_uint(buf, "status_interval", cfg.status_interval);
     cbor::kv_float64(buf, "sample_rate", static_cast<double>(cfg.rate));
 
-    if (!cfg.block_overrides.empty()) {
-        cbor::encode_text(buf, "block_overrides");
-        encode_property_map(buf, cfg.block_overrides);
+    // Decode chain summary
+    cbor::encode_text(buf, "decode_chains");
+    cbor::encode_array_begin(buf, static_cast<uint32_t>(cfg.decode_configs.size()));
+    for (const auto& dc : cfg.decode_configs) {
+        cbor::encode_map_begin(buf, 3);
+        cbor::kv_text(buf, "label", dc.label);
+        cbor::kv_uint(buf, "sf", dc.sf);
+        cbor::kv_uint(buf, "sync_word", dc.sync_word);
     }
 
     return buf;
@@ -1483,7 +1551,7 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
     return ok;
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char* argv[]) {
     TrxConfig cfg;  // holds defaults for parse_args (only debug is set there)
@@ -1730,9 +1798,9 @@ int main(int argc, char* argv[]) {
                                             &channel_busy);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> rx_sched;
-    rx_sched.timeout_inactivity_count  = 1U;  // sleep after 1 idle cycle; SoapySource notifies progress on data
-    rx_sched.watchdog_min_stall_count  = 10U; // suppress watchdog log for ≤10s gaps (normal inter-frame silence at SF8)
-    rx_sched.watchdog_max_warnings     = 30U; // 30s of continuous stall → ERROR
+    rx_sched.timeout_inactivity_count  = 1U;   // sleep after 1 idle cycle; SoapySource notifies progress on data
+    rx_sched.watchdog_min_stall_count  = 10U;  // suppress watchdog for ≤10s gaps (normal inter-frame silence)
+    rx_sched.watchdog_max_warnings     = 30U;  // 30s of continuous stall → ERROR
     if (auto ret = rx_sched.exchange(std::move(rx_graph)); !ret) {
         std::fprintf(stderr, "ERROR: RX scheduler init failed\n");
         tx_sched->requestStop();
@@ -1765,7 +1833,7 @@ int main(int argc, char* argv[]) {
             auto err = std::format("{}", ret.error());
             std::fprintf(stderr, "\n--- RX scheduler stopped ---\n");
             std::fprintf(stderr, "  error:     %s\n", err.c_str());
-            std::fprintf(stderr, "  uptime:    %llds\n", static_cast<long long>(uptime));
+            std::fprintf(stderr, "  uptime:    %" PRId64 "s\n", static_cast<int64_t>(uptime));
             std::fprintf(stderr, "  frames:    %u (crc_ok: %u, crc_fail: %u)\n",
                          shared_status.frame_count.load(),
                          shared_status.crc_ok.load(),
@@ -1852,7 +1920,7 @@ int main(int argc, char* argv[]) {
                     auto now = std::chrono::steady_clock::now();
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         now - last_status).count();
-                    if (elapsed >= static_cast<long>(cfg.status_interval)) {
+                    if (elapsed >= static_cast<int64_t>(cfg.status_interval)) {
                         // Sync overflow counter from source block
                         if (overflow_ptr) {
                             shared_status.overflow_count.store(

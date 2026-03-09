@@ -1,39 +1,43 @@
 # lora_trx configuration
 #
-# [codec_*]   LoRa PHY parameters and block property overrides
-# [radio_*]   RF frontend: frequency, channels, gains
-# [set_*]     binds a codec to a radio
-# [meshcore]  MeshCore protocol settings
-# [logging]   Python script log configuration
+# [device]      SDR hardware: driver, parameters, sample rate, clock
+# [network]     UDP I/O: listen address, port, status, TX queue, LBT
+# [aggregator]  lora_agg.py: upstream/listen addresses, combining window
+# [codec_*]     LoRa PHY parameters: bw, cr, sync_word, preamble_len
+# [radio_*]     RF frontend: frequency, channels, gains
+# [set_*]       binds a codec to a radio; REQUIRES [[set_*.decode]] entries
+# [meshcore]    MeshCore protocol settings (Python scripts only)
+# [logging]     Python script log configuration
 #
 # The first [set_*] (by file order) is used at runtime.
-# CR is the denominator (5–8) of the LoRa coding rate 4/N.
-#
-# Block property overrides (FrameSync, DemodDecoder)
-# go flat in the codec section. Each block applies only the keys it
-# recognises and silently ignores the rest.
+# CR is the denominator (5-8) of the LoRa coding rate 4/N.
 #
 # B210/B220 channel mapping:
 #   0 = TRX_A  (TX/RX)    1 = RX_A  (RX only)
 #   2 = RX_B   (RX only)  3 = TRX_B (TX/RX)
 # TX only on channels 0 and 3.  Both chains share one PLL per direction.
 
-# TODO: add "device" block
-device = "uhd"
-param = "type=b200"
-rate = 250000
+[device]
+driver = "uhd"
+param  = "type=b200"
+rate   = 250000
 # internal, external, gpsdo
-clock = "external"
+clock  = "external"
 
-# TODO: add "network" block
-udp_listen = "127.0.0.1"
-udp_port = 5556    # raw port; lora_agg subscribes here and serves consumers on 5555
+[network]
+udp_listen      = "127.0.0.1"
+udp_port        = 5556          # lora_trx raw port; lora_agg subscribes here
 status_interval = 10
 
 # Listen-before-talk: defer TX until CAD detects no channel activity
-lbt = true
-lbt_timeout_ms = 2000   # max wait for channel clear before rejecting TX
-tx_queue_depth = 4       # max queued TX requests (rejects when full)
+lbt            = true
+lbt_timeout_ms = 2000           # max wait for channel clear before rejecting TX
+tx_queue_depth = 4              # max queued TX requests (rejects when full)
+
+[aggregator]
+upstream  = "127.0.0.1:5556"   # lora_trx raw port (lora_agg subscribes here)
+listen    = "127.0.0.1:5555"   # consumer-facing port served by lora_agg
+window_ms = 200                 # diversity combining window in milliseconds
 
 [meshcore]
 # port              = 7834                         # TCP listen port (avoid 5000 on macOS)
@@ -55,71 +59,87 @@ flood_scope       = "de-hh"                        # flood scope (SET_FLOOD_SCOP
 [logging]
 level = "INFO"
 
+# --- PHY codecs ---
+# [codec_*] contains PHY-only parameters: bw, cr, sync_word, preamble_len.
+# sf is specified per decode chain in [[set_*.decode]].
+# Block-level overrides (min_snr_db, energy_thresh, ldro_mode, impl_*)
+# belong in [[set_*.decode]], not here.
+
 [codec_meshcore_868]
-sf = 8
-bw = 62500
-cr = 8
-sync_word = 0x12
-preamble_len = 8
-min_snr_db = -19.0
-# energy_thresh = 1e-6
-# max_symbols = 256
-# ldro_mode = 2
-# impl_head = false
-# impl_cr = 4
-# impl_pay_len = 0
-# impl_has_crc = true
-# timeout_symbols = 30
-
-[codec_meshcore_433]
-sf = 11
-bw = 250000
-cr = 5
-sync_word = 0x12
+bw           = 62500
+cr           = 8
+sync_word    = 0x12
 preamble_len = 8
 
-[codec_reticulum_868]
-sf = 8
-bw = 125000
-cr = 5
-sync_word = 0x12
-preamble_len = 8
+# --- Radio frontends ---
 
 [radio_868]
-freq = 869618000
+freq       = 869618000
 rx_channel = [1, 2]
 tx_channel = 0
-rx_gain = 38
-tx_gain = 50
+rx_gain    = 35
+tx_gain    = 50
 
-[radio_433]
-freq = 433650000
-rx_channel = [2]
-tx_channel = 3
-rx_gain = 34
-tx_gain = 50
+# --- Active network sets ---
+# The first [set_*] by file order is used at runtime.
+# [[set_*.decode]] entries are REQUIRED (at least one per [set_*]).
+# Each entry creates one FrameSync + DemodDecoder + FrameSink chain per
+# radio channel.  Keys sf, sync_word, and label are all required.
+# Block-level overrides go here, one set per decode chain.
 
 [set_meshcore_868]
-name = "MeshCore 868 MHz"
+name  = "MeshCore 868 MHz"
 codec = "codec_meshcore_868"
 radio = "radio_868"
 
-# Optional: multiple decode chains per radio channel.
-# Each [[set_meshcore_868.decode]] entry creates a FrameSync+DemodDecoder
-# pair (with a Splitter when >1 entry).  Each chain has its own FrameSink.
-# If omitted, uses the codec's sf/sync_word.
-#
-# [[set_meshcore_868.decode]]
-# sf = 8
-# sync_word = 0x12
-# label = "meshcore"
+[[set_meshcore_868.decode]]
+label      = "meshcore"
+sf         = 8
+sync_word  = 0x12
+min_snr_db = -19.0
+# energy_thresh   = 1e-6
+# max_symbols     = 256
+# ldro_mode       = 2
+# impl_head       = false
+# impl_cr         = 4
+# impl_pay_len    = 0
+# impl_has_crc    = true
+# timeout_symbols = 30
 
+# Example: decode Meshtastic on the same radio in parallel
 # [[set_meshcore_868.decode]]
-# sf = 7
-# sync_word = 0x2B
-# label = "meshtastic"
+# label      = "meshtastic"
+# sf         = 7
+# sync_word  = 0x2B
+# min_snr_db = -15.0
+
+# --- Inactive networks (examples) ---
+
+# [codec_meshcore_433]
+# bw           = 250000
+# cr           = 5
+# sync_word    = 0x12
+# preamble_len = 8
+
+# [codec_reticulum_868]
+# bw           = 125000
+# cr           = 5
+# sync_word    = 0x12
+# preamble_len = 8
+
+# [radio_433]
+# freq       = 433650000
+# rx_channel = [2]
+# tx_channel = 3
+# rx_gain    = 34
+# tx_gain    = 50
 
 # [set_meshcore_433]
-# name = "MeshCore 433 MHz"
+# name  = "MeshCore 433 MHz"
 # codec = "codec_meshcore_433"
 # radio = "radio_433"
+# [[set_meshcore_433.decode]]
+# label      = "meshcore"
+# sf         = 11
+# sync_word  = 0x12
+# min_snr_db = -15.0

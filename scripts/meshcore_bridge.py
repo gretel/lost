@@ -2155,7 +2155,13 @@ def main() -> None:
             codec = cfg.get(codec_name, {})
             radio = cfg.get(radio_name, {})
             if codec:
-                sf = codec.get("sf", sf)
+                # sf is now in [[set_*.decode]] entries; fall back to codec for compat
+                decode_entries = val.get("decode", [])
+                sf = (
+                    decode_entries[0].get("sf", codec.get("sf", sf))
+                    if decode_entries
+                    else codec.get("sf", sf)
+                )
                 bw_khz = codec.get("bw", bw_khz * 1000) / 1000
                 cr = codec.get("cr", cr + 4) - 4  # denominator -> offset
             if radio:

@@ -46,8 +46,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     uint16_t    sync_word{0x12};
     uint8_t     phy_sf{8};
     uint32_t    phy_bw{62500};
+    std::string label{};    ///< decode chain label — emitted as "decode_label" in CBOR output
 
-    GR_MAKE_REFLECTABLE(FrameSink, in, udp_dest, cbor_stdout, sync_word, phy_sf, phy_bw);
+    GR_MAKE_REFLECTABLE(FrameSink, in, udp_dest, cbor_stdout, sync_word, phy_sf, phy_bw, label);
 
     uint32_t             _pay_len{0};
     uint8_t              _cr{4};
@@ -113,7 +114,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
             static_cast<unsigned>((hi >> 16) & 0xFFFFU),
             static_cast<unsigned>(hi & 0xFFFFU),
             static_cast<unsigned>(lo >> 48),
-            static_cast<unsigned long long>(lo & 0x0000FFFFFFFFFFFFULL));
+            static_cast<uint64_t>(lo & 0x0000FFFFFFFFFFFFULL));
         return out;
     }
 
@@ -152,7 +153,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     }
 
     void start() {
-        _rng.seed(std::random_device{}());
+        _rng.seed(std::random_device {}());
 
         if (udp_dest.empty()) return;
 
@@ -269,6 +270,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         if (_rx_channel >= 0) {
             std::printf("  ch=%d", static_cast<int>(_rx_channel));
         }
+        if (!label.empty()) {
+            std::printf("  [%s]", label.c_str());
+        }
         if (_is_downchirp) {
             std::printf("  (downchirp)");
         }
@@ -294,6 +298,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         uint32_t top_fields = 11;  // type, ts, seq, phy, payload, payload_len,
                                    // crc_valid, cr, is_downchirp, id, payload_hash
         if (_rx_channel >= 0) top_fields++;
+        if (!label.empty()) top_fields++;
 
         cbor::encode_map_begin(buf, top_fields);
         cbor::kv_text(buf, "type", "lora_frame");
@@ -329,6 +334,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         cbor::kv_bool(buf, "is_downchirp", _is_downchirp);
         if (_rx_channel >= 0) {
             cbor::kv_uint(buf, "rx_channel", static_cast<uint64_t>(_rx_channel));
+        }
+        if (!label.empty()) {
+            cbor::kv_text(buf, "decode_label", label);
         }
 
         // Unique decode event identifier (UUID v4, RFC 4122)
