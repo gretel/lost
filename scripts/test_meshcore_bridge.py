@@ -1564,8 +1564,14 @@ class TestRegionScope(unittest.TestCase):
         finally:
             sock.close()
 
-    def test_txt_msg_uses_t_direct_with_region(self):
-        """TXT_MSG TX uses T_DIRECT with transport codes when region set."""
+    def test_txt_msg_always_uses_route_direct(self):
+        """TXT_MSG TX always uses plain ROUTE_DIRECT even when region scope is set.
+
+        Transport codes are a flood routing concept — they control which region
+        repeaters forward a flood packet.  Direct messages are peer-to-peer and
+        must never carry transport codes, regardless of send_scope or region_scope.
+        Adding T_DIRECT breaks delivery on real firmware.
+        """
         import socket
 
         state = make_state(region_scope="de-nord")
@@ -1596,10 +1602,7 @@ class TestRegionScope(unittest.TestCase):
             msg = cbor2.loads(data)
             packet = msg["payload"]
             route = packet[0] & 0x03
-            self.assertEqual(route, 0x03)  # ROUTE_T_DIRECT
-            # Transport codes present (4 bytes after header)
-            tc1 = int.from_bytes(packet[1:3], "little")
-            self.assertGreater(tc1, 0)
+            self.assertEqual(route, 0x02)  # ROUTE_DIRECT — never T_DIRECT
         finally:
             sock.close()
 
@@ -2892,8 +2895,13 @@ class TestSendTxtMsg(unittest.TestCase):
         self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
         self.assertEqual(len(self.state.pending_acks), 1)
 
-    def test_send_txt_msg_send_scope_overrides_region(self):
-        """With send_scope set, wire packet uses ROUTE_T_DIRECT (header bits [1:0] == 3)."""
+    def test_send_txt_msg_route_direct_even_with_send_scope(self):
+        """TXT_MSG always uses ROUTE_DIRECT even when send_scope is non-zero.
+
+        Transport codes are for flood routing only.  Direct messages must use
+        plain ROUTE_DIRECT regardless of send_scope — adding T_DIRECT breaks
+        delivery on real firmware.
+        """
         import cbor2
 
         # Set a non-zero 16-byte send_scope key
@@ -2908,9 +2916,9 @@ class TestSendTxtMsg(unittest.TestCase):
         raw, _addr = self.udp_sock.recvfrom(65536)
         msg = cbor2.loads(raw)
         wire = msg["payload"]
-        # ROUTE_T_DIRECT = 3; header byte bits [1:0] == 3
+        # ROUTE_DIRECT = 2; must never be T_DIRECT (3)
         route_type = wire[0] & 0x03
-        self.assertEqual(route_type, 3)
+        self.assertEqual(route_type, 2)
 
 
 class TestSendAdvert(unittest.TestCase):

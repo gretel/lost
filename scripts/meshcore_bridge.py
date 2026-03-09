@@ -1402,17 +1402,11 @@ def _handle_send_txt_msg(
         attempt=attempt,
     )
 
-    # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
-    active_key = state.send_scope if any(state.send_scope) else state.region_key
-    if active_key:
-        # Repackage with T_DIRECT route and transport codes.
-        # Original packet (ROUTE_DIRECT): header(1) + path_len(1) + payload
-        from meshcore_tx import build_wire_packet, make_header
-
-        txt_payload = packet[2:]  # skip header + path_len (both 1 byte)
-        tc1 = _compute_transport_code(active_key, PAYLOAD_TXT, txt_payload)
-        header = make_header(ROUTE_T_DIRECT, PAYLOAD_TXT)
-        packet = build_wire_packet(header, txt_payload, transport_codes=(tc1, 0))
+    # Direct TXT_MSG is always sent as ROUTE_DIRECT — transport codes are a flood
+    # routing concept (they control which region repeaters forward a packet) and
+    # have no meaning on a direct peer-to-peer message.  Adding T_DIRECT here was
+    # breaking delivery: the remote device received the packet but the changed
+    # wire format confused its mesh layer.
 
     # Track TX hash to filter echo
     h = _hash_payload(packet)
