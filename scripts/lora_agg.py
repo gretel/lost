@@ -135,10 +135,9 @@ def format_ruling(group: PendingGroup) -> str:
     parts.append(f"ch={winner.rx_channel}")
     if winner.decode_label:
         parts.append(f"[{winner.decode_label}]")
+    parts.append(f"hash={group.payload_hash:08x}")
 
-    if n == 1:
-        parts.append("[only decode]")
-    else:
+    if n > 1:
         parts.append(f"[best of {n}, {n_ok} CRC_OK]")
     return " ".join(parts)
 
