@@ -190,12 +190,6 @@ public:
             return gr::work::Status::OK;
         }
 
-        if (out_span.empty()) {
-            std::ignore = input.consume(0UZ);
-            output.publish(0UZ);
-            return gr::work::Status::OK;
-        }
-
         const std::complex<float>* w1 = _buf.data();
         const std::complex<float>* w2 = _buf.data() + _sym_len;
 
@@ -236,17 +230,24 @@ public:
                          static_cast<unsigned>(result));
         }
 
-        out_span[0] = result;
-        if (detected) {
-            gr::property_map tag_map;
-            tag_map["cad_detected"]        = detected;
-            tag_map["cad_upchirp"]         = up_detected;
-            tag_map["cad_downchirp"]       = dn_detected;
-            tag_map["cad_peak_ratio_up"]   = static_cast<double>(std::max(r1_up, r2_up));
-            tag_map["cad_peak_ratio_down"] = static_cast<double>(std::max(r1_dn, r2_dn));
-            this->publishTag(tag_map, 0UZ);
+        // Write result to output port if a consumer is connected (out_span
+        // is non-empty).  When the output is unconnected (LBT-only mode),
+        // the detection result is still available via the _channel_busy atomic.
+        if (!out_span.empty()) {
+            out_span[0] = result;
+            if (detected) {
+                gr::property_map tag_map;
+                tag_map["cad_detected"]        = detected;
+                tag_map["cad_upchirp"]         = up_detected;
+                tag_map["cad_downchirp"]       = dn_detected;
+                tag_map["cad_peak_ratio_up"]   = static_cast<double>(std::max(r1_up, r2_up));
+                tag_map["cad_peak_ratio_down"] = static_cast<double>(std::max(r1_dn, r2_dn));
+                this->publishTag(tag_map, 0UZ);
+            }
+            output.publish(1UZ);
+        } else {
+            output.publish(0UZ);
         }
-        output.publish(1UZ);
 
         _buf_fill = 0U;
         std::ignore = input.consume(consume);

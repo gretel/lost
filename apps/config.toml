@@ -30,6 +30,11 @@ udp_listen = "127.0.0.1"
 udp_port = 5556    # raw port; lora_agg subscribes here and serves consumers on 5555
 status_interval = 10
 
+# Listen-before-talk: defer TX until CAD detects no channel activity
+lbt = true
+lbt_timeout_ms = 2000   # max wait for channel clear before rejecting TX
+tx_queue_depth = 4       # max queued TX requests (rejects when full)
+
 [meshcore]
 # port              = 7834                         # TCP listen port (avoid 5000 on macOS)
 name          = "'DO2THX 📡"                   # node display name (SET_ADVERT_NAME)
@@ -84,7 +89,7 @@ preamble_len = 8
 freq = 869618000
 rx_channel = [1, 2]
 tx_channel = 0
-rx_gain = 42
+rx_gain = 38
 tx_gain = 50
 
 [radio_433]

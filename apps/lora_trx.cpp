@@ -5,7 +5,7 @@
 // 1-ch RX: SoapySimpleSource -> FrameSync -> DemodDecoder -> FrameSink
 // 2-ch RX: SoapyDualSimpleSource -+-> FrameSync -> DemodDecoder -> FrameSink (per-chain)
 //                                 +-> FrameSync -> DemodDecoder -> FrameSink (per-chain)
-// TX: dispatched to io pool thread (non-blocking); tx_busy flag prevents concurrent TX
+// TX: bounded request queue with dedicated worker thread; LBT defers TX until channel clear
 //
 // Dual-RX uses a single MIMO stream (one device handle, two output ports).
 // Full-duplex TX in both modes: RX runs continuously while TX uses an
@@ -25,12 +25,15 @@
 #include <chrono>
 #include <cinttypes>
 #include <complex>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <queue>
 #include <string>
 #include <thread>
 #include <utility>
@@ -43,6 +46,7 @@
 #include <gnuradio-4.0/Tensor.hpp>
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
+#include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
 #include <gnuradio-4.0/lora/FrameSync.hpp>
 #include <gnuradio-4.0/lora/DemodDecoder.hpp>
 #include <gnuradio-4.0/lora/Splitter.hpp>
@@ -174,6 +178,11 @@ struct TrxConfig {
     uint32_t             status_interval{10};  ///< seconds between status heartbeats (0 = off)
     bool                 debug{false};
 
+    // Listen-before-talk (LBT): defer TX until CAD detects no channel activity
+    bool                 lbt{true};             ///< enable LBT (CAD-based)
+    uint32_t             lbt_timeout_ms{2000};  ///< max wait for channel clear before rejecting TX
+    uint32_t             tx_queue_depth{4};     ///< max queued TX requests (rejects when full)
+
     gr::property_map     block_overrides{};    ///< flat block property overrides from codec section
     std::vector<DecodeConfig> decode_configs{}; ///< per-chain decode configs (empty = use default sf/sync)
 };
@@ -302,6 +311,7 @@ void print_usage() {
         "Options:\n"
         "  --config <file>   TOML configuration file (default: config.toml)\n"
         "  --debug           Enable verbose state-machine traces on stderr\n"
+        "  --no-lbt          Disable listen-before-talk (transmit immediately)\n"
         "  --version         Show version and exit\n"
         "  -h, --help        Show this help\n\n"
         "Configuration is defined entirely in the TOML file.\n"
@@ -320,6 +330,7 @@ int parse_args(int argc, char* argv[], TrxConfig& cfg, std::string& config_path)
         }
         if (arg == "--config" && i + 1 < argc) { config_path = argv[++i]; continue; }
         if (arg == "--debug") { cfg.debug = true; continue; }
+        if (arg == "--no-lbt") { cfg.lbt = false; continue; }
         std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
         print_usage();
         return 1;
@@ -351,6 +362,11 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
     int64_t     g_port       = tbl["udp_port"].value_or(int64_t{5556});
     int64_t     g_status_int = tbl["status_interval"].value_or(int64_t{10});
     bool        g_debug      = debug;
+
+    // LBT defaults (global level in TOML)
+    bool        g_lbt        = tbl["lbt"].value_or(true);
+    int64_t     g_lbt_tmo    = tbl["lbt_timeout_ms"].value_or(int64_t{2000});
+    int64_t     g_tx_qdepth  = tbl["tx_queue_depth"].value_or(int64_t{4});
 
     // --- Collect codec and radio sections ---
     struct CodecCfg {
@@ -503,6 +519,9 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
         cfg.port         = static_cast<uint16_t>(g_port);
         cfg.status_interval = static_cast<uint32_t>(g_status_int);
         cfg.debug        = g_debug;
+        cfg.lbt          = g_lbt;
+        cfg.lbt_timeout_ms  = static_cast<uint32_t>(g_lbt_tmo);
+        cfg.tx_queue_depth  = static_cast<uint32_t>(g_tx_qdepth);
         cfg.block_overrides = codec.block_overrides;
         // Set-level
         cfg.name    = section["name"].value_or(std::string(skey));
@@ -697,6 +716,58 @@ int transmit(const std::vector<cf32>& iq, gr::lora::TxQueueSource& source) {
     return 0;
 }
 
+// --- TX request queue for LBT ---
+
+struct TxRequest {
+    gr::lora::cbor::Map      msg;
+    struct sockaddr_storage   sender;
+};
+
+/// Bounded FIFO queue for TX requests.  Thread-safe (mutex + condvar).
+/// The UDP loop pushes; a dedicated TX worker thread pops and processes.
+class TxRequestQueue {
+ public:
+    explicit TxRequestQueue(std::size_t capacity) : _capacity(capacity) {}
+
+    /// Push a request.  Returns false if queue is full (caller should reject).
+    bool push(TxRequest req) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_queue.size() >= _capacity) return false;
+        _queue.push(std::move(req));
+        _cv.notify_one();
+        return true;
+    }
+
+    /// Pop a request, blocking until one is available or stop is requested.
+    /// Returns std::nullopt on stop.
+    std::optional<TxRequest> pop() {
+        std::unique_lock<std::mutex> lock(_mutex);
+        _cv.wait(lock, [this] { return !_queue.empty() || _stop; });
+        if (_stop && _queue.empty()) return std::nullopt;
+        auto req = std::move(_queue.front());
+        _queue.pop();
+        return req;
+    }
+
+    void request_stop() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _stop = true;
+        _cv.notify_all();
+    }
+
+    std::size_t size() const {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _queue.size();
+    }
+
+ private:
+    mutable std::mutex          _mutex;
+    std::condition_variable     _cv;
+    std::queue<TxRequest>       _queue;
+    std::size_t                 _capacity;
+    bool                        _stop{false};
+};
+
 void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
                        UdpState& udp, const struct sockaddr_storage& sender,
                        gr::lora::TxQueueSource& txSource,
@@ -832,18 +903,22 @@ auto& add_decode_chain(gr::Graph& graph, const TrxConfig& cfg,
 //
 // Topology depends on the number of radio channels and decode configs:
 //
-//   1 radio, 1 decode:  Source → FrameSync → DemodDecoder → FrameSink
+//   1 radio, 1 decode:
+//     Source → Splitter(2) → FrameSync → DemodDecoder → FrameSink
+//                          → CAD (channel activity)
 //
 //   N radio × M decode (total chains > 1):
-//     Source ─out#r─→ [Splitter(M)] ─out#d─→ FrameSync → DemodDecoder → FrameSink
+//     Source ─out#r─→ [Splitter(M+1)] ─out#0..M-1─→ FrameSync → DemodDecoder → FrameSink
+//                                     ─out#M─→ CAD (first radio only)
 //
-// Splitter is omitted when M=1 (only one decode config per radio channel).
+// CAD monitors the first radio channel for listen-before-talk (LBT).
 // Each decode chain has its own FrameSink (no DiversityCombiner).
 //
 // Returns pointer to source block's cumulative overflow counter (valid while graph lives).
 uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                          std::function<void(const std::vector<uint8_t>&, bool)> callback,
-                         std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr) {
+                         std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
+                         std::atomic<bool>* channel_busy = nullptr) {
     auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
     using namespace std::string_literals;
 
@@ -878,11 +953,40 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
             {"max_time_out_us", static_cast<uint32_t>(10'000U)},
         });
 
+        // Splitter: fanout to decode chain + CAD
+        auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
+            {"n_outputs", gr::Size_t{2}},
+        });
+        if (!ok(graph.connect<"out">(source).to<"in">(splitter))) {
+            std::fprintf(stderr, "ERROR: failed to connect source -> Splitter\n");
+        }
+
         auto rx_ch = static_cast<int32_t>(cfg.rx_channels[0]) * 100;
         auto& sync = add_decode_chain(graph, cfg, rx_ch, decodes[0], callback, spectrum);
-        if (!ok(graph.connect<"out">(source).to<"in">(sync))) {
-            std::fprintf(stderr, "ERROR: failed to connect source -> decode chain\n");
+        if (!ok(graph.connect(splitter, "out#0"s, sync, "in"s))) {
+            std::fprintf(stderr, "ERROR: failed to connect Splitter -> decode chain\n");
         }
+
+        // CAD block for LBT — NullSink drains the async output to prevent
+        // the scheduler from stalling on a full unread output buffer.
+        auto& cad = graph.emplaceBlock<gr::lora::ChannelActivityDetector>({
+            {"sf", cfg.sf},
+            {"bandwidth", cfg.bw},
+            {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
+            {"alpha", 4.16f},
+            {"dual_chirp", true},
+        });
+        if (channel_busy != nullptr) {
+            cad.set_channel_busy_flag(channel_busy);
+        }
+        if (!ok(graph.connect(splitter, "out#1"s, cad, "in"s))) {
+            std::fprintf(stderr, "ERROR: failed to connect Splitter -> CAD\n");
+        }
+        auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
+        if (!ok(graph.connect<"out">(cad).to<"in">(cad_sink))) {
+            std::fprintf(stderr, "ERROR: failed to connect CAD -> NullSink\n");
+        }
+
         return &source._totalOverFlowCount;
     }
 
@@ -896,31 +1000,82 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
         std::size_t chain_idx = 0;
         for (std::size_t r = 0; r < nRadio; r++) {
             bool firstChain = (r == 0);
+            // CAD gets one extra Splitter output on the first radio
+            const bool addCad = firstChain && (channel_busy != nullptr);
 
             if (nDecode == 1) {
-                auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
-                auto [sync, demod] = add_decode_pair(
-                    graph, cfg, rx_ch, decodes[0],
-                    firstChain ? spectrum : nullptr);
+                // Insert Splitter(1 decode + optional CAD)
+                auto nOut = static_cast<gr::Size_t>(addCad ? 2 : 1);
+                if (nOut > 1) {
+                    auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
+                        {"n_outputs", nOut},
+                    });
+                    if (!connectPort(r, splitter)) {
+                        std::fprintf(stderr, "ERROR: failed to connect source -> Splitter (radio %zu)\n", r);
+                    }
 
-                if (!connectPort(r, sync)) {
-                    std::fprintf(stderr, "ERROR: failed to connect source -> FrameSync (radio %zu)\n", r);
-                }
+                    auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
+                    auto [sync, demod] = add_decode_pair(
+                        graph, cfg, rx_ch, decodes[0],
+                        firstChain ? spectrum : nullptr);
+                    if (!ok(graph.connect(splitter, "out#0"s, sync, "in"s))) {
+                        std::fprintf(stderr, "ERROR: failed to connect Splitter -> FrameSync (radio %zu)\n", r);
+                    }
 
-                // Per-chain sink (replaces shared DiversityCombiner)
-                auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-                    {"sync_word", cfg.sync},
-                    {"phy_sf", cfg.sf},
-                    {"phy_bw", cfg.bw},
-                });
-                sink._frame_callback = callback;
-                if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
-                    std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink (chain %zu)\n", chain_idx);
+                    if (addCad) {
+                        auto& cad = graph.emplaceBlock<gr::lora::ChannelActivityDetector>({
+                            {"sf", cfg.sf},
+                            {"bandwidth", cfg.bw},
+                            {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
+                            {"alpha", 4.16f},
+                            {"dual_chirp", true},
+                        });
+                        cad.set_channel_busy_flag(channel_busy);
+                        if (!ok(graph.connect(splitter, "out#1"s, cad, "in"s))) {
+                            std::fprintf(stderr, "ERROR: failed to connect Splitter -> CAD\n");
+                        }
+                        auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
+                        if (!ok(graph.connect<"out">(cad).to<"in">(cad_sink))) {
+                            std::fprintf(stderr, "ERROR: failed to connect CAD -> NullSink\n");
+                        }
+                    }
+
+                    // Per-chain sink
+                    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
+                        {"sync_word", cfg.sync},
+                        {"phy_sf", cfg.sf},
+                        {"phy_bw", cfg.bw},
+                    });
+                    sink._frame_callback = callback;
+                    if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
+                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink (chain %zu)\n", chain_idx);
+                    }
+                } else {
+                    // No CAD, no splitter needed — direct connection
+                    auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
+                    auto [sync, demod] = add_decode_pair(
+                        graph, cfg, rx_ch, decodes[0],
+                        firstChain ? spectrum : nullptr);
+                    if (!connectPort(r, sync)) {
+                        std::fprintf(stderr, "ERROR: failed to connect source -> FrameSync (radio %zu)\n", r);
+                    }
+
+                    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
+                        {"sync_word", cfg.sync},
+                        {"phy_sf", cfg.sf},
+                        {"phy_bw", cfg.bw},
+                    });
+                    sink._frame_callback = callback;
+                    if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
+                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink (chain %zu)\n", chain_idx);
+                    }
                 }
                 chain_idx++;
             } else {
+                // nDecode > 1: Splitter with nDecode outputs + optional CAD
+                auto nOut = static_cast<gr::Size_t>(nDecode + (addCad ? 1 : 0));
                 auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
-                    {"n_outputs", static_cast<gr::Size_t>(nDecode)},
+                    {"n_outputs", nOut},
                 });
 
                 if (!connectPort(r, splitter)) {
@@ -939,7 +1094,7 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         std::fprintf(stderr, "ERROR: failed to connect Splitter -> FrameSync (chain %zu)\n", chain_idx);
                     }
 
-                    // Per-chain sink (replaces shared DiversityCombiner)
+                    // Per-chain sink
                     auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
                         {"sync_word", cfg.sync},
                         {"phy_sf", cfg.sf},
@@ -950,6 +1105,26 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink (chain %zu)\n", chain_idx);
                     }
                     chain_idx++;
+                }
+
+                // Wire CAD to the extra Splitter output (first radio only)
+                if (addCad) {
+                    auto& cad = graph.emplaceBlock<gr::lora::ChannelActivityDetector>({
+                        {"sf", cfg.sf},
+                        {"bandwidth", cfg.bw},
+                        {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
+                        {"alpha", 4.16f},
+                        {"dual_chirp", true},
+                    });
+                    cad.set_channel_busy_flag(channel_busy);
+                    auto cadPort = "out#"s + std::to_string(nDecode);
+                    if (!ok(graph.connect(splitter, cadPort, cad, "in"s))) {
+                        std::fprintf(stderr, "ERROR: failed to connect Splitter -> CAD\n");
+                    }
+                    auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
+                    if (!ok(graph.connect<"out">(cad).to<"in">(cad_sink))) {
+                        std::fprintf(stderr, "ERROR: failed to connect CAD -> NullSink\n");
+                    }
                 }
             }
         }
@@ -1144,6 +1319,7 @@ struct RxBlocks {
     std::vector<std::shared_ptr<gr::BlockModel>> demod_decoder;
     std::vector<std::shared_ptr<gr::BlockModel>> splitters;
     std::shared_ptr<gr::BlockModel>              soapy_source;
+    std::shared_ptr<gr::BlockModel>              cad_block;
 };
 
 // Scan the scheduler's block span and collect references by type name.
@@ -1157,6 +1333,8 @@ RxBlocks find_rx_blocks(std::span<std::shared_ptr<gr::BlockModel>> blocks) {
             rx.demod_decoder.push_back(blk);
         } else if (tn.find("Splitter") != std::string_view::npos) {
             rx.splitters.push_back(blk);
+        } else if (tn.find("ChannelActivityDetector") != std::string_view::npos) {
+            rx.cad_block = blk;
         } else if (tn.find("Soapy") != std::string_view::npos) {
             rx.soapy_source = blk;
         }
@@ -1417,6 +1595,11 @@ int main(int argc, char* argv[]) {
     if (cfg.debug) {
         std::fprintf(stderr, "  Debug:       enabled\n");
     }
+    std::fprintf(stderr, "  LBT:         %s", cfg.lbt ? "on" : "off");
+    if (cfg.lbt) {
+        std::fprintf(stderr, " (timeout=%ums, queue=%u)", cfg.lbt_timeout_ms, cfg.tx_queue_depth);
+    }
+    std::fprintf(stderr, "\n");
     std::fprintf(stderr, "  Listen:      %s:%u\n", cfg.listen.c_str(), cfg.port);
     if (cfg.status_interval > 0) {
         std::fprintf(stderr, "  Status:      every %u s\n", cfg.status_interval);
@@ -1538,9 +1721,13 @@ int main(int argc, char* argv[]) {
     // singleThreadedBlocking runs on the calling thread, so the pool is unused.
     gr::thread_pool::Manager::defaultCpuPool()->setThreadBounds(1, 1);
 
+    // --- LBT: channel-busy flag updated by CAD in the RX graph ---
+    std::atomic<bool> channel_busy{false};
+
     // --- Build and start RX graph in a background thread ---
     gr::Graph rx_graph;
-    uint64_t* overflow_ptr = build_rx_graph(rx_graph, cfg, frame_callback, spectrum);
+    uint64_t* overflow_ptr = build_rx_graph(rx_graph, cfg, frame_callback, spectrum,
+                                            &channel_busy);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> rx_sched;
     rx_sched.timeout_inactivity_count  = 1U;  // sleep after 1 idle cycle; SoapySource notifies progress on data
@@ -1558,9 +1745,10 @@ int main(int argc, char* argv[]) {
     // After exchange(), the original emplaceBlock references are dangling —
     // we find them by scanning typeName().
     auto rx_blocks = find_rx_blocks(rx_sched.blocks());
-    std::fprintf(stderr, "  blocks: %zu FrameSync, %zu DemodDecoder, %zu Splitter, soapy=%s\n",
+    std::fprintf(stderr, "  blocks: %zu FrameSync, %zu DemodDecoder, %zu Splitter, CAD=%s, soapy=%s\n",
                  rx_blocks.frame_sync.size(), rx_blocks.demod_decoder.size(),
                  rx_blocks.splitters.size(),
+                 rx_blocks.cad_block ? "yes" : "no",
                  rx_blocks.soapy_source ? "yes" : "no");
 
     std::atomic<bool> rx_done{false};
@@ -1609,9 +1797,43 @@ int main(int argc, char* argv[]) {
     // --- Pre-build config CBOR (sent once on subscribe) ---
     auto config_cbor = build_config_cbor(cfg);
 
-    // TX concurrency guard — only one TX at a time.
-    // Set before dispatching to io pool; cleared when the dispatch completes.
-    std::atomic<bool> tx_busy{false};
+    // --- TX request queue + worker thread (replaces tx_busy + io pool dispatch) ---
+    TxRequestQueue tx_queue(cfg.tx_queue_depth);
+
+    std::thread tx_worker([&tx_queue, &cfg, &udp, &tx_source, &channel_busy,
+                           tx_spectrum_ref = tx_spectrum]() {
+        while (auto req = tx_queue.pop()) {
+            // LBT: wait for channel to clear before transmitting
+            if (cfg.lbt) {
+                auto deadline = std::chrono::steady_clock::now()
+                              + std::chrono::milliseconds(cfg.lbt_timeout_ms);
+                bool timed_out = false;
+                while (channel_busy.load(std::memory_order_acquire)) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        timed_out = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+                if (timed_out) {
+                    uint64_t seq = gr::lora::cbor::get_uint_or(req->msg, "seq", 0);
+                    std::fprintf(stderr, "TX: LBT timeout (channel busy >%ums), rejecting seq=%" PRIu64 "\n",
+                                 cfg.lbt_timeout_ms, seq);
+                    std::vector<uint8_t> rej;
+                    rej.reserve(80);
+                    gr::lora::cbor::encode_map_begin(rej, 4);
+                    gr::lora::cbor::kv_text(rej, "type", "lora_tx_ack");
+                    gr::lora::cbor::kv_uint(rej, "seq", seq);
+                    gr::lora::cbor::kv_bool(rej, "ok", false);
+                    gr::lora::cbor::kv_text(rej, "error", "channel_busy");
+                    udp.sendTo(rej, req->sender);
+                    continue;
+                }
+            }
+            handle_tx_request(req->msg, cfg, udp, req->sender,
+                              tx_source, tx_spectrum_ref.get());
+        }
+    });
 
     // --- Main loop: recv UDP datagrams, dispatch TX requests ---
     std::vector<uint8_t> recv_buf(65536);
@@ -1670,8 +1892,8 @@ int main(int argc, char* argv[]) {
             auto type = gr::lora::cbor::get_text_or(msg, "type", "");
             if (type == "lora_tx") {
                 udp.subscribe(sender);
-                if (tx_busy.exchange(true, std::memory_order_acq_rel)) {
-                    // Another TX is already in flight — reject immediately.
+                if (!tx_queue.push({msg, sender})) {
+                    // Queue full — reject immediately.
                     uint64_t seq = gr::lora::cbor::get_uint_or(msg, "seq", 0);
                     std::vector<uint8_t> rej;
                     rej.reserve(80);
@@ -1679,24 +1901,8 @@ int main(int argc, char* argv[]) {
                     gr::lora::cbor::kv_text(rej, "type", "lora_tx_ack");
                     gr::lora::cbor::kv_uint(rej, "seq", seq);
                     gr::lora::cbor::kv_bool(rej, "ok", false);
-                    gr::lora::cbor::kv_text(rej, "error", "tx_busy");
+                    gr::lora::cbor::kv_text(rej, "error", "tx_queue_full");
                     udp.sendTo(rej, sender);
-                } else {
-                    // Dispatch TX to io pool so the UDP loop stays responsive.
-                    // Captures: msg and sender by value (copies), everything
-                    // else by reference (all outlive the io pool task).
-                    auto msg_copy    = msg;
-                    auto sender_copy = sender;
-                    auto tx_spectrum_ref = tx_spectrum; // keep shared_ptr alive
-                    gr::thread_pool::Manager::defaultIoPool()->execute(
-                        [&cfg, &udp, &tx_busy, &tx_source,
-                         tx_spectrum_ref,
-                         msg_copy    = std::move(msg_copy),
-                         sender_copy = std::move(sender_copy)]() mutable {
-                            handle_tx_request(msg_copy, cfg, udp, sender_copy,
-                                              tx_source, tx_spectrum_ref.get());
-                            tx_busy.store(false, std::memory_order_release);
-                        });
                 }
             } else if (type == "lora_config") {
                 udp.subscribe(sender);
@@ -1727,23 +1933,19 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // --- Shutdown (order matters: stop RX first, then TX) ---
+    // --- Shutdown (order matters: stop RX first, then TX worker, then TX graph) ---
     std::fprintf(stderr, "\nStopping...\n");
     if (!rx_done.load(std::memory_order_relaxed)) {
         rx_sched.requestStop();
     }
     rx_thread.join();
 
-    // Wait for any in-flight TX (dispatched to io pool) to complete before
-    // closing the SoapySDR device.  The io pool task clears tx_busy on exit.
-    if (tx_busy.load(std::memory_order_acquire)) {
-        std::fprintf(stderr, "  waiting for TX to complete...\n");
-        while (tx_busy.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    }
+    // Drain TX request queue: signal stop, then join the worker thread.
+    // The worker finishes any in-flight TX before exiting.
+    tx_queue.request_stop();
+    tx_worker.join();
 
-    // Stop TX graph after RX is done and no in-flight TX remains.
+    // Stop TX graph after worker is done (no more IQ will be pushed).
     tx_sched->requestStop();
     tx_source.notifyProgress();  // wake the scheduler so it sees REQUESTED_STOP
     tx_thread.join();
