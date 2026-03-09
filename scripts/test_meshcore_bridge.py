@@ -2249,6 +2249,45 @@ class TestSetFloodScope(unittest.TestCase):
         result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
         self.assertEqual(result[0][0], bridge.RESP_ERROR)
 
+    def test_allzero_key_ignored_when_config_scope_active(self):
+        """All-zero key from companion is ignored when config.toml specifies a non-zero scope.
+
+        meshcore-cli sends CMD_SET_FLOOD_SCOPE with all-zero key on every connect
+        (its stale default). The bridge must not let this overwrite a config-specified
+        scope — otherwise the configured flood scope is cleared every session.
+        """
+        config_scope = bytes(range(1, 17))  # non-zero config scope
+        state = make_state(send_scope=config_scope)
+        null_sock = _FakeUDPSock()
+        # Companion sends all-zero key (its stale default)
+        payload = bytes([bridge.CMD_SET_FLOOD_SCOPE, 0x00]) + b"\x00" * 16
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        # Must return OK (not error) but scope must remain unchanged
+        self.assertEqual(result[0][0], bridge.RESP_OK)
+        self.assertEqual(state.send_scope, config_scope)
+
+    def test_allzero_key_accepted_when_no_config_scope(self):
+        """All-zero key is accepted normally when config.toml has no scope set."""
+        state = make_state()  # default: send_scope = b"\x00" * 16
+        state.send_scope = bytes(range(16))  # set a non-zero runtime scope
+        null_sock = _FakeUDPSock()
+        # Companion clears scope to all-zero — should be honoured (no config scope)
+        payload = bytes([bridge.CMD_SET_FLOOD_SCOPE, 0x00]) + b"\x00" * 16
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(result[0][0], bridge.RESP_OK)
+        self.assertEqual(state.send_scope, b"\x00" * 16)
+
+    def test_nonzero_key_always_applied(self):
+        """A non-zero key from the companion is always applied, even with config scope set."""
+        config_scope = bytes(range(1, 17))
+        state = make_state(send_scope=config_scope)
+        null_sock = _FakeUDPSock()
+        new_key = bytes(range(16, 32))
+        payload = bytes([bridge.CMD_SET_FLOOD_SCOPE, 0x00]) + new_key
+        result = bridge.handle_command(payload, state, null_sock, ("127.0.0.1", 5555))
+        self.assertEqual(result[0][0], bridge.RESP_OK)
+        self.assertEqual(state.send_scope, new_key)
+
 
 class TestGetAllowedRepeatFreq(unittest.TestCase):
     """CMD_GET_ALLOWED_REPEAT_FREQ (0x3C) handler."""

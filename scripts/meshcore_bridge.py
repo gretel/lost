@@ -1243,8 +1243,18 @@ def handle_command(
         if not data or data[0] != 0:
             return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
         if len(data) >= 17:  # discriminator(1) + key(16)
-            state.send_scope = bytes(data[1:17])
-            log.info("companion: SET_FLOOD_SCOPE key=%s", state.send_scope.hex())
+            incoming_key = bytes(data[1:17])
+            _null_key = b"\x00" * 16
+            # If config.toml specifies a scope and the companion sends all-zeros,
+            # treat it as the client's stale default (not an intentional clear) and
+            # ignore it so the config value survives the companion init sequence.
+            if incoming_key == _null_key and any(state._startup_send_scope):
+                log.debug(
+                    "companion: SET_FLOOD_SCOPE all-zero ignored (config scope active)"
+                )
+            else:
+                state.send_scope = incoming_key
+                log.info("companion: SET_FLOOD_SCOPE key=%s", state.send_scope.hex())
         else:
             state.send_scope = b"\x00" * 16  # clear scope
             log.info("companion: SET_FLOOD_SCOPE cleared")
