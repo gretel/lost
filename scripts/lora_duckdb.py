@@ -9,7 +9,6 @@ payload bytes for later analysis.
 
 Usage:
     lora_duckdb.py                                    # defaults
-    lora_duckdb.py --connect 127.0.0.1:5555           # custom lora_trx
     lora_duckdb.py --db data/lora_frames.duckdb       # custom db path
 
 Dashboard (after stopping collector):

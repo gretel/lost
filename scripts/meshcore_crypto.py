@@ -49,6 +49,32 @@ CIPHER_BLOCK_SIZE = 16
 CIPHER_MAC_SIZE = 2
 PATH_HASH_SIZE = 1
 
+# Path hash size selector (upper 2 bits of path_len byte)
+PATH_MODE_1BYTE = 0x00  # 1-byte hashes (legacy / default)
+PATH_MODE_2BYTE = 0x01  # 2-byte hashes
+PATH_MODE_3BYTE = 0x02  # 3-byte hashes
+PATH_MODE_RSVD = 0x03  # reserved / invalid
+
+
+def decode_path_len(raw: int) -> tuple[int, int, int]:
+    """Decode the MeshCore packed path_len byte.
+
+    The path_len byte on the wire encodes two fields:
+      bits [7:6]  path_mode  — hash size selector: 0=1B, 1=2B, 2=3B, 3=reserved
+      bits [5:0]  hash_count — number of hop hashes (0–63)
+
+    The total number of path bytes to skip is: hash_count * hash_size.
+
+    Returns:
+        (hash_count, hash_size, path_byte_len)
+
+    Source: MeshCore/src/Packet.h getPathHashSize(), getPathHashCount(), getPathByteLen()
+    """
+    hash_count = raw & 0x3F
+    hash_size = ((raw >> 6) & 0x03) + 1
+    return hash_count, hash_size, hash_count * hash_size
+
+
 # MeshCore header field masks
 ROUTE_MASK = 0x03  # bits [1:0]
 PTYPE_SHIFT = 2  # bits [5:2]
@@ -294,7 +320,8 @@ def parse_meshcore_header(data: bytes) -> dict | None:
     if off >= len(data):
         return None
     path_len = data[off]
-    off += 1 + path_len
+    _, _, path_byte_len = decode_path_len(path_len)
+    off += 1 + path_byte_len
 
     return {
         "route": route,

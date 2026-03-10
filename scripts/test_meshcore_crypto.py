@@ -45,6 +45,7 @@ from meshcore_crypto import (
     meshcore_expanded_key,
     meshcore_mac_then_decrypt,
     meshcore_shared_secret,
+    decode_path_len,
     parse_meshcore_header,
     save_channel,
     save_pubkey,
@@ -282,6 +283,86 @@ class TestParseMeshcoreHeader(unittest.TestCase):
         hdr = parse_meshcore_header(data)
         self.assertIsNotNone(hdr)
         self.assertEqual(hdr["version"], 2)
+
+    def test_path_mode_1byte_hashes(self):
+        # Mode 0 (bits 7:6 = 0b00): 1-byte hashes, count=3 → 3 path bytes
+        # path_len byte = 0b00000011 = 0x03
+        data = b"\x11" + bytes([0x03]) + b"\x01\x02\x03" + b"\xcc" * 10
+        hdr = parse_meshcore_header(data)
+        self.assertIsNotNone(hdr)
+        # off = 1(hdr) + 1(path_len_field) + 3(path bytes) = 5
+        self.assertEqual(hdr["off"], 5)
+        self.assertEqual(hdr["path_len"], 0x03)
+
+    def test_path_mode_2byte_hashes(self):
+        # Mode 1 (bits 7:6 = 0b01): 2-byte hashes, count=2 → 4 path bytes
+        # path_len byte = 0b01000010 = 0x42
+        data = b"\x11" + bytes([0x42]) + b"\x01\x02\x03\x04" + b"\xcc" * 10
+        hdr = parse_meshcore_header(data)
+        self.assertIsNotNone(hdr)
+        # off = 1(hdr) + 1(path_len_field) + 4(path bytes) = 6
+        self.assertEqual(hdr["off"], 6)
+
+    def test_path_mode_3byte_hashes(self):
+        # Mode 2 (bits 7:6 = 0b10): 3-byte hashes, count=1 → 3 path bytes
+        # path_len byte = 0b10000001 = 0x81
+        data = b"\x11" + bytes([0x81]) + b"\x01\x02\x03" + b"\xcc" * 10
+        hdr = parse_meshcore_header(data)
+        self.assertIsNotNone(hdr)
+        # off = 1(hdr) + 1(path_len_field) + 3(path bytes) = 5
+        self.assertEqual(hdr["off"], 5)
+
+    def test_path_mode_zero_hops(self):
+        # Mode 1 (2-byte hashes), count=0 → 0 path bytes (empty path)
+        # path_len byte = 0b01000000 = 0x40
+        data = b"\x11" + bytes([0x40]) + b"\xcc" * 10
+        hdr = parse_meshcore_header(data)
+        self.assertIsNotNone(hdr)
+        # off = 1(hdr) + 1(path_len_field) + 0(path bytes) = 2
+        self.assertEqual(hdr["off"], 2)
+
+
+class TestDecodePathLen(unittest.TestCase):
+    def test_mode0_zero_hops(self):
+        count, size, total = decode_path_len(0x00)
+        self.assertEqual(count, 0)
+        self.assertEqual(size, 1)
+        self.assertEqual(total, 0)
+
+    def test_mode0_three_hops(self):
+        # 0x03 = 0b00000011: mode=0, count=3 → 1-byte hashes, 3 bytes
+        count, size, total = decode_path_len(0x03)
+        self.assertEqual(count, 3)
+        self.assertEqual(size, 1)
+        self.assertEqual(total, 3)
+
+    def test_mode1_two_hops(self):
+        # 0x42 = 0b01000010: mode=1, count=2 → 2-byte hashes, 4 bytes
+        count, size, total = decode_path_len(0x42)
+        self.assertEqual(count, 2)
+        self.assertEqual(size, 2)
+        self.assertEqual(total, 4)
+
+    def test_mode2_one_hop(self):
+        # 0x81 = 0b10000001: mode=2, count=1 → 3-byte hashes, 3 bytes
+        count, size, total = decode_path_len(0x81)
+        self.assertEqual(count, 1)
+        self.assertEqual(size, 3)
+        self.assertEqual(total, 3)
+
+    def test_mode1_zero_hops(self):
+        # 0x40 = 0b01000000: mode=1, count=0 → 2-byte hashes, 0 bytes
+        count, size, total = decode_path_len(0x40)
+        self.assertEqual(count, 0)
+        self.assertEqual(size, 2)
+        self.assertEqual(total, 0)
+
+    def test_mode3_reserved(self):
+        # 0xC0 = 0b11000000: mode=3 (reserved) → size=4 per formula, count=0
+        # decode_path_len doesn't validate; caller or parse_meshcore_header must reject
+        count, size, total = decode_path_len(0xC0)
+        self.assertEqual(size, 4)  # ((3 & 3) + 1) = 4
+        self.assertEqual(total, 0)
 
 
 # ---- ADVERT extraction ----

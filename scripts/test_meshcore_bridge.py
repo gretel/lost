@@ -466,6 +466,69 @@ class TestFrameConversion(unittest.TestCase):
         self.assertEqual(companion_msgs[0][1:33], pubkey)
         self.assertEqual(ack_packets, [])
 
+    def test_advert_2byte_hash_path(self):
+        """ADVERT with 2-byte hash path (mode=1) is parsed correctly.
+
+        path_len byte = 0x41 = 0b01000001: mode=1 (2-byte hashes), count=1 → 2 path bytes.
+        Bug: old code did off += 1 + 0x41 = off + 66, skipping 64 bytes too many.
+        Fix: off += 1 + (1 * 2) = off + 3.
+        """
+        hdr = (0x04 << 2) | 0x01  # ADVERT + FLOOD
+        path_len_byte = 0x41  # mode=1 (2-byte hashes), count=1
+        path_data = b"\xaa\xbb"  # 2 bytes of path data
+        pubkey = bytes(range(32))
+        ts = struct.pack("<I", int(time.time()))
+        sig = b"\x00" * 64
+        app_data = bytes([0x81]) + b"2ByteHop"  # flags: chat + has_name
+
+        payload = bytes([hdr, path_len_byte]) + path_data + pubkey + ts + sig + app_data
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 3.0},
+            "payload": payload,
+        }
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(
+            frame, self.state
+        )
+        # Must produce a PUSH_NEW_ADVERT with the correct pubkey
+        self.assertEqual(
+            len(companion_msgs), 1, "expected PUSH_NEW_ADVERT for 2-byte hash path"
+        )
+        self.assertEqual(companion_msgs[0][0], bridge.PUSH_NEW_ADVERT)
+        self.assertEqual(companion_msgs[0][1:33], pubkey)
+
+    def test_advert_3byte_hash_path(self):
+        """ADVERT with 3-byte hash path (mode=2) is parsed correctly.
+
+        path_len byte = 0x82 = 0b10000010: mode=2 (3-byte hashes), count=2 → 6 path bytes.
+        Bug: old code did off += 1 + 0x82 = off + 131.
+        Fix: off += 1 + (2 * 3) = off + 7.
+        """
+        hdr = (0x04 << 2) | 0x01  # ADVERT + FLOOD
+        path_len_byte = 0x82  # mode=2 (3-byte hashes), count=2
+        path_data = b"\x11\x22\x33\x44\x55\x66"  # 6 bytes
+        pubkey = bytes(range(32))
+        ts = struct.pack("<I", int(time.time()))
+        sig = b"\x00" * 64
+        app_data = bytes([0x81]) + b"3ByteHop"
+
+        payload = bytes([hdr, path_len_byte]) + path_data + pubkey + ts + sig + app_data
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 3.0},
+            "payload": payload,
+        }
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(
+            frame, self.state
+        )
+        self.assertEqual(
+            len(companion_msgs), 1, "expected PUSH_NEW_ADVERT for 3-byte hash path"
+        )
+        self.assertEqual(companion_msgs[0][0], bridge.PUSH_NEW_ADVERT)
+        self.assertEqual(companion_msgs[0][1:33], pubkey)
+
     def test_advert_auto_learns_key(self):
         """ADVERT auto-learns the sender's public key."""
         hdr = (0x04 << 2) | 0x01

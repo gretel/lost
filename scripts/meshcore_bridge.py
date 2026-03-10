@@ -77,6 +77,7 @@ from meshcore_crypto import (
     extract_advert_pubkey,
     extract_advert_name,
     parse_meshcore_header,
+    decode_path_len,
     build_grp_txt,
     compute_ack_hash,
     # Protocol constants (canonical source)
@@ -624,6 +625,8 @@ def lora_frame_to_companion_msgs(
     if off >= len(payload):
         return empty
     path_len = payload[off]
+    hop_count, _, path_byte_len = decode_path_len(path_len)
+    advert_start = off + 1 + path_byte_len
 
     # SNR/RSSI from PHY — track for real radio stats
     snr_db = phy.get("snr_db", 0.0)
@@ -635,23 +638,23 @@ def lora_frame_to_companion_msgs(
 
     # For ADVERT: push as NEW_ADVERT + auto-learn key + auto-add contact
     if ptype == PAYLOAD_ADVERT:
-        return _handle_advert_rx(payload, off + 1 + path_len, state), []
+        return _handle_advert_rx(payload, advert_start, state), []
 
     # For ACK: check against pending ACKs and push confirmation
     if ptype == PAYLOAD_ACK:
-        return _handle_ack_rx(payload, off + 1 + path_len, state), []
+        return _handle_ack_rx(payload, advert_start, state), []
 
     # For TXT_MSG: decrypt and produce CONTACT_MSG_RECV_V3 + ACK TX
     if ptype == PAYLOAD_TXT:
-        return _handle_txt_msg_rx(payload, snr_byte, path_len, state)
+        return _handle_txt_msg_rx(payload, snr_byte, hop_count, state)
 
     # For ANON_REQ: decrypt and produce CONTACT_MSG_RECV_V3 + ACK TX
     if ptype == PAYLOAD_ANON_REQ:
-        return _handle_anon_req_rx(payload, snr_byte, path_len, state)
+        return _handle_anon_req_rx(payload, snr_byte, hop_count, state)
 
     # For GRP_TXT: decrypt and produce CHANNEL_MSG_RECV_V3 (no ACK for group)
     if ptype == PAYLOAD_GRP_TXT:
-        return _handle_grp_txt_rx(payload, snr_byte, path_len, state), []
+        return _handle_grp_txt_rx(payload, snr_byte, hop_count, state), []
 
     # For PATH: decrypt and extract bundled ACK (response to flood TXT_MSG)
     if ptype == PAYLOAD_PATH:
@@ -865,7 +868,7 @@ def _handle_path_rx(
 def _build_contact_msg_recv_v3(
     snr_byte: int,
     src_prefix: bytes,
-    path_len: int,
+    hop_count: int,
     txt_type: int,
     ts: int,
     text: bytes,
@@ -876,7 +879,7 @@ def _build_contact_msg_recv_v3(
     buf.extend(struct.pack("<b", snr_byte))  # SNR * 4
     buf.extend(b"\x00\x00")  # reserved
     buf.extend(src_prefix[:6].ljust(6, b"\x00"))  # pubkey prefix (6 bytes)
-    buf.append(path_len)
+    buf.append(hop_count)  # number of hops in path (decoded from path_len byte)
     buf.append(txt_type)
     buf.extend(struct.pack("<I", ts))
     buf.extend(text)
@@ -898,7 +901,7 @@ def _build_ack_wire_packet(ack_hash: bytes) -> bytes:
 def _handle_txt_msg_rx(
     payload: bytes,
     snr_byte: int,
-    path_len: int,
+    hop_count: int,
     state: BridgeState,
 ) -> tuple[list[bytes], list[bytes]]:
     """Decrypt TXT_MSG and produce CONTACT_MSG_RECV_V3 + RF ACK packet."""
@@ -941,7 +944,7 @@ def _handle_txt_msg_rx(
         msg = _build_contact_msg_recv_v3(
             snr_byte,
             sender_pub[:6],
-            path_len,
+            hop_count,
             txt_type,
             ts,
             text.encode("utf-8"),
@@ -964,7 +967,7 @@ def _handle_txt_msg_rx(
 def _handle_anon_req_rx(
     payload: bytes,
     snr_byte: int,
-    path_len: int,
+    hop_count: int,
     state: BridgeState,
 ) -> tuple[list[bytes], list[bytes]]:
     """Decrypt ANON_REQ, deliver to companion, and send encrypted RESPONSE to sender.
@@ -994,7 +997,7 @@ def _handle_anon_req_rx(
         msg = _build_contact_msg_recv_v3(
             snr_byte,
             sender_pub[:6],
-            path_len,
+            hop_count,
             0,  # txt_type: plain text
             ts,
             text.encode("utf-8"),
@@ -1024,7 +1027,7 @@ def _handle_anon_req_rx(
 def _handle_grp_txt_rx(
     payload: bytes,
     snr_byte: int,
-    path_len: int,
+    hop_count: int,
     state: BridgeState,
 ) -> list[bytes]:
     """Decrypt GRP_TXT and produce CHANNEL_MSG_RECV_V3."""
@@ -1060,7 +1063,7 @@ def _handle_grp_txt_rx(
         buf.extend(struct.pack("<b", snr_byte))
         buf.extend(b"\x00\x00")  # reserved
         buf.append(chan_idx)
-        buf.append(path_len)
+        buf.append(hop_count)  # number of hops in path (decoded from path_len byte)
         buf.append(0)  # txt_type: text
         buf.extend(struct.pack("<I", ts))
         buf.extend(text.encode("utf-8"))
@@ -1808,7 +1811,8 @@ def _parse_advert_wire_packet(data: bytes) -> dict[str, Any] | None:
     if off >= len(data):
         return None
     path_len = data[off]
-    off += 1 + path_len  # skip path_len byte + path
+    _, _, path_byte_len = decode_path_len(path_len)
+    off += 1 + path_byte_len  # skip path_len byte + path
 
     # ADVERT payload starts here: pubkey(32) + timestamp(4) + signature(64) + app_data
     advert_start = off

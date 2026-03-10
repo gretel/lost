@@ -30,7 +30,6 @@ is embedded in the WAV RIFF INFO chunk (ICMT / INAM).
 Usage:
     lora_wav.py                           # live UDP, default 127.0.0.1:5555
     lora_wav.py --no-play                 # save WAV only, no speaker output
-    lora_wav.py --connect 127.0.0.1:5556
     lora_wav.py --audio-dir /tmp/lora
 
 Dependencies: cbor2, sounddevice (optional -- disabled by --no-play)

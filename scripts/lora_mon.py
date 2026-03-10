@@ -9,7 +9,6 @@ using a local identity, auto-learned public keys, and channel PSKs.
 
 Usage:
     lora_mon.py                           # connects to 127.0.0.1:5555
-    lora_mon.py --connect 127.0.0.1:5556
     lora_mon.py --connect [::1]:5555      # IPv6
     lora_mon.py --identity scripts/data/meshcore/identity.bin
     lora_mon.py --channel secret:BASE64   # add a group channel
