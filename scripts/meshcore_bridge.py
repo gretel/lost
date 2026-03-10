@@ -646,15 +646,15 @@ def lora_frame_to_companion_msgs(
 
     # For TXT_MSG: decrypt and produce CONTACT_MSG_RECV_V3 + ACK TX
     if ptype == PAYLOAD_TXT:
-        return _handle_txt_msg_rx(payload, snr_byte, hop_count, state)
+        return _handle_txt_msg_rx(payload, snr_byte, path_len, state)
 
     # For ANON_REQ: decrypt and produce CONTACT_MSG_RECV_V3 + ACK TX
     if ptype == PAYLOAD_ANON_REQ:
-        return _handle_anon_req_rx(payload, snr_byte, hop_count, state)
+        return _handle_anon_req_rx(payload, snr_byte, path_len, state)
 
     # For GRP_TXT: decrypt and produce CHANNEL_MSG_RECV_V3 (no ACK for group)
     if ptype == PAYLOAD_GRP_TXT:
-        return _handle_grp_txt_rx(payload, snr_byte, hop_count, state), []
+        return _handle_grp_txt_rx(payload, snr_byte, path_len, state), []
 
     # For PATH: decrypt and extract bundled ACK (response to flood TXT_MSG)
     if ptype == PAYLOAD_PATH:
@@ -868,7 +868,7 @@ def _handle_path_rx(
 def _build_contact_msg_recv_v3(
     snr_byte: int,
     src_prefix: bytes,
-    hop_count: int,
+    path_len: int,
     txt_type: int,
     ts: int,
     text: bytes,
@@ -879,7 +879,7 @@ def _build_contact_msg_recv_v3(
     buf.extend(struct.pack("<b", snr_byte))  # SNR * 4
     buf.extend(b"\x00\x00")  # reserved
     buf.extend(src_prefix[:6].ljust(6, b"\x00"))  # pubkey prefix (6 bytes)
-    buf.append(hop_count)  # number of hops in path (decoded from path_len byte)
+    buf.append(path_len)  # raw packed path_len byte (mode bits [7:6] + hop count [5:0])
     buf.append(txt_type)
     buf.extend(struct.pack("<I", ts))
     buf.extend(text)
@@ -901,7 +901,7 @@ def _build_ack_wire_packet(ack_hash: bytes) -> bytes:
 def _handle_txt_msg_rx(
     payload: bytes,
     snr_byte: int,
-    hop_count: int,
+    path_len: int,
     state: BridgeState,
 ) -> tuple[list[bytes], list[bytes]]:
     """Decrypt TXT_MSG and produce CONTACT_MSG_RECV_V3 + RF ACK packet."""
@@ -944,7 +944,7 @@ def _handle_txt_msg_rx(
         msg = _build_contact_msg_recv_v3(
             snr_byte,
             sender_pub[:6],
-            hop_count,
+            path_len,
             txt_type,
             ts,
             text.encode("utf-8"),
@@ -967,7 +967,7 @@ def _handle_txt_msg_rx(
 def _handle_anon_req_rx(
     payload: bytes,
     snr_byte: int,
-    hop_count: int,
+    path_len: int,
     state: BridgeState,
 ) -> tuple[list[bytes], list[bytes]]:
     """Decrypt ANON_REQ, deliver to companion, and send encrypted RESPONSE to sender.
@@ -997,7 +997,7 @@ def _handle_anon_req_rx(
         msg = _build_contact_msg_recv_v3(
             snr_byte,
             sender_pub[:6],
-            hop_count,
+            path_len,
             0,  # txt_type: plain text
             ts,
             text.encode("utf-8"),
@@ -1027,7 +1027,7 @@ def _handle_anon_req_rx(
 def _handle_grp_txt_rx(
     payload: bytes,
     snr_byte: int,
-    hop_count: int,
+    path_len: int,
     state: BridgeState,
 ) -> list[bytes]:
     """Decrypt GRP_TXT and produce CHANNEL_MSG_RECV_V3."""
@@ -1063,7 +1063,9 @@ def _handle_grp_txt_rx(
         buf.extend(struct.pack("<b", snr_byte))
         buf.extend(b"\x00\x00")  # reserved
         buf.append(chan_idx)
-        buf.append(hop_count)  # number of hops in path (decoded from path_len byte)
+        buf.append(
+            path_len
+        )  # raw packed path_len byte (mode bits [7:6] + hop count [5:0])
         buf.append(0)  # txt_type: text
         buf.extend(struct.pack("<I", ts))
         buf.extend(text.encode("utf-8"))
