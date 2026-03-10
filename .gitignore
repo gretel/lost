@@ -1,52 +1,21 @@
-# Build output
-build/
-build_*/
-cmake-build-*/
-out/
-compile_commands.json
-
-# CMake generated
-**/CMakeFiles/
 **/CMakeCache.txt
-**cmake_install.cmake
+**/CMakeFiles/
 **/CTestTestfile.cmake
-Makefile
-
-# Python
+**cmake_install.cmake
+*.pyc
+._*
+.cache/
+.DS_Store
 .venv/
 __pycache__/
-*.pyc
-
-# Scratch
-tmp/
-
-# Runtime data — ignore generated files, keep directory scaffolding
-scripts/data/*.duckdb
-scripts/data/*.duckdb.wal
-scripts/data/meshcore/identity.bin
-scripts/data/meshcore/keys/*.pub
-scripts/data/meshcore/contacts/*.contact
-scripts/data/meshcore/channels/*.channel
-
-# macOS
-.DS_Store
-._*
-
-# Agent
+build/
+build_*/
 CLAUDE.md
-GR4LORA_REVIEW.md
-
-# Plans and design docs (local only)
-docs/plans/
-
-# GR4 reference docs (not our code)
-docs/GR4_CORE_*
-
-# IDE
-.vs/
-.vscode/
-.idea/
-.cache/
-*.swp
-*~
-CMakeLists.txt.user
+cmake-build-*/
+compile_commands.json
+docs/plans
+Makefile
+opencode.json
+out/
+scripts/data
+tmp/
