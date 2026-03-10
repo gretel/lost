@@ -59,7 +59,7 @@
 #include "FrameSink.hpp"
 #include "TxQueueSource.hpp"
 #include "cbor.hpp"
-#include "timestamp.hpp"
+#include <gnuradio-4.0/lora/log.hpp>
 
 namespace {
 

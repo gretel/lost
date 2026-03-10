@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //
-// timestamp.hpp — shared UTC timestamp + structured log helpers for apps.
+// log.hpp — UTC timestamp + structured log helpers for gr4-lora.
 //
 // ts_now()                        → "2026-03-09T14:33:17.342Z"
 // log_ts(level, tag, fmt, ...)    → writes to stderr with unified format:
@@ -9,8 +9,8 @@
 // Level strings (caller pads to 5 chars):
 //   "debug"  "info "  "warn "  "error"
 
-#ifndef GR4_LORA_TIMESTAMP_HPP
-#define GR4_LORA_TIMESTAMP_HPP
+#ifndef GR4_LORA_LOG_HPP
+#define GR4_LORA_LOG_HPP
 
 #include <chrono>
 #include <cstdarg>
@@ -55,4 +55,4 @@ inline void log_ts(const char* level, const char* tag, const char* fmt, ...) {
 
 }  // namespace gr::lora
 
-#endif  // GR4_LORA_TIMESTAMP_HPP
+#endif  // GR4_LORA_LOG_HPP

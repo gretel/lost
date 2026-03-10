@@ -21,6 +21,7 @@
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
+#include <gnuradio-4.0/lora/log.hpp>
 
 namespace gr::lora {
 
@@ -30,6 +31,7 @@ static constexpr int kPreambleBinTolerance = 1;  ///< max FFT bin drift between 
 static constexpr int kSyncWordBinTolerance = 2;  ///< max bin error for sync word (net ID) verification
 static constexpr uint8_t kMaxAdditionalUpchirps = 3;  ///< extra preamble symbols before rollover
 static constexpr uint8_t kMaxPreambleRotations  = 4;  ///< max buffer rotations after extra upchirps
+static constexpr float   kMinPreamblePMR        = 4.0f;  ///< min dechirp peak-to-mean ratio in DETECT
 
 namespace detail {
 
@@ -213,11 +215,7 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         if (needRecalc && _N > 0) {
             recalculate();
             _nf_log_interval = static_cast<uint64_t>(bandwidth) * os_factor * 10;
-            if (debug) {
-                std::fprintf(stderr, "[FrameSync] settingsChanged: recalculated"
-                    " (sf=%u, bw=%u, os=%u, preamble=%u, sync=0x%02X)\n",
-                    sf, bandwidth, os_factor, preamble_len, sync_word);
-            }
+
         }
         // Hot-reconfig parameters (center_freq, energy_thresh, min_snr_db,
         // max_symbols, debug, rx_channel) are already updated by the
@@ -505,10 +503,12 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                                            nibbles[3], nibbles[4]);
         if (!info.checksum_valid || info.payload_len == 0) {
             if (debug) {
-                std::fprintf(stderr, "[FrameSync] header decode failed: checksum=%s pay_len=%u",
-                             info.checksum_valid ? "OK" : "FAIL", info.payload_len);
-                if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
-                std::fprintf(stderr, "\n");
+                if (rx_channel >= 0)
+                    log_ts("warn ", "FrameSync", "header decode failed: checksum=%s pay_len=%u  ch=%d",
+                           info.checksum_valid ? "OK" : "FAIL", info.payload_len, rx_channel);
+                else
+                    log_ts("warn ", "FrameSync", "header decode failed: checksum=%s pay_len=%u",
+                           info.checksum_valid ? "OK" : "FAIL", info.payload_len);
             }
             return;  // fall back to max_symbols safety cap
         }
@@ -523,12 +523,6 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 / (sf - 2 * static_cast<int>(ldro))))
             * (4 + info.cr);
 
-        if (debug) {
-            std::fprintf(stderr, "[FrameSync] header: pay_len=%u cr=%u has_crc=%d -> %u symbols",
-                         info.payload_len, info.cr, info.has_crc, _frame_symb_numb);
-            if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
-            std::fprintf(stderr, "\n");
-        }
     }
 
     [[nodiscard]] gr::work::Status processBulk(
@@ -548,10 +542,6 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         if (in_span.size() < _sps) {
             _idle_call_count++;
             if (_idle_call_count > 100 && _state != DETECT) {
-                if (debug) {
-                    std::fprintf(stderr, "[FrameSync] stale burst reset after %u idle calls (state=%d)\n",
-                                 _idle_call_count, static_cast<int>(_state));
-                }
                 resetToDetect();
             }
             std::ignore = input.consume(0UZ);
@@ -583,7 +573,10 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
         switch (_state) {
         case DETECT: {
-            _bin_idx_new = static_cast<int32_t>(get_symbol_val(_in_down.data(), _downchirp.data()));
+            auto [dechirp_bin, dechirp_pmr] = dechirp_and_quality(
+                _in_down.data(), _downchirp.data(), _scratch_N.data(), _N, _fft,
+                /*remove_dc=*/true);
+            _bin_idx_new = static_cast<int32_t>(dechirp_bin);
 
             // Update noise floor EMA from idle symbols (no preamble building)
             if (_symbol_cnt <= 1) {
@@ -626,28 +619,6 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
                 // Periodic noise floor log (debug mode, every ~10s)
                 _nf_sample_cnt += _sps;
-                if (debug && _nf_log_interval > 0 && _noise_floor_db > -999.f) {
-                    if (_nf_sample_cnt >= _nf_log_interval) {
-                        _nf_sample_cnt = 0;
-                        if (_nf_history.size() >= kMaxNfHistory) {
-                            _nf_history.erase(_nf_history.begin());
-                        }
-                        _nf_history.push_back(_noise_floor_db);
-                        // Compute median via nth_element (O(n), no full sort)
-                        auto tmp = _nf_history;
-                        auto mid = tmp.begin() + static_cast<std::ptrdiff_t>(tmp.size() / 2);
-                        std::nth_element(tmp.begin(), mid, tmp.end());
-                        float median = *mid;
-                        std::fprintf(stderr,
-                            "[FrameSync] noise floor: %.1f dBFS  peak: %.1f dBFS  median: %.1f dBFS  (n=%zu)",
-                            static_cast<double>(_noise_floor_db),
-                            static_cast<double>(_peak_db),
-                            static_cast<double>(median),
-                            _nf_history.size());
-                        if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
-                        std::fprintf(stderr, "\n");
-                    }
-                }
             }
 
             if (!has_energy(_in_down.data(), _N)) {
@@ -656,11 +627,11 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 break;
             }
 
-            if (debug && _symbol_cnt > 2) {
-                std::fprintf(stderr, "[FrameSync] DETECT: cnt=%d bin=%d new=%d",
-                             _symbol_cnt, _bin_idx, _bin_idx_new);
-                if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
-                std::fprintf(stderr, "\n");
+            // Reject symbols with poor dechirp quality (noise / DC offset / interference)
+            if (dechirp_pmr < kMinPreamblePMR) {
+                _symbol_cnt = 1;
+                _bin_idx = -1;
+                break;
             }
 
             // Look for consecutive reference upchirps (within +/-kPreambleBinTolerance)
@@ -697,17 +668,19 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
             _bin_idx = _bin_idx_new;
 
             if (static_cast<uint32_t>(_symbol_cnt) == _n_up_req) {
-                if (debug) {
-                    std::fprintf(stderr, "[FrameSync] DETECT->SYNC: k_hat=%d", _k_hat);
-                    if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
-                    std::fprintf(stderr, "\n");
-                }
                 _additional_upchirps = 0;
                 _state = SYNC;
                 _sync_phase = NET_ID1;
                 _symbol_cnt = 0;
                 _cfo_frac_sto_frac_est = false;
                 _k_hat = detail::most_frequent(_preamb_up_vals);
+
+                if (debug) {
+                    if (rx_channel >= 0)
+                        log_ts("debug", "FrameSync", "DETECT->SYNC: k_hat=%d  ch=%d", _k_hat, rx_channel);
+                    else
+                        log_ts("debug", "FrameSync", "DETECT->SYNC: k_hat=%d", _k_hat);
+                }
 
                 // Copy net_id samples
                 int src_start = static_cast<int>(_sps * 3 / 4) - _k_hat * os;
@@ -778,14 +751,18 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                             // SNR too low to resolve the sync word offset (single
                             // symbol, no coherent integration).
                             if (debug) {
-                                std::fprintf(stderr,
-                                    "[FrameSync] NET_ID1: no sync word after %u+%u extra upchirp-like symbols "
-                                    "(bin=%d), SNR too low? resetting",
-                                    static_cast<unsigned>(kMaxAdditionalUpchirps),
-                                    static_cast<unsigned>(_preamble_rotations),
-                                    bin_idx);
-                                if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
-                                std::fprintf(stderr, "\n");
+                                if (rx_channel >= 0)
+                                    log_ts("warn ", "FrameSync",
+                                           "NET_ID1: no sync word after %u+%u extra upchirp-like symbols (bin=%d), SNR too low? resetting  ch=%d",
+                                           static_cast<unsigned>(kMaxAdditionalUpchirps),
+                                           static_cast<unsigned>(_preamble_rotations),
+                                           bin_idx, rx_channel);
+                                else
+                                    log_ts("warn ", "FrameSync",
+                                           "NET_ID1: no sync word after %u+%u extra upchirp-like symbols (bin=%d), SNR too low? resetting",
+                                           static_cast<unsigned>(kMaxAdditionalUpchirps),
+                                           static_cast<unsigned>(_preamble_rotations),
+                                           bin_idx);
                             }
                             resetToDetect();
                             _items_to_consume = 0;
@@ -989,10 +966,12 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 _signal_db = sig;
                 if (_snr_db < min_snr_db) {
                     if (debug) {
-                        std::fprintf(stderr, "[FrameSync] SYNC rejected: snr=%.1f dB < min %.1f dB",
-                                     static_cast<double>(_snr_db), static_cast<double>(min_snr_db));
-                        if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
-                        std::fprintf(stderr, "\n");
+                        if (rx_channel >= 0)
+                            log_ts("warn ", "FrameSync", "SYNC rejected: snr=%.1f dB < min %.1f dB  ch=%d",
+                                   static_cast<double>(_snr_db), static_cast<double>(min_snr_db), rx_channel);
+                        else
+                            log_ts("warn ", "FrameSync", "SYNC rejected: snr=%.1f dB < min %.1f dB",
+                                   static_cast<double>(_snr_db), static_cast<double>(min_snr_db));
                     }
                     resetToDetect();
                     _items_to_consume = 0;
@@ -1001,12 +980,18 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 }
                 _state = OUTPUT;
                 if (debug) {
-                    std::fprintf(stderr, "[FrameSync] SYNC->OUTPUT: cfo_int=%d cfo_frac=%.3f sto_frac=%.3f snr=%.1f dB noise=%.1f dBFS",
-                                 _cfo_int, static_cast<double>(_cfo_frac),
-                                 static_cast<double>(_sto_frac), static_cast<double>(_snr_db),
-                                 static_cast<double>(_noise_floor_db));
-                    if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
-                    std::fprintf(stderr, "\n");
+                    if (rx_channel >= 0)
+                        log_ts("info ", "FrameSync",
+                               "SYNC->OUTPUT: cfo_int=%d cfo_frac=%.3f sto_frac=%.3f snr=%.1f dB noise=%.1f dBFS  ch=%d",
+                               _cfo_int, static_cast<double>(_cfo_frac),
+                               static_cast<double>(_sto_frac), static_cast<double>(_snr_db),
+                               static_cast<double>(_noise_floor_db), rx_channel);
+                    else
+                        log_ts("info ", "FrameSync",
+                               "SYNC->OUTPUT: cfo_int=%d cfo_frac=%.3f sto_frac=%.3f snr=%.1f dB noise=%.1f dBFS",
+                               _cfo_int, static_cast<double>(_cfo_frac),
+                               static_cast<double>(_sto_frac), static_cast<double>(_snr_db),
+                               static_cast<double>(_noise_floor_db));
                 }
                 _output_symb_cnt = 0;
                 _burst_tag_published = false;
@@ -1033,12 +1018,6 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
             uint32_t symb_limit = (_frame_symb_numb > 0) ? _frame_symb_numb : max_symbols;
             if (!has_energy(_in_down.data(), _N)
                 || _output_symb_cnt >= symb_limit) {
-                if (debug) {
-                    std::fprintf(stderr, "[FrameSync] OUTPUT->DETECT: %u/%u symbols emitted",
-                                 _output_symb_cnt, symb_limit);
-                    if (rx_channel >= 0) std::fprintf(stderr, "  ch=%d", rx_channel);
-                    std::fprintf(stderr, "\n");
-                }
                 resetToDetect();
                 _items_to_consume = static_cast<int>(_sps);
                 items_to_output = 0;

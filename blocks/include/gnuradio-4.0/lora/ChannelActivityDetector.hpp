@@ -7,13 +7,13 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
-#include <cstdio>
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
+#include <gnuradio-4.0/lora/log.hpp>
 
 namespace gr::lora {
 
@@ -125,16 +125,6 @@ private:
         _buf_fill = 0U;
         _fft      = gr::algorithm::FFT<std::complex<float>>{};
 
-        if (debug) {
-            std::fprintf(stderr,
-                         "[CAD] rebuild: SF%u os=%u N=%u sym_len=%u win_len=%u alpha=%.3f\n",
-                         static_cast<unsigned>(sf.value),
-                         static_cast<unsigned>(os_factor.value),
-                         static_cast<unsigned>(_N),
-                         static_cast<unsigned>(_sym_len),
-                         static_cast<unsigned>(_win_len),
-                         static_cast<double>(static_cast<float>(alpha)));
-        }
     }
 
     /// Core dechirp+FFT peak-ratio computation, no buffer side-effects.
@@ -220,15 +210,7 @@ public:
         if (up_detected) result |= 0x01U;
         if (dn_detected) result |= 0x02U;
 
-        if (debug) {
-            std::fprintf(stderr,
-                         "[CAD] up=%.2f,%.2f (%s) dn=%.2f,%.2f (%s) -> 0x%02X\n",
-                         static_cast<double>(r1_up), static_cast<double>(r2_up),
-                         up_detected ? "DETECT" : "miss",
-                         static_cast<double>(r1_dn), static_cast<double>(r2_dn),
-                         dn_detected ? "DETECT" : "miss",
-                         static_cast<unsigned>(result));
-        }
+
 
         // Write result to output port if a consumer is connected (out_span
         // is non-empty).  When the output is unconnected (LBT-only mode),

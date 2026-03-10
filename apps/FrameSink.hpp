@@ -32,7 +32,7 @@
 #include <gnuradio-4.0/Block.hpp>
 
 #include "cbor.hpp"
-#include "timestamp.hpp"
+#include <gnuradio-4.0/lora/log.hpp>
 
 namespace gr::lora {
 

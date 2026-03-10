@@ -19,6 +19,7 @@
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
+#include <gnuradio-4.0/lora/log.hpp>
 
 namespace gr::lora {
 
@@ -93,10 +94,6 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
                          const gr::property_map& newSettings) {
         if (_N > 0 && (newSettings.contains("sf") || newSettings.contains("bandwidth"))) {
             recalculate();
-            if (debug) {
-                std::fprintf(stderr, "[DemodDecoder] settingsChanged: recalculated (sf=%u, bw=%u)\n",
-                             sf, bandwidth);
-            }
         }
     }
 
@@ -206,8 +203,8 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
         }
 
         if (debug) {
-            std::fprintf(stderr, "[DemodDecoder] frame: pay_len=%u cr=%u crc=%s nibbles=%zu\n",
-                         _pay_len, _cr, crc_valid ? "OK" : "FAIL", _nibbles.size());
+            log_ts("debug", "DemodDecoder", "frame: pay_len=%u cr=%u crc=%s nibbles=%zu",
+                   _pay_len, _cr, crc_valid ? "OK" : "FAIL", _nibbles.size());
         }
 
         for (uint32_t i = 0; i < _pay_len && out_idx < out_span.size(); i++) {
@@ -305,11 +302,12 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
                     }
 
                     if (debug) {
-                        std::fprintf(stderr, "[DemodDecoder] IDLE->HEADER: sf=%u cfo_int=%d cfo_frac=%.3f snr=%.1f dB noise=%.1f dBFS%s\n",
-                                     sf, _cfo_int, static_cast<double>(_cfo_frac),
-                                     static_cast<double>(_snr_db),
-                                     _noise_floor_db,
-                                     _is_downchirp ? " (downchirp)" : "");
+                        log_ts("info ", "DemodDecoder",
+                               "IDLE->HEADER: sf=%u cfo_int=%d cfo_frac=%.3f snr=%.1f dB noise=%.1f dBFS%s",
+                               sf, _cfo_int, static_cast<double>(_cfo_frac),
+                               static_cast<double>(_snr_db),
+                               _noise_floor_db,
+                               _is_downchirp ? " (downchirp)" : "");
                     }
 
                     buildDownchirpWithCFO();
@@ -365,9 +363,9 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
                             _nibbles[0], _nibbles[1], _nibbles[2], _nibbles[3], _nibbles[4]);
 
                         if (debug) {
-                            std::fprintf(stderr, "[DemodDecoder] header: pay_len=%u cr=%u has_crc=%d checksum=%s\n",
-                                         info.payload_len, info.cr, info.has_crc,
-                                         info.checksum_valid ? "OK" : "FAIL");
+                            log_ts("debug", "DemodDecoder", "header: pay_len=%u cr=%u has_crc=%d checksum=%s",
+                                   info.payload_len, info.cr, info.has_crc,
+                                   info.checksum_valid ? "OK" : "FAIL");
                         }
 
                         if (!info.checksum_valid || info.payload_len == 0) {

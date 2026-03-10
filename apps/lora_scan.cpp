@@ -47,7 +47,7 @@
 #include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
 #include <gnuradio-4.0/soapy/Soapy.hpp>
 
-#include "timestamp.hpp"
+#include <gnuradio-4.0/lora/log.hpp>
 
 using cf32 = std::complex<float>;
 
