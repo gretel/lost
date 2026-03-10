@@ -37,6 +37,7 @@ tx_queue_depth = 4              # max queued TX requests (rejects when full)
 [aggregator]
 upstream  = "127.0.0.1:5556"   # lora_trx raw port (lora_agg subscribes here)
 listen    = "127.0.0.1:5555"   # consumer-facing port served by lora_agg
+window_ms = 200                 # diversity combining window (ms)
 
 [meshcore]
 # port              = 7834                         # TCP listen port (avoid 5000 on macOS)

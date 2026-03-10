@@ -25,14 +25,12 @@ import cbor2
 from lora_common import (
     config_agg_listen,
     config_agg_upstream,
+    config_agg_window_ms,
     load_config,
     parse_host_port,
     setup_logging,
 )
 
-DEFAULT_UPSTREAM = "127.0.0.1:5556"
-DEFAULT_LISTEN = "127.0.0.1:5555"
-DEFAULT_WINDOW_MS = 200
 KEEPALIVE_INTERVAL = 5.0  # seconds
 RECV_TIMEOUT = 0.05  # 50ms poll interval for draining groups
 CLIENT_EXPIRY = 60.0  # evict consumers with no keepalive after this
@@ -279,8 +277,8 @@ class ConsumerServer:
 # ---------------------------------------------------------------------------
 
 
-def run(args: argparse.Namespace) -> None:
-    window_s = DEFAULT_WINDOW_MS / 1000.0
+def run(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    window_s = config_agg_window_ms(cfg) / 1000.0
 
     # Parse upstream addresses
     upstreams: list[tuple[str, int]] = []
@@ -310,7 +308,10 @@ def run(args: argparse.Namespace) -> None:
     # Consumer-facing server
     server = ConsumerServer(listen_host, listen_port)
     log.info(
-        "listening: %s:%d (window=%dms)", listen_host, listen_port, DEFAULT_WINDOW_MS
+        "listening: %s:%d (window=%dms)",
+        listen_host,
+        listen_port,
+        config_agg_window_ms(cfg),
     )
 
     # Aggregation state
@@ -443,10 +444,11 @@ def run(args: argparse.Namespace) -> None:
 
             try:
                 events = sel.select(timeout=RECV_TIMEOUT)
-            except (InterruptedError, OSError):
+            except InterruptedError, OSError:
                 continue
 
             for key, _ in events:
+                assert isinstance(key.fileobj, socket.socket)
                 sock = key.fileobj
 
                 if sock is server.sock:
@@ -556,7 +558,7 @@ def main() -> None:
     args = parser.parse_args()
 
     setup_logging("gr4.agg", cfg, debug=args.debug, no_color=args.no_color)
-    run(args)
+    run(args, cfg)
 
 
 if __name__ == "__main__":
