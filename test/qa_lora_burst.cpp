@@ -860,6 +860,30 @@ const boost::ut::suite<"Edge case tests"> edge_case_tests = [] {
             << "watchdog should reject stuck-upchirp sequence";
     };
 
+    "DETECT rejects DC-offset false preamble"_test = [] {
+        // Generate a signal with a strong DC offset — consistent bin-0
+        // peaks that would previously trigger false DETECT→SYNC.
+        constexpr uint32_t n_symbols = 20;  // plenty to trigger old detector
+        const uint32_t total_samples = n_symbols * SPS + SPS * 5;
+
+        std::vector<std::complex<float>> iq(total_samples);
+        // DC offset at -20 dBFS (0.1 amplitude) — strong enough to pass
+        // energy_thresh but not a real chirp
+        for (auto& s : iq) s = {0.1f, 0.0f};
+
+        // Add light noise so it's realistic
+        std::mt19937 gen(42);
+        std::normal_distribution<float> dist(0.f, 0.01f);
+        for (auto& s : iq) s += std::complex<float>(dist(gen), dist(gen));
+
+        auto result = run_decode(iq);
+
+        std::printf("DC false detect: %zu bytes output (expected 0)\n",
+                    result.samples.size());
+        expect(eq(result.samples.size(), 0UZ))
+            << "DC offset should not produce decoded output";
+    };
+
     "Two back-to-back frames with no silence gap"_test = [] {
         // Frame A: zero_pad=0 (no trailing silence)
         // Frame B: normal trailing silence

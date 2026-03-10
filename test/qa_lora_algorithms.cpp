@@ -3,7 +3,9 @@
 
 #include <array>
 #include <cstring>
+#include <random>
 
+#include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/algorithm/tables.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
@@ -47,6 +49,72 @@ const boost::ut::suite<"LoRa algorithm utilities"> utilities_tests = [] {
             auto bits = int2bool(v, 8);
             expect(eq(bool2int(bits), v)) << "roundtrip failed for " << v;
         }
+    };
+};
+
+const boost::ut::suite<"Dechirp quality measurement"> dechirp_quality_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "dechirp_and_quality separates chirp from noise"_test = [] {
+
+        std::vector<std::complex<float>> upchirp(N);
+        std::vector<std::complex<float>> downchirp(N);
+        build_ref_chirps(upchirp.data(), downchirp.data(), SF);
+
+        std::vector<std::complex<float>> scratch(N);
+        gr::algorithm::FFT<std::complex<float>> fft;
+
+        // (a) Real upchirp — should have high PMR
+        auto [bin_chirp, pmr_chirp] = dechirp_and_quality(
+            upchirp.data(), downchirp.data(), scratch.data(), N, fft);
+        std::printf("chirp: bin=%u PMR=%.1f\n", bin_chirp, static_cast<double>(pmr_chirp));
+        expect(eq(bin_chirp, 0u)) << "upchirp(id=0) dechirps to bin 0";
+        expect(gt(pmr_chirp, 10.f)) << "real chirp PMR should be >> 1";
+
+        // (b) Gaussian noise — should have low PMR
+        std::mt19937 gen(42);
+        std::normal_distribution<float> dist(0.f, 1.f);
+        std::vector<std::complex<float>> noise(N);
+        for (auto& s : noise) s = {dist(gen), dist(gen)};
+
+        auto [bin_noise, pmr_noise] = dechirp_and_quality(
+            noise.data(), downchirp.data(), scratch.data(), N, fft);
+        std::printf("noise: bin=%u PMR=%.1f\n", bin_noise, static_cast<double>(pmr_noise));
+        expect(lt(pmr_noise, 4.f)) << "noise PMR should be low";
+    };
+
+    "dechirp_and_quality DC removal"_test = [] {
+        // Generate upchirp with id=5 (lands at bin 5 after dechirp)
+        std::vector<std::complex<float>> chirp(N);
+        build_upchirp(chirp.data(), 5, SF);
+
+        std::vector<std::complex<float>> downchirp(N);
+        {
+            std::vector<std::complex<float>> up(N);
+            build_ref_chirps(up.data(), downchirp.data(), SF);
+        }
+
+        // Add a large DC offset
+        for (auto& s : chirp) s += std::complex<float>(3.0f, 0.0f);
+
+        std::vector<std::complex<float>> scratch(N);
+        gr::algorithm::FFT<std::complex<float>> fft;
+
+        // With DC removal, should find the real chirp
+        auto [bin_dc, pmr_dc] = dechirp_and_quality(
+            chirp.data(), downchirp.data(), scratch.data(), N, fft, true);
+        std::printf("DC removed: bin=%u PMR=%.1f\n", bin_dc, static_cast<double>(pmr_dc));
+        expect(eq(bin_dc, 5u)) << "should find chirp at bin 5 after DC removal";
+
+        // Verify DC removal doesn't break a clean chirp at bin 0
+        std::vector<std::complex<float>> clean_chirp(N);
+        build_upchirp(clean_chirp.data(), 0, SF);
+        auto [bin_clean, pmr_clean] = dechirp_and_quality(
+            clean_chirp.data(), downchirp.data(), scratch.data(), N, fft, true);
+        std::printf("Clean chirp + DC removal: bin=%u PMR=%.1f\n", bin_clean, static_cast<double>(pmr_clean));
+        expect(eq(bin_clean, 0u)) << "clean upchirp(0) should still dechirp to bin 0";
+        expect(gt(pmr_clean, 10.f)) << "clean chirp PMR should remain high";
     };
 };
 

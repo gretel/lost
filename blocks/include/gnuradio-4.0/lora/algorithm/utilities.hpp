@@ -101,6 +101,59 @@ inline void build_ref_chirps(std::complex<float>* upchirp, std::complex<float>* 
     return max_idx;
 }
 
+/// Result of dechirp + FFT: argmax bin index and peak-to-mean ratio (PMR).
+struct DechirpResult {
+    uint32_t bin;   ///< FFT bin with maximum magnitude
+    float    pmr;   ///< peak / mean magnitude ratio (higher = better quality)
+};
+
+/// Dechirp + FFT + argmax + quality: like dechirp_argmax but also returns
+/// peak-to-mean ratio (PMR) — the ratio of the peak FFT magnitude to the
+/// mean magnitude across all bins.  A real chirp produces PMR >> 1 (e.g., 16
+/// for SF8); noise produces PMR ~ 1.5-2.5.
+///
+/// When remove_dc is true, the mean of the input is subtracted before
+/// dechirping.  This suppresses DC offset / LO leakage that would
+/// otherwise produce a spurious peak at bin 0.
+///
+/// scratch must point to N writable elements.
+[[nodiscard]] inline DechirpResult dechirp_and_quality(
+        const std::complex<float>* samples,
+        const std::complex<float>* ref_chirp,
+        std::complex<float>* scratch, uint32_t N,
+        gr::algorithm::FFT<std::complex<float>>& fft,
+        bool remove_dc = false) {
+    if (remove_dc) {
+        std::complex<float> mean{0.f, 0.f};
+        for (uint32_t i = 0; i < N; i++) mean += samples[i];
+        mean /= static_cast<float>(N);
+        for (uint32_t i = 0; i < N; i++) {
+            scratch[i] = (samples[i] - mean) * ref_chirp[i];
+        }
+    } else {
+        for (uint32_t i = 0; i < N; i++) {
+            scratch[i] = samples[i] * ref_chirp[i];
+        }
+    }
+    auto fft_out = fft.compute(std::span<const std::complex<float>>(scratch, N));
+
+    float max_mag = 0.f;
+    float total_mag = 0.f;
+    uint32_t max_idx = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        float mag = std::sqrt(fft_out[i].real() * fft_out[i].real()
+                            + fft_out[i].imag() * fft_out[i].imag());
+        total_mag += mag;
+        if (mag > max_mag) {
+            max_mag = mag;
+            max_idx = i;
+        }
+    }
+    float mean_mag = total_mag / static_cast<float>(N);
+    float pmr = (mean_mag > 0.f) ? (max_mag / mean_mag) : 0.f;
+    return {max_idx, pmr};
+}
+
 }  // namespace gr::lora
 
 #endif  // GNURADIO_LORA_UTILITIES_HPP
