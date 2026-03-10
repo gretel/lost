@@ -4570,6 +4570,8 @@ class TestCtrlRx(unittest.TestCase):
 
     def test_ctrl_discover_resp_produces_control_data_push(self):
         """Incoming CTRL DISCOVER_RESP produces a CONTROL_DATA push (0x8E)."""
+        import struct
+
         state = make_state()
         # Build a DISCOVER_RESP payload: subtype=0x91 (RESP|node_type=1),
         # SNR_in=10*4=40=0x28, tag=4 bytes, pubkey_prefix=8 bytes
@@ -4578,15 +4580,30 @@ class TestCtrlRx(unittest.TestCase):
         frame = self._make_ctrl_frame(ctrl_payload)
         msgs, acks = bridge.lora_frame_to_companion_msgs(frame, state)
         self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0][0], 0x8E)  # PUSH_CONTROL_DATA
+        msg = msgs[0]
+        self.assertEqual(msg[0], 0x8E)  # PUSH_CONTROL_DATA
+        # PHY values from frame: snr_db=3.0 → int(3.0*4)=12, rssi_dbm=-85
+        self.assertEqual(struct.unpack_from("<b", msg, 1)[0], 12)  # SNR byte
+        self.assertEqual(struct.unpack_from("<b", msg, 2)[0], -85)  # RSSI byte
+        self.assertEqual(msg[3], 0)  # path_len: ROUTE_FLOOD, 0 hops
+        # _handle_ctrl_rx strips the MeshCore header; ctrl_payload follows verbatim
+        self.assertEqual(msg[4:], ctrl_payload)
 
     def test_ctrl_non_discover_produces_control_data_push(self):
         """Any CTRL packet produces CONTROL_DATA push."""
+        import struct
+
         state = make_state()
-        frame = self._make_ctrl_frame(bytes([0x80, 0x01, 0x00, 0x00, 0x00, 0x00]))
+        ctrl_payload = bytes([0x80, 0x01, 0x00, 0x00, 0x00, 0x00])
+        frame = self._make_ctrl_frame(ctrl_payload)
         msgs, acks = bridge.lora_frame_to_companion_msgs(frame, state)
         self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0][0], 0x8E)
+        msg = msgs[0]
+        self.assertEqual(msg[0], 0x8E)
+        self.assertEqual(struct.unpack_from("<b", msg, 1)[0], 12)  # SNR byte
+        self.assertEqual(struct.unpack_from("<b", msg, 2)[0], -85)  # RSSI byte
+        self.assertEqual(msg[3], 0)  # path_len: ROUTE_FLOOD, 0 hops
+        self.assertEqual(msg[4:], ctrl_payload)
 
 
 if __name__ == "__main__":
