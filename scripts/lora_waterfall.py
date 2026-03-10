@@ -43,6 +43,7 @@ from lora_common import (
     create_udp_subscriber,
     format_ascii,
     load_config,
+    parse_host_port,
     setup_logging,
     sync_word_name,
 )
@@ -774,8 +775,6 @@ def main() -> None:
 
     # Connect directly to lora_trx (not lora_agg) — needs raw spectrum frames
     if args.connect:
-        from lora_common import parse_host_port
-
         host, port = parse_host_port(args.connect)
     else:
         host, port = config_udp_host(cfg), config_udp_port(cfg)
