@@ -132,7 +132,7 @@ static constexpr std::array kFrameSyncOverrides = {"energy_thresh", "min_snr_db"
 static constexpr std::array kDemodDecoderOverrides = {
     "impl_head", "impl_cr", "impl_pay_len", "impl_has_crc", "ldro_mode"};  // NOLINT(whitespace/indent_namespace)
 
-// Channel mapping: follows physical connector order on B210/B220 case.
+// Channel mapping: follows physical connector order on UHD case.
 //   0 = TRX_A (chain A, TX/RX)   TX + RX
 //   1 = RX_A  (chain A, RX2)     RX only
 //   2 = RX_B  (chain B, RX2)     RX only
@@ -184,8 +184,6 @@ struct TrxConfig {
     uint16_t             port{5556};
     uint32_t             status_interval{10};  ///< seconds between status heartbeats (0 = off)
     bool                 debug{false};
-
-    // Listen-before-talk (LBT): defer TX until CAD detects no channel activity
     bool                 lbt{true};             ///< enable LBT (CAD-based)
     uint32_t             lbt_timeout_ms{2000};  ///< max wait for channel clear before rejecting TX
     uint32_t             tx_queue_depth{4};     ///< max queued TX requests (rejects when full)
@@ -737,7 +735,7 @@ std::unique_ptr<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThre
 build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
     const auto& tx_map = kChannelMap[cfg.tx_channel];
 
-    // Both TX SoapySDR channels open (balanced B210 2RX+2TX mode).
+    // Both TX SoapySDR channels open (balanced UHD 2RX+2TX mode).
     // ch0 = TRX_A, ch1 = TRX_B.  IQ goes to cfg.tx_channel's soapy_channel;
     // the other channel carries zeros from TxQueueSource::out1.
     // TxQueueSource always puts IQ on out0.  If cfg.tx_channel maps to soapy
@@ -1693,7 +1691,7 @@ int main(int argc, char* argv[]) {
     }
     if (cfg.rx_channels.size() > 2) {
         gr::lora::log_ts("error", "lora_trx",
-            "rx_channel has %zu entries but B210 supports at most "
+            "rx_channel has %zu entries but UHD supports at most "
             "2 simultaneous RX streams (one per SoapySDR channel)",
             cfg.rx_channels.size());
         return 1;
@@ -1991,7 +1989,7 @@ int main(int argc, char* argv[]) {
     });
 
     gr::lora::log_ts("info ", "lora_trx",
-        "RX running (%zu channel%s, full-duplex TX) — Ctrl+C to stop",
+        "RX running (%zu channel%s) — Ctrl+C to stop",
         cfg.rx_channels.size(),
         cfg.rx_channels.size() > 1 ? "s" : "");
 

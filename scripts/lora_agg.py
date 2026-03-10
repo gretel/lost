@@ -36,7 +36,7 @@ DEFAULT_WINDOW_MS = 200
 KEEPALIVE_INTERVAL = 5.0  # seconds
 RECV_TIMEOUT = 0.05  # 50ms poll interval for draining groups
 CLIENT_EXPIRY = 60.0  # evict consumers with no keepalive after this
-UPSTREAM_SILENCE_WARN = 30.0  # warn if no upstream data for this long
+UPSTREAM_SILENCE_WARN = 15.0  # warn if no upstream data for this long
 UDP_RCVBUF = 512 * 1024  # 512 KB receive buffer for burst resilience
 DEDUP_COOLDOWN = 5.0  # suppress duplicate hashes for this long after emit
 
