@@ -120,7 +120,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         pass
     return "dev"
 
@@ -213,6 +213,7 @@ PUSH_PATH_UPDATE = 0x81
 PUSH_ACK = 0x82
 PUSH_MESSAGES_WAITING = 0x83
 PUSH_NEW_ADVERT = 0x8A
+PUSH_CONTROL_DATA = 0x8E
 
 # ---- Helpers ----
 
@@ -585,6 +586,38 @@ class BridgeState:
 # ---- RX frame -> companion message conversion ----
 
 
+def _handle_ctrl_rx(
+    payload: bytes,
+    path_len: int,
+    state: BridgeState,
+) -> list[bytes]:
+    """Handle received CTRL packet: push as CONTROL_DATA (0x8E) to companion.
+
+    Wire format after header + [transport_codes] + path_len + path:
+      [ctrl_payload...]
+
+    Companion push format (matches meshcore_py reader.py PacketType.CONTROL_DATA):
+      [0x8E][snr_byte(1)][rssi_byte(1)][path_len(1)][ctrl_payload...]
+    """
+    hdr_info = parse_meshcore_header(payload)
+    if hdr_info is None:
+        return []
+    off = hdr_info["off"]
+    ctrl_payload = payload[off:]
+
+    snr_byte = max(-128, min(127, int(state.last_snr_db * 4)))
+    rssi_byte = max(-128, min(127, state.last_rssi_dbm))
+
+    push = (
+        bytes([PUSH_CONTROL_DATA])
+        + struct.pack("<b", snr_byte)
+        + struct.pack("<b", rssi_byte)
+        + bytes([path_len])
+        + ctrl_payload
+    )
+    return [push]
+
+
 def lora_frame_to_companion_msgs(
     frame: dict[str, Any],
     state: BridgeState,
@@ -659,6 +692,10 @@ def lora_frame_to_companion_msgs(
     # For PATH: decrypt and extract bundled ACK (response to flood TXT_MSG)
     if ptype == PAYLOAD_PATH:
         return _handle_path_rx(payload, path_len, state), []
+
+    # For CTRL: push as CONTROL_DATA (for node_discover responses etc.)
+    if ptype == PAYLOAD_CTRL:
+        return _handle_ctrl_rx(payload, path_len, state), []
 
     return empty
 
@@ -1172,8 +1209,8 @@ def _build_self_advert_push(state: BridgeState) -> bytes | None:
 def handle_command(
     cmd_payload: bytes,
     state: BridgeState,
-    udp_sock: socket.socket,
-    udp_addr: tuple[str, int],
+    udp_sock: socket.socket | None,
+    udp_addr: tuple[str, int] | None,
 ) -> list[bytes]:
     """Handle a companion protocol command, return list of response payloads."""
     if not cmd_payload:
@@ -1227,15 +1264,19 @@ def handle_command(
         return [state.build_no_more_msgs()]
 
     if cmd == CMD_SEND_TXT_MSG:
+        assert udp_sock is not None and udp_addr is not None
         return _handle_send_txt_msg(data, state, udp_sock, udp_addr)
 
     if cmd == CMD_SEND_CHAN_TXT_MSG:
+        assert udp_sock is not None and udp_addr is not None
         return _handle_send_chan_txt_msg(data, state, udp_sock, udp_addr)
 
     if cmd == CMD_SEND_CONTROL_DATA:
+        assert udp_sock is not None and udp_addr is not None
         return _handle_send_control_data(data, state, udp_sock, udp_addr)
 
     if cmd == CMD_SEND_SELF_ADVERT:
+        assert udp_sock is not None and udp_addr is not None
         return _handle_send_advert(data, state, udp_sock, udp_addr)
 
     if cmd == CMD_SET_ADVERT_NAME:
@@ -2051,7 +2092,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except (ConnectionError, OSError):
+                    except ConnectionError, OSError:
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2073,7 +2114,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except (BlockingIOError, OSError):
+                    except BlockingIOError, OSError:
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2223,7 +2264,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except (ConnectionError, OSError):
+    except ConnectionError, OSError:
         pass  # client disconnected, will be cleaned up on next recv
 
 

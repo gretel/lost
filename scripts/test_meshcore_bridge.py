@@ -10,6 +10,7 @@ Run:  python3 -m unittest scripts/test_meshcore_bridge.py -v
 from __future__ import annotations
 
 import os
+import socket
 import struct
 import sys
 import time
@@ -70,17 +71,20 @@ def make_state(**kwargs):
         contacts_dir=tmpdir / "contacts",
     )
     defaults.update(kwargs)
-    return bridge.BridgeState(**defaults)
+    return bridge.BridgeState(**defaults)  # type: ignore[arg-type]
 
 
-class _FakeUDPSock:
+class _FakeUDPSock(socket.socket):
     """Minimal UDP socket mock that captures sendto calls."""
 
     def __init__(self) -> None:
+        super().__init__(socket.AF_INET, socket.SOCK_DGRAM)
+        self.close()  # release the FD immediately; we only need the type
         self.sent: list[bytes] = []
 
-    def sendto(self, data: bytes, addr: object) -> None:
+    def sendto(self, data: bytes, addr: object) -> int:  # type: ignore[override]
         self.sent.append(data)
+        return len(data)
 
 
 # ---- Frame codec tests ----
@@ -870,7 +874,7 @@ class TestAdvertParser(unittest.TestCase):
         payload = bytes([hdr, 0]) + pk + ts + sig + app_data
 
         info = bridge._parse_advert_wire_packet(payload)
-        self.assertIsNotNone(info)
+        assert info is not None
         self.assertEqual(info["pubkey"], pk)
         self.assertEqual(info["node_type"], 0x01)
         self.assertEqual(info["name"], "")
@@ -886,7 +890,7 @@ class TestAdvertParser(unittest.TestCase):
         payload = bytes([hdr, 0]) + pk + ts + sig + app_data
 
         info = bridge._parse_advert_wire_packet(payload)
-        self.assertIsNotNone(info)
+        assert info is not None
         self.assertEqual(info["name"], "Hello")
 
     def test_non_advert_returns_none(self):
@@ -911,7 +915,7 @@ class TestAdvertParser(unittest.TestCase):
         payload = bytes([hdr]) + transport + bytes([0]) + pk + ts + sig + app_data
 
         info = bridge._parse_advert_wire_packet(payload)
-        self.assertIsNotNone(info)
+        assert info is not None
         self.assertEqual(info["pubkey"], pk)
         self.assertEqual(info["name"], "Trans")
 
@@ -1913,9 +1917,9 @@ class TestAnonReqResponse(unittest.TestCase):
         # MAC+ciphertext starts after dest_hash(1) + src_hash(1)
         enc_data = resp_payload[2:]
         shared = meshcore_shared_secret(prv_a, pub_b)
-        self.assertIsNotNone(shared)
+        assert shared is not None
         plaintext = meshcore_mac_then_decrypt(shared, enc_data)
-        self.assertIsNotNone(plaintext, "RESPONSE decryption failed")
+        assert plaintext is not None, "RESPONSE decryption failed"
         # Plaintext: 0x00 (RESP_SERVER_LOGIN_OK) + node name
         self.assertEqual(plaintext[0], 0x00)
         self.assertIn(b"bridge-node", plaintext)
@@ -2893,22 +2897,6 @@ class TestSendControlData(unittest.TestCase):
 
 
 # ---- Send TXT message tests ----
-
-
-def _make_contact_record(pub_key: bytes, name: str = "peer") -> bytes:
-    """Build a minimal 147-byte contact record for testing."""
-    name_bytes = name.encode("utf-8")[:32].ljust(32, b"\x00")
-    record = (
-        pub_key  # pubkey (32)
-        + b"\x01"  # node_type=chat
-        + b"\x00"  # flags
-        + b"\xff"  # path_len=-1 (flood)
-        + b"\x00" * 64  # path
-        + name_bytes  # name (32)
-        + b"\x00" * 16  # last_advert(4) + lat(4) + lon(4) + lastmod(4)
-    )
-    assert len(record) == 147
-    return record
 
 
 class TestSendTxtMsg(unittest.TestCase):
@@ -3990,6 +3978,7 @@ class TestPathAckRx(unittest.TestCase):
 
         # Encrypt with shared secret (B encrypts for A)
         secret = meshcore_shared_secret(prv_b, pub_a)
+        assert secret is not None
         encrypted = meshcore_encrypt_then_mac(secret, path_plaintext)
 
         # Wire format: header(1) + flood_path_len(1) + dest_hash(1) + src_hash(1) + encrypted
@@ -4185,14 +4174,20 @@ def _u3_test_set_radio_tx_power_empty_data_ok(self):
     self.assertEqual(responses[0][0], bridge.RESP_OK)
 
 
-TestRadioParamCommands.test_set_radio_params_too_short_returns_ok_no_change = (
-    _u1_test_set_radio_params_too_short_returns_ok_no_change
+setattr(
+    TestRadioParamCommands,
+    "test_set_radio_params_too_short_returns_ok_no_change",
+    _u1_test_set_radio_params_too_short_returns_ok_no_change,
 )
-TestRadioParamCommands.test_set_radio_tx_power_negative_value = (
-    _u2_test_set_radio_tx_power_negative_value
+setattr(
+    TestRadioParamCommands,
+    "test_set_radio_tx_power_negative_value",
+    _u2_test_set_radio_tx_power_negative_value,
 )
-TestRadioParamCommands.test_set_radio_tx_power_empty_data_ok = (
-    _u3_test_set_radio_tx_power_empty_data_ok
+setattr(
+    TestRadioParamCommands,
+    "test_set_radio_tx_power_empty_data_ok",
+    _u3_test_set_radio_tx_power_empty_data_ok,
 )
 
 
@@ -4209,8 +4204,10 @@ def _v1_test_set_advert_latlon_too_short_returns_ok_no_change(self):
     self.assertEqual(state.lat_e6, original_lat)
 
 
-TestLatLonInAdvert.test_set_advert_latlon_too_short_returns_ok_no_change = (
-    _v1_test_set_advert_latlon_too_short_returns_ok_no_change
+setattr(
+    TestLatLonInAdvert,
+    "test_set_advert_latlon_too_short_returns_ok_no_change",
+    _v1_test_set_advert_latlon_too_short_returns_ok_no_change,
 )
 
 
@@ -4245,11 +4242,15 @@ def _w2_test_stub_cmds_increment_msg_seq(self):
     self.assertEqual(state.msg_seq, 2)
 
 
-TestCommandHandler.test_stub_cmds_return_msg_sent_flood_routing = (
-    _w1_test_stub_cmds_return_msg_sent_flood_routing
+setattr(
+    TestCommandHandler,
+    "test_stub_cmds_return_msg_sent_flood_routing",
+    _w1_test_stub_cmds_return_msg_sent_flood_routing,
 )
-TestCommandHandler.test_stub_cmds_increment_msg_seq = (
-    _w2_test_stub_cmds_increment_msg_seq
+setattr(
+    TestCommandHandler,
+    "test_stub_cmds_increment_msg_seq",
+    _w2_test_stub_cmds_increment_msg_seq,
 )
 
 
@@ -4280,11 +4281,15 @@ def _x3_test_reboot_returns_ok(self):
     self.assertEqual(responses[0][0], bridge.RESP_OK)
 
 
-TestCommandHandler.test_reset_path_returns_ok = _x1_test_reset_path_returns_ok
-TestCommandHandler.test_set_tuning_params_returns_ok = (
-    _x2_test_set_tuning_params_returns_ok
+setattr(
+    TestCommandHandler, "test_reset_path_returns_ok", _x1_test_reset_path_returns_ok
 )
-TestCommandHandler.test_reboot_returns_ok = _x3_test_reboot_returns_ok
+setattr(
+    TestCommandHandler,
+    "test_set_tuning_params_returns_ok",
+    _x2_test_set_tuning_params_returns_ok,
+)
+setattr(TestCommandHandler, "test_reboot_returns_ok", _x3_test_reboot_returns_ok)
 
 
 # ---- Group Y: handle_command empty payload ----
@@ -4297,8 +4302,10 @@ def _y1_test_handle_command_empty_payload_returns_empty(self):
     self.assertEqual(responses, [])
 
 
-TestCommandHandler.test_handle_command_empty_payload_returns_empty = (
-    _y1_test_handle_command_empty_payload_returns_empty
+setattr(
+    TestCommandHandler,
+    "test_handle_command_empty_payload_returns_empty",
+    _y1_test_handle_command_empty_payload_returns_empty,
 )
 
 
@@ -4545,6 +4552,41 @@ class TestSetCustomVar(unittest.TestCase):
         """Empty payload also returns RESP_ERROR."""
         resp = self._cmd(b"")
         self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+
+
+class TestCtrlRx(unittest.TestCase):
+    def _make_ctrl_frame(self, ctrl_payload: bytes) -> dict:
+        """Build a fake lora_frame dict containing a CTRL packet."""
+        from meshcore_tx import build_wire_packet, make_header
+
+        header = make_header(bridge.ROUTE_FLOOD, 0x0B)  # PAYLOAD_CTRL
+        wire = build_wire_packet(header, ctrl_payload)
+        return {
+            "type": "lora_frame",
+            "payload": wire,
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 3.0, "rssi_dbm": -85},
+        }
+
+    def test_ctrl_discover_resp_produces_control_data_push(self):
+        """Incoming CTRL DISCOVER_RESP produces a CONTROL_DATA push (0x8E)."""
+        state = make_state()
+        # Build a DISCOVER_RESP payload: subtype=0x91 (RESP|node_type=1),
+        # SNR_in=10*4=40=0x28, tag=4 bytes, pubkey_prefix=8 bytes
+        tag = b"\x01\x02\x03\x04"
+        ctrl_payload = bytes([0x91, 40]) + tag + b"\xaa" * 8
+        frame = self._make_ctrl_frame(ctrl_payload)
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0][0], 0x8E)  # PUSH_CONTROL_DATA
+
+    def test_ctrl_non_discover_produces_control_data_push(self):
+        """Any CTRL packet produces CONTROL_DATA push."""
+        state = make_state()
+        frame = self._make_ctrl_frame(bytes([0x80, 0x01, 0x00, 0x00, 0x00, 0x00]))
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0][0], 0x8E)
 
 
 if __name__ == "__main__":
