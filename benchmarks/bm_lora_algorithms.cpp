@@ -16,7 +16,6 @@
 
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
-#include <gnuradio-4.0/lora/algorithm/firdes.hpp>
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
 #include <gnuradio-4.0/lora/algorithm/tables.hpp>
@@ -363,22 +362,6 @@ const boost::ut::suite misc_benchmarks = [] {
             };
     }
 
-    // --- FIR filter design: channelizer initialization ---
-    {
-        constexpr uint32_t NUM_TAPS    = 101;
-        constexpr double   SAMPLE_RATE = 250000.0;
-        constexpr double   CUTOFF      = 31250.0;  // BW/2
-
-        auto warmup = gr::lora::firdes_low_pass(NUM_TAPS, SAMPLE_RATE, CUTOFF);
-        g_sink = warmup.size();
-
-        constexpr int REPS = 5'000;
-        ::benchmark::benchmark<REPS>(std::string_view("firdes_low_pass (101 taps)"), NUM_TAPS) =
-            [] {
-                auto taps = gr::lora::firdes_low_pass(NUM_TAPS, SAMPLE_RATE, CUTOFF);
-                g_sink = taps.size();
-            };
-    }
 };
 
 // Measure best-of-N batches to avoid OS scheduling jitter in the mean.

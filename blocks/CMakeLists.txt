@@ -11,8 +11,9 @@ gr_add_block_library(
     HEADERS
         include/gnuradio-4.0/lora/FrameSync.hpp
         include/gnuradio-4.0/lora/DemodDecoder.hpp
-        include/gnuradio-4.0/lora/FreqXlatingDecimator.hpp
         include/gnuradio-4.0/lora/Splitter.hpp
         include/gnuradio-4.0/lora/ChannelActivityDetector.hpp
+        include/gnuradio-4.0/lora/FrameSink.hpp
+        include/gnuradio-4.0/lora/TxQueueSource.hpp
     LINK_LIBRARIES
         gr-lora)

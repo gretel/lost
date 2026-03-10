@@ -463,4 +463,47 @@ const boost::ut::suite<"TX inverted IQ"> tx_inverted_iq_tests = [] {
     };
 };
 
+// ============================================================================
+// Multi-config TX pipeline: verify all 36 SF×CR×BW configurations
+// ============================================================================
+
+const boost::ut::suite<"TX multi-config pipeline"> tx_multi_config_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+    using namespace gr::lora::test;
+
+    "multi-config TX pipeline"_test = [] {
+        for (const auto& cfg : allConfigs()) {
+            const auto label = cfg.subdir();
+            const std::vector<uint8_t> payload(cfg.payload.begin(), cfg.payload.end());
+            const bool use_ldro = needs_ldro(cfg.sf, cfg.bw);
+
+            auto whitened = whiten(payload);
+            expect_vectors_equal(whitened,
+                load_u8(cfg, "tx_01_whitened_nibbles.u8"), label + " whiten");
+
+            auto with_header = insert_header(whitened,
+                static_cast<uint8_t>(payload.size()), cfg.cr, cfg.has_crc);
+            expect_vectors_equal(with_header,
+                load_u8(cfg, "tx_02_with_header.u8"), label + " header");
+
+            auto with_crc = add_crc(with_header, payload, cfg.has_crc);
+            expect_vectors_equal(with_crc,
+                load_u8(cfg, "tx_03_with_crc.u8"), label + " crc");
+
+            auto encoded = hamming_encode_frame(with_crc, cfg.sf, cfg.cr);
+            expect_vectors_equal(encoded,
+                load_u8(cfg, "tx_04_encoded.u8"), label + " hamming");
+
+            auto interleaved = interleave_frame(encoded, cfg.sf, cfg.cr, use_ldro);
+            expect_vectors_equal(interleaved,
+                load_u32(cfg, "tx_05_interleaved.u32"), label + " interleave");
+
+            auto gray = gray_demap(interleaved, cfg.sf);
+            expect_vectors_equal(gray,
+                load_u32(cfg, "tx_06_gray_mapped.u32"), label + " gray");
+        }
+    };
+};
+
 int main() { /* boost::ut auto-runs all suites */ }

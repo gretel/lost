@@ -39,10 +39,6 @@ add_ut_test(qa_lora_burst)
 target_compile_definitions(qa_lora_burst PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
 
-add_ut_test(qa_lora_channelizer)
-target_compile_definitions(qa_lora_channelizer PRIVATE
-    TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
-
 add_ut_test(qa_lora_splitter)
 target_compile_definitions(qa_lora_splitter PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
@@ -51,6 +47,10 @@ add_ut_test(qa_lora_cad)
 target_compile_definitions(qa_lora_cad PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
 set_tests_properties(qa_lora_cad PROPERTIES TIMEOUT 60)
+
+# Test vector generator (not a test — run manually to regenerate vectors)
+add_executable(generate_vectors generate_vectors.cpp)
+target_link_libraries(generate_vectors PRIVATE gr-lora)
 
 # --- Hardware tests (require SoapySDR + B210/B220) ---
 if(TARGET gr-soapy)

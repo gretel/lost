@@ -132,7 +132,7 @@ const boost::ut::suite<"Decode pipeline algorithm-level"> decode_algo_tests = []
     using namespace gr::lora;
 
     "DemodDecoder decodes Hello MeshCore from aligned symbols"_test = [] {
-        auto iq = load_cf32("tx_07_iq_frame.cf32");
+        auto iq = load_cf32(DEFAULT_CONFIG, "tx_07_iq_frame_gr3.cf32");
         auto expected_payload = load_text("payload.txt");
 
         // Extract aligned, downsampled payload symbols from the test IQ.
@@ -229,7 +229,7 @@ const boost::ut::suite<"Full RX pipeline"> full_graph_tests = [] {
     using namespace boost::ut;
 
     "Full pipeline decodes Hello MeshCore"_test = [] {
-        auto iq = load_cf32("tx_07_iq_frame.cf32");
+        auto iq = load_cf32(DEFAULT_CONFIG, "tx_07_iq_frame_gr3.cf32");
         auto expected_payload = load_text("payload.txt");
 
         auto result = run_decode(iq);

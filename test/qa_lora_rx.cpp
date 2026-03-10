@@ -10,6 +10,7 @@
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
 #include <gnuradio-4.0/lora/algorithm/tables.hpp>
+#include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
 using namespace gr::lora::test;
 
@@ -350,6 +351,106 @@ const boost::ut::suite<"Full RX pipeline (algorithm-level)"> full_rx_pipeline_te
         expect(eq(decoded_str, payload_str))
             << "Payload mismatch: got \"" << decoded_str
             << "\" expected \"" << payload_str << "\"";
+    };
+};
+
+// ============================================================================
+// Multi-config RX pipeline: verify all 36 SF×CR×BW configurations
+// ============================================================================
+
+const boost::ut::suite<"Multi-config RX pipeline"> multi_config_rx_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+    using namespace gr::lora::test;
+
+    "multi-config RX pipeline"_test = [] {
+        for (const auto& cfg : allConfigs()) {
+            const auto label = cfg.subdir();
+            const bool use_ldro = needs_ldro(cfg.sf, cfg.bw);
+            const uint32_t N_val = cfg.N();
+
+            auto gray_mapped = load_u32(cfg, "tx_06_gray_mapped.u32");
+            auto payload_str = load_text(cfg, "payload.txt");
+
+            // === Stage 1: FFTDemod simulation (subtract 1 mod N) ===
+            std::vector<uint16_t> fft_output;
+            for (auto gm : gray_mapped) {
+                fft_output.push_back(static_cast<uint16_t>((gm + N_val - 1) % N_val));
+            }
+
+            // === Stage 2: GrayMapping (binary_to_gray) ===
+            std::vector<uint16_t> interleaved;
+            for (auto sym : fft_output) {
+                interleaved.push_back(static_cast<uint16_t>(sym ^ (sym >> 1)));
+            }
+
+            // === Stage 3: Deinterleave (LDRO-aware) ===
+            std::vector<uint8_t> all_codewords;
+            std::size_t sym_idx = 0;
+            bool is_first = true;
+            while (sym_idx < interleaved.size()) {
+                bool reduced_rate = is_first || use_ldro;
+                uint8_t sf_app = reduced_rate ? static_cast<uint8_t>(cfg.sf - 2) : cfg.sf;
+                uint8_t cw_len = is_first ? uint8_t(8) : static_cast<uint8_t>(4 + cfg.cr);
+
+                if (sym_idx + cw_len > interleaved.size()) break;
+
+                std::vector<uint16_t> block_syms;
+                for (std::size_t j = 0; j < cw_len; j++) {
+                    uint16_t sym = interleaved[sym_idx + j];
+                    if (reduced_rate) {
+                        sym >>= (cfg.sf - sf_app);
+                    }
+                    block_syms.push_back(sym);
+                }
+
+                auto cw = deinterleave_block(block_syms, cfg.sf, cw_len, sf_app);
+                all_codewords.insert(all_codewords.end(), cw.begin(), cw.end());
+
+                sym_idx += cw_len;
+                is_first = false;
+            }
+
+            // === Stage 4: Hamming decode ===
+            std::vector<uint8_t> nibbles;
+            for (std::size_t i = 0; i < all_codewords.size(); i++) {
+                uint8_t cr_app = (static_cast<int>(i) < cfg.sf - 2) ? uint8_t(4) : cfg.cr;
+                nibbles.push_back(hamming_decode_hard(all_codewords[i], cr_app));
+            }
+
+            // === Stage 5: Header decode ===
+            expect(ge(nibbles.size(), std::size_t{5}))
+                << label << " not enough nibbles for header";
+            auto hdr = parse_explicit_header(nibbles[0], nibbles[1], nibbles[2],
+                                              nibbles[3], nibbles[4]);
+            expect(hdr.checksum_valid) << label << " header checksum invalid";
+            expect(eq(static_cast<int>(hdr.payload_len),
+                      static_cast<int>(payload_str.size())))
+                << label << " header payload_len mismatch";
+            expect(eq(static_cast<int>(hdr.cr), static_cast<int>(cfg.cr)))
+                << label << " header CR mismatch";
+
+            // === Stage 6: Dewhitening via dewhiten() ===
+            std::size_t data_nibs = hdr.payload_len * 2 + (hdr.has_crc ? 4 : 0);
+            std::vector<uint8_t> data_nibbles(nibbles.begin() + 5,
+                nibbles.begin() + std::min(nibbles.size(), 5 + data_nibs));
+            auto decoded_bytes = dewhiten(data_nibbles, hdr.payload_len);
+
+            // === Stage 7: CRC verify ===
+            if (hdr.has_crc && decoded_bytes.size() >= hdr.payload_len + 2u) {
+                std::span<const uint8_t> pay_span(decoded_bytes.data(), hdr.payload_len);
+                bool crc_ok = lora_verify_crc(pay_span,
+                    decoded_bytes[hdr.payload_len], decoded_bytes[hdr.payload_len + 1]);
+                expect(crc_ok) << label << " CRC verification failed";
+            }
+
+            // === Final: compare payload ===
+            std::string decoded_str(decoded_bytes.begin(),
+                                    decoded_bytes.begin() + hdr.payload_len);
+            expect(eq(decoded_str, payload_str))
+                << label << " payload mismatch: got \"" << decoded_str
+                << "\" expected \"" << payload_str << "\"";
+        }
     };
 };
 

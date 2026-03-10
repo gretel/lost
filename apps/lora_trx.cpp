@@ -56,9 +56,9 @@
 #include <gnuradio-4.0/soapy/SoapySink.hpp>
 #include <gnuradio-4.0/testing/NullSources.hpp>
 
-#include "FrameSink.hpp"
-#include "TxQueueSource.hpp"
-#include "cbor.hpp"
+#include <gnuradio-4.0/lora/FrameSink.hpp>
+#include <gnuradio-4.0/lora/TxQueueSource.hpp>
+#include <gnuradio-4.0/lora/cbor.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
 namespace {

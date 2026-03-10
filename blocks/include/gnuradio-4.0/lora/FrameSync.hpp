@@ -16,7 +16,7 @@
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
-#include <gnuradio-4.0/lora/SpectrumTap.hpp>
+#include <gnuradio-4.0/lora/algorithm/SpectrumTap.hpp>
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
