@@ -38,10 +38,11 @@ import cbor2
 
 from lora_common import (
     KEEPALIVE_INTERVAL,
+    config_udp_host,
+    config_udp_port,
     create_udp_subscriber,
     format_ascii,
     load_config,
-    resolve_udp_address,
     setup_logging,
     sync_word_name,
 )
@@ -721,7 +722,7 @@ def main() -> None:
         "--connect",
         metavar="HOST:PORT",
         default=None,
-        help="lora_trx UDP address (default from config.toml or 127.0.0.1:5555)",
+        help="lora_trx UDP address (default from config.toml or 127.0.0.1:5556)",
     )
     parser.add_argument(
         "--bw-factor",
@@ -771,9 +772,15 @@ def main() -> None:
     cfg = load_config()
     setup_logging("gr4.waterfall", cfg, no_color=args.no_color)
 
-    host, port = resolve_udp_address(args.connect, cfg)
+    # Connect directly to lora_trx (not lora_agg) — needs raw spectrum frames
+    if args.connect:
+        from lora_common import parse_host_port
 
-    # Create UDP socket and subscribe (no sync_word filter -- need all msgs)
+        host, port = parse_host_port(args.connect)
+    else:
+        host, port = config_udp_host(cfg), config_udp_port(cfg)
+
+    # Subscribe without sync_word filter — need spectrum + all frame types
     sock, sub_msg, addr = create_udp_subscriber(host, port, timeout=0.0, blocking=False)
     log.info("connecting to %s:%d", host, port)
 

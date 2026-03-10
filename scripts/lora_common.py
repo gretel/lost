@@ -501,12 +501,18 @@ def resolve_udp_address(
     connect_arg: str | None,
     cfg: dict[str, Any],
 ) -> tuple[str, int]:
-    """Resolve lora_trx UDP address from --connect arg or config.toml.
+    """Resolve consumer UDP address from --connect arg or config.toml.
 
-    Priority: explicit --connect > config.toml > defaults (127.0.0.1:5555).
+    Priority: explicit --connect > [aggregator].listen (if present) >
+    [network].udp_port > defaults (127.0.0.1:5555).
+
+    When lora_agg is configured, clients should connect to the aggregator
+    (5555) rather than directly to lora_trx (5556).
     """
     if connect_arg:
         return parse_host_port(connect_arg)
+    if cfg.get("aggregator"):
+        return parse_host_port(config_agg_listen(cfg))
     return config_udp_host(cfg), config_udp_port(cfg)
 
 
@@ -518,11 +524,11 @@ def create_udp_subscriber(
     timeout: float = RECV_TIMEOUT,
     blocking: bool = True,
 ) -> tuple[socket.socket, bytes, tuple[str, int]]:
-    """Create a UDP socket, subscribe to lora_trx, return (sock, sub_msg, addr).
+    """Create a UDP socket, subscribe to lora_trx/lora_agg, return (sock, sub_msg, addr).
 
     Args:
-        host: lora_trx host address.
-        port: lora_trx UDP port.
+        host: Server host address.
+        port: Server UDP port.
         sync_words: Optional sync_word filter (e.g. [0x12] for MeshCore).
         timeout: Socket receive timeout (seconds). Ignored if blocking=False.
         blocking: If False, set socket to non-blocking mode.

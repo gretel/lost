@@ -47,6 +47,7 @@ from typing import Any
 import cbor2
 
 from lora_common import (
+    config_agg_listen,
     config_region_scope,
     config_udp_host,
     config_udp_port,
@@ -2234,7 +2235,7 @@ def main() -> None:
         help=f"TCP listen port (overrides config.toml; default: {BRIDGE_PORT})",
     )
     parser.add_argument(
-        "--udp",
+        "--connect",
         metavar="HOST:PORT",
         default=None,
         help="lora_trx UDP address (default from config.toml or 127.0.0.1:5555)",
@@ -2298,12 +2299,14 @@ def main() -> None:
     cfg = load_config(args.config)
     setup_logging("gr4.bridge", cfg, debug=args.debug, no_color=args.no_color)
 
-    # Resolve UDP address
-    if args.udp:
+    # Resolve UDP address — prefer lora_agg consumer port when configured
+    if args.connect:
         try:
-            udp_host, udp_port = parse_host_port(args.udp)
+            udp_host, udp_port = parse_host_port(args.connect)
         except ValueError as exc:
             parser.error(str(exc))
+    elif cfg.get("aggregator"):
+        udp_host, udp_port = parse_host_port(config_agg_listen(cfg))
     else:
         udp_host = config_udp_host(cfg)
         udp_port = config_udp_port(cfg)

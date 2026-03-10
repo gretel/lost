@@ -229,7 +229,7 @@ class ConsumerServer:
         return None
 
     def broadcast(self, data: bytes, sync_word: int | None = None) -> None:
-        """Broadcast data to all registered consumers."""
+        """Broadcast data to all registered consumers (filtered by sync_word)."""
         dead: list[tuple[str, int]] = []
         for addr, info in self._clients.items():
             sw_filter = info.get("sync_words", set())
