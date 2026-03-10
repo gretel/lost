@@ -214,8 +214,13 @@ class ConsumerServer:
             sync_words = set(msg.get("sync_word", []))
             is_new = addr not in self._clients
             self._clients[addr] = {"sync_words": sync_words}
-            action = "consumer connected" if is_new else "consumer reconnected"
-            log.info("%s %s:%d sw=%s", action, addr[0], addr[1], sync_words or "all")
+            if is_new:
+                sw_str = (
+                    ", ".join(f"0x{sw:02x}" for sw in sorted(sync_words))
+                    if sync_words
+                    else "all"
+                )
+                log.info("consumer connected %s:%d sw=%s", addr[0], addr[1], sw_str)
             return None
         if msg_type == "lora_tx":
             self._clients.setdefault(addr, {"sync_words": set()})
