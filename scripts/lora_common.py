@@ -233,7 +233,7 @@ def _want_color(stream: IO[Any]) -> bool:
 class _ColorFormatter(logging.Formatter):
     """Log formatter with ANSI colors keyed on log level.
 
-    Timestamps are UTC ISO-8601 with milliseconds ("2026-03-09T14:33:17.342Z").
+    Timestamps are local time HH:MM:SS.mmmm (4 fractional digits, 100µs precision).
     Level labels are padded full words (e.g. "info   ", "warning").
     The label is bold+colored; timestamp, logger name, and message are plain.
 
@@ -268,11 +268,11 @@ class _ColorFormatter(logging.Formatter):
         self._use_color = use_color
 
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
-        """Return UTC ISO-8601 timestamp with milliseconds and Z suffix."""
+        """Return local time HH:MM:SS with 4 fractional digits (100µs precision)."""
         import datetime as _dt
 
-        now = _dt.datetime.fromtimestamp(record.created, tz=_dt.timezone.utc)
-        return now.strftime("%Y-%m-%dT%H:%M:%S") + f".{now.microsecond // 1000:03d}Z"
+        now = _dt.datetime.fromtimestamp(record.created)
+        return now.strftime("%H:%M:%S") + f".{now.microsecond // 100:04d}"
 
     def format(self, record: logging.LogRecord) -> str:
         if not self._use_color:

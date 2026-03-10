@@ -212,14 +212,10 @@ class ConsumerServer:
         msg_type = msg.get("type", "")
         if msg_type == "subscribe":
             sync_words = set(msg.get("sync_word", []))
+            is_new = addr not in self._clients
             self._clients[addr] = {"sync_words": sync_words}
-            if log.isEnabledFor(logging.DEBUG):
-                log.debug(
-                    "consumer registered: %s:%d sw=%s",
-                    addr[0],
-                    addr[1],
-                    sync_words or "all",
-                )
+            action = "consumer connected" if is_new else "consumer reconnected"
+            log.info("%s %s:%d sw=%s", action, addr[0], addr[1], sync_words or "all")
             return None
         if msg_type == "lora_tx":
             self._clients.setdefault(addr, {"sync_words": set()})
@@ -326,6 +322,7 @@ def run(args: argparse.Namespace) -> None:
         i: time.monotonic() for i in range(len(up_socks))
     }
     upstream_warned: dict[int, bool] = {i: False for i in range(len(up_socks))}
+    upstream_connected: dict[int, bool] = {i: False for i in range(len(up_socks))}
 
     # Map socket fd -> upstream index for health tracking
     sock_to_idx: dict[int, int] = {sock.fileno(): i for i, sock in enumerate(up_socks)}
@@ -474,9 +471,16 @@ def run(args: argparse.Namespace) -> None:
                     idx = sock_to_idx.get(sock.fileno())
                     if idx is not None:
                         last_upstream_rx[idx] = time.monotonic()
-                        if upstream_warned[idx]:
+                        if not upstream_connected[idx]:
                             log.info(
-                                "upstream %s:%d resumed",
+                                "upstream connected: %s:%d",
+                                up_addrs[idx][0],
+                                up_addrs[idx][1],
+                            )
+                            upstream_connected[idx] = True
+                        elif upstream_warned[idx]:
+                            log.info(
+                                "upstream reconnected: %s:%d",
                                 up_addrs[idx][0],
                                 up_addrs[idx][1],
                             )
