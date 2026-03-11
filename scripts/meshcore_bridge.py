@@ -172,6 +172,8 @@ CMD_PATH_DISCOVERY = 0x34
 CMD_GET_STATS = 0x38
 CMD_SEND_CONTROL_DATA = 0x37
 CMD_SET_FLOOD_SCOPE = 0x36
+CMD_BINARY_REQ = 0x32
+CMD_SEND_ANON_REQ = 0x39
 CMD_SET_AUTOADD_CONFIG = 0x3A
 CMD_GET_AUTOADD_CONFIG = 0x3B
 CMD_GET_ALLOWED_REPEAT_FREQ = 0x3C
@@ -214,6 +216,7 @@ PUSH_PATH_UPDATE = 0x81
 PUSH_ACK = 0x82
 PUSH_MESSAGES_WAITING = 0x83
 PUSH_NEW_ADVERT = 0x8A
+PUSH_BINARY_RESPONSE = 0x8C
 PUSH_CONTROL_DATA = 0x8E
 
 # ---- Helpers ----
@@ -1077,7 +1080,24 @@ def _handle_txt_msg_rx(
             ack_packets.append(_build_ack_wire_packet(ack_hash))
             log.info("ACK hash: %s for %s..", ack_hash.hex(), sender_pub.hex()[:8])
 
-        return ([msg], ack_packets)
+        companion_msgs: list[bytes] = [msg]
+
+        # If this is a CLI response (txt_type == 1), push BINARY_RESPONSE (0x8C)
+        # so the companion can match it against a pending binary request.
+        # Format: [0x8C][tag(4)][data_bytes]
+        # tag = first 4 bytes of compute_ack_hash(plaintext, sender_pub)
+        if txt_type == 1 and plaintext is not None and len(plaintext) >= 5:
+            tag = compute_ack_hash(plaintext, sender_pub)
+            data_bytes = text.encode("utf-8")
+            binary_resp = bytes([PUSH_BINARY_RESPONSE]) + tag + data_bytes
+            companion_msgs.append(binary_resp)
+            log.info(
+                "BINARY_RESPONSE push: tag=%s from %s..",
+                tag.hex(),
+                sender_pub.hex()[:8],
+            )
+
+        return (companion_msgs, ack_packets)
 
     # Decryption failed — pass as opaque (not addressed to us, or unknown sender)
     log.debug("TXT_MSG: decryption failed (not for us or unknown sender)")
@@ -1596,6 +1616,55 @@ def handle_command(
     if cmd in (CMD_TRACE, CMD_PATH_DISCOVERY):
         log.debug("companion: unimplemented repeater cmd 0x%02x (stub MSG_SENT)", cmd)
         return [state.build_msg_sent(flood=True)]
+
+    if cmd == CMD_BINARY_REQ:
+        # Frame: [0x32][dst_pubkey(32)][request_type(1)][opt_data...]
+        assert udp_sock is not None and udp_addr is not None
+        if len(data) < 33:
+            return [state.build_error()]
+        dst_pub = data[:32]
+        req_data = data[32:]  # request_type(1) + opt extra data
+        ts = int(time.time())
+        # Send as TXT_TYPE_CLI (msg_type=1) carrying raw binary request data
+        companion_data = (
+            bytes([0x01, 0x00]) + struct.pack("<I", ts) + dst_pub[:6] + req_data
+        )
+        log.info(
+            "companion: BINARY_REQ type=0x%02x to %s..",
+            req_data[0] if req_data else 0,
+            dst_pub.hex()[:8],
+        )
+        return _handle_send_txt_msg(companion_data, state, udp_sock, udp_addr)
+
+    if cmd == CMD_SEND_ANON_REQ:
+        # Frame: [0x39][dst_pubkey(32)][request_type(1)][path_len(1)][path_bytes...]
+        assert udp_sock is not None and udp_addr is not None
+        if len(data) < 33:
+            return [state.build_error()]
+        dst_pub = data[:32]
+        req_type = data[32] if len(data) > 32 else 0
+        log.info(
+            "companion: SEND_ANON_REQ type=0x%02x to %s..",
+            req_type,
+            dst_pub.hex()[:8],
+        )
+        from meshcore_tx import build_anon_req, make_cbor_tx_request
+
+        pkt = build_anon_req(
+            state.expanded_prv, state.pub_key, dst_pub, bytes([req_type])
+        )
+        h = _hash_payload(pkt)
+        state.recent_tx[h] = time.monotonic()
+        state.pkt_sent += 1
+        state.pkt_flood_tx += 1
+        cbor_msg = make_cbor_tx_request(pkt)
+        udp_sock.sendto(cbor_msg, udp_addr)
+        ts = int(time.time())
+        plaintext = struct.pack("<I", ts) + bytes([0x00]) + bytes([req_type])
+        expected_ack = compute_ack_hash(plaintext, state.pub_key)
+        resp = state.build_msg_sent(flood=True, ack_hash=expected_ack)
+        state.pending_acks[expected_ack] = (time.monotonic(), dst_pub[:6])
+        return [resp]
 
     # Unknown command — return OK silently
     return [state.build_ok()]

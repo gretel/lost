@@ -4851,5 +4851,120 @@ class TestRepeaterCommands(unittest.TestCase):
         self.assertEqual(responses[0][0], bridge.RESP_ERROR)
 
 
+class TestBinaryReq(unittest.TestCase):
+    def _make_peer_contact(self, state):
+        peer_prv, peer_pub, _ = make_identity()
+        record = bridge._build_contact_record(peer_pub, name="repeater")
+        state.contacts[peer_pub.hex()] = record
+        from meshcore_crypto import save_pubkey
+
+        save_pubkey(state.keys_dir, peer_pub)
+        state.known_keys[peer_pub.hex()] = peer_pub
+        return peer_pub, peer_prv
+
+    def test_cmd_binary_req_returns_msg_sent(self):
+        """CMD_BINARY_REQ sends a binary TXT_MSG and returns MSG_SENT."""
+        state = make_state()
+        peer_pub, _ = self._make_peer_contact(state)
+        sock = _FakeUDPSock()
+        # request_type=0x01 (STATUS)
+        cmd = bytes([bridge.CMD_BINARY_REQ]) + peer_pub + bytes([0x01])
+        responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        self.assertGreater(len(sock.sent), 0)
+
+    def test_cmd_binary_req_short_payload_returns_error(self):
+        """CMD_BINARY_REQ with payload shorter than 33 bytes returns error."""
+        state = make_state()
+        sock = _FakeUDPSock()
+        cmd = bytes([bridge.CMD_BINARY_REQ]) + b"\x00" * 10  # too short
+        responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+    def test_cmd_send_anon_req_returns_msg_sent(self):
+        """CMD_SEND_ANON_REQ sends an ANON_REQ and returns MSG_SENT."""
+        state = make_state()
+        peer_pub, _ = self._make_peer_contact(state)
+        sock = _FakeUDPSock()
+        # request_type=0x04 (OWNER)
+        cmd = (
+            bytes([bridge.CMD_SEND_ANON_REQ])
+            + peer_pub
+            + bytes([0x04])
+            + bytes([0])  # path_len=0
+        )
+        responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        self.assertGreater(len(sock.sent), 0)
+
+    def test_cmd_send_anon_req_short_payload_returns_error(self):
+        """CMD_SEND_ANON_REQ with payload shorter than 33 bytes returns error."""
+        state = make_state()
+        sock = _FakeUDPSock()
+        cmd = bytes([bridge.CMD_SEND_ANON_REQ]) + b"\x00" * 10  # too short
+        responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+    def test_incoming_cli_txt_msg_produces_binary_response_push(self):
+        """TXT_MSG with txt_type=CLI (0x01) produces BINARY_RESPONSE push (0x8C)."""
+        state = make_state()
+        peer_prv, peer_pub, _ = make_identity()
+        from meshcore_crypto import save_pubkey
+
+        save_pubkey(state.keys_dir, peer_pub)
+        state.known_keys[peer_pub.hex()] = peer_pub
+
+        # Build an incoming CLI TXT_MSG from peer
+        from meshcore_tx import build_txt_msg
+
+        pkt = build_txt_msg(
+            peer_prv,
+            peer_pub,
+            state.pub_key,
+            "status data",
+            txt_type=1,
+            route_type=bridge.ROUTE_FLOOD,
+        )
+        frame = {
+            "type": "lora_frame",
+            "payload": pkt,
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 4.0, "rssi_dbm": -80},
+        }
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, state)
+        # Should include a BINARY_RESPONSE push
+        push_types = [m[0] for m in msgs]
+        self.assertIn(bridge.PUSH_BINARY_RESPONSE, push_types)
+
+    def test_incoming_plain_txt_msg_does_not_produce_binary_response(self):
+        """TXT_MSG with txt_type=PLAIN (0x00) does NOT produce BINARY_RESPONSE push."""
+        state = make_state()
+        peer_prv, peer_pub, _ = make_identity()
+        from meshcore_crypto import save_pubkey
+
+        save_pubkey(state.keys_dir, peer_pub)
+        state.known_keys[peer_pub.hex()] = peer_pub
+
+        from meshcore_tx import build_txt_msg
+
+        pkt = build_txt_msg(
+            peer_prv,
+            peer_pub,
+            state.pub_key,
+            "hello world",
+            txt_type=0,
+            route_type=bridge.ROUTE_FLOOD,
+        )
+        frame = {
+            "type": "lora_frame",
+            "payload": pkt,
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 4.0, "rssi_dbm": -80},
+        }
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, state)
+        push_types = [m[0] for m in msgs]
+        self.assertNotIn(bridge.PUSH_BINARY_RESPONSE, push_types)
+
+
 if __name__ == "__main__":
     unittest.main()
