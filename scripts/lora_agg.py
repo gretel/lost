@@ -241,7 +241,7 @@ class ConsumerServer:
                 if self._fail_counts[addr] >= self._max_failures:
                     dead.append(addr)
         for addr in dead:
-            log.info(
+            log.warning(
                 "evicting consumer %s:%d after %d send failures",
                 addr[0],
                 addr[1],
@@ -376,7 +376,7 @@ def run(args: argparse.Namespace) -> None:
             raw = apply_config(msg)
             new_window_ms = config_agg_window_ms(raw)
             window_s = new_window_ms / 1000.0
-            log.info("config received: window=%dms", new_window_ms)
+            log.debug("config received: window=%dms", new_window_ms)
             data = cbor2.dumps(msg)
             server.broadcast(data)
             return

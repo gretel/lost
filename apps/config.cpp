@@ -61,19 +61,18 @@ void merge_properties(gr::property_map& base, const gr::property_map& overrides)
 void print_usage() {
     std::fprintf(stderr,
         "Usage: lora_trx [options]\n\n"
-        "Full-duplex LoRa transceiver. All I/O is CBOR over UDP.\n"
-        "TX requests use type \"lora_tx\" (see docs/cbor-schemas.md).\n\n"
+        "Full-duplex LoRa transceiver with CBOR-over-UDP I/O.\n\n"
         "Options:\n"
-        "  --config <file>   TOML configuration file (default: config.toml)\n"
-        "  --debug           Enable verbose state-machine traces on stderr\n"
-        "  --no-lbt          Disable listen-before-talk (transmit immediately)\n"
-        "  --version         Show version and exit\n"
-        "  -h, --help        Show this help\n\n"
-        "Configuration is defined entirely in the TOML file.\n"
-        "See apps/config.toml for a documented example.\n");
+        "  --config <file>       TOML configuration file (default: config.toml)\n"
+        "  --log-level <level>   Log level: DEBUG, INFO, WARNING, ERROR\n"
+        "                        Overrides [logging] level in config.toml.\n"
+        "                        DEBUG also enables verbose decoder traces.\n"
+        "  --version             Show version and exit\n"
+        "  -h, --help            Show this help\n");
 }
 
-int parse_args(int argc, char* argv[], TrxConfig& cfg, std::string& config_path) {
+int parse_args(int argc, char* argv[], std::string& config_path,
+               std::string& log_level) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -88,12 +87,10 @@ int parse_args(int argc, char* argv[], TrxConfig& cfg, std::string& config_path)
             config_path = argv[++i];
             continue;
         }
-        if (arg == "--debug") {
-            cfg.debug = true;
-            continue;
-        }
-        if (arg == "--no-lbt") {
-            cfg.lbt = false;
+        if (arg == "--log-level" && i + 1 < argc) {
+            log_level = argv[++i];
+            // Uppercase for consistency
+            for (auto& ch : log_level) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
             continue;
         }
         std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
@@ -108,7 +105,8 @@ int parse_args(int argc, char* argv[], TrxConfig& cfg, std::string& config_path)
 
 // --- TOML config loader ---
 
-std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
+std::vector<TrxConfig> load_config(const std::string& path,
+                                   const std::string& cli_log_level) {
     toml::table tbl;
     try {
         tbl = toml::parse_file(path);
@@ -168,7 +166,7 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
     bool        g_lbt        = net_or_b("lbt", true);
     int64_t     g_lbt_tmo    = net_or_i("lbt_timeout_ms", int64_t{2000});
     int64_t     g_tx_qdepth  = net_or_i("tx_queue_depth", int64_t{4});
-    bool        g_debug      = debug;
+    bool        g_debug      = (cli_log_level == "DEBUG");
 
     // --- [aggregator] section ---
     auto* agg_tbl = tbl["aggregator"].as_table();
@@ -207,6 +205,12 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
         g_logging.level = log_tbl->at_path("level").value_or(std::string{"INFO"});
         g_logging.color = log_tbl->at_path("color").value_or(true);
     }
+    // CLI --log-level overrides TOML
+    if (!cli_log_level.empty()) {
+        g_logging.level = cli_log_level;
+    }
+    // Apply resolved log level globally (affects all log_ts calls)
+    gr::lora::set_log_level(g_logging.level);
 
     // --- Collect codec and radio sections ---
     struct CodecCfg {
@@ -422,7 +426,7 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
                         dc.block_overrides.insert_or_assign(pk, pv);
                 }
 
-                if (g_debug && !dc.block_overrides.empty()) {
+                if (!dc.block_overrides.empty()) {
                     gr::lora::log_ts("debug", "lora_trx",
                         "[[%s.decode]] '%s': %zu override(s)",
                         skey.c_str(), dc.label.c_str(),
@@ -440,7 +444,7 @@ std::vector<TrxConfig> load_config(const std::string& path, bool debug) {
             return {};
         }
 
-        if (g_debug) {
+        {
             std::string rx_list;
             for (std::size_t i = 0; i < cfg.rx_channels.size(); i++) {
                 if (i > 0) rx_list += ",";

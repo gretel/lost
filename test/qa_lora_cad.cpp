@@ -227,6 +227,74 @@ const boost::ut::suite<"CAD algorithm direct"> algo_tests = [] {
         expect(gt(ratio, 4.16f)) << "clean downchirp should give peak_ratio > alpha";
     };
 
+    "default_alpha returns correct values for SF7-12"_test = [] {
+        using gr::lora::ChannelActivityDetector;
+        expect(eq(ChannelActivityDetector::default_alpha(7U), 4.23f));
+        expect(eq(ChannelActivityDetector::default_alpha(8U), 4.16f));
+        expect(eq(ChannelActivityDetector::default_alpha(9U), 4.09f));
+        expect(eq(ChannelActivityDetector::default_alpha(10U), 4.04f));
+        expect(eq(ChannelActivityDetector::default_alpha(11U), 3.98f));
+        expect(eq(ChannelActivityDetector::default_alpha(12U), 3.91f));
+        expect(eq(ChannelActivityDetector::default_alpha(6U), 0.f));
+        expect(eq(ChannelActivityDetector::default_alpha(13U), 0.f));
+    };
+
+    "detect() finds upchirp at +20 dB"_test = [] {
+        using gr::lora::ChannelActivityDetector;
+        constexpr uint8_t kSF = 8;
+        constexpr uint8_t kOS = 4;
+
+        ChannelActivityDetector block;
+        block.sf        = kSF;
+        block.os_factor = kOS;
+        block.alpha     = ChannelActivityDetector::default_alpha(kSF);
+        block.start();
+
+        auto win = make_upchirp_window(kSF, kOS, 20.f);
+        auto r   = block.detect(win.data());
+
+        expect(r.detected)    << "detect() should find upchirp at +20 dB";
+        expect(r.up_detected) << "up_detected should be true";
+        expect(gt(r.peak_ratio_up, 4.16f)) << "peak_ratio_up should exceed alpha";
+    };
+
+    "detect() does not fire on noise"_test = [] {
+        using gr::lora::ChannelActivityDetector;
+        constexpr uint8_t kSF = 8;
+        constexpr uint8_t kOS = 4;
+
+        ChannelActivityDetector block;
+        block.sf        = kSF;
+        block.os_factor = kOS;
+        block.alpha     = ChannelActivityDetector::default_alpha(kSF);
+        block.start();
+
+        auto win = make_noise_window(kSF, kOS, 1.f, 42U);
+        auto r   = block.detect(win.data());
+
+        expect(!r.detected) << "detect() should not fire on noise";
+    };
+
+    "detect() finds downchirp when dual_chirp=true"_test = [] {
+        using gr::lora::ChannelActivityDetector;
+        constexpr uint8_t kSF = 8;
+        constexpr uint8_t kOS = 4;
+
+        ChannelActivityDetector block;
+        block.sf         = kSF;
+        block.os_factor  = kOS;
+        block.alpha      = ChannelActivityDetector::default_alpha(kSF);
+        block.dual_chirp = true;
+        block.start();
+
+        auto win = make_downchirp_window(kSF, kOS, 20.f);
+        auto r   = block.detect(win.data());
+
+        expect(r.detected)    << "detect() should find downchirp at +20 dB";
+        expect(r.dn_detected) << "dn_detected should be true";
+        expect(gt(r.peak_ratio_dn, 4.16f)) << "peak_ratio_dn should exceed alpha";
+    };
+
     "pure noise gives peak_ratio < alpha (SF8)"_test = [] {
         constexpr uint8_t  kSF     = 8;
         constexpr uint8_t  kOS     = 4;

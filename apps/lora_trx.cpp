@@ -579,7 +579,7 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
             {"sf", cfg.sf},
             {"bandwidth", cfg.bw},
             {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
-            {"alpha", 4.16f},
+            {"alpha", gr::lora::ChannelActivityDetector::default_alpha(cfg.sf)},
             {"dual_chirp", true},
         });
         if (channel_busy != nullptr) {
@@ -637,7 +637,7 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                             {"sf", cfg.sf},
                             {"bandwidth", cfg.bw},
                             {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
-                            {"alpha", 4.16f},
+                            {"alpha", gr::lora::ChannelActivityDetector::default_alpha(cfg.sf)},
                             {"dual_chirp", true},
                         });
                         cad.set_channel_busy_flag(channel_busy);
@@ -739,7 +739,7 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         {"sf", cfg.sf},
                         {"bandwidth", cfg.bw},
                         {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
-                        {"alpha", 4.16f},
+                        {"alpha", gr::lora::ChannelActivityDetector::default_alpha(cfg.sf)},
                         {"dual_chirp", true},
                     });
                     cad.set_channel_busy_flag(channel_busy);
@@ -788,7 +788,7 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         {"sf", cfg.sf},
                         {"bandwidth", cfg.bw},
                         {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
-                        {"alpha", 4.16f},
+                        {"alpha", gr::lora::ChannelActivityDetector::default_alpha(cfg.sf)},
                         {"dual_chirp", true},
                     });
                     cad.set_channel_busy_flag(channel_busy);
@@ -849,11 +849,9 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
         });
     }
 
-    if (cfg.debug) {
-        gr::lora::log_ts("debug", "lora_trx",
-            "RX graph: %zu radio(s) x %zu decode(s) = %zu chains",
-            nRadio, nDecode, nChains);
-    }
+    gr::lora::log_ts("debug", "lora_trx",
+        "RX graph: %zu radio(s) x %zu decode(s) = %zu chains",
+        nRadio, nDecode, nChains);
 
     return overflow_ptr;
 }
@@ -1043,20 +1041,20 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    TrxConfig cfg;  // holds defaults for parse_args (only debug is set there)
     std::string config_path;
-    int rc = parse_args(argc, argv, cfg, config_path);
+    std::string log_level;
+    int rc = parse_args(argc, argv, config_path, log_level);
     if (rc != 0) {
         return rc == 2 ? 0 : 1;  // 2 = --help/--version (clean exit)
     }
 
-    auto configs = load_config(config_path, cfg.debug);
+    auto configs = load_config(config_path, log_level);
     if (configs.empty()) {
         return 1;
     }
 
     // Use first set for now (multi-set support is future work)
-    cfg = std::move(configs[0]);
+    TrxConfig cfg = std::move(configs[0]);
 
     if (cfg.rx_channels.empty()) {
         gr::lora::log_ts("error", "lora_trx",
@@ -1181,9 +1179,7 @@ int main(int argc, char* argv[]) {
     if (!cfg.clock.empty()) {
         gr::lora::log_ts("info ", "lora_trx", "clock source: %s", cfg.clock.c_str());
     }
-    if (cfg.debug) {
-        gr::lora::log_ts("debug", "lora_trx", "debug output enabled");
-    }
+    gr::lora::log_ts("debug", "lora_trx", "debug output enabled");
     if (cfg.status_interval > 0) {
         gr::lora::log_ts("info ", "lora_trx",
             "status heartbeat every %u s", cfg.status_interval);

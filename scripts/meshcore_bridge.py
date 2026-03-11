@@ -1526,7 +1526,7 @@ def handle_command(
         state.autoadd_config = data[0] if data else 0
         if len(data) >= 2:
             state.autoadd_max_hops = min(data[1], 64)
-        log.info(
+        log.debug(
             "companion: SET_AUTOADD_CONFIG config=0x%02x max_hops=%d",
             state.autoadd_config,
             state.autoadd_max_hops,
@@ -1547,7 +1547,7 @@ def handle_command(
         if data[1] >= 3:
             return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
         state.path_hash_mode = data[1]
-        log.info("companion: SET_PATH_HASH_MODE mode=%d", state.path_hash_mode)
+        log.debug("companion: SET_PATH_HASH_MODE mode=%d", state.path_hash_mode)
         return [state.build_ok()]
 
     if cmd == CMD_SET_OTHER_PARAMS:
@@ -1558,7 +1558,7 @@ def handle_command(
             state.telemetry_mode = data[1]
             state.adv_loc_policy = data[2]
             state.multi_acks = data[3] if len(data) >= 4 else 0
-            log.info(
+            log.debug(
                 "companion: SET_OTHER_PARAMS manual_add=%d telemetry=0x%02x adv_loc=%d multi_acks=%d",
                 state.manual_add_contacts,
                 state.telemetry_mode,
@@ -2380,7 +2380,7 @@ def run_bridge(
                             state.cr = int(phy.get("cr", state.cr + 4)) - 4
                             state.tx_power = int(phy.get("tx_gain", state.tx_power))
                         if not config_shown:
-                            log.info(
+                            log.debug(
                                 "config: %.3f MHz SF%d BW %.1fk CR 4/%d",
                                 state.freq_mhz,
                                 state.sf,
@@ -2396,7 +2396,7 @@ def run_bridge(
                         total = frames_info.get("total", 0)
                         if total != last_status_total:
                             ok = frames_info.get("crc_ok", 0)
-                            log.info("status: %d frames (%d CRC_OK)", total, ok)
+                            log.debug("status: %d frames (%d CRC_OK)", total, ok)
                             last_status_total = total
                         continue
 

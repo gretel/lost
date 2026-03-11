@@ -74,6 +74,24 @@ struct ChannelActivityDetector
     /// DownchirpRef: multiply by conj(downchirp) = upchirp  → detects downchirp signal
     enum class RefType { UpchirpRef, DownchirpRef };
 
+    /// SF-dependent detection threshold (Vangelista & Calvagno 2022, P_fa = 1e-3).
+    /// Returns 0 for SF < 7.
+    static constexpr float default_alpha(uint32_t sf_val) {
+        constexpr std::array<float, 13> kTable = {
+            0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f,
+            4.23f, 4.16f, 4.09f, 4.04f, 3.98f, 3.91f,
+        };
+        return (sf_val < kTable.size()) ? kTable[sf_val] : 0.f;
+    }
+
+    struct DetectResult {
+        float peak_ratio_up{0.f};
+        float peak_ratio_dn{0.f};
+        bool  up_detected{false};
+        bool  dn_detected{false};
+        bool  detected{false};
+    };
+
     /// Compute the best peak_ratio = max|Y|/mean|Y| across os_factor sub-chip
     /// timing offsets for one oversampled symbol window.
     ///
@@ -89,6 +107,31 @@ struct ChannelActivityDetector
         const std::complex<float>* ref =
             (ref_type == RefType::UpchirpRef) ? _down_ref.data() : _up_ref.data();
         return peak_ratio_impl(samples, ref);
+    }
+
+    /// Run full 2-window detection on a buffer of 2*sym_len oversampled samples.
+    /// Standalone entry-point for non-graph callers (e.g., lora_scan).
+    /// Call start() before first use.
+    [[nodiscard]] DetectResult detect(const std::complex<float>* samples) {
+        const std::complex<float>* w1 = samples;
+        const std::complex<float>* w2 = samples + _sym_len;
+        const float thresh = static_cast<float>(alpha);
+
+        DetectResult r;
+        const float r1_up = peak_ratio_impl(w1, _down_ref.data());
+        const float r2_up = peak_ratio_impl(w2, _down_ref.data());
+        r.peak_ratio_up = std::max(r1_up, r2_up);
+        r.up_detected   = (r1_up > thresh) && (r2_up > thresh);
+
+        if (dual_chirp) {
+            const float r1_dn = peak_ratio_impl(w1, _up_ref.data());
+            const float r2_dn = peak_ratio_impl(w2, _up_ref.data());
+            r.peak_ratio_dn = std::max(r1_dn, r2_dn);
+            r.dn_detected   = (r1_dn > thresh) && (r2_dn > thresh);
+        }
+
+        r.detected = r.up_detected || r.dn_detected;
+        return r;
     }
 
 private:
@@ -180,50 +223,29 @@ public:
             return gr::work::Status::OK;
         }
 
-        const std::complex<float>* w1 = _buf.data();
-        const std::complex<float>* w2 = _buf.data() + _sym_len;
-
-        // Upchirp: dechirp with conjugate upchirp = downchirp reference (_down_ref).
-        const float r1_up = peak_ratio_impl(w1, _down_ref.data());
-        const float r2_up = peak_ratio_impl(w2, _down_ref.data());
-        const bool  up_detected = (r1_up > static_cast<float>(alpha)) &&
-                                  (r2_up > static_cast<float>(alpha));
-
-        // Downchirp: dechirp with conjugate downchirp = upchirp reference (_up_ref).
-        float r1_dn = 0.f, r2_dn = 0.f;
-        bool  dn_detected = false;
-        if (dual_chirp) {
-            r1_dn = peak_ratio_impl(w1, _up_ref.data());
-            r2_dn = peak_ratio_impl(w2, _up_ref.data());
-            dn_detected = (r1_dn > static_cast<float>(alpha)) &&
-                          (r2_dn > static_cast<float>(alpha));
-        }
-
-        const bool detected = up_detected || dn_detected;
+        const auto det = detect(_buf.data());
 
         // Update external LBT flag (if wired)
         if (_channel_busy != nullptr) {
-            _channel_busy->store(detected, std::memory_order_release);
+            _channel_busy->store(det.detected, std::memory_order_release);
         }
 
         uint8_t result = 0U;
-        if (up_detected) result |= 0x01U;
-        if (dn_detected) result |= 0x02U;
-
-
+        if (det.up_detected) result |= 0x01U;
+        if (det.dn_detected) result |= 0x02U;
 
         // Write result to output port if a consumer is connected (out_span
         // is non-empty).  When the output is unconnected (LBT-only mode),
         // the detection result is still available via the _channel_busy atomic.
         if (!out_span.empty()) {
             out_span[0] = result;
-            if (detected) {
+            if (det.detected) {
                 gr::property_map tag_map;
-                tag_map["cad_detected"]        = detected;
-                tag_map["cad_upchirp"]         = up_detected;
-                tag_map["cad_downchirp"]       = dn_detected;
-                tag_map["cad_peak_ratio_up"]   = static_cast<double>(std::max(r1_up, r2_up));
-                tag_map["cad_peak_ratio_down"] = static_cast<double>(std::max(r1_dn, r2_dn));
+                tag_map["cad_detected"]        = det.detected;
+                tag_map["cad_upchirp"]         = det.up_detected;
+                tag_map["cad_downchirp"]       = det.dn_detected;
+                tag_map["cad_peak_ratio_up"]   = static_cast<double>(det.peak_ratio_up);
+                tag_map["cad_peak_ratio_down"] = static_cast<double>(det.peak_ratio_dn);
                 this->publishTag(tag_map, 0UZ);
             }
             output.publish(1UZ);

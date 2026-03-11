@@ -142,11 +142,16 @@ struct SharedStatus {
 void print_usage();
 
 /// Parse CLI args.  Returns 0 on success, 1 on error, 2 on --help/--version.
-int parse_args(int argc, char* argv[], TrxConfig& cfg, std::string& config_path);
+/// `log_level` receives the --log-level value (empty if not specified).
+int parse_args(int argc, char* argv[], std::string& config_path,
+               std::string& log_level);
 
 /// Load TOML config file into a vector of TrxConfig (one per set).
+/// `cli_log_level` overrides [logging] level from TOML when non-empty.
+/// "DEBUG" also enables block-level debug traces (cfg.debug = true).
 /// Returns empty vector on error (messages printed to stderr).
-std::vector<TrxConfig> load_config(const std::string& path, bool debug);
+std::vector<TrxConfig> load_config(const std::string& path,
+                                   const std::string& cli_log_level = "");
 
 // --- Property map utilities ---
 

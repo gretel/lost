@@ -190,7 +190,7 @@ def run_collector(host: str, port: int, db_path: str) -> None:
             crc = "OK" if msg.get("crc_valid") else "FAIL"
             snr = phy.get("snr_db")
             snr_str = f" SNR={snr:.1f}" if snr is not None else ""
-            log.info(
+            log.debug(
                 "#%d seq=%s %dB CRC_%s%s",
                 total,
                 msg.get("seq", 0),

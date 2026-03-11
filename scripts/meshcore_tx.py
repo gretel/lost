@@ -8,13 +8,13 @@ to lora_trx via CBOR over UDP. Manages persistent Ed25519 identity keypairs.
 
 Usage:
   # Send ADVERT beacon via UDP to lora_trx:
-  meshcore_tx.py advert --name "MyNode" --udp 127.0.0.1:5555
+  meshcore_tx.py advert --name "MyNode" --connect 127.0.0.1:5555
 
   # Send encrypted message to a known contact (DIRECT routing):
-  meshcore_tx.py send --dest <64hex_pubkey> --udp localhost:5555 "Hello"
+  meshcore_tx.py send --dest <64hex_pubkey> --connect localhost:5555 "Hello"
 
   # Send anonymous encrypted request (includes sender pubkey):
-  meshcore_tx.py anon-req --dest <64hex_pubkey> --udp localhost:5555 "Hello"
+  meshcore_tx.py anon-req --dest <64hex_pubkey> --connect localhost:5555 "Hello"
 
   # Print contact QR code (scannable by MeshCore companion app):
   meshcore_tx.py advert --name "MyNode" --qr
@@ -384,16 +384,16 @@ def cmd_anon_req(args, expanded_prv: bytes, pub_key: bytes, seed: bytes) -> byte
 _EPILOG = """\
 examples:
   # Broadcast ADVERT beacon via UDP to lora_trx:
-  %(prog)s advert --name "MyNode" --udp 127.0.0.1:5555
+  %(prog)s advert --name "MyNode" --connect 127.0.0.1:5555
 
   # Print contact QR code (scannable by MeshCore companion):
   %(prog)s advert --name "MyNode" --qr
 
   # Send encrypted message to a known contact (direct):
-  %(prog)s send --dest <64hex> --udp localhost:5555 "Hello from gr4-lora"
+  %(prog)s send --dest <64hex> --connect localhost:5555 "Hello from gr4-lora"
 
   # Anonymous encrypted request (includes sender pubkey):
-  %(prog)s anon-req --dest <64hex> --udp localhost:5555 "Hello"
+  %(prog)s anon-req --dest <64hex> --connect localhost:5555 "Hello"
 
   # Dry run (CBOR to stdout, no transmission):
   %(prog)s advert --name "MyNode" --dry-run
@@ -425,11 +425,11 @@ def main():
     )
     shared.add_argument("--bw", type=int, default=None, help="Override bandwidth in Hz")
     shared.add_argument(
-        "--udp",
+        "--connect",
         type=str,
         default=None,
         metavar="HOST:PORT",
-        help="Send CBOR TX request via UDP instead of stdout (e.g. 127.0.0.1:5555)",
+        help="Send CBOR TX request to lora_trx via UDP (e.g. 127.0.0.1:5555)",
     )
     shared.add_argument(
         "--config",
@@ -581,10 +581,10 @@ def main():
 
     cbor_msg = make_cbor_tx_request(packet, **phy)
 
-    if args.udp:
+    if args.connect:
         # Send via UDP to lora_trx
         try:
-            host, port = parse_host_port(args.udp)
+            host, port = parse_host_port(args.connect)
         except ValueError as exc:
             log.error("%s", exc)
             sys.exit(1)
