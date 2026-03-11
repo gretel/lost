@@ -10,7 +10,7 @@ endif()
 
 # SoapySink.hpp lives in blocks/include/ — add it to the include path via gr-lora
 
-add_executable(lora_trx lora_trx.cpp)
+add_executable(lora_trx lora_trx.cpp config.cpp)
 target_link_libraries(lora_trx PRIVATE gnuradio-blocklib-core gr-lora gr-soapy gr-testing tomlplusplus::tomlplusplus)
 
 add_executable(lora_scan lora_scan.cpp)

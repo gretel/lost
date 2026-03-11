@@ -6,7 +6,8 @@ lora_common.py -- Shared constants and helpers for LoRa scripts.
 Provides:
   - MeshCore protocol display names (ROUTE_NAMES, PAYLOAD_NAMES)
   - Hex/ASCII formatting helpers
-  - Shared TOML configuration loader (config.toml search path)
+  - CBOR config handshake (wait_for_config) — scripts get ALL config from lora_trx
+  - Legacy TOML configuration loader (deprecated, kept for backward compat)
   - UDP subscriber setup for connecting to lora_trx
   - Host:port parsing (IPv4 + IPv6)
   - MeshCore URI builders
@@ -14,6 +15,7 @@ Provides:
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import socket
@@ -311,46 +313,33 @@ class _ColorFormatter(logging.Formatter):
 
 def setup_logging(
     name: str,
-    cfg: dict[str, Any] | None = None,
     *,
-    debug: bool = False,
+    log_level: str = "INFO",
     no_color: bool = False,
 ) -> logging.Logger:
     """Configure syslog-style logging and return a named logger.
 
-    Reads optional ``[logging]`` section from *cfg* (a parsed config.toml dict):
+    *log_level* sets the root logger level (DEBUG, INFO, WARNING, ERROR).
+    Colors are strictly a local terminal concern — ANSI codes are only
+    emitted when stderr is a TTY.  Piped output, files, and syslog always
+    get plain text.
 
-    .. code-block:: toml
-
-        [logging]
-        level  = "INFO"        # DEBUG, INFO, WARNING, ERROR
-        color  = true          # false to force-disable ANSI colors
-
-    Colors are strictly a local terminal concern — ANSI codes are only emitted
-    when stderr is a TTY.  Piped output, files, and syslog always get plain text.
-
-    The *debug* flag overrides the configured level to DEBUG.
     The *no_color* flag forces plain output (also respected: ``NO_COLOR`` env var).
     Output goes to stderr so that stdout remains available for data.
     """
-    log_cfg = (cfg or {}).get("logging", {})
-    level_str = "DEBUG" if debug else log_cfg.get("level", "INFO")
-    level = getattr(logging, level_str.upper(), logging.INFO)
-    fmt = log_cfg.get("format", DEFAULT_LOG_FORMAT)
-    datefmt = log_cfg.get("datefmt", DEFAULT_LOG_DATEFMT)
+    level = getattr(logging, log_level.upper(), logging.INFO)
 
-    # Color: --no-color flag > config > auto-detect
     if no_color:
         use_color = False
     else:
-        cfg_color = log_cfg.get("color")
-        if cfg_color is not None:
-            use_color = bool(cfg_color) and _want_color(sys.stderr)
-        else:
-            use_color = _want_color(sys.stderr)
+        use_color = _want_color(sys.stderr)
 
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(_ColorFormatter(fmt=fmt, datefmt=datefmt, use_color=use_color))
+    handler.setFormatter(
+        _ColorFormatter(
+            fmt=DEFAULT_LOG_FORMAT, datefmt=DEFAULT_LOG_DATEFMT, use_color=use_color
+        )
+    )
 
     root = logging.getLogger()
     root.setLevel(level)
@@ -358,6 +347,32 @@ def setup_logging(
     root.handlers = [handler]
 
     return logging.getLogger(name)
+
+
+def add_logging_args(parser: "argparse.ArgumentParser") -> None:
+    """Add the standard ``--log-level`` and ``--no-color`` arguments."""
+    parser.add_argument(
+        "--log-level",
+        metavar="LEVEL",
+        default="INFO",
+        choices=[
+            "DEBUG",
+            "INFO",
+            "WARNING",
+            "ERROR",
+            "debug",
+            "info",
+            "warning",
+            "error",
+        ],
+        help="Log verbosity (default: INFO)",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        default=False,
+        help="Disable ANSI color output (also: NO_COLOR env var)",
+    )
 
 
 # ---- Shared TOML configuration ----
@@ -552,6 +567,76 @@ def create_udp_subscriber(
     addr = (host, port)
     sock.sendto(sub_msg, addr)
     return sock, sub_msg, addr
+
+
+# ---- CBOR config handshake ----
+
+#: Default timeout waiting for config message from lora_trx (seconds).
+CONFIG_TIMEOUT = 10.0
+
+
+def wait_for_config(
+    sock: socket.socket,
+    *,
+    timeout: float = CONFIG_TIMEOUT,
+) -> dict[str, Any]:
+    """Block until a CBOR ``config`` message arrives on *sock*.
+
+    lora_trx sends a ``config`` message immediately on subscribe.  This
+    function reads datagrams until it receives one with ``type == "config"``,
+    or until *timeout* seconds elapse.
+
+    Returns the full decoded CBOR config dict (with ``phy``, ``server``,
+    ``decode_chains``, and ``raw`` sub-dicts).  Raises ``TimeoutError`` if
+    no config arrives within the deadline.
+
+    The ``raw`` sub-dict mirrors the TOML section structure
+    (``network``, ``aggregator``, ``meshcore``, ``logging``) and can be
+    passed directly to existing ``config_*`` accessor functions.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    old_timeout = sock.gettimeout()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"no config message from lora_trx within {timeout:.0f}s"
+                )
+            sock.settimeout(remaining)
+            try:
+                data, _ = sock.recvfrom(65536)
+            except socket.timeout:
+                raise TimeoutError(
+                    f"no config message from lora_trx within {timeout:.0f}s"
+                ) from None
+            if not data:
+                continue
+            try:
+                msg = cbor2.loads(data)
+            except Exception:
+                continue
+            if isinstance(msg, dict) and msg.get("type") == "config":
+                return msg
+    finally:
+        sock.settimeout(old_timeout)
+
+
+def apply_config(
+    config_msg: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract the ``raw`` passthrough config from a CBOR config message.
+
+    Returns a dict with the same nested structure as config.toml
+    (``network``, ``aggregator``, ``meshcore``, ``logging``).  This dict
+    works with all existing ``config_*`` accessor functions.
+
+    Logging configuration is NOT applied here — logging level is a CLI
+    concern only (``--log-level``, ``--no-color``).
+    """
+    return config_msg.get("raw", {})
 
 
 # ---- MeshCore URI helpers ----

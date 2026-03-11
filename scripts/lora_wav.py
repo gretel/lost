@@ -54,6 +54,7 @@ import cbor2
 
 from lora_common import (
     KEEPALIVE_INTERVAL,
+    add_logging_args,
     create_udp_subscriber,
     load_config,
     resolve_udp_address,
@@ -590,16 +591,11 @@ def main() -> None:
         default=False,
         help="Save WAV files without playing audio",
     )
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        default=False,
-        help="Disable ANSI color output",
-    )
+    add_logging_args(parser)
     args = parser.parse_args()
 
     cfg = load_config()
-    setup_logging("gr4.wav", cfg, no_color=args.no_color)
+    setup_logging("gr4.wav", log_level=args.log_level, no_color=args.no_color)
 
     try:
         host, port = resolve_udp_address(args.connect, cfg)

@@ -31,11 +31,10 @@ from lora_common import (
     KEEPALIVE_INTERVAL,
     PAYLOAD_NAMES,
     ROUTE_NAMES,
-    config_region_scope,
+    add_logging_args,
     create_udp_subscriber,
     format_hexdump,
-    load_config,
-    resolve_udp_address,
+    parse_host_port,
     sanitize_text,
     setup_logging,
     sync_word_name,
@@ -501,28 +500,19 @@ def main() -> None:
         metavar="NAME:PSK_B64",
         help="Add a group channel (e.g. 'secret:BASE64'). May be repeated.",
     )
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        default=False,
-        help="Disable ANSI color output (also: NO_COLOR env var)",
-    )
+    add_logging_args(parser)
     args = parser.parse_args()
 
-    # Load shared config (auto-detect config.toml)
-    cfg = load_config()
-    setup_logging("gr4.mon", cfg, no_color=args.no_color)
+    setup_logging("gr4.mon", log_level=args.log_level, no_color=args.no_color)
 
-    # Log region scope if configured
-    region = config_region_scope(cfg)
-    if region:
-        log.info("region: %s", sanitize_text(str(region)))
-
-    # Resolve --connect default from config
-    try:
-        host, port = resolve_udp_address(args.connect, cfg)
-    except ValueError as exc:
-        parser.error(str(exc))
+    # Resolve address from CLI or hardcoded default
+    if args.connect:
+        try:
+            host, port = parse_host_port(args.connect)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        host, port = "127.0.0.1", 5555
 
     # Load channels from directory (seeds from repo on first run)
     channels = load_channels(args.channels_dir)

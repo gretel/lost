@@ -38,11 +38,9 @@ import cbor2
 
 from lora_common import (
     KEEPALIVE_INTERVAL,
-    config_udp_host,
-    config_udp_port,
+    add_logging_args,
     create_udp_subscriber,
     format_ascii,
-    load_config,
     parse_host_port,
     setup_logging,
     sync_word_name,
@@ -439,7 +437,7 @@ def get_terminal_size() -> tuple[int, int]:
     try:
         sz = os.get_terminal_size()
         return sz.columns, sz.lines
-    except (AttributeError, ValueError, OSError):
+    except AttributeError, ValueError, OSError:
         return 80, 24
 
 
@@ -761,23 +759,16 @@ def main() -> None:
         default=0.3,
         help="EMA smoothing alpha, 0.0-1.0 (default: 0.3, lower=smoother)",
     )
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        default=False,
-        help="Disable ANSI color output (also: NO_COLOR env var)",
-    )
+    add_logging_args(parser)
     args = parser.parse_args()
 
-    # Resolve address
-    cfg = load_config()
-    setup_logging("gr4.waterfall", cfg, no_color=args.no_color)
+    setup_logging("gr4.waterfall", log_level=args.log_level, no_color=args.no_color)
 
-    # Connect directly to lora_trx (not lora_agg) — needs raw spectrum frames
+    # Connect directly to lora_trx (needs raw spectrum frames)
     if args.connect:
         host, port = parse_host_port(args.connect)
     else:
-        host, port = config_udp_host(cfg), config_udp_port(cfg)
+        host, port = "127.0.0.1", 5556  # lora_trx direct (not agg)
 
     # Subscribe without sync_word filter — need spectrum + all frame types
     sock, sub_msg, addr = create_udp_subscriber(host, port, timeout=0.0, blocking=False)
@@ -951,7 +942,7 @@ def main() -> None:
 
             try:
                 data, _addr = sock.recvfrom(65536)
-            except (BlockingIOError, OSError):
+            except BlockingIOError, OSError:
                 continue
 
             try:

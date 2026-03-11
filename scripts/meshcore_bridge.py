@@ -9,8 +9,7 @@ companion apps.
 
 Usage:
     meshcore_bridge.py                    # default: TCP 7834, UDP 127.0.0.1:5555
-    meshcore_bridge.py --port 5000 --udp 127.0.0.1:5555
-    meshcore_bridge.py --config apps/config.toml
+    meshcore_bridge.py --port 5000 --connect 127.0.0.1:5555
 
 Architecture:
     meshcore-cli ──TCP:7834──► meshcore_bridge ──UDP:5555──► lora_trx
@@ -18,7 +17,7 @@ Architecture:
                   protocol
 
 Note: port 5000 is occupied by macOS AirPlay/Control Center. Use 7834 (default)
-or configure a different port in [meshcore] port = ... in config.toml.
+or override with --port.
 
 The bridge:
   - Accepts one TCP client at a time (matches real MeshCore firmware)
@@ -47,15 +46,14 @@ from typing import Any
 import cbor2
 
 from lora_common import (
-    config_agg_listen,
-    config_region_scope,
-    config_udp_host,
-    config_udp_port,
-    load_config,
+    add_logging_args,
+    apply_config,
+    create_udp_subscriber,
     parse_host_port,
     sanitize_text,
     setup_logging,
     utf8_truncate,
+    wait_for_config,
 )
 from meshcore_crypto import (
     DEFAULT_IDENTITY_FILE,
@@ -120,7 +118,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         pass
     return "dev"
 
@@ -409,7 +407,7 @@ class BridgeState:
         self.autoadd_config: int = autoadd_config
         self.autoadd_max_hops: int = autoadd_max_hops
 
-        # Startup config mirrors (config.toml values) — re-applied on each APP_START
+        # Startup config mirrors (lora_trx values) — re-applied on each APP_START
         # so the bridge's identity is restored after a companion session overwrites it.
         self._startup_name: str = name
         self._startup_lat_e6: int = lat_e6
@@ -427,10 +425,10 @@ class BridgeState:
         self.multi_acks: int = 0
 
     def apply_startup_config(self) -> None:
-        """Re-apply config.toml settings to live state.
+        """Re-apply startup settings to live state.
 
         Called on each APP_START so the bridge's identity (name, location,
-        flood scope, repeat mode, etc.) is restored to config.toml values
+        flood scope, repeat mode, etc.) is restored to startup values
         after a companion session may have overwritten them.
         """
         self.name = self._startup_name
@@ -479,7 +477,7 @@ class BridgeState:
         git_rev = _get_git_rev()
         # fw_build (12 bytes): binary name, zero-padded
         fw_build = utf8_truncate("lora_trx", 12).ljust(12, b"\x00")
-        # model (40 bytes): configurable via [meshcore] model in config.toml
+        # model (40 bytes): configurable via [meshcore] model in lora_trx config
         model_b = utf8_truncate(self.model, 40).ljust(40, b"\x00")
         # version (20 bytes): git short SHA
         version_b = utf8_truncate(git_rev, 20).ljust(20, b"\x00")
@@ -1346,7 +1344,7 @@ def handle_command(
 
     if cmd == CMD_APP_START:
         log.info("companion: APP_START")
-        # Re-apply config.toml values so companion session changes don't persist
+        # Re-apply startup values so companion session changes don't persist
         state.apply_startup_config()
         # Send SELF_INFO + push our own ADVERT so companion learns our contact
         responses = [state.build_self_info()]
@@ -1503,7 +1501,7 @@ def handle_command(
         if len(data) >= 17:  # discriminator(1) + key(16)
             incoming_key = bytes(data[1:17])
             _null_key = b"\x00" * 16
-            # If config.toml specifies a scope and the companion sends all-zeros,
+            # If startup config specifies a scope and the companion sends all-zeros,
             # treat it as the client's stale default (not an intentional clear) and
             # ignore it so the config value survives the companion init sequence.
             if incoming_key == _null_key and any(state._startup_send_scope):
@@ -1861,7 +1859,7 @@ def _handle_send_advert(
 
     flood = len(data) > 0 and data[0] == 0x01
 
-    # Include location in ADVERT when set (CMD_SET_ADVERT_LATLON or config.toml)
+    # Include location in ADVERT when set (CMD_SET_ADVERT_LATLON or lora_trx config)
     lat = state.lat_e6 / 1e6 if state.lat_e6 != 0 else None
     lon = state.lon_e6 / 1e6 if state.lon_e6 != 0 else None
 
@@ -2274,22 +2272,19 @@ def _resolve_contact(state: BridgeState, prefix: bytes) -> tuple[bytes, bytes] |
 
 def run_bridge(
     tcp_port: int,
-    udp_host: str,
-    udp_port: int,
+    udp_sock: socket.socket,
+    sub_msg: bytes,
+    udp_addr: tuple[str, int],
     state: BridgeState,
 ) -> None:
-    """Run the bridge: TCP server + UDP subscriber."""
-    # UDP socket for lora_trx communication
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_sock.bind(("", 0))
-    udp_sock.setblocking(False)
-    udp_addr = (udp_host, udp_port)
+    """Run the bridge: TCP server + UDP subscriber.
 
-    # Subscribe to lora_trx (sync_word=0x12 for MeshCore)
-    sub_msg = cbor2.dumps({"type": "subscribe", "sync_word": [0x12]})
-    udp_sock.sendto(sub_msg, udp_addr)
-    log.info("subscribed to lora_trx at %s:%d", udp_host, udp_port)
+    *udp_sock* is an already-subscribed UDP socket (from main's
+    wait_for_config handshake).  *sub_msg* is the CBOR subscribe
+    message for keepalive re-sends.
+    """
+    udp_sock.setblocking(False)
+    log.info("bridge running (UDP %s:%d)", udp_addr[0], udp_addr[1])
 
     # TCP server
     tcp_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2341,7 +2336,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except (ConnectionError, OSError):
+                    except ConnectionError, OSError:
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2363,7 +2358,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except (BlockingIOError, OSError):
+                    except BlockingIOError, OSError:
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2375,22 +2370,24 @@ def run_bridge(
 
                     msg_type = msg.get("type")
 
-                    # Handle config (log once)
+                    # Handle config — update PHY on BridgeState
                     if msg_type == "config":
+                        phy = msg.get("phy", {})
+                        if phy:
+                            state.freq_mhz = phy.get("freq", state.freq_mhz * 1e6) / 1e6
+                            state.bw_khz = phy.get("bw", state.bw_khz * 1e3) / 1e3
+                            state.sf = int(phy.get("sf", state.sf))
+                            state.cr = int(phy.get("cr", state.cr + 4)) - 4
+                            state.tx_power = int(phy.get("tx_gain", state.tx_power))
                         if not config_shown:
-                            phy = msg.get("phy", {})
-                            freq = phy.get("freq", 0)
                             log.info(
-                                "config: %.3f MHz SF%s BW %.1fk",
-                                freq / 1e6,
-                                phy.get("sf", "?"),
-                                phy.get("bw", 0) / 1e3,
+                                "config: %.3f MHz SF%d BW %.1fk CR 4/%d",
+                                state.freq_mhz,
+                                state.sf,
+                                state.bw_khz,
+                                state.cr + 4,
                             )
                             config_shown = True
-                        # Update noise floor from config if provided
-                        noise_floor = msg.get("noise_floor_dbm")
-                        if noise_floor is not None:
-                            state.noise_floor_dbm = int(noise_floor)
                         continue
 
                     # Handle status (log only when frame count changes)
@@ -2513,7 +2510,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except (ConnectionError, OSError):
+    except ConnectionError, OSError:
         pass  # client disconnected, will be cleaned up on next recv
 
 
@@ -2528,125 +2525,104 @@ def main() -> None:
         "--port",
         type=int,
         default=None,
-        help=f"TCP listen port (overrides config.toml; default: {BRIDGE_PORT})",
+        help=f"TCP listen port (default: {BRIDGE_PORT})",
     )
     parser.add_argument(
         "--connect",
         metavar="HOST:PORT",
         default=None,
-        help="lora_trx UDP address (default from config.toml or 127.0.0.1:5555)",
+        help="lora_trx UDP address (default: 127.0.0.1:5555)",
     )
     parser.add_argument(
         "--identity",
         type=Path,
         default=None,
-        help=f"Identity file (overrides config.toml; default: {DEFAULT_IDENTITY_FILE})",
+        help=f"Identity file (default: {DEFAULT_IDENTITY_FILE})",
     )
     parser.add_argument(
         "--name",
         default=None,
-        help="Node name for SELF_INFO (overrides config.toml; default: gr4-lora)",
-    )
-    parser.add_argument(
-        "--config",
-        metavar="PATH",
-        default=None,
-        help="Path to config.toml (auto-detected if omitted)",
+        help="Node name for SELF_INFO (default from lora_trx config or 'lora_trx')",
     )
     parser.add_argument(
         "--keys-dir",
         type=Path,
         default=None,
-        help=f"Key store directory (overrides config.toml; default: {DEFAULT_KEYS_DIR})",
+        help=f"Key store directory (default: {DEFAULT_KEYS_DIR})",
     )
     parser.add_argument(
         "--channels-dir",
         type=Path,
         default=None,
-        help=f"Channel store directory (overrides config.toml; default: {DEFAULT_CHANNELS_DIR})",
+        help=f"Channel store directory (default: {DEFAULT_CHANNELS_DIR})",
     )
     parser.add_argument(
         "--contacts-dir",
         type=Path,
         default=None,
-        help=f"Contact store directory (overrides config.toml; default: {DEFAULT_CONTACTS_DIR})",
+        help=f"Contact store directory (default: {DEFAULT_CONTACTS_DIR})",
     )
     parser.add_argument(
         "--region-scope",
         metavar="NAME",
         default=None,
         help="Region scope for transport codes (e.g. 'de-nord'). "
-        "Default from config.toml or empty (disabled).",
+        "Default from lora_trx config or empty (disabled).",
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging (echo filter diagnostics, etc.)",
-    )
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        default=False,
-        help="Disable ANSI color output (also: NO_COLOR env var)",
-    )
+    add_logging_args(parser)
     args = parser.parse_args()
 
-    # Load config and configure logging
-    cfg = load_config(args.config)
-    setup_logging("gr4.bridge", cfg, debug=args.debug, no_color=args.no_color)
+    setup_logging("gr4.bridge", log_level=args.log_level, no_color=args.no_color)
 
-    # Resolve UDP address — prefer lora_agg consumer port when configured
+    # Resolve UDP address from CLI or hardcoded default
     if args.connect:
         try:
             udp_host, udp_port = parse_host_port(args.connect)
         except ValueError as exc:
             parser.error(str(exc))
-    elif cfg.get("aggregator"):
-        udp_host, udp_port = parse_host_port(config_agg_listen(cfg))
     else:
-        udp_host = config_udp_host(cfg)
-        udp_port = config_udp_port(cfg)
+        udp_host, udp_port = "127.0.0.1", 5555
 
-    # Extract PHY params from config for SELF_INFO (identity loaded after config resolution)
-    # Find first set and resolve codec + radio
-    freq_mhz = 869.618
-    bw_khz = 62.5
-    sf = 8
-    cr = 4
-    tx_power = 14
+    # Subscribe to lora_trx and wait for CBOR config message.
+    # All configuration (PHY params, meshcore settings) comes from lora_trx.
+    log.info("connecting to lora_trx at %s:%d", udp_host, udp_port)
+    udp_sock, sub_msg, udp_addr = create_udp_subscriber(
+        udp_host,
+        udp_port,
+        sync_words=[0x12],
+        timeout=30.0,
+    )
+    config_msg = wait_for_config(udp_sock, timeout=30.0)
+    raw = apply_config(config_msg)
+    phy = config_msg.get("phy", {})
 
-    for key, val in cfg.items():
-        if key.startswith("set_") and isinstance(val, dict):
-            codec_name = val.get("codec", "")
-            radio_name = val.get("radio", "")
-            codec = cfg.get(codec_name, {})
-            radio = cfg.get(radio_name, {})
-            if codec:
-                # sf is now in [[set_*.decode]] entries; fall back to codec for compat
-                decode_entries = val.get("decode", [])
-                sf = (
-                    decode_entries[0].get("sf", codec.get("sf", sf))
-                    if decode_entries
-                    else codec.get("sf", sf)
-                )
-                bw_khz = codec.get("bw", bw_khz * 1000) / 1000
-                cr = codec.get("cr", cr + 4) - 4  # denominator -> offset
-            if radio:
-                freq_mhz = radio.get("freq", freq_mhz * 1e6) / 1e6
-                tx_power = int(radio.get("tx_gain", tx_power))
-            break
+    # Extract PHY params from CBOR phy section
+    freq_mhz = phy.get("freq", 869_618_000.0) / 1e6
+    bw_khz = phy.get("bw", 62_500) / 1e3
+    sf = int(phy.get("sf", 8))
+    cr = int(phy.get("cr", 8)) - 4  # denominator -> offset (8 -> 4)
+    tx_power = int(phy.get("tx_gain", 14))
+    log.info(
+        "PHY: %.3f MHz SF%d BW %.1fk CR 4/%d TX %d",
+        freq_mhz,
+        sf,
+        bw_khz,
+        cr + 4,
+        tx_power,
+    )
 
-    # Resolve region scope: CLI flag overrides config.toml
+    # Extract meshcore settings from CBOR raw section.
+    # Resolution order: CLI flag > CBOR config > built-in default.
+    meshcore_cfg = raw.get("meshcore", {})
+
+    # Region scope
     if args.region_scope is not None:
         region_scope = args.region_scope
     else:
-        region_scope = config_region_scope(cfg)
+        region_scope = str(meshcore_cfg.get("region_scope", ""))
     if region_scope:
         log.info("region scope: #%s", region_scope)
 
-    # Read optional settings from [meshcore] config section.
-    # Resolution order: CLI flag > config.toml [meshcore] > built-in default.
-    meshcore_cfg = cfg.get("meshcore", {})
     lat_e6 = int(float(meshcore_cfg.get("lat", 0.0)) * 1e6)
     lon_e6 = int(float(meshcore_cfg.get("lon", 0.0)) * 1e6)
 
@@ -2660,39 +2636,45 @@ def main() -> None:
     if args.name is not None:
         node_name = args.name
     else:
-        node_name = meshcore_cfg.get("name", "lora_trx")
+        node_name = str(meshcore_cfg.get("name", "lora_trx"))
 
     # Device model string reported in DEVICE_INFO (CMD_DEVICE_QUERY response)
-    node_model = meshcore_cfg.get("model", "lora_trx")
+    node_model = str(meshcore_cfg.get("model", "lora_trx"))
 
     # Identity file
     if args.identity is not None:
         identity_file = args.identity
     else:
-        identity_file = Path(meshcore_cfg.get("identity_file", DEFAULT_IDENTITY_FILE))
+        identity_file = Path(
+            str(meshcore_cfg.get("identity_file", "")) or DEFAULT_IDENTITY_FILE
+        )
 
     # Store directories
     if args.keys_dir is not None:
         keys_dir = args.keys_dir
     else:
-        keys_dir = Path(meshcore_cfg.get("keys_dir", DEFAULT_KEYS_DIR))
+        keys_dir = Path(str(meshcore_cfg.get("keys_dir", "")) or DEFAULT_KEYS_DIR)
 
     if args.channels_dir is not None:
         channels_dir = args.channels_dir
     else:
-        channels_dir = Path(meshcore_cfg.get("channels_dir", DEFAULT_CHANNELS_DIR))
+        channels_dir = Path(
+            str(meshcore_cfg.get("channels_dir", "")) or DEFAULT_CHANNELS_DIR
+        )
 
     if args.contacts_dir is not None:
         contacts_dir = args.contacts_dir
     else:
-        contacts_dir = Path(meshcore_cfg.get("contacts_dir", DEFAULT_CONTACTS_DIR))
+        contacts_dir = Path(
+            str(meshcore_cfg.get("contacts_dir", "")) or DEFAULT_CONTACTS_DIR
+        )
 
-    # Repeat mode settings (config.toml [meshcore] only, no CLI flags)
+    # Repeat mode settings (CBOR config only, no CLI flags)
     startup_client_repeat = int(meshcore_cfg.get("client_repeat", 0))
     startup_path_hash_mode = int(meshcore_cfg.get("path_hash_mode", 0))
     startup_autoadd_config = int(meshcore_cfg.get("autoadd_config", 0))
     startup_autoadd_max_hops = min(int(meshcore_cfg.get("autoadd_max_hops", 0)), 64)
-    flood_scope_raw = meshcore_cfg.get("flood_scope", "")
+    flood_scope_raw = str(meshcore_cfg.get("flood_scope", ""))
     startup_send_scope = _parse_flood_scope(flood_scope_raw)
 
     # Load identity (now that identity_file is resolved)
@@ -2751,7 +2733,7 @@ def main() -> None:
         len(state.contacts),
     )
 
-    run_bridge(tcp_port, udp_host, udp_port, state)
+    run_bridge(tcp_port, udp_sock, sub_msg, udp_addr, state)
 
 
 if __name__ == "__main__":

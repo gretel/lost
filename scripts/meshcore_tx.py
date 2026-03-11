@@ -53,6 +53,7 @@ import segno
 from nacl.signing import SigningKey
 
 from lora_common import (
+    add_logging_args,
     config_udp_host,
     config_udp_port,
     load_config,
@@ -517,20 +518,13 @@ def main():
     )
     p_anon.add_argument("message", nargs="+", help="Message text")
 
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        default=False,
-        help="Disable ANSI color output (also: NO_COLOR env var)",
-    )
+    add_logging_args(parser)
 
     args = parser.parse_args()
 
     # Configure logging (library-level loggers inherit root config)
     cfg = load_config(args.config)
-    setup_logging(
-        "gr4.tx", cfg, debug=getattr(args, "debug", False), no_color=args.no_color
-    )
+    setup_logging("gr4.tx", log_level=args.log_level, no_color=args.no_color)
 
     # Load identity
     expanded_prv, pub_key, seed = load_or_create_identity(args.identity)

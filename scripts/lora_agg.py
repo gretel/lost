@@ -23,10 +23,9 @@ from typing import Any
 import cbor2
 
 from lora_common import (
-    config_agg_listen,
-    config_agg_upstream,
+    add_logging_args,
+    apply_config,
     config_agg_window_ms,
-    load_config,
     parse_host_port,
     setup_logging,
 )
@@ -277,8 +276,8 @@ class ConsumerServer:
 # ---------------------------------------------------------------------------
 
 
-def run(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
-    window_s = config_agg_window_ms(cfg) / 1000.0
+def run(args: argparse.Namespace) -> None:
+    window_s = 0.200  # default 200ms, updated when CBOR config arrives
 
     # Parse upstream addresses
     upstreams: list[tuple[str, int]] = []
@@ -308,10 +307,10 @@ def run(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     # Consumer-facing server
     server = ConsumerServer(listen_host, listen_port)
     log.info(
-        "listening: %s:%d (window=%dms)",
+        "listening: %s:%d (window=%dms, default until config received)",
         listen_host,
         listen_port,
-        config_agg_window_ms(cfg),
+        int(window_s * 1000),
     )
 
     # Aggregation state
@@ -372,8 +371,17 @@ def run(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             del recently_emitted[h]
 
     def handle_upstream_frame(msg: dict[str, Any]) -> None:
+        nonlocal window_s
+        if msg.get("type") == "config":
+            raw = apply_config(msg)
+            new_window_ms = config_agg_window_ms(raw)
+            window_s = new_window_ms / 1000.0
+            log.info("config received: window=%dms", new_window_ms)
+            data = cbor2.dumps(msg)
+            server.broadcast(data)
+            return
         if msg.get("type") != "lora_frame":
-            # Pass through status/config messages
+            # Pass through status messages
             data = cbor2.dumps(msg)
             server.broadcast(data)
             return
@@ -524,41 +532,27 @@ def run(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
 
 
 def main() -> None:
-    cfg = load_config()
-
     parser = argparse.ArgumentParser(
         description="LoRa frame aggregation — dedup multi-decoder output",
     )
-    default_upstream = config_agg_upstream(cfg)
-    default_listen = config_agg_listen(cfg)
-
     parser.add_argument(
         "--upstream",
         nargs="+",
-        default=[default_upstream],
+        default=["127.0.0.1:5556"],
         metavar="HOST:PORT",
-        help=f"lora_trx raw port(s) (default: {default_upstream})",
+        help="lora_trx raw port(s) (default: 127.0.0.1:5556)",
     )
     parser.add_argument(
         "--listen",
-        default=default_listen,
+        default="127.0.0.1:5555",
         metavar="HOST:PORT",
-        help=f"Consumer-facing bind address (default: {default_listen})",
+        help="Consumer-facing bind address (default: 127.0.0.1:5555)",
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging",
-    )
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        help="Disable colored log output",
-    )
+    add_logging_args(parser)
     args = parser.parse_args()
 
-    setup_logging("gr4.agg", cfg, debug=args.debug, no_color=args.no_color)
-    run(args, cfg)
+    setup_logging("gr4.agg", log_level=args.log_level, no_color=args.no_color)
+    run(args)
 
 
 if __name__ == "__main__":
