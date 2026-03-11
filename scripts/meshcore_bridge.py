@@ -1088,7 +1088,9 @@ def _handle_txt_msg_rx(
         # tag = first 4 bytes of compute_ack_hash(plaintext, sender_pub)
         if txt_type == 1 and plaintext is not None and len(plaintext) >= 5:
             tag = compute_ack_hash(plaintext, sender_pub)
-            data_bytes = text.encode("utf-8")
+            data_bytes = plaintext[5:].rstrip(
+                b"\x00"
+            )  # raw binary payload, no UTF-8 round-trip
             binary_resp = bytes([PUSH_BINARY_RESPONSE]) + tag + data_bytes
             companion_msgs.append(binary_resp)
             log.info(
@@ -1648,17 +1650,17 @@ def handle_command(
             return [state.build_error()]
         dst_pub = data[:32]
         req_type = data[32] if len(data) > 32 else 0
-        # Parse optional path_len + path_bytes fields (spec 0x39 frame)
-        path_bytes = b""
-        if len(data) > 33:
-            path_n = data[33]
-            if path_n > 0 and len(data) >= 34 + path_n:
-                path_bytes = bytes(data[34 : 34 + path_n])
-                log.debug(
-                    "companion: SEND_ANON_REQ path_len=%d path=%s",
-                    path_n,
-                    path_bytes.hex(),
-                )
+        # Parse optional path_len + path_bytes fields (spec 0x39 frame).
+        # path_bytes represents the routing path to reach the destination.
+        # build_anon_req takes a data payload, not a path, so path_bytes are
+        # not forwarded — full path routing for ANON_REQ is not yet implemented.
+        path_n = data[33] if len(data) > 33 else 0
+        path_bytes_val = data[34 : 34 + path_n] if path_n > 0 else b""
+        if path_bytes_val:
+            log.debug(
+                "companion: SEND_ANON_REQ path=%s (path routing not yet implemented)",
+                path_bytes_val.hex(),
+            )
         log.info(
             "companion: SEND_ANON_REQ type=0x%02x to %s..",
             req_type,
