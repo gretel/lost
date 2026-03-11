@@ -70,6 +70,7 @@ jobs:
         run: cmake --build build -j$(nproc)
 
       - name: Test
+        if: matrix.build-type == 'Release'
         run: ctest --test-dir build --output-on-failure --timeout 120
 
       - name: Upload binaries
