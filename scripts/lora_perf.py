@@ -52,6 +52,17 @@ class RunningStats:
     retune_counts: list[int] = field(default_factory=list)
     l2_time_fracs: list[float] = field(default_factory=list)
     total_overflows: int = 0
+    det_ratios: list[float] = field(default_factory=list)
+    det_sfs: dict[int, int] = field(default_factory=dict)  # SF -> count
+
+    def record_detections(self, dets: list[dict]) -> None:
+        for d in dets:
+            r = d.get("ratio", 0.0)
+            if r > 0:
+                self.det_ratios.append(r)
+            sf = d.get("sf", 0)
+            if sf > 0:
+                self.det_sfs[sf] = self.det_sfs.get(sf, 0) + 1
 
     def record_sweep(
         self,
@@ -133,6 +144,12 @@ def emit_summary(stats: RunningStats) -> str:
     avg_retunes = _avg(stats.retune_counts)
     total_det = sum(stats.detection_counts)
 
+    # Detection quality stats
+    avg_ratio = _avg(stats.det_ratios) if stats.det_ratios else 0.0
+    min_ratio = min(stats.det_ratios) if stats.det_ratios else 0.0
+    max_ratio = max(stats.det_ratios) if stats.det_ratios else 0.0
+    sf_str = ",".join(f"SF{sf}:{n}" for sf, n in sorted(stats.det_sfs.items()))
+
     return (
         f"SUMMARY sweeps={n} "
         f"avg_dur={avg_dur}ms min_dur={min_dur}ms max_dur={max_dur}ms p50_dur={p50_dur}ms "
@@ -141,6 +158,8 @@ def emit_summary(stats: RunningStats) -> str:
         f"avg_retunes={avg_retunes:.1f} "
         f"avg_l2_pct={avg_l2_pct:.1f} "
         f"total_det={total_det} total_ovf={stats.total_overflows}"
+        f" avg_ratio={avg_ratio:.1f} min_ratio={min_ratio:.1f} max_ratio={max_ratio:.1f}"
+        f" sfs={sf_str or '-'}"
     )
 
 
@@ -177,6 +196,30 @@ def main() -> None:
         elif msg_type == "scan_overflow":
             current.overflow_count = msg.get("count", 0)
             stats.total_overflows = current.overflow_count
+
+        elif msg_type == "scan_spectrum":
+            dets = [d for d in msg.get("detections", []) if isinstance(d, dict)]
+            if dets:
+                # scan_spectrum arrives AFTER scan_sweep_end in the CBOR
+                # stream, so record detections directly into stats and emit
+                # a supplementary DET line (the SWEEP line was already
+                # printed without detection detail).
+                stats.record_detections(dets)
+                sweep_num = msg.get("sweep", current.sweep)
+                det_parts = []
+                for d in dets:
+                    freq_mhz = d.get("freq", 0) / 1e6
+                    sf = d.get("sf", 0)
+                    bw_k = d.get("bw", 0) / 1e3
+                    ratio = d.get("ratio", 0.0)
+                    chirp = d.get("chirp", "")
+                    det_parts.append(
+                        f"{freq_mhz:.3f}/SF{sf}/BW{bw_k:.0f}k/r={ratio:.1f}/{chirp}"
+                    )
+                print(
+                    f"DET sweep={sweep_num} n={len(dets)} {' '.join(det_parts)}",
+                    flush=True,
+                )
 
         elif msg_type == "scan_sweep_end":
             line = emit_sweep(msg, current)
