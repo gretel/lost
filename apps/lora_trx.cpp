@@ -753,54 +753,6 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                             "failed to connect CAD -> NullSink");
                     }
                 }
-
-                for (std::size_t d = 0; d < nDecode; d++) {
-                    auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100
-                               + static_cast<int32_t>(d);
-                    auto [sync, demod] = add_decode_pair(
-                        graph, cfg, rx_ch, decodes[d],
-                        (firstChain && d == 0) ? spectrum : nullptr);
-
-                    auto splitterPort = "out#"s + std::to_string(d);
-                    if (!ok(graph.connect(splitter, splitterPort, sync, "in"s))) {
-                        std::fprintf(stderr, "ERROR: failed to connect Splitter -> FrameSync (chain %zu)\n",
-                                    chain_idx);
-                    }
-
-                    // Per-chain sink
-                    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-                        {"sync_word", decodes[d].sync_word},
-                        {"phy_sf", decodes[d].sf},
-                        {"phy_bw", cfg.bw},
-                        {"label", decodes[d].label},
-                    });
-                    sink._frame_callback = callback;
-                    if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
-                        std::fprintf(stderr, "ERROR: failed to connect DemodDecoder -> FrameSink"
-                                    " (chain %zu)\n", chain_idx);
-                    }
-                    chain_idx++;
-                }
-
-                // Wire CAD to the extra Splitter output (first radio only)
-                if (addCad) {
-                    auto& cad = graph.emplaceBlock<gr::lora::ChannelActivityDetector>({
-                        {"sf", cfg.sf},
-                        {"bandwidth", cfg.bw},
-                        {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
-                        {"alpha", gr::lora::ChannelActivityDetector::default_alpha(cfg.sf)},
-                        {"dual_chirp", true},
-                    });
-                    cad.set_channel_busy_flag(channel_busy);
-                    auto cadPort = "out#"s + std::to_string(nDecode);
-                    if (!ok(graph.connect(splitter, cadPort, cad, "in"s))) {
-                        std::fprintf(stderr, "ERROR: failed to connect Splitter -> CAD\n");
-                    }
-                    auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
-                    if (!ok(graph.connect<"out">(cad).to<"in">(cad_sink))) {
-                        std::fprintf(stderr, "ERROR: failed to connect CAD -> NullSink\n");
-                    }
-                }
             }
         }
     };
