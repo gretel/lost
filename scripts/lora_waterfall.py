@@ -41,9 +41,9 @@ from lora_common import (
     add_logging_args,
     create_udp_subscriber,
     format_ascii,
+    format_frame,
     parse_host_port,
     setup_logging,
-    sync_word_name,
 )
 
 log = logging.getLogger("gr4.waterfall")
@@ -548,45 +548,30 @@ def format_header(
 
 
 def _format_decode_line(decode: dict[str, Any], width: int) -> str:
-    """Format last-decode metadata + ASCII payload preview for header line 3."""
-    crc_ok = decode.get("crc_valid", False)
-    if crc_ok:
-        crc_tag = "\033[1;32mCRC_OK\033[0m"
-    else:
-        crc_tag = "\033[1;31mCRC_FAIL\033[0m"
+    """Format last-decode metadata + ASCII payload preview for header line 3.
 
-    sf = decode.get("sf", "?")
-    cr = decode.get("cr", 0)
-    cr_str = f"CR4/{4 + cr}" if isinstance(cr, int) else f"CR?/{cr}"
-    snr = decode.get("snr_db")
-    snr_str = f"SNR={snr:+.1f}dB" if snr is not None else ""
-    payload_len = decode.get("payload_len", 0)
-    rx_ch = decode.get("rx_channel")
-    ch_str = f"ch{rx_ch}" if rx_ch is not None else ""
-    sw = decode.get("sync_word")
-    sw_str = sync_word_name(sw) if sw is not None else ""
-
+    Uses format_frame() from lora_common for consistent display with lora_mon.
+    Shows only the first line of format_frame output, with ASCII payload
+    preview appended to fill the remaining terminal width.
+    """
     # Local timezone timestamp from wall-clock time captured at decode
     ts_wall = decode.get("_wall_time")
-    if ts_wall is not None:
-        ts_str = time.strftime("%H:%M:%S", time.localtime(ts_wall))
-    else:
-        ts_str = ""
+    ts_str = (
+        time.strftime("%H:%M:%S", time.localtime(ts_wall))
+        if ts_wall is not None
+        else ""
+    )
 
-    parts = [f"{crc_tag} {payload_len}B SF{sf} {cr_str}"]
-    if sw_str:
-        parts.append(sw_str)
-    if snr_str:
-        parts.append(snr_str)
-    if ch_str:
-        parts.append(ch_str)
+    # Get first line of format_frame output (the header line)
+    full = format_frame(decode)
+    first_line = full.split("\n")[0]
+
+    meta = first_line
     if ts_str:
-        parts.append(ts_str)
-
-    meta = " ".join(parts)
+        meta += f" {ts_str}"
 
     # Append ASCII payload preview to fill remaining width
-    payload = decode.get("_payload", b"")
+    payload = decode.get("payload", b"")
     if payload:
         meta_vis = _ansi_visible_len(meta)
         remaining = width - meta_vis - 2  # 2 for " |" separator
@@ -998,19 +983,9 @@ def main() -> None:
 
             # Track frame decodes for tinting + header line 3
             if msg_type == "lora_frame":
-                phy = msg.get("phy", {})
-                last_decode = {
-                    "crc_valid": msg.get("crc_valid", False),
-                    "sf": phy.get("sf", "?"),
-                    "cr": phy.get("cr", 0),
-                    "snr_db": phy.get("snr_db"),
-                    "sync_word": phy.get("sync_word"),
-                    "payload_len": msg.get("payload_len", 0),
-                    "rx_channel": msg.get("rx_channel"),
-                    "_payload": msg.get("payload", b""),
-                    "_time": time.monotonic(),
-                    "_wall_time": time.time(),
-                }
+                last_decode = dict(msg)
+                last_decode["_time"] = time.monotonic()
+                last_decode["_wall_time"] = time.time()
                 header_printed = False  # update line 3
                 continue
 
