@@ -45,8 +45,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-arm64-clang20-${{ matrix.build-type }}-${{ github.sha }}
-          restore-keys: ccache-arm64-clang20-${{ matrix.build-type }}
+          key: ccache-arm64-clang20-${{ matrix.build-type }}
 
       - name: Configure ccache
         run: |
@@ -86,7 +85,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ${{ steps.restore-ccache.outputs.cache-primary-key }}
+          key: ccache-arm64-clang20-${{ matrix.build-type }}
 
       - name: Show ccache stats
         if: always()
