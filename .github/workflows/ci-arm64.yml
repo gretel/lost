@@ -73,20 +73,99 @@ jobs:
         if: matrix.build-type == 'Release'
         run: ctest --test-dir build --output-on-failure --timeout 120
 
-      - name: Upload binaries
-        if: matrix.build-type == 'Release'
-        uses: actions/upload-artifact@v4
-        with:
-          name: gr4-lora-arm64
-          path: build/apps/lora_trx
-          if-no-files-found: warn
-
       - name: Save ccache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-arm64-clang20-${{ matrix.build-type }}-${{ github.run_id }}
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache --show-stats
+
+  deploy:
+    name: "arm64 | clang-20 | Release | static-libc++"
+    runs-on: ubuntu-24.04-arm
+    needs: build
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CC: clang-20
+      CXX: clang++-20
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Fetch submodules
+        run: git submodule update --init --recursive
+
+      - name: Install dependencies
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            clang-20 clang-tools-20 libc++-20-dev libc++abi-20-dev \
+            cmake ninja-build ccache \
+            libsoapysdr-dev soapysdr-module-uhd libuhd-dev
+
+      - name: Restore ccache
+        id: restore-ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-arm64-clang20-Release-${{ github.run_id }}
+          restore-keys: ccache-arm64-clang20-Release
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=3G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=6
+          ccache --set-config=depend_mode=true
+          ccache --set-config=hash_dir=false
+          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
+          ccache -z
+
+      - name: Configure (static libc++)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DUSE_CCACHE=ON \
+            -DENABLE_COVERAGE=OFF \
+            -DENABLE_LORA_TESTING=OFF \
+            -DENABLE_LORA_BENCHMARKS=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -lc++abi -static-libgcc -Wl,-Bstatic -lc++ -lc++abi -Wl,-Bdynamic"
+
+      - name: Build lora_trx
+        run: cmake --build build --target lora_trx lora_scan -j$(nproc)
+
+      - name: Verify linkage
+        run: |
+          echo "=== ldd ==="
+          ldd build/apps/lora_trx
+          echo "=== file ==="
+          file build/apps/lora_trx
+
+      - name: Upload deploy artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gr4-lora-arm64-deploy
+          path: |
+            build/apps/lora_trx
+            build/apps/lora_scan
+          if-no-files-found: error
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-arm64-clang20-Release-${{ github.run_id }}
 
       - name: Show ccache stats
         if: always()
