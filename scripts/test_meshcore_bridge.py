@@ -4966,5 +4966,28 @@ class TestBinaryReq(unittest.TestCase):
         self.assertNotIn(bridge.PUSH_BINARY_RESPONSE, push_types)
 
 
+class TestPrivateKey(unittest.TestCase):
+    def test_export_private_key_returns_seed(self):
+        """CMD_EXPORT_PRIVATE_KEY returns PRIVATE_KEY (0x0E) with the 32-byte seed."""
+        state = make_state()
+        cmd = bytes([bridge.CMD_EXPORT_PRIVATE_KEY])
+        responses = bridge.handle_command(cmd, state, None, None)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], 0x0E)
+        self.assertEqual(len(responses[0]), 33)  # 0x0E + 32 bytes seed
+        self.assertEqual(responses[0][1:], state.seed)
+
+    def test_import_private_key_updates_identity(self):
+        """CMD_IMPORT_PRIVATE_KEY accepts new seed and updates pub_key/expanded_prv."""
+        state = make_state()
+        # Generate a new seed to import
+        _, new_pub, new_seed = make_identity()
+        cmd = bytes([bridge.CMD_IMPORT_PRIVATE_KEY]) + new_seed
+        responses = bridge.handle_command(cmd, state, None, None)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        self.assertEqual(state.pub_key, new_pub)
+        self.assertEqual(state.seed, new_seed)
+
+
 if __name__ == "__main__":
     unittest.main()

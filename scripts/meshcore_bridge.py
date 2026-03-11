@@ -120,7 +120,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         pass
     return "dev"
 
@@ -159,6 +159,8 @@ CMD_REBOOT = 0x13
 CMD_GET_BATT_AND_STORAGE = 0x14
 CMD_SET_TUNING_PARAMS = 0x15
 CMD_DEVICE_QUERY = 0x16
+CMD_EXPORT_PRIVATE_KEY = 0x17
+CMD_IMPORT_PRIVATE_KEY = 0x18
 CMD_LOGIN = 0x1A
 CMD_STATUS_REQ = 0x1B
 CMD_LOGOUT = 0x1D
@@ -194,6 +196,7 @@ RESP_NO_MORE_MSGS = 0x0A
 RESP_CONTACT_URI = 0x0B
 RESP_BATTERY = 0x0C
 RESP_DEVICE_INFO = 0x0D
+RESP_PRIVATE_KEY = 0x0E
 RESP_CONTACT_MSG_RECV_V3 = 0x10
 RESP_CHANNEL_MSG_RECV_V3 = 0x11
 RESP_CHANNEL_INFO = 0x12
@@ -408,6 +411,9 @@ class BridgeState:
         self.send_scope: bytes = send_scope if len(send_scope) == 16 else b"\x00" * 16
         self.autoadd_config: int = autoadd_config
         self.autoadd_max_hops: int = autoadd_max_hops
+
+        # Identity file path — needed for private key import persistence
+        self._identity_file: Path | None = None
 
         # Startup config mirrors (config.toml values) — re-applied on each APP_START
         # so the bridge's identity is restored after a companion session overwrites it.
@@ -1359,6 +1365,28 @@ def handle_command(
 
     if cmd == CMD_DEVICE_QUERY:
         return [state.build_device_info()]
+
+    if cmd == CMD_EXPORT_PRIVATE_KEY:
+        log.info("companion: EXPORT_PRIVATE_KEY")
+        return [bytes([RESP_PRIVATE_KEY]) + state.seed]
+
+    if cmd == CMD_IMPORT_PRIVATE_KEY:
+        if len(data) < 32:
+            return [state.build_error()]
+        new_seed = data[:32]
+        from meshcore_crypto import meshcore_expanded_key
+        import nacl.signing
+
+        new_expanded = meshcore_expanded_key(new_seed)
+        signing_key = nacl.signing.SigningKey(new_seed)
+        new_pub = bytes(signing_key.verify_key)
+        state.seed = new_seed
+        state.expanded_prv = new_expanded
+        state.pub_key = new_pub
+        if state._identity_file is not None:
+            state._identity_file.write_bytes(new_seed + new_pub)
+        log.info("companion: IMPORT_PRIVATE_KEY new pub=%s..", new_pub.hex()[:8])
+        return [state.build_ok()]
 
     if cmd == CMD_GET_CONTACTS:
         return state.build_contacts_response()
@@ -2341,7 +2369,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except (ConnectionError, OSError):
+                    except ConnectionError, OSError:
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2363,7 +2391,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except (BlockingIOError, OSError):
+                    except BlockingIOError, OSError:
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2513,7 +2541,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except (ConnectionError, OSError):
+    except ConnectionError, OSError:
         pass  # client disconnected, will be cleaned up on next recv
 
 
@@ -2735,6 +2763,8 @@ def main() -> None:
         autoadd_max_hops=startup_autoadd_max_hops,
         model=node_model,
     )
+
+    state._identity_file = identity_file
 
     # Load persisted contacts from disk
     persisted = _load_persisted_contacts(contacts_dir)
