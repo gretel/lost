@@ -1091,7 +1091,7 @@ def _handle_txt_msg_rx(
             data_bytes = plaintext[5:].rstrip(
                 b"\x00"
             )  # raw binary payload, no UTF-8 round-trip
-            binary_resp = bytes([PUSH_BINARY_RESPONSE]) + tag + data_bytes
+            binary_resp = bytes([PUSH_BINARY_RESPONSE]) + tag[:4] + data_bytes
             companion_msgs.append(binary_resp)
             log.info(
                 "BINARY_RESPONSE push: tag=%s from %s..",
@@ -1668,8 +1668,13 @@ def handle_command(
         )
         from meshcore_tx import build_anon_req, make_cbor_tx_request
 
+        ts = int(time.time())
         pkt = build_anon_req(
-            state.expanded_prv, state.pub_key, dst_pub, bytes([req_type])
+            state.expanded_prv,
+            state.pub_key,
+            dst_pub,
+            bytes([req_type]),
+            timestamp=ts,
         )
         h = _hash_payload(pkt)
         state.recent_tx[h] = time.monotonic()
@@ -1677,9 +1682,9 @@ def handle_command(
         state.pkt_flood_tx += 1
         cbor_msg = make_cbor_tx_request(pkt)
         udp_sock.sendto(cbor_msg, udp_addr)
-        ts = int(time.time())
-        plaintext = struct.pack("<I", ts) + bytes([0x00]) + bytes([req_type])
-        expected_ack = compute_ack_hash(plaintext, state.pub_key)
+        expected_ack = compute_ack_hash(
+            struct.pack("<I", ts) + bytes([req_type]), state.pub_key
+        )
         resp = state.build_msg_sent(flood=True, ack_hash=expected_ack)
         state.pending_acks[expected_ack] = (time.monotonic(), dst_pub[:6])
         return [resp]
