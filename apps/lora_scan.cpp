@@ -832,6 +832,20 @@ static InterleavedResult interleavedSweep(
 
         const auto probeStart = std::chrono::steady_clock::now();
 
+        // Single capture: narrowest BW (first in sorted bwDets) needs the
+        // most L1 samples.  Wider BWs use a prefix of the same buffer.
+        const uint32_t sf12Win = (1U << 12U) * cfg.os_factor * 2U;
+        const double   maxTargetRate = bwDets.front().bw * static_cast<double>(cfg.os_factor);
+        const auto     maxDecFactor  = static_cast<uint32_t>(std::round(cfg.l1_rate / maxTargetRate));
+        const uint32_t maxL1Win      = sf12Win * maxDecFactor;
+
+        const auto l2Raw = capture_samples(sg.capture, maxL1Win, stopFlag);
+        if (l2Raw.empty()) {
+            retune_source(soapy_source, tileCentre, cfg.settle_ms);
+            if (callbacks.onRetune) callbacks.onRetune(tileCentre, "l1_restore");
+            continue;
+        }
+
         for (auto& bd : bwDets) {
             if (stopFlag.load(std::memory_order_relaxed)) {
                 break;
@@ -839,14 +853,10 @@ static InterleavedResult interleavedSweep(
 
             const double   targetRate = bd.bw * static_cast<double>(cfg.os_factor);
             const auto     decFactor  = static_cast<uint32_t>(std::round(cfg.l1_rate / targetRate));
-            const uint32_t sf12Win    = (1U << 12U) * cfg.os_factor * 2U;
             const uint32_t l1Win      = sf12Win * decFactor;
 
-            const auto raw = capture_samples(sg.capture, l1Win, stopFlag);
-            if (raw.empty()) {
-                break;
-            }
-            const auto cadBuf = decimate(raw.data(), l1Win, cfg.l1_rate, targetRate);
+            // Decimate a prefix of the single capture
+            const auto cadBuf = decimate(l2Raw.data(), l1Win, cfg.l1_rate, targetRate);
 
             const auto r = detectOnBuffer(cadBuf.data(), bd.dets, freq, bd.bw);
             if (r.detected) {
