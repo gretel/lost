@@ -4622,6 +4622,117 @@ class TestSelfInfoFields(unittest.TestCase):
         self.assertEqual(payload[base + 3], 1)  # manual_add_contacts
 
 
+class TestPathLearning(unittest.TestCase):
+    def test_path_rx_updates_contact_out_path_len(self):
+        """After a PATH+ACK is received, the sender's contact out_path_len is updated."""
+        state = make_state()
+        # Create a peer identity
+        peer_expanded_prv, peer_pub, peer_seed = make_identity()
+        from meshcore_crypto import save_pubkey
+
+        save_pubkey(state.keys_dir, peer_pub)
+        state.known_keys[peer_pub.hex()] = peer_pub
+
+        # Add a contact record for the peer (out_path_len=-1 = flood)
+        record = bridge._build_contact_record(peer_pub, name="peer")
+        state.contacts[peer_pub.hex()] = record
+        self.assertEqual(struct.unpack_from("<b", record, 34)[0], -1)  # initially flood
+
+        # Pre-register an expected ACK so _match_pending_ack works
+        ack_hash = b"\x11\x22\x33\x44"
+        state.pending_acks[ack_hash] = (time.monotonic(), peer_pub[:6])
+
+        # Build a PATH+ACK from peer:
+        # Plaintext: path_len_enc(1) + path(1 hop hash) + extra_type(1) + ack_hash(4)
+        # 1 hop: the bridge's own hash (state.pub_key[0])
+        path_len_enc = 0x01  # 1 hop, hash_size=1 (bits[7:6]=00 -> size=1)
+        path_hash = bytes([state.pub_key[0]])
+        plaintext = (
+            bytes([path_len_enc]) + path_hash + bytes([bridge.PAYLOAD_ACK]) + ack_hash
+        )
+
+        from meshcore_crypto import meshcore_shared_secret, meshcore_encrypt_then_mac
+
+        shared = meshcore_shared_secret(peer_expanded_prv, state.pub_key)
+        assert shared is not None
+        encrypted = meshcore_encrypt_then_mac(shared, plaintext)
+
+        # Wire: ROUTE_FLOOD header + path_len=0 + dest_hash(1) + src_hash(1) + MAC+ct
+        from meshcore_tx import build_wire_packet, make_header
+
+        inner_payload = bytes([state.pub_key[0], peer_pub[0]]) + encrypted
+        path_pkt = build_wire_packet(
+            make_header(bridge.ROUTE_FLOOD, 0x08), inner_payload
+        )
+
+        frame = {
+            "type": "lora_frame",
+            "payload": path_pkt,
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0, "rssi_dbm": -70},
+        }
+
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, state)
+
+        # Contact should have out_path_len updated
+        updated = state.contacts[peer_pub.hex()]
+        new_path_len = struct.unpack_from("<b", updated, 34)[0]
+        # The return path was [state.pub_key[0]] (1 byte, 1 hop)
+        # Reversed (forward path) is still [state.pub_key[0]] (1 hop)
+        self.assertEqual(new_path_len, 1)
+
+        # Should also emit PUSH_PATH_UPDATE
+        push_types = [m[0] for m in msgs]
+        self.assertIn(bridge.PUSH_PATH_UPDATE, push_types)
+
+        # Should also have processed the ACK (pending_acks entry removed)
+        self.assertNotIn(ack_hash, state.pending_acks)
+
+    def test_path_rx_no_contact_does_not_crash(self):
+        """PATH from unknown contact (not in contacts) is handled gracefully."""
+        state = make_state()
+        peer_expanded_prv, peer_pub, _ = make_identity()
+        from meshcore_crypto import save_pubkey
+
+        save_pubkey(state.keys_dir, peer_pub)
+        state.known_keys[peer_pub.hex()] = peer_pub
+        # Note: peer is NOT added to state.contacts
+
+        ack_hash = b"\xaa\xbb\xcc\xdd"
+        state.pending_acks[ack_hash] = (time.monotonic(), peer_pub[:6])
+
+        path_len_enc = 0x01
+        path_hash = bytes([state.pub_key[0]])
+        plaintext = (
+            bytes([path_len_enc]) + path_hash + bytes([bridge.PAYLOAD_ACK]) + ack_hash
+        )
+
+        from meshcore_crypto import meshcore_shared_secret, meshcore_encrypt_then_mac
+
+        shared = meshcore_shared_secret(peer_expanded_prv, state.pub_key)
+        assert shared is not None
+        encrypted = meshcore_encrypt_then_mac(shared, plaintext)
+
+        from meshcore_tx import build_wire_packet, make_header
+
+        inner_payload = bytes([state.pub_key[0], peer_pub[0]]) + encrypted
+        path_pkt = build_wire_packet(
+            make_header(bridge.ROUTE_FLOOD, 0x08), inner_payload
+        )
+
+        frame = {
+            "type": "lora_frame",
+            "payload": path_pkt,
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0, "rssi_dbm": -70},
+        }
+
+        # Should not raise; ACK should still be processed
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, state)
+        # ACK still matched even without a contact record
+        self.assertNotIn(ack_hash, state.pending_acks)
+
+
 class TestPacketStats(unittest.TestCase):
     def test_stats_type2_has_26_bytes(self):
         state = make_state()

@@ -120,7 +120,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         pass
     return "dev"
 
@@ -858,6 +858,51 @@ def _handle_ack_rx(
     return _match_pending_ack(ack_bytes, state)
 
 
+def _update_contact_path(
+    state: BridgeState,
+    sender_pub: bytes,
+    return_path: bytes,
+) -> bytes | None:
+    """Update a contact's out_path_len/path from a received PATH return path.
+
+    The return_path is the route from sender back to us — reversed, it becomes
+    the forward path from us to the sender.  Returns a PUSH_PATH_UPDATE (0x81)
+    payload if a contact was updated, else None.
+    """
+    pk_hex = sender_pub.hex()
+    record = state.contacts.get(pk_hex)
+    if record is None:
+        return None
+
+    # Reverse the return path to get the outgoing forward path
+    forward_path = bytes(reversed(return_path))
+    n = len(forward_path)
+    if n > 64:
+        forward_path = forward_path[:64]
+        n = 64
+
+    # Unpack and repack the 147-byte contact record
+    buf = bytearray(record)
+    struct.pack_into("<b", buf, 34, n)  # out_path_len (signed)
+    buf[35 : 35 + n] = forward_path  # path bytes
+    if n < 64:
+        buf[35 + n : 99] = b"\x00" * (64 - n)  # zero-pad remainder
+
+    state.contacts[pk_hex] = bytes(buf)
+    _persist_contacts(state)
+
+    log.info(
+        "path learned for %s..: %d hops → %s",
+        pk_hex[:8],
+        n,
+        forward_path.hex(),
+    )
+
+    # Build PUSH_PATH_UPDATE: [0x81][pubkey_prefix(6)][path_len(1)][path(N)]
+    push = bytes([PUSH_PATH_UPDATE]) + sender_pub[:6] + bytes([n]) + forward_path
+    return push
+
+
 def _handle_path_rx(
     payload: bytes,
     path_len: int,
@@ -893,12 +938,15 @@ def _handle_path_rx(
     # Trial decryption over known keys (match src_hash)
     candidates = [pub for pub in state.known_keys.values() if pub[0] == src_hash]
     plaintext: bytes | None = None
+    sender_pub: bytes | None = None
     for peer_pub in candidates:
         secret = meshcore_shared_secret(state.expanded_prv, peer_pub)
         if secret is None:
             continue
-        plaintext = meshcore_mac_then_decrypt(secret, encrypted)
-        if plaintext is not None:
+        pt = meshcore_mac_then_decrypt(secret, encrypted)
+        if pt is not None:
+            plaintext = pt
+            sender_pub = peer_pub
             break
 
     if plaintext is None or len(plaintext) < 2:
@@ -911,6 +959,7 @@ def _handle_path_rx(
     hash_size = ((path_len_enc >> 6) & 0x03) + 1
     path_bytes = hash_count * hash_size
     idx = 1 + path_bytes
+    return_path = plaintext[1 : 1 + path_bytes]
 
     if idx >= len(plaintext):
         log.debug("PATH: no extra data after return path")
@@ -919,12 +968,20 @@ def _handle_path_rx(
     extra_type = plaintext[idx] & 0x0F
     extra = plaintext[idx + 1 :]
 
+    results: list[bytes] = []
+
+    # Learn the path: update contact record and emit PUSH_PATH_UPDATE
+    if sender_pub is not None:
+        path_push = _update_contact_path(state, sender_pub, return_path)
+        if path_push is not None:
+            results.append(path_push)
+
     if extra_type == PAYLOAD_ACK and len(extra) >= 4:
         ack_bytes = extra[:4]
         log.info("PATH+ACK: extracted ACK hash %s", ack_bytes.hex())
-        return _match_pending_ack(ack_bytes, state)
+        results.extend(_match_pending_ack(ack_bytes, state))
 
-    return []
+    return results
 
 
 def _build_contact_msg_recv_v3(
@@ -2128,7 +2185,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except (ConnectionError, OSError):
+                    except ConnectionError, OSError:
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2150,7 +2207,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except (BlockingIOError, OSError):
+                    except BlockingIOError, OSError:
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2300,7 +2357,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except (ConnectionError, OSError):
+    except ConnectionError, OSError:
         pass  # client disconnected, will be cleaned up on next recv
 
 
