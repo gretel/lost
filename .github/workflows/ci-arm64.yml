@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: ISC
+name: ARM64 CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: "arm64 | gcc-15 | ${{ matrix.build-type }}"
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: ubuntu:25.10
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: [Release, Debug]
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CC: gcc-15
+      CXX: g++-15
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            git cmake ninja-build gcc-15 g++-15 ccache \
+            libsoapysdr-dev soapysdr-module-uhd libuhd-dev
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-arm64-gcc15-${{ matrix.build-type }}-${{ github.sha }}
+          restore-keys: ccache-arm64-gcc15-${{ matrix.build-type }}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} \
+            -DUSE_CCACHE=ON \
+            -DENABLE_COVERAGE=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure --timeout 60
+
+      - name: Upload binaries
+        if: matrix.build-type == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gr4-lora-arm64
+          path: |
+            build/apps/lora_trx
+          if-no-files-found: warn
