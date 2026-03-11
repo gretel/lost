@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <numeric>
 #include <sstream>
@@ -702,6 +703,20 @@ struct InterleavedResult {
     std::vector<DirectCadResult> detections;
     std::vector<double>          energy;
     uint32_t                     l1_hot_total = 0;
+    uint32_t                     l2_probes    = 0;
+};
+
+struct L2BwResult {
+    double      bw;
+    uint32_t    sf;
+    double      ratio;
+    const char* chirp;
+};
+
+struct SweepCallbacks {
+    std::function<void(double freq, const char* reason)>                            onRetune;
+    std::function<void(double freq, uint32_t durationMs, std::vector<L2BwResult>)>  onL2Probe;
+    std::function<void(int snap, int total, uint32_t hotCount)>                     onProgress;
 };
 
 static InterleavedResult interleavedSweep(
@@ -709,7 +724,8 @@ static InterleavedResult interleavedSweep(
         std::shared_ptr<gr::BlockModel>& soapy_source,
         const std::vector<double>& channels,
         const ScanConfig& cfg,
-        const std::atomic<bool>& stopFlag) {
+        const std::atomic<bool>& stopFlag,
+        const SweepCallbacks& callbacks = {}) {
     InterleavedResult ir;
 
     const std::size_t nCh    = channels.size();
@@ -794,6 +810,9 @@ static InterleavedResult interleavedSweep(
         }
 
         if (bestIdx < 0) {
+            if (callbacks.onProgress && (snap % 100 == 0)) {
+                callbacks.onProgress(snap + 1, kSnapshots, ir.l1_hot_total);
+            }
             continue;
         }
 
@@ -806,9 +825,13 @@ static InterleavedResult interleavedSweep(
 
         double bestRatio = 0.0;
         DirectCadResult bestResult;
+        std::vector<L2BwResult> bwResults;
 
         // Retune to hot channel for L2 CAD
         retune_source(soapy_source, freq, cfg.settle_ms);
+        if (callbacks.onRetune) callbacks.onRetune(freq, "l2_probe");
+
+        const auto probeStart = std::chrono::steady_clock::now();
 
         for (auto& bd : bwDets) {
             if (stopFlag.load(std::memory_order_relaxed)) {
@@ -839,16 +862,36 @@ static InterleavedResult interleavedSweep(
                 }
             }
 
+            {
+                const double ratio = r.detected
+                    ? std::max(r.peak_ratio_up, r.peak_ratio_dn) : 0.0;
+                const char* chirp = !r.detected ? ""
+                    : (r.peak_ratio_up > 0 && r.peak_ratio_dn > 0) ? "both"
+                    : (r.peak_ratio_dn > r.peak_ratio_up) ? "dn" : "up";
+                bwResults.push_back({bd.bw, r.sf_detected, ratio, chirp});
+            }
+
             if (bestRatio > 10.0) {
                 break;
             }
         }
 
+        const auto probeEnd = std::chrono::steady_clock::now();
+        const auto probeMs  = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                probeEnd - probeStart).count());
+
+        if (callbacks.onL2Probe) {
+            callbacks.onL2Probe(freq, probeMs, std::move(bwResults));
+        }
+
         // Return to tile centre for next L1 snapshot
         retune_source(soapy_source, tileCentre, cfg.settle_ms);
         update_spectrum_centre(sg.spectrum, tileCentre);
+        if (callbacks.onRetune) callbacks.onRetune(tileCentre, "l1_restore");
 
         probed[static_cast<std::size_t>(bestIdx)] = true;
+        ++ir.l2_probes;
 
         if (bestRatio > 0.0) {
             ir.detections.push_back(bestResult);
@@ -940,6 +983,92 @@ static void emitStatusCbor(const ScanConfig& cfg, const ScanStats& stats,
     std::fflush(stdout);
 }
 
+// ─── CBOR event emitters (real-time diagnostics) ─────────────────────────────
+
+static void emitSweepStartCbor(uint32_t sweep) {
+    namespace cb = gr::lora::cbor;
+    std::vector<uint8_t> buf;
+    buf.reserve(64);
+    cb::encode_map_begin(buf, 3);
+    cb::kv_text(buf, "type", "scan_sweep_start");
+    cb::kv_text(buf, "ts", gr::lora::ts_now());
+    cb::kv_uint(buf, "sweep", sweep);
+    std::fwrite(buf.data(), 1, buf.size(), stdout);
+    std::fflush(stdout);
+}
+
+static void emitSweepEndCbor(uint32_t sweep, uint32_t durationMs,
+                              uint32_t l1Snapshots, uint32_t l2Probes,
+                              uint32_t hotCount, uint32_t detections,
+                              uint32_t overflows) {
+    namespace cb = gr::lora::cbor;
+    std::vector<uint8_t> buf;
+    buf.reserve(128);
+    cb::encode_map_begin(buf, 9);
+    cb::kv_text(buf, "type", "scan_sweep_end");
+    cb::kv_text(buf, "ts", gr::lora::ts_now());
+    cb::kv_uint(buf, "sweep", sweep);
+    cb::kv_uint(buf, "duration_ms", durationMs);
+    cb::kv_uint(buf, "l1_snapshots", l1Snapshots);
+    cb::kv_uint(buf, "l2_probes", l2Probes);
+    cb::kv_uint(buf, "hot_count", hotCount);
+    cb::kv_uint(buf, "detections", detections);
+    cb::kv_uint(buf, "overflows", overflows);
+    std::fwrite(buf.data(), 1, buf.size(), stdout);
+    std::fflush(stdout);
+}
+
+static void emitL2ProbeCbor(uint32_t sweep, double freq, uint32_t durationMs,
+                             const std::vector<L2BwResult>& results) {
+    namespace cb = gr::lora::cbor;
+    std::vector<uint8_t> buf;
+    buf.reserve(256);
+    cb::encode_map_begin(buf, 6);
+    cb::kv_text(buf, "type", "scan_l2_probe");
+    cb::kv_text(buf, "ts", gr::lora::ts_now());
+    cb::kv_uint(buf, "sweep", sweep);
+    cb::kv_uint(buf, "freq", static_cast<uint64_t>(freq));
+    cb::kv_uint(buf, "duration_ms", durationMs);
+    cb::encode_text(buf, "results");
+    cb::encode_array_begin(buf, results.size());
+    for (const auto& r : results) {
+        cb::encode_map_begin(buf, 4);
+        cb::kv_uint(buf, "bw", static_cast<uint64_t>(r.bw));
+        cb::kv_uint(buf, "sf", r.sf);
+        cb::kv_float64(buf, "ratio", r.ratio);
+        cb::kv_text(buf, "chirp", r.chirp);
+    }
+    std::fwrite(buf.data(), 1, buf.size(), stdout);
+    std::fflush(stdout);
+}
+
+static void emitRetuneCbor(uint32_t sweep, double freq, const char* reason) {
+    namespace cb = gr::lora::cbor;
+    std::vector<uint8_t> buf;
+    buf.reserve(96);
+    cb::encode_map_begin(buf, 5);
+    cb::kv_text(buf, "type", "scan_retune");
+    cb::kv_text(buf, "ts", gr::lora::ts_now());
+    cb::kv_uint(buf, "sweep", sweep);
+    cb::kv_uint(buf, "freq", static_cast<uint64_t>(freq));
+    cb::kv_text(buf, "reason", reason);
+    std::fwrite(buf.data(), 1, buf.size(), stdout);
+    std::fflush(stdout);
+}
+
+static void emitOverflowCbor(uint32_t sweep, uint64_t count) {
+    namespace cb = gr::lora::cbor;
+    std::vector<uint8_t> buf;
+    buf.reserve(64);
+    cb::encode_map_begin(buf, 4);
+    cb::kv_text(buf, "type", "scan_overflow");
+    cb::kv_text(buf, "ts", gr::lora::ts_now());
+    cb::kv_uint(buf, "sweep", sweep);
+    cb::kv_uint(buf, "count", count);
+    std::fwrite(buf.data(), 1, buf.size(), stdout);
+    std::fflush(stdout);
+}
+
 // ─── UTC time helper: "HH:MM:SS.mmm" ─────────────────────────────────────────
 
 static std::string ts_short() {
@@ -970,7 +1099,6 @@ int main(int argc, char** argv) {
     int savedStdout = -1;
 
     try {
-
     const auto channels = makeChannelList(cfg.freq_start, cfg.freq_stop, cfg.min_bw());
 
     constexpr uint32_t kSF12Len = 4096U;
@@ -1109,8 +1237,6 @@ int main(int argc, char** argv) {
         std::fflush(out);
     }
 
-    auto lastStatusUpdate = std::chrono::steady_clock::now();
-
     const double scanRange = channels.back() - channels.front() + cfg.min_bw();
     const double usableBw  = cfg.l1_rate * 0.8;
     const bool   singleTile = scanRange <= usableBw;
@@ -1161,6 +1287,25 @@ int main(int argc, char** argv) {
 
     std::vector<double> sweepEnergy(channels.size(), 0.0);
     auto lastCborStatus = std::chrono::steady_clock::now();
+    double avgSweepMs = 0.0;
+
+    // Overflow polling: typed access to SoapySource
+    uint64_t lastOverflowCount = 0;
+    auto checkOverflows = [&](uint32_t sweep) {
+        // Access overflow count via the typed block inside the wrapper.
+        // SoapyBlock<cf32, 1>::totalOverflowCount() is atomic and cross-thread safe.
+        using SoapyType = gr::blocks::soapy::SoapyBlock<std::complex<float>, 1UL>;
+        auto* wrapper = dynamic_cast<gr::BlockWrapper<SoapyType>*>(soapy_source.get());
+        if (!wrapper) return;
+        const uint64_t current = wrapper->blockRef().totalOverflowCount();
+        if (current > lastOverflowCount) {
+            stats.overflows = static_cast<uint32_t>(current);
+            if (cfg.cbor_out) {
+                emitOverflowCbor(sweep, current);
+            }
+            lastOverflowCount = current;
+        }
+    };
 
     while (!g_stop.load(std::memory_order_relaxed)
            && !sched_done.load(std::memory_order_relaxed)) {
@@ -1168,12 +1313,76 @@ int main(int argc, char** argv) {
         std::ranges::fill(sweepEnergy, 0.0);
 
         if (useInterleaved) {
-            const auto bResult = interleavedSweep(sg, soapy_source, channels, cfg, g_stop);
+            const uint32_t sweepNum = stats.sweeps + 1;
+            const auto sweepStart = std::chrono::steady_clock::now();
+
+            if (cfg.cbor_out) {
+                emitSweepStartCbor(sweepNum);
+            }
+
+            // Status bar state updated by callbacks
+            uint32_t lastL2ProbeMs = 0;
+            double   lastL2Freq    = 0.0;
+            std::string lastL2Bw;
+
+            SweepCallbacks callbacks;
+            if (cfg.cbor_out) {
+                callbacks.onRetune = [sweepNum](double freq, const char* reason) {
+                    emitRetuneCbor(sweepNum, freq, reason);
+                };
+            }
+            callbacks.onL2Probe = [&, sweepNum](double freq, uint32_t ms,
+                    std::vector<L2BwResult> results) {
+                lastL2ProbeMs = ms;
+                lastL2Freq    = freq;
+                double bestRatio = 0.0;
+                for (const auto& r : results) {
+                    if (r.ratio > bestRatio) {
+                        bestRatio = r.ratio;
+                        char tmp[16];
+                        std::snprintf(tmp, sizeof(tmp), "BW%.0fk", r.bw / 1e3);
+                        lastL2Bw = tmp;
+                    }
+                }
+                if (cfg.cbor_out) {
+                    emitL2ProbeCbor(sweepNum, freq, ms, results);
+                }
+                checkOverflows(sweepNum);
+            };
+            callbacks.onProgress = [&](int snap, int total, uint32_t hotCount) {
+                std::fprintf(stderr,
+                    "\rsweep %u  L1 %d/%d  hot %u  L2: %.3f %s (%ums)  OVF %u  %.1fs/sw   ",
+                    sweepNum, snap, total, hotCount,
+                    lastL2Freq / 1e6,
+                    lastL2Bw.empty() ? "-" : lastL2Bw.c_str(),
+                    lastL2ProbeMs, stats.overflows,
+                    avgSweepMs / 1000.0);
+            };
+
+            const auto bResult = interleavedSweep(sg, soapy_source, channels, cfg,
+                                                   g_stop, callbacks);
             for (const auto& det : bResult.detections) {
                 reportDetection(det);
             }
             stats.l1_hot = bResult.l1_hot_total;
             sweepEnergy = bResult.energy;
+
+            const auto sweepEnd = std::chrono::steady_clock::now();
+            const auto sweepMs  = static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    sweepEnd - sweepStart).count());
+            avgSweepMs = (stats.sweeps == 0)
+                ? static_cast<double>(sweepMs)
+                : avgSweepMs * 0.8 + static_cast<double>(sweepMs) * 0.2;
+
+            if (cfg.cbor_out) {
+                const auto kTotalSnaps = static_cast<uint32_t>(
+                    5U * channels.size() * cfg.bws.size());
+                emitSweepEndCbor(sweepNum, sweepMs, kTotalSnaps,
+                                 bResult.l2_probes, bResult.l1_hot_total,
+                                 static_cast<uint32_t>(sweepDetections.size()),
+                                 stats.overflows);
+            }
         }
 
         if (useDirectCad && !useInterleaved
@@ -1277,20 +1486,20 @@ int main(int argc, char** argv) {
             }
         }
 
+        checkOverflows(stats.sweeps);
+
         if (cfg.sweeps > 0 && stats.sweeps >= cfg.sweeps) {
             break;
         }
 
-        const auto now = std::chrono::steady_clock::now();
-        if (!g_stop.load(std::memory_order_relaxed)
-            && (now - lastStatusUpdate) >= std::chrono::milliseconds(500)) {
-            lastStatusUpdate = now;
+        if (!g_stop.load(std::memory_order_relaxed)) {
             const std::string lastDet = stats.last_det_freq.empty()
                 ? "none"
                 : (stats.last_det_freq + " " + stats.last_det_time);
-            std::fprintf(stderr, "\rsweep %u  hot %u/%zu  OVF %u  DROP %u  last: %s   ",
-                         stats.sweeps, stats.l1_hot, channels.size(),
-                         stats.overflows, stats.drops, lastDet.c_str());
+            std::fprintf(stderr,
+                "\rsweep %u  hot %u/%zu  OVF %u  %.1fs/sw  last: %s   ",
+                stats.sweeps, stats.l1_hot, channels.size(),
+                stats.overflows, avgSweepMs / 1000.0, lastDet.c_str());
         }
     }
 
@@ -1302,7 +1511,6 @@ int main(int argc, char** argv) {
     sched.requestStop();
     sched_thread.join();
     std::quick_exit(0);
-
     } catch (const std::exception& e) {
         if (savedStdout >= 0) {
             dup2(savedStdout, STDOUT_FILENO);
