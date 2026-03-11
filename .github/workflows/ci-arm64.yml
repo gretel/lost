@@ -9,7 +9,7 @@ on:
 
 jobs:
   build:
-    name: "arm64 | gcc-15 | ${{ matrix.build-type }}"
+    name: "arm64 | clang-20 | ${{ matrix.build-type }}"
     runs-on: ubuntu-24.04-arm
     container:
       image: ubuntu:25.10
@@ -19,15 +19,16 @@ jobs:
         build-type: [Release, Debug]
     env:
       DEBIAN_FRONTEND: noninteractive
-      CC: gcc-15
-      CXX: g++-15
+      CC: clang-20
+      CXX: clang++-20
 
     steps:
       - name: Install dependencies
         run: |
           apt-get update -y
           apt-get install -y --no-install-recommends \
-            git cmake ninja-build gcc-15 g++-15 ccache \
+            ca-certificates git cmake ninja-build \
+            clang-20 libc++-20-dev libc++abi-20-dev ccache \
             libsoapysdr-dev soapysdr-module-uhd libuhd-dev
 
       - uses: actions/checkout@v6
@@ -39,8 +40,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-arm64-gcc15-${{ matrix.build-type }}-${{ github.sha }}
-          restore-keys: ccache-arm64-gcc15-${{ matrix.build-type }}
+          key: ccache-arm64-clang20-${{ matrix.build-type }}-${{ github.sha }}
+          restore-keys: ccache-arm64-clang20-${{ matrix.build-type }}
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
 
@@ -64,6 +65,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gr4-lora-arm64
-          path: |
-            build/apps/lora_trx
+          path: build/apps/lora_trx
           if-no-files-found: warn
