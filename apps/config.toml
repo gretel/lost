@@ -77,7 +77,7 @@ preamble_len = 8
 freq       = 869618000
 rx_channel = [1, 2]
 tx_channel = 0
-rx_gain    = 36
+rx_gain    = 40
 tx_gain    = 50
 
 # --- Active network sets ---

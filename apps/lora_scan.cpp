@@ -25,10 +25,13 @@
 #include <thread>
 #include <vector>
 
+#include <unistd.h>  // dup, dup2, fileno
+
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
 #include <gnuradio-4.0/soapy/Soapy.hpp>
 
+#include <gnuradio-4.0/lora/cbor.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
 using cf32 = std::complex<float>;
@@ -49,6 +52,7 @@ struct ScanStats {
     uint32_t    overflows       = 0;
     uint32_t    drops           = 0;
     uint32_t    l1_hot          = 0;   // hot channels in current sweep
+    uint32_t    total_detections = 0;
     std::string last_det_freq;         // last YES detection frequency
     std::string last_det_time;         // last YES detection timestamp
 };
@@ -62,13 +66,14 @@ struct ScanConfig {
     uint32_t             os_factor    = 4;
     double               gain         = 40.0;
     int                  settle_ms    = 5;
-    double               l1_rate      = 8.0e6;   // wideband L1 sample rate (even B210 decimation)
+    double               l1_rate      = 16.0e6;  // wideband L1 sample rate (32 MHz / 2 = even decimation on B210)
     uint32_t             cad_windows  = 8;
     uint32_t             max_l2       = 8;        // max L2 candidates per sweep
     float                min_ratio    = 8.0F;     // minimum peak ratio to report (noise floor ~4)
     uint32_t             sweeps       = 0;        // 0 = infinite
     bool                 layer1_only  = false;
     bool                 all_channels = false;
+    bool                 cbor_out     = false;
 
     /// Narrowest bandwidth (used for channel grid and L1).
     [[nodiscard]] double min_bw() const { return *std::ranges::min_element(bws); }
@@ -89,13 +94,14 @@ static void print_usage() {
         "  --os <n>              Oversampling factor (default: 4)\n"
         "  --gain <dB>           RX gain (default: 40)\n"
         "  --settle-ms <ms>      PLL settle delay after retune (default: 5)\n"
-        "  --l1-rate <Hz>        L1 wideband sample rate (default: 8e6)\n"
+        "  --l1-rate <Hz>        L1 wideband sample rate (default: 16e6)\n"
         "  --cad-windows <K>     CAD windows per BW per channel (default: 8)\n"
         "  --max-l2 <N>          Max L2 candidates per sweep (default: 8)\n"
         "  --min-ratio <f>       Min peak ratio to report (default: 8.0)\n"
         "  --sweeps <N>          Stop after N sweeps (default: 0 = infinite)\n"
         "  --layer1-only         Stop after Layer 1 (energy scan only)\n"
         "  --all-channels        Run CAD on all channels, not just hot ones\n"
+        "  --cbor                Emit CBOR frames on stdout (pipe to lora_spectrum.py)\n"
         "  --log-level <level>   Log level: DEBUG, INFO, WARNING, ERROR\n"
         "  --version             Show version and exit\n"
         "  -h, --help            Show this help\n");
@@ -149,6 +155,7 @@ static int parseArgs(int argc, char** argv, ScanConfig& cfg) {
         else if (arg == "--sweeps")        cfg.sweeps       = static_cast<uint32_t>(std::stoul(next()));
         else if (arg == "--layer1-only")   cfg.layer1_only  = true;
         else if (arg == "--all-channels")  cfg.all_channels = true;
+        else if (arg == "--cbor")          cfg.cbor_out     = true;
         else {
             std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             print_usage();
@@ -650,6 +657,7 @@ static std::vector<DirectCadResult> directCadSweep(
 
 struct InterleavedResult {
     std::vector<DirectCadResult> detections;
+    std::vector<double>          energy;        // per-channel max-hold energy
     uint32_t                     l1_hot_total = 0;
 };
 
@@ -661,6 +669,7 @@ static InterleavedResult interleavedSweep(
 
     const std::size_t nCh    = channels.size();
     const double      chBw   = cfg.min_bw();
+    ir.energy.resize(nCh, 0.0);  // max-hold across all snapshots
 
     // Pre-build detectors for each BW (reused across snapshots).
     struct BwDetectors {
@@ -758,6 +767,11 @@ static InterleavedResult interleavedSweep(
             if (cnt > 0) {
                 energy[chIdx] = sum / static_cast<double>(cnt);
             }
+        }
+
+        // Max-hold into result for CBOR spectrum output.
+        for (std::size_t chIdx = 0; chIdx < nCh; ++chIdx) {
+            ir.energy[chIdx] = std::max(ir.energy[chIdx], energy[chIdx]);
         }
 
         // Median threshold.
@@ -868,6 +882,93 @@ static InterleavedResult interleavedSweep(
     return ir;
 }
 
+// ─── CBOR output ──────────────────────────────────────────────────────────────
+
+/// Emit a scan_spectrum CBOR frame to stdout.
+static void emitSpectrumCbor(
+    const std::vector<double>& channels,
+    const std::vector<double>& energy,
+    const std::vector<std::size_t>& hotIndices,
+    const std::vector<DirectCadResult>& detections,
+    uint32_t sweepCount)
+{
+    namespace cb = gr::lora::cbor;
+    std::vector<uint8_t> buf;
+    buf.reserve(512);
+
+    cb::encode_map_begin(buf, 9);
+    cb::kv_text(buf, "type", "scan_spectrum");
+    cb::kv_text(buf, "ts", gr::lora::ts_now());
+    cb::kv_uint(buf, "sweep", sweepCount);
+    cb::kv_uint(buf, "freq_min", static_cast<uint64_t>(channels.front()));
+
+    const uint64_t step = channels.size() > 1
+        ? static_cast<uint64_t>(channels[1] - channels[0])
+        : 62500;
+    cb::kv_uint(buf, "freq_step", step);
+
+    // Per-channel energy as float32 LE byte string.
+    const auto nCh = static_cast<uint32_t>(energy.size());
+    std::vector<uint8_t> floatBuf(nCh * sizeof(float));
+    for (uint32_t i = 0; i < nCh; ++i) {
+        auto val = static_cast<float>(energy[i]);
+        std::memcpy(floatBuf.data() + i * sizeof(float), &val, sizeof(float));
+    }
+    cb::kv_bytes(buf, "channels", floatBuf.data(), floatBuf.size());
+    cb::kv_uint(buf, "n_channels", nCh);
+
+    // HOT channel indices.
+    cb::encode_text(buf, "hot");
+    cb::encode_array_begin(buf, hotIndices.size());
+    for (auto idx : hotIndices) {
+        cb::encode_uint(buf, static_cast<uint64_t>(idx));
+    }
+
+    // Detections array.
+    cb::encode_text(buf, "detections");
+    cb::encode_array_begin(buf, detections.size());
+    for (const auto& det : detections) {
+        cb::encode_map_begin(buf, 5);
+        cb::kv_uint(buf, "freq", static_cast<uint64_t>(det.freq));
+        cb::kv_uint(buf, "sf", det.sf_detected);
+        cb::kv_uint(buf, "bw", static_cast<uint64_t>(det.bw));
+        cb::kv_float64(buf, "ratio", std::max(det.peak_ratio_up, det.peak_ratio_dn));
+        const char* chirp = (det.peak_ratio_up > 0 && det.peak_ratio_dn > 0) ? "both"
+                          : (det.peak_ratio_dn > det.peak_ratio_up)           ? "dn"
+                          :                                                     "up";
+        cb::kv_text(buf, "chirp", chirp);
+    }
+
+    std::fwrite(buf.data(), 1, buf.size(), stdout);
+    std::fflush(stdout);
+}
+
+/// Emit a scan_status CBOR frame to stdout.
+static void emitStatusCbor(const ScanConfig& cfg, const ScanStats& stats,
+                           const std::string& mode)
+{
+    namespace cb = gr::lora::cbor;
+    std::vector<uint8_t> buf;
+    buf.reserve(256);
+
+    cb::encode_map_begin(buf, 8);
+    cb::kv_text(buf, "type", "scan_status");
+    cb::kv_text(buf, "ts", gr::lora::ts_now());
+    cb::kv_text(buf, "mode", mode);
+    cb::kv_uint(buf, "sweeps", stats.sweeps);
+    cb::kv_uint(buf, "detections", stats.total_detections);
+    cb::kv_uint(buf, "overflows", stats.overflows);
+    cb::kv_uint(buf, "dropouts", stats.drops);
+
+    cb::encode_text(buf, "scan_range");
+    cb::encode_array_begin(buf, 2);
+    cb::encode_uint(buf, static_cast<uint64_t>(cfg.freq_start));
+    cb::encode_uint(buf, static_cast<uint64_t>(cfg.freq_stop));
+
+    std::fwrite(buf.data(), 1, buf.size(), stdout);
+    std::fflush(stdout);
+}
+
 // ─── UTC time helper for stdout table: "HH:MM:SS.mmm" ────────────────────────
 
 static std::string ts_short() {
@@ -894,6 +995,9 @@ int main(int argc, char** argv) {
     }
 
     std::signal(SIGINT, sigintHandler);
+
+    int savedStdout = -1;  // for stdout→stderr redirect during device init
+    try {
 
     const auto channels = makeChannelList(cfg.freq_start, cfg.freq_stop, cfg.min_bw());
 
@@ -936,6 +1040,14 @@ int main(int argc, char** argv) {
     }
 
     // Open SDR — same pattern as lora_trx.
+    // When --cbor is active, stdout is the CBOR pipe.  gr::exception's
+    // constructor (Message.hpp) and UHD/SoapySDR may print to stdout.
+    // Temporarily redirect stdout → stderr to keep the pipe clean.
+    if (cfg.cbor_out) {
+        std::fflush(stdout);
+        savedStdout = dup(STDOUT_FILENO);
+        dup2(STDERR_FILENO, STDOUT_FILENO);
+    }
     auto dev = openDevice(cfg);
     dev.setGain(SOAPY_SDR_RX, 0, cfg.gain);
 
@@ -946,21 +1058,32 @@ int main(int argc, char** argv) {
     auto stream = dev.setupStream<cf32, SOAPY_SDR_RX>();
     stream.activate();
 
+    if (savedStdout >= 0) {
+        dup2(savedStdout, STDOUT_FILENO);
+        close(savedStdout);
+    }
+
     ScanStats stats;
 
     // ── Layer 1 only mode ────────────────────────────────────────────────────
     if (cfg.layer1_only) {
-        std::printf("%-15s  %12s  %6s\n", "freq_hz", "energy_lin", "L1");
-        std::printf("%s\n", std::string(38, '-').c_str());
+        auto* out = cfg.cbor_out ? stderr : stdout;
+        std::fprintf(out, "%-15s  %12s  %6s\n", "freq_hz", "energy_lin", "L1");
+        std::fprintf(out, "%s\n", std::string(38, '-').c_str());
 
         while (!g_stop.load(std::memory_order_relaxed)) {
             const auto l1 = layer1Scan(stream, dev, channels, cfg, stats);
+            std::vector<std::size_t> hotIndices;
             for (std::size_t idx = 0; idx < channels.size(); ++idx) {
                 const bool hot = std::ranges::find(l1.hot_idx, static_cast<int>(idx)) != l1.hot_idx.end();
-                std::printf("%-15.0f  %12.6f  %6s\n",
+                if (hot) hotIndices.push_back(idx);
+                std::fprintf(out, "%-15.0f  %12.6f  %6s\n",
                             channels[idx], l1.energy[idx], hot ? "HOT" : "");
             }
-            std::fflush(stdout);
+            std::fflush(out);
+            if (cfg.cbor_out) {
+                emitSpectrumCbor(channels, l1.energy, hotIndices, {}, stats.sweeps);
+            }
             if (++stats.sweeps >= cfg.sweeps && cfg.sweeps > 0) {
                 break;
             }
@@ -972,10 +1095,13 @@ int main(int argc, char** argv) {
     // ── Full scan: adaptive mode selection ─────────────────────────────────
 
     // Print header once.
-    std::printf("%-13s  %10s  %6s  %6s  %6s  %6s  %4s\n",
-                "time", "freq_mhz", "bw_khz", "up", "dn", "wins", "sf");
-    std::printf("%s\n", std::string(60, '-').c_str());
-    std::fflush(stdout);
+    {
+        auto* out = cfg.cbor_out ? stderr : stdout;
+        std::fprintf(out, "%-13s  %10s  %6s  %6s  %6s  %6s  %4s\n",
+                    "time", "freq_mhz", "bw_khz", "up", "dn", "wins", "sf");
+        std::fprintf(out, "%s\n", std::string(60, '-').c_str());
+        std::fflush(out);
+    }
 
     auto lastStatusUpdate = std::chrono::steady_clock::now();
 
@@ -1012,23 +1138,32 @@ int main(int argc, char** argv) {
         "scan mode: %s  (%zu ch, range=%.1f MHz, tile=%.1f MHz)",
         modeName, channels.size(), scanRange / 1.0e6, usableBw / 1.0e6);
 
-    // Helper: report a detection result to stdout and update stats.
+    // Detections collected per sweep for CBOR output.
+    std::vector<DirectCadResult> sweepDetections;
+
+    // Helper: report a detection result and update stats.
     auto reportDetection = [&](const DirectCadResult& det) {
         const double ratio = std::max(det.peak_ratio_up, det.peak_ratio_dn);
         if (ratio < static_cast<double>(cfg.min_ratio)) {
             return;
         }
 
+        ++stats.total_detections;
+        if (cfg.cbor_out) {
+            sweepDetections.push_back(det);
+        }
+
         const auto ts = ts_short();
         const std::string sfStr = det.sf_detected
             ? ("SF" + std::to_string(det.sf_detected)) : "-";
 
+        auto* out = cfg.cbor_out ? stderr : stdout;
         std::fprintf(stderr, "\r%s\r", std::string(80, ' ').c_str());
-        std::printf("%-13s  %10.3f  %6.1f  %6.1f  %6.1f  %6s  %4s\n",
+        std::fprintf(out, "%-13s  %10.3f  %6.1f  %6.1f  %6.1f  %6s  %4s\n",
                     ts.c_str(), det.freq / 1.0e6, det.bw / 1.0e3,
                     det.peak_ratio_up, det.peak_ratio_dn,
                     "1/1", sfStr.c_str());
-        std::fflush(stdout);
+        std::fflush(out);
 
         char freqBuf[32];
         std::snprintf(freqBuf, sizeof(freqBuf), "%.3f MHz", det.freq / 1.0e6);
@@ -1039,7 +1174,13 @@ int main(int argc, char** argv) {
     // For mode A fallback: secondary BWs get fewer CAD windows.
     const uint32_t quickWindows = std::max(4U, cfg.cad_windows / 8U);
 
+    // Per-sweep energy for CBOR spectrum output.
+    std::vector<double> sweepEnergy(channels.size(), 0.0);
+    auto lastCborStatus = std::chrono::steady_clock::now();
+
     while (!g_stop.load(std::memory_order_relaxed)) {
+        sweepDetections.clear();
+        std::ranges::fill(sweepEnergy, 0.0);
 
         // ── Phase 1: Mode B (interleaved L1+L2)
         // When available, mode B is the primary scan mode.  Its snapshot
@@ -1053,6 +1194,7 @@ int main(int argc, char** argv) {
                 reportDetection(det);
             }
             stats.l1_hot = bResult.l1_hot_total;
+            sweepEnergy = bResult.energy;
         }
 
         // ── Phase 2: Mode C (direct CAD) — only when B is not available
@@ -1063,6 +1205,7 @@ int main(int argc, char** argv) {
                 reportDetection(det);
             }
             stats.l1_hot = static_cast<uint32_t>(cResults.size());
+            // Mode C has no L1 energy — leave sweepEnergy at 0.
         }
 
         // ── Phase 3: Mode A fallback (full L1 + sequential L2) ─────────
@@ -1070,6 +1213,7 @@ int main(int argc, char** argv) {
             && !g_stop.load(std::memory_order_relaxed)) {
             const auto l1 = layer1Scan(stream, dev, channels, cfg, stats);
             stats.l1_hot = static_cast<uint32_t>(l1.hot_idx.size());
+            sweepEnergy = l1.energy;
 
             std::vector<std::size_t> l2_candidates;
             if (cfg.all_channels) {
@@ -1127,6 +1271,39 @@ int main(int argc, char** argv) {
         }
 
         ++stats.sweeps;
+
+        // ── CBOR output ────────────────────────────────────────────────
+        if (cfg.cbor_out) {
+            // Collect HOT channel indices from energy data.
+            std::vector<std::size_t> hotIndices;
+            if (!sweepEnergy.empty()) {
+                std::vector<double> sorted(sweepEnergy.begin(), sweepEnergy.end());
+                std::ranges::sort(sorted);
+                const auto nCh = sweepEnergy.size();
+                const double median = (nCh % 2 == 1)
+                    ? sorted[nCh / 2]
+                    : (sorted[nCh / 2 - 1] + sorted[nCh / 2]) / 2.0;
+                const double thresh = median * 6.0;
+                for (std::size_t idx = 0; idx < nCh; ++idx) {
+                    if (sweepEnergy[idx] > thresh) {
+                        hotIndices.push_back(idx);
+                    }
+                }
+            }
+            emitSpectrumCbor(channels, sweepEnergy, hotIndices,
+                             sweepDetections, stats.sweeps);
+
+            // Periodic status frame (every 5 seconds or on first sweep).
+            const auto now2 = std::chrono::steady_clock::now();
+            const std::string modeStr = useInterleaved ? "B"
+                : (useDirectCad ? "C" : "A");
+            if (stats.sweeps == 1
+                || (now2 - lastCborStatus) >= std::chrono::seconds(5)) {
+                lastCborStatus = now2;
+                emitStatusCbor(cfg, stats, modeStr);
+            }
+        }
+
         if (cfg.sweeps > 0 && stats.sweeps >= cfg.sweeps) {
             break;
         }
@@ -1154,4 +1331,14 @@ int main(int argc, char** argv) {
 
     // Avoid SoapySDR unloadModules() hang on exit.
     std::quick_exit(0);
+
+    } catch (const std::exception& e) {
+        // Restore stdout in case we were in the dup2 redirect window.
+        if (savedStdout >= 0) {
+            dup2(savedStdout, STDOUT_FILENO);
+            close(savedStdout);
+        }
+        std::fprintf(stderr, "fatal: %s\n", e.what());
+        return 1;
+    }
 }
