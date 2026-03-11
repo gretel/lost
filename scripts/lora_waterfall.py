@@ -17,7 +17,7 @@ SGR mouse mode (wezterm, iTerm2, kitty, xterm, etc.).
 Usage:
     lora_waterfall.py                          # default: 127.0.0.1:5555
     lora_waterfall.py --connect 192.168.1.10:5555
-    lora_waterfall.py --bw-factor 1.5          # show 1.5x bandwidth
+    lora_waterfall.py --bw-hz 150000           # zoom to 150 kHz (62.5 kHz BW signal)
     lora_waterfall.py --delay 2.0              # longer delay for SF12 frames
 """
 
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import re
 import select
@@ -50,10 +51,14 @@ from lora_common import (
 log = logging.getLogger("gr4.waterfall")
 
 
-# ---- xterm-256color palette for waterfall ----
-# Map dB range to color ramp: dark navy -> teal -> green -> yellow -> warm orange
-# Using xterm palette indices 16-231 (6x6x6 color cube)
-# Avoids purple/violet tones for a more eye-soothing display.
+# ---- xterm-256color palette + block-density characters for waterfall ----
+#
+# Each waterfall cell uses two visual channels simultaneously:
+#   1. Background color (64-step ramp: navy → teal → green → yellow → orange)
+#   2. Unicode block character whose density encodes the same dB level
+#
+# This doubles the dynamic range visible to the eye and works even in
+# terminals with poor 256-color rendering.
 
 
 def _cube(r: int, g: int, b: int) -> int:
@@ -61,325 +66,116 @@ def _cube(r: int, g: int, b: int) -> int:
     return 16 + 36 * r + 6 * g + b
 
 
-def _build_ramp(stops: list[tuple[int, int, int]]) -> list[int]:
-    """Convert a list of (r, g, b) tuples (0-5 each) to xterm-256 indices."""
-    return [_cube(r, g, b) for r, g, b in stops]
+# Base ramp stops: navy → teal → green → yellow → warm orange (64 entries)
+_BASE_STOPS: list[tuple[int, int, int]] = [
+    # Dark navy (0-7)
+    (0, 0, 1),
+    (0, 0, 1),
+    (0, 0, 2),
+    (0, 0, 2),
+    (0, 1, 2),
+    (0, 1, 2),
+    (0, 1, 3),
+    (0, 1, 3),
+    # Teal (8-19)
+    (0, 2, 3),
+    (0, 2, 3),
+    (0, 2, 2),
+    (0, 2, 2),
+    (0, 3, 2),
+    (0, 3, 2),
+    (0, 3, 1),
+    (0, 3, 1),
+    (0, 3, 0),
+    (0, 3, 0),
+    (0, 4, 0),
+    (0, 4, 0),
+    # Green (20-31)
+    (0, 4, 0),
+    (0, 5, 0),
+    (0, 5, 0),
+    (1, 5, 0),
+    (1, 5, 0),
+    (1, 5, 0),
+    (2, 5, 0),
+    (2, 5, 0),
+    (2, 5, 0),
+    (3, 5, 0),
+    (3, 5, 0),
+    (3, 5, 0),
+    # Yellow (32-47)
+    (3, 5, 0),
+    (4, 5, 0),
+    (4, 5, 0),
+    (4, 5, 0),
+    (4, 5, 0),
+    (5, 5, 0),
+    (5, 5, 0),
+    (5, 5, 0),
+    (5, 5, 0),
+    (5, 5, 0),
+    (5, 4, 0),
+    (5, 4, 0),
+    (5, 4, 0),
+    (5, 4, 0),
+    (5, 3, 0),
+    (5, 3, 0),
+    # Warm orange (48-63)
+    (5, 3, 0),
+    (5, 3, 0),
+    (5, 2, 0),
+    (5, 2, 0),
+    (5, 2, 0),
+    (5, 2, 0),
+    (5, 1, 0),
+    (5, 1, 0),
+    (5, 1, 0),
+    (5, 1, 0),
+    (5, 1, 0),
+    (5, 1, 0),
+    (5, 1, 0),
+    (5, 0, 0),
+    (5, 0, 0),
+    (5, 0, 0),
+]
+
+N_COLORS: int = len(_BASE_STOPS)
+
+# xterm-256 color index for each ramp position
+RAMP_BASE: list[int] = [_cube(r, g, b) for r, g, b in _BASE_STOPS]
+
+# Block-density characters mapped to color index ranges.
+# Five levels: space (noise) → ░ → ▒ → ▓ → █ (peak).
+# Breakpoints at 20 % intervals across N_COLORS=64.
+_LEVEL_CHARS: list[str] = []
+for _ci in range(N_COLORS):
+    _frac = _ci / (N_COLORS - 1)
+    if _frac < 0.20:
+        _LEVEL_CHARS.append(" ")  # below noise: invisible
+    elif _frac < 0.40:
+        _LEVEL_CHARS.append("░")  # U+2591 light shade
+    elif _frac < 0.60:
+        _LEVEL_CHARS.append("▒")  # U+2592 medium shade
+    elif _frac < 0.80:
+        _LEVEL_CHARS.append("▓")  # U+2593 dark shade
+    else:
+        _LEVEL_CHARS.append("█")  # U+2588 full block
 
 
-# --- Normal palette: navy → teal → green → yellow → warm orange ---
-RAMP_NORMAL: list[int] = _build_ramp(
-    [
-        # Dark navy (0-7)
-        (0, 0, 1),
-        (0, 0, 1),
-        (0, 0, 2),
-        (0, 0, 2),
-        (0, 1, 2),
-        (0, 1, 2),
-        (0, 1, 3),
-        (0, 1, 3),
-        # Teal (8-19)
-        (0, 2, 3),
-        (0, 2, 3),
-        (0, 2, 2),
-        (0, 2, 2),
-        (0, 3, 2),
-        (0, 3, 2),
-        (0, 3, 1),
-        (0, 3, 1),
-        (0, 3, 0),
-        (0, 3, 0),
-        (0, 4, 0),
-        (0, 4, 0),
-        # Green (20-31)
-        (0, 4, 0),
-        (0, 5, 0),
-        (0, 5, 0),
-        (1, 5, 0),
-        (1, 5, 0),
-        (1, 5, 0),
-        (2, 5, 0),
-        (2, 5, 0),
-        (2, 5, 0),
-        (3, 5, 0),
-        (3, 5, 0),
-        (3, 5, 0),
-        # Yellow (32-47)
-        (3, 5, 0),
-        (4, 5, 0),
-        (4, 5, 0),
-        (4, 5, 0),
-        (4, 5, 0),
-        (5, 5, 0),
-        (5, 5, 0),
-        (5, 5, 0),
-        (5, 5, 0),
-        (5, 5, 0),
-        (5, 4, 0),
-        (5, 4, 0),
-        (5, 4, 0),
-        (5, 4, 0),
-        (5, 3, 0),
-        (5, 3, 0),
-        # Warm orange (48-63)
-        (5, 3, 0),
-        (5, 3, 0),
-        (5, 2, 0),
-        (5, 2, 0),
-        (5, 2, 0),
-        (5, 2, 0),
-        (5, 1, 0),
-        (5, 1, 0),
-        (5, 1, 0),
-        (5, 1, 0),
-        (5, 1, 0),
-        (5, 1, 0),
-        (5, 1, 0),
-        (5, 0, 0),
-        (5, 0, 0),
-        (5, 0, 0),
-    ]
-)
+def _estimate_noise_floor(bins: list[float]) -> float:
+    """Estimate noise floor as the 25th percentile of spectrum bins."""
+    if not bins:
+        return -100.0
+    n = len(bins)
+    if n > 256:
+        step = n // 128
+        sampled = sorted(bins[::step])
+        return sampled[len(sampled) // 4]
+    return sorted(bins)[n // 4]
 
-# --- CRC_OK palette: dark teal → cyan → bright aqua → white-cyan ---
-RAMP_DECODE_OK: list[int] = _build_ramp(
-    [
-        # Dark teal (0-7)
-        (0, 1, 1),
-        (0, 1, 1),
-        (0, 1, 2),
-        (0, 1, 2),
-        (0, 2, 2),
-        (0, 2, 2),
-        (0, 2, 3),
-        (0, 2, 3),
-        # Teal-cyan (8-19)
-        (0, 2, 3),
-        (0, 3, 3),
-        (0, 3, 3),
-        (0, 3, 4),
-        (0, 3, 4),
-        (0, 3, 4),
-        (0, 4, 4),
-        (0, 4, 4),
-        (0, 4, 5),
-        (0, 4, 5),
-        (0, 5, 5),
-        (0, 5, 5),
-        # Bright cyan (20-31)
-        (0, 5, 5),
-        (0, 5, 5),
-        (1, 5, 5),
-        (1, 5, 5),
-        (1, 5, 5),
-        (2, 5, 5),
-        (2, 5, 5),
-        (2, 5, 5),
-        (3, 5, 5),
-        (3, 5, 5),
-        (3, 5, 5),
-        (3, 5, 5),
-        # Light cyan (32-47)
-        (3, 5, 5),
-        (4, 5, 5),
-        (4, 5, 5),
-        (4, 5, 5),
-        (4, 5, 5),
-        (4, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        # White-cyan (48-63)
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-    ]
-)
-
-# --- CRC_FAIL palette: dark red → red → orange-red ---
-RAMP_DECODE_FAIL: list[int] = _build_ramp(
-    [
-        # Dark red (0-7)
-        (1, 0, 0),
-        (1, 0, 0),
-        (1, 0, 0),
-        (1, 0, 0),
-        (2, 0, 0),
-        (2, 0, 0),
-        (2, 0, 0),
-        (2, 0, 0),
-        # Medium red (8-19)
-        (2, 0, 0),
-        (2, 0, 0),
-        (3, 0, 0),
-        (3, 0, 0),
-        (3, 0, 0),
-        (3, 0, 0),
-        (3, 1, 0),
-        (3, 1, 0),
-        (4, 0, 0),
-        (4, 0, 0),
-        (4, 1, 0),
-        (4, 1, 0),
-        # Bright red (20-31)
-        (4, 1, 0),
-        (4, 1, 0),
-        (5, 0, 0),
-        (5, 0, 0),
-        (5, 1, 0),
-        (5, 1, 0),
-        (5, 1, 0),
-        (5, 1, 0),
-        (5, 2, 0),
-        (5, 2, 0),
-        (5, 2, 0),
-        (5, 2, 0),
-        # Orange-red (32-47)
-        (5, 2, 0),
-        (5, 2, 1),
-        (5, 3, 0),
-        (5, 3, 0),
-        (5, 3, 1),
-        (5, 3, 1),
-        (5, 3, 1),
-        (5, 4, 1),
-        (5, 4, 1),
-        (5, 4, 2),
-        (5, 4, 2),
-        (5, 4, 2),
-        (5, 4, 3),
-        (5, 5, 3),
-        (5, 5, 3),
-        (5, 5, 4),
-        # Light orange-red (48-63)
-        (5, 5, 4),
-        (5, 5, 4),
-        (5, 5, 4),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-    ]
-)
-
-# --- TX ack palette: dark purple → blue → light blue ---
-RAMP_TX: list[int] = _build_ramp(
-    [
-        # Dark purple (0-7)
-        (1, 0, 1),
-        (1, 0, 1),
-        (1, 0, 2),
-        (1, 0, 2),
-        (1, 0, 2),
-        (1, 0, 3),
-        (1, 0, 3),
-        (1, 0, 3),
-        # Blue-purple (8-19)
-        (1, 0, 3),
-        (1, 0, 4),
-        (1, 0, 4),
-        (1, 1, 4),
-        (1, 1, 4),
-        (1, 1, 5),
-        (1, 1, 5),
-        (1, 1, 5),
-        (0, 1, 5),
-        (0, 2, 5),
-        (0, 2, 5),
-        (0, 2, 5),
-        # Blue (20-31)
-        (0, 2, 5),
-        (0, 3, 5),
-        (0, 3, 5),
-        (0, 3, 5),
-        (1, 3, 5),
-        (1, 3, 5),
-        (1, 4, 5),
-        (1, 4, 5),
-        (1, 4, 5),
-        (2, 4, 5),
-        (2, 4, 5),
-        (2, 4, 5),
-        # Light blue (32-47)
-        (2, 5, 5),
-        (2, 5, 5),
-        (3, 5, 5),
-        (3, 5, 5),
-        (3, 5, 5),
-        (3, 5, 5),
-        (4, 5, 5),
-        (4, 5, 5),
-        (4, 5, 5),
-        (4, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        # White-blue (48-63)
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-        (5, 5, 5),
-    ]
-)
-
-N_COLORS: int = len(RAMP_NORMAL)
-
-# Palette constants for render_row
-PALETTE_NORMAL: int = 0
-PALETTE_DECODE_OK: int = 1
-PALETTE_DECODE_FAIL: int = 2
-PALETTE_TX: int = 3
-PALETTES: list[list[int]] = [RAMP_NORMAL, RAMP_DECODE_OK, RAMP_DECODE_FAIL, RAMP_TX]
 
 # Header occupies 3 fixed lines at the top
 HEADER_LINES: int = 3
-
-# EMA alpha for noise floor tracking from spectrum data
-_NOISE_FLOOR_ALPHA: float = 0.05
 
 # Maximum number of rendered rows to keep for scroll-back history
 HISTORY_SIZE: int = 2000
@@ -405,13 +201,12 @@ def render_row(
     db_max: float,
     center_idx: int,
     visible_bins: int,
-    *,
-    palette: int = PALETTE_NORMAL,
 ) -> str:
-    """Render one waterfall row as xterm-256color background-colored spaces.
+    """Render one waterfall row using background color + block-density chars.
 
-    palette selects the color ramp: PALETTE_NORMAL, PALETTE_DECODE_OK,
-    PALETTE_DECODE_FAIL, or PALETTE_TX.
+    Each cell combines:
+      - Background color from RAMP_BASE (64-step navy→orange ramp)
+      - A Unicode block character (space/░/▒/▓/█) encoding the same level
     """
     half = visible_bins // 2
     start = max(0, center_idx - half)
@@ -423,12 +218,11 @@ def render_row(
     if n == 0:
         return " " * width
 
-    ramp = PALETTES[palette]
     parts: list[str] = []
     for col in range(width):
         src_idx = min(col * n // width, n - 1)
         ci = db_to_color_index(visible[src_idx], db_min, db_max)
-        parts.append(f"\033[48;5;{ramp[ci]}m ")
+        parts.append(f"\033[48;5;{RAMP_BASE[ci]}m{_LEVEL_CHARS[ci]}")
     parts.append("\033[0m")
     return "".join(parts)
 
@@ -444,14 +238,12 @@ def get_terminal_size() -> tuple[int, int]:
 
 def format_freq_axis(
     center_freq_mhz: float,
-    sample_rate_hz: float,
-    bw_factor: float,
+    visible_bw_hz: float,
     width: int,
 ) -> str:
     """Format a frequency axis string spanning the visible bandwidth."""
-    visible_bw = sample_rate_hz * bw_factor
-    f_lo = center_freq_mhz - visible_bw / 2e6
-    f_hi = center_freq_mhz + visible_bw / 2e6
+    f_lo = center_freq_mhz - visible_bw_hz / 2e6
+    f_hi = center_freq_mhz + visible_bw_hz / 2e6
 
     lo_str = f"{f_lo:.3f}"
     mid_str = f"{center_freq_mhz:.3f}"
@@ -481,7 +273,7 @@ def format_db_legend(db_min: float, db_max: float) -> str:
     parts = [f" {db_min:.0f}dB "]
     for i in range(n_samples):
         ci = i * (N_COLORS - 1) // (n_samples - 1)
-        color = RAMP_NORMAL[ci]
+        color = RAMP_BASE[ci]
         parts.append(f"\033[48;5;{color}m \033[0m")
     parts.append(f" {db_max:.0f}dB")
     return "".join(parts)
@@ -495,7 +287,7 @@ def _ansi_visible_len(s: str) -> int:
 def format_header(
     center_freq_mhz: float,
     sample_rate: float,
-    bw_factor: float,
+    visible_bw_hz: float,
     db_min: float,
     db_max: float,
     fft_size: int,
@@ -513,13 +305,13 @@ def format_header(
 
     # Line 1: frequency axis
     buf.append("\033[1;1H\033[2K")
-    axis = format_freq_axis(center_freq_mhz, sample_rate, bw_factor, total_width)
+    axis = format_freq_axis(center_freq_mhz, visible_bw_hz, total_width)
     buf.append(f"\033[1m{axis}\033[0m")
 
     # Line 2: dB legend + FFT/SR + gain + status counters + pause indicator
     buf.append("\033[2;1H\033[2K")
     legend = format_db_legend(db_min, db_max)
-    info = f"  FFT={fft_size}  SR={sample_rate / 1000:.0f}kHz"
+    info = f"  FFT={fft_size}  SR={sample_rate / 1000:.0f}kHz  VBW={visible_bw_hz / 1000:.0f}kHz"
     if rx_gain is not None:
         info += f"  G={rx_gain:.0f}dB"
     if last_status is not None:
@@ -588,21 +380,6 @@ def decode_bins(bins_raw: bytes) -> list[float]:
     # memoryview.cast avoids an intermediate copy vs struct.unpack
     n_bytes = len(bins_raw) - (len(bins_raw) % 4)
     return list(memoryview(bins_raw[:n_bytes]).cast("f"))
-
-
-def _estimate_noise_floor(bins: list[float]) -> float:
-    """Estimate noise floor as the 25th percentile of spectrum bins."""
-    if not bins:
-        return -100.0
-    # Partial sort: only need the lower quarter
-    n = len(bins)
-    q1_idx = n // 4
-    # Use sorted slice of a sample for speed on large FFTs
-    if n > 256:
-        step = n // 128
-        sampled = sorted(bins[::step])
-        return sampled[len(sampled) // 4]
-    return sorted(bins)[q1_idx]
 
 
 # ---- Mouse input parsing ----
@@ -732,10 +509,13 @@ def main() -> None:
         help="lora_trx UDP address (default from config.toml or 127.0.0.1:5556)",
     )
     parser.add_argument(
-        "--bw-factor",
+        "--bw-hz",
         type=float,
-        default=1.0,
-        help="Show this fraction of the sample rate bandwidth (default: 1.0)",
+        default=None,
+        help=(
+            "Visible bandwidth in Hz (default: full sample rate). "
+            "Use e.g. 150000 to zoom in on a 62.5 kHz LoRa signal."
+        ),
     )
     parser.add_argument(
         "--db-min",
@@ -752,8 +532,8 @@ def main() -> None:
     parser.add_argument(
         "--db-range",
         type=float,
-        default=60.0,
-        help="dB range for auto-scale (default: 60)",
+        default=30.0,
+        help="dB range for auto-scale (default: 30)",
     )
     parser.add_argument(
         "--fps",
@@ -808,13 +588,17 @@ def main() -> None:
     frame_count: int = 0
     skip_count: int = 0
 
-    # dB scale -- auto-adjusted from rx_gain, overridable by CLI
+    # dB scale — calibrated once from the first spectrum's noise floor, then
+    # frozen.  --db-min / --db-max override for manual control.
     db_min: float = args.db_min if args.db_min is not None else -80.0
     db_max: float = args.db_max if args.db_max is not None else -20.0
     db_min_manual: bool = args.db_min is not None
     db_max_manual: bool = args.db_max is not None
+    _scale_calibrated: bool = db_min_manual  # skip auto-cal if user set --db-min
     rx_gain: float | None = None  # from config/status messages
-    noise_floor_ema: float | None = None  # tracked from spectrum data
+    # Visible bandwidth in Hz — set from --bw-hz, or defaults to full sample rate.
+    # Resolved once sample_rate is known; capped at sample_rate.
+    visible_bw_hz: float = 0.0  # 0 = unset; resolved when sample_rate arrives
 
     # FPS throttling
     min_frame_interval: float = 1.0 / max(args.fps, 1.0)
@@ -824,18 +608,29 @@ def main() -> None:
     ema_alpha: float = max(0.01, min(1.0, args.smoothing))
     rx_ema: list[float] | None = None
 
-    # Frame activity: track decodes for header line 3 and delayed row tinting.
-    # recent_decodes holds the last few decoded frames with their arrival times.
+    # Upper bound extension for tinting window: time for EMA to decay to 10%
+    # of a step response. The frame signal stays visible in EMA for this long
+    # after the frame ends, so the tinting window must extend by this amount.
+    # Formula: ceil(log(0.1) / log(1 - alpha)) / fps
+    _ema_decay_tail: float = math.ceil(
+        math.log(0.1) / math.log(max(1e-9, 1.0 - ema_alpha))
+    ) / max(args.fps, 1.0)
+
+    # Frame activity: track the most recent decoded frame for header and tinting.
+    # active_frame = (dec_time, frame_duration, tint_mode) of the last decode.
     # Rows are held in pending_rows for display_delay seconds before rendering;
-    # at flush time each row's palette is chosen by checking whether any recent
-    # decode's frame window covers the row's capture time.
+    # at flush time each row's tint is chosen by checking whether active_frame's
+    # window [dec_time - duration, dec_time + _ema_decay_tail] covers capture_time.
+    # Using only the most recent decode keeps tints clean — LoRa is half-duplex,
+    # so only one frame is on-air at a time.
     display_delay: float = max(0.0, args.delay)
     last_decode: dict | None = None  # most recent decode (for header line 3)
-    recent_decodes: deque[dict] = deque(maxlen=8)  # for delayed tint lookup
+    # active_frame: (dec_time, duration_s, crc_ok) | None
+    active_frame: tuple[float, float, bool] | None = None
     last_tx_time: float = 0.0
     last_status: dict | None = None  # most recent status heartbeat
-    # pending_rows: (capture_time, ema_snapshot) pairs awaiting flush
-    pending_rows: deque[tuple[float, list[float]]] = deque()
+    # pending_rows: (capture_time, ema_snapshot, db_min, db_max) awaiting flush
+    pending_rows: deque[tuple[float, list[float], float, float]] = deque()
 
     # Scrolling state (terminal scroll region)
     scroll_region_set: bool = False
@@ -912,7 +707,7 @@ def main() -> None:
                                 format_header(
                                     center_freq_mhz,
                                     sample_rate,
-                                    args.bw_factor,
+                                    visible_bw_hz,
                                     db_min,
                                     db_max,
                                     fft_size,
@@ -950,7 +745,7 @@ def main() -> None:
                     hdr = format_header(
                         center_freq_mhz,
                         sample_rate,
-                        args.bw_factor,
+                        visible_bw_hz,
                         db_min,
                         db_max,
                         fft_size,
@@ -992,6 +787,9 @@ def main() -> None:
                 sr = server.get("sample_rate", 0)
                 if sr > 0:
                     sample_rate = sr
+                    visible_bw_hz = (
+                        min(args.bw_hz, sample_rate) if args.bw_hz else sample_rate
+                    )
                 g = phy.get("rx_gain")
                 if g is not None and float(g) != rx_gain:
                     rx_gain = float(g)
@@ -1023,12 +821,18 @@ def main() -> None:
                 # repaints on every status heartbeat caused visible flicker.
                 continue
 
-            # Track frame decodes for header line 3 and delayed tinting
+            # Track frame decodes for header line 3 and delayed row tinting.
+            # active_frame = (dec_time, duration, crc_ok) for the most recent
+            # decode only — LoRa is half-duplex so one frame at a time.
             if msg_type == "lora_frame":
                 last_decode = dict(msg)
                 last_decode["_time"] = time.monotonic()
                 last_decode["_wall_time"] = time.time()
-                recent_decodes.append(last_decode)
+                active_frame = (
+                    last_decode["_time"],
+                    _frame_duration(last_decode),
+                    bool(last_decode.get("crc_valid", False)),
+                )
                 header_printed = False  # update line 3
                 continue
 
@@ -1053,6 +857,9 @@ def main() -> None:
                 center_freq_mhz = new_center_freq / 1e6
             if new_sample_rate > 0:
                 sample_rate = new_sample_rate
+                visible_bw_hz = (
+                    min(args.bw_hz, sample_rate) if args.bw_hz else sample_rate
+                )
             fft_size = new_fft_size
 
             bins = decode_bins(bins_raw)
@@ -1065,20 +872,20 @@ def main() -> None:
                 for i in range(n_bins):
                     rx_ema[i] += ema_alpha * (bins[i] - rx_ema[i])
 
-            # Track noise floor from spectrum data (for dynamic adjustment)
-            nf = _estimate_noise_floor(rx_ema)
-            if noise_floor_ema is None:
-                noise_floor_ema = nf
-            else:
-                noise_floor_ema += _NOISE_FLOOR_ALPHA * (nf - noise_floor_ema)
-
-            # Dynamic dB scale: blend gain-based baseline with actual noise floor
-            if not db_min_manual and noise_floor_ema is not None:
-                # Set floor 10 dB below tracked noise floor
-                target_min = noise_floor_ema - 10.0
-                # Smooth transition
-                db_min += 0.02 * (target_min - db_min)
-            if not db_max_manual:
+            # One-shot scale calibration: on the first spectrum frame, set db_min
+            # so the observed noise floor maps to ~20% up the ramp (just above
+            # the invisible "space" zone).  After that the scale is frozen.
+            # This keeps chirps bright and noise visible without continuous drift.
+            if not _scale_calibrated:
+                nf = _estimate_noise_floor(rx_ema)
+                if not db_min_manual:
+                    # Place noise floor at the 20% ramp breakpoint (ci=12/64)
+                    # db at 20% = db_min + 0.20 * db_range  →  db_min = nf - 0.20*range
+                    db_min = nf - 0.20 * args.db_range
+                if not db_max_manual:
+                    db_max = db_min + args.db_range
+                _scale_calibrated = True
+            elif not db_max_manual:
                 db_max = db_min + args.db_range
 
             # Throttle spectrum ingestion to target FPS
@@ -1088,87 +895,64 @@ def main() -> None:
                 # Still flush pending rows even when skipping new spectrum
             else:
                 last_render_time = now
-                # Enqueue a snapshot of the current EMA for delayed rendering
-                pending_rows.append((now, list(rx_ema)))
+                # Enqueue EMA snapshot + scale at capture time for delayed
+                # rendering.  Snapshotting db_min/db_max here prevents the
+                # noise-floor AGC from retroactively darkening pre-chirp rows
+                # when chirp energy lifts the scale during the display delay.
+                pending_rows.append((now, list(rx_ema), db_min, db_max))
 
-            # ---- Flush pending rows that have aged past display_delay ----
+            # ---- Scroll region + header setup ----
+            # Must happen immediately on first spectrum / terminal resize,
+            # BEFORE any row is flushed.  If we defer to inside the flush loop
+            # the first \033[S fires without DECSTBM set and scrolls the header.
             now_flush = time.monotonic()
             tw, th = get_terminal_size()
 
-            # Set up scroll region on first use or terminal resize
-            need_scroll_region: bool = False
             if center_freq_mhz > 0 and sample_rate > 0:
                 if (
                     not scroll_region_set
                     or tw != last_term_width
                     or th != last_term_height
                 ):
-                    need_scroll_region = True
                     scroll_region_set = True
                     last_term_width = tw
                     last_term_height = th
-                    header_printed = False  # force header repaint after region change
-
-            if not scroll_region_set:
-                continue
-
-            # Compute visible bin parameters (same for all flushed rows this cycle)
-            rx_n = len(rx_ema)
-            rx_visible = int(rx_n * min(args.bw_factor, 1.0))
-            if rx_visible < 1:
-                rx_visible = rx_n
-            rx_center = rx_n // 2
-
-            # Flush rows whose display_delay has elapsed
-            while pending_rows and (now_flush - pending_rows[0][0]) >= display_delay:
-                capture_time, snap = pending_rows.popleft()
-
-                # Select palette: check if this row's capture time falls within
-                # any recent decode's frame window.  The decode arrives after
-                # the frame completes, so the frame window is
-                # [decode_time - frame_duration, decode_time + 0.1s].
-                # The 0.1s overhang absorbs UDP jitter between spectrum and decode.
-                active_palette = PALETTE_NORMAL
-                for dec in recent_decodes:
-                    dur = _frame_duration(dec)
-                    dec_t = dec["_time"]
-                    if (dec_t - dur) <= capture_time <= (dec_t + 0.1):
-                        if dec.get("crc_valid", False):
-                            active_palette = PALETTE_DECODE_OK
-                        else:
-                            active_palette = PALETTE_DECODE_FAIL
-                        break
-                if active_palette == PALETTE_NORMAL:
-                    tx_age = capture_time - last_tx_time
-                    if -0.1 <= tx_age <= 0.5:
-                        active_palette = PALETTE_TX
-
-                row = render_row(
-                    snap,
-                    tw,
-                    db_min,
-                    db_max,
-                    rx_center,
-                    rx_visible,
-                    palette=active_palette,
-                )
-
-                # Store row in history for scroll-back
-                history.append(row)
-
-                # If paused, accumulate history but don't update the live display.
-                # On resize, repaint from history so the layout stays clean.
-                if scroll_offset > 0:
-                    if need_scroll_region:
+                    if scroll_offset == 0:
+                        # Establish DECSTBM and repaint header immediately.
+                        # Clears waterfall area to avoid stale rows at wrong size.
+                        setup: list[str] = [
+                            f"\033[{HEADER_LINES + 1};{th}r",  # scroll region
+                            f"\033[{HEADER_LINES + 1};{th}r",  # set twice: wezterm quirk
+                        ]
+                        setup.append(
+                            format_header(
+                                center_freq_mhz,
+                                sample_rate,
+                                visible_bw_hz,
+                                db_min,
+                                db_max,
+                                fft_size,
+                                tw,
+                                rx_gain,
+                                last_decode,
+                                last_status,
+                            )
+                        )
+                        sys.stdout.write("".join(setup))
+                        sys.stdout.flush()
+                        header_printed = True
+                        last_header_repaint = now_flush
+                    else:
+                        # Paused: reset scroll region + repaint header + history
                         waterfall_rows = th - HEADER_LINES
                         max_offset = max(0, len(history) - waterfall_rows)
                         scroll_offset = min(scroll_offset, max_offset)
-                        parts: list[str] = ["\033[r"]  # reset scroll region
+                        parts: list[str] = ["\033[r"]
                         parts.append(
                             format_header(
                                 center_freq_mhz,
                                 sample_rate,
-                                args.bw_factor,
+                                visible_bw_hz,
                                 db_min,
                                 db_max,
                                 fft_size,
@@ -1187,44 +971,70 @@ def main() -> None:
                         sys.stdout.write("".join(parts))
                         sys.stdout.flush()
                         header_printed = True
-                        need_scroll_region = False  # done once per cycle
+
+            if not scroll_region_set:
+                continue
+
+            # Header repaint: fire immediately when header_printed=False
+            # (new decode / gain change), or on the periodic timer.
+            now_mono = time.monotonic()
+            needs_header = not header_printed or (
+                now_mono - last_header_repaint >= header_repaint_interval
+            )
+            if scroll_offset == 0 and needs_header:
+                sys.stdout.write(
+                    format_header(
+                        center_freq_mhz,
+                        sample_rate,
+                        visible_bw_hz,
+                        db_min,
+                        db_max,
+                        fft_size,
+                        tw,
+                        rx_gain,
+                        last_decode,
+                        last_status,
+                    )
+                )
+                sys.stdout.flush()
+                header_printed = True
+                last_header_repaint = now_mono
+
+            # Compute visible bin parameters (same for all flushed rows this cycle)
+            rx_n = len(rx_ema)
+            rx_visible = int(
+                rx_n * min(visible_bw_hz, sample_rate) / max(sample_rate, 1.0)
+            )
+            if rx_visible < 1:
+                rx_visible = rx_n
+            rx_center = rx_n // 2
+
+            # ---- Flush rows whose display_delay has elapsed ----
+            while pending_rows and (now_flush - pending_rows[0][0]) >= display_delay:
+                capture_time, snap, snap_db_min, snap_db_max = pending_rows.popleft()
+
+                # Render with scale snapshotted at capture time.
+                row = render_row(
+                    snap,
+                    tw,
+                    snap_db_min,
+                    snap_db_max,
+                    rx_center,
+                    rx_visible,
+                )
+
+                # Store row in history for scroll-back
+                history.append(row)
+
+                if scroll_offset > 0:
+                    # Paused: accumulate history only, don't touch the display.
                     frame_count += 1
                     continue
 
-                # Periodic header repaint for status counters / dB scale changes
-                now_mono = time.monotonic()
-                if (
-                    header_printed
-                    and now_mono - last_header_repaint >= header_repaint_interval
-                ):
-                    header_printed = False
-
-                # Build single atomic output: scroll region + header + row
-                # Batching into one write avoids intermediate terminal states
-                # that cause flicker (wezterm redraws on DECSTBM / cursor moves).
-                frame_buf: list[str] = []
-                if need_scroll_region:
-                    frame_buf.append(f"\033[{HEADER_LINES + 1};{th}r")
-                    need_scroll_region = False  # done once per cycle
-                if not header_printed:
-                    frame_buf.append(
-                        format_header(
-                            center_freq_mhz,
-                            sample_rate,
-                            args.bw_factor,
-                            db_min,
-                            db_max,
-                            fft_size,
-                            tw,
-                            rx_gain,
-                            last_decode,
-                            last_status,
-                        )
-                    )
-                    header_printed = True
-                    last_header_repaint = now_mono
-                frame_buf.append(f"\033[{th};1H{row}\n")
-                sys.stdout.write("".join(frame_buf))
+                # Live mode: scroll region up 1, write new row at the bottom.
+                # \033[S = scroll up within DECSTBM (set above, before flush).
+                # No \n — avoids a second implicit scroll if cursor is at th.
+                sys.stdout.write(f"\033[{th};1H\033[S\033[{th};1H{row}")
                 sys.stdout.flush()
                 frame_count += 1
 
