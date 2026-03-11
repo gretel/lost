@@ -250,7 +250,7 @@ def build_txt_msg(
     expanded_prv: bytes,
     pub_key: bytes,
     dest_pub: bytes,
-    text: str,
+    text: str | bytes,
     *,
     timestamp: int | None = None,
     attempt: int = 0,
@@ -271,7 +271,7 @@ def build_txt_msg(
     expanded_prv: 64-byte MeshCore expanded private key (for ECDH).
     pub_key: 32-byte sender's Ed25519 public key.
     dest_pub: 32-byte recipient's Ed25519 public key.
-    text: Message text (UTF-8).
+    text: Message text (UTF-8 str) or raw payload bytes (e.g. for binary CLI req).
     attempt: Retry attempt number (0 for first send).
     txt_type: Message type (0=plain, 1=CLI, 2=signed). Default 0.
     """
@@ -285,9 +285,8 @@ def build_txt_msg(
     # Build plaintext: timestamp(4) + txt_type_attempt(1) + text
     # txt_type_attempt: upper 6 bits = txt_type, lower 2 bits = attempt
     ts_bytes = struct.pack("<I", timestamp)
-    plaintext = (
-        ts_bytes + bytes([(txt_type << 2) | (attempt & 0x03)]) + text.encode("utf-8")
-    )
+    text_bytes = text if isinstance(text, bytes) else text.encode("utf-8")
+    plaintext = ts_bytes + bytes([(txt_type << 2) | (attempt & 0x03)]) + text_bytes
 
     # Encrypt then MAC
     encrypted = meshcore_encrypt_then_mac(secret, plaintext)

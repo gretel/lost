@@ -1623,9 +1623,12 @@ def handle_command(
         if len(data) < 33:
             return [state.build_error()]
         dst_pub = data[:32]
-        req_data = data[32:]  # request_type(1) + opt extra data
+        req_data = data[32:]  # request_type(1) + opt extra data — raw binary
         ts = int(time.time())
-        # Send as TXT_TYPE_CLI (msg_type=1) carrying raw binary request data
+        # Build companion_data in the CMD_SEND_TXT_MSG wire format so that
+        # _handle_send_txt_msg can resolve the destination contact and TX.
+        # Pass txt_type=1 (CLI) so the encrypted payload header byte is correct
+        # and the raw binary req_data is not corrupted by UTF-8 decode/re-encode.
         companion_data = (
             bytes([0x01, 0x00]) + struct.pack("<I", ts) + dst_pub[:6] + req_data
         )
@@ -1634,15 +1637,28 @@ def handle_command(
             req_data[0] if req_data else 0,
             dst_pub.hex()[:8],
         )
-        return _handle_send_txt_msg(companion_data, state, udp_sock, udp_addr)
+        return _handle_send_txt_msg(
+            companion_data, state, udp_sock, udp_addr, txt_type=1
+        )
 
     if cmd == CMD_SEND_ANON_REQ:
-        # Frame: [0x39][dst_pubkey(32)][request_type(1)][path_len(1)][path_bytes...]
+        # Frame: [0x39][dst_pubkey(32)][request_type(1)][path_len(1)][path_bytes(N)]
         assert udp_sock is not None and udp_addr is not None
         if len(data) < 33:
             return [state.build_error()]
         dst_pub = data[:32]
         req_type = data[32] if len(data) > 32 else 0
+        # Parse optional path_len + path_bytes fields (spec 0x39 frame)
+        path_bytes = b""
+        if len(data) > 33:
+            path_n = data[33]
+            if path_n > 0 and len(data) >= 34 + path_n:
+                path_bytes = bytes(data[34 : 34 + path_n])
+                log.debug(
+                    "companion: SEND_ANON_REQ path_len=%d path=%s",
+                    path_n,
+                    path_bytes.hex(),
+                )
         log.info(
             "companion: SEND_ANON_REQ type=0x%02x to %s..",
             req_type,
@@ -1701,8 +1717,14 @@ def _handle_send_txt_msg(
     state: BridgeState,
     udp_sock: socket.socket,
     udp_addr: tuple[str, int],
+    txt_type: int = 0,
 ) -> list[bytes]:
-    """Handle CMD_SEND_TXT_MSG: build MeshCore wire packet and TX via UDP."""
+    """Handle CMD_SEND_TXT_MSG: build MeshCore wire packet and TX via UDP.
+
+    txt_type: MeshCore message type field (0=plain text, 1=CLI binary, 2=signed).
+    For CMD_BINARY_REQ callers must pass txt_type=1 to set the CLI bit in the
+    encrypted payload header byte.
+    """
     if len(data) < 12:  # type(1) + attempt(1) + ts(4) + dst(6)
         return [state.build_error()]
 
@@ -1710,11 +1732,12 @@ def _handle_send_txt_msg(
     attempt = data[1]
     ts = struct.unpack_from("<I", data, 2)[0]
     dst_prefix = data[6:12]
-    text = data[12:]
+    text = data[12:]  # raw bytes (may be binary for CLI requests)
 
     log.info(
-        "companion: SEND_TXT_MSG type=%d dst=%s '%s'",
+        "companion: SEND_TXT_MSG type=%d txt_type=%d dst=%s '%s'",
         msg_type,
+        txt_type,
         dst_prefix.hex(),
         sanitize_text(text.decode("utf-8", errors="replace")),
     )
@@ -1743,18 +1766,18 @@ def _handle_send_txt_msg(
         make_header,
     )
 
-    text_str = text.decode("utf-8", errors="replace")
-
     if use_flood:
         # Build encrypted payload first (ROUTE_FLOOD, no transport codes).
         # Then optionally repackage with ROUTE_T_FLOOD + transport codes.
+        # Pass raw bytes directly so binary payloads (txt_type=1) are not corrupted.
         tmp = build_txt_msg(
             state.expanded_prv,
             state.pub_key,
             dest_pub,
-            text_str,
+            text,
             timestamp=ts,
             attempt=attempt,
+            txt_type=txt_type,
             route_type=ROUTE_FLOOD,
         )
         if active_key:
@@ -1771,13 +1794,15 @@ def _handle_send_txt_msg(
         # Zero-hop direct (out_path_len == 0) or known multi-hop path (out_path_len > 0).
         # Multi-hop path routing (ROUTE_T_DIRECT with stored_path) is not yet implemented;
         # for now fall through to zero-hop ROUTE_DIRECT which works for both cases.
+        # Pass raw bytes directly so binary payloads (txt_type=1) are not corrupted.
         packet = build_txt_msg(
             state.expanded_prv,
             state.pub_key,
             dest_pub,
-            text_str,
+            text,
             timestamp=ts,
             attempt=attempt,
+            txt_type=txt_type,
             route_type=ROUTE_DIRECT,
         )
         log.info(
@@ -1806,7 +1831,11 @@ def _handle_send_txt_msg(
     # Both RESP_MSG_SENT (expected_ack field) and pending_acks must use the
     # same crypto hash — meshcore-cli matches PUSH_ACK.code against
     # MSG_SENT.expected_ack to confirm delivery.
-    plaintext = struct.pack("<I", ts) + bytes([(0x00 << 2) | (attempt & 0x03)]) + text
+    # Use txt_type (not hardcoded 0) so CLI requests (txt_type=1) produce the
+    # correct ack hash matching what the recipient's MeshCore firmware computes.
+    plaintext = (
+        struct.pack("<I", ts) + bytes([(txt_type << 2) | (attempt & 0x03)]) + text
+    )
     expected_ack = compute_ack_hash(plaintext, state.pub_key)
     resp = state.build_msg_sent(flood=use_flood, ack_hash=expected_ack)
     state.pending_acks[expected_ack] = (time.monotonic(), dst_prefix)
