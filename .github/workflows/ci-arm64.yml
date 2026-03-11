@@ -36,7 +36,7 @@ jobs:
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            clang-20 libc++-20-dev libc++abi-20-dev \
+            clang-20 clang-tools-20 libc++-20-dev libc++abi-20-dev \
             cmake ninja-build ccache \
             libsoapysdr-dev soapysdr-module-uhd libuhd-dev
 
