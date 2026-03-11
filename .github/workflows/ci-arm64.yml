@@ -30,6 +30,7 @@ jobs:
             ca-certificates git cmake ninja-build \
             clang-20 libc++-20-dev libc++abi-20-dev ccache \
             libsoapysdr-dev soapysdr-module-uhd libuhd-dev
+          git config --global --add safe.directory '*'
 
       - uses: actions/checkout@v6
         with:
@@ -37,9 +38,7 @@ jobs:
           fetch-depth: 0
 
       - name: Fetch submodules
-        run: |
-          git config --global --add safe.directory '*'
-          git submodule update --init --recursive
+        run: git submodule update --init --recursive
 
       - name: Cache ccache
         uses: actions/cache@v5
