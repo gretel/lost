@@ -521,6 +521,29 @@ const boost::ut::suite<"CAD multi-SF detection"> multi_sf_tests = [] {
         expect(eq(r.sf, 10U)) << "winning SF should be 10, got " << r.sf;
         expect(r.dn_detected) << "dn_detected should be true";
     };
+
+    "detectMultiSf with dual_chirp=false detects upchirp only"_test = [] {
+        constexpr uint8_t kTargetSf = 8;
+        constexpr uint8_t kOS       = 4;
+        constexpr uint32_t kSf12Win = (1U << 12U) * kOS * 2U;
+
+        auto chirpWin = make_upchirp_window(kTargetSf, kOS, 20.f);
+        std::vector<cf32> buf(kSf12Win, {0.f, 0.f});
+        std::copy(chirpWin.begin(), chirpWin.end(), buf.begin());
+
+        ChannelActivityDetector block;
+        block.os_factor  = kOS;
+        block.dual_chirp = false;
+        block.sf         = kTargetSf;
+        block.start();
+        block.initMultiSf();
+
+        auto r = block.detectMultiSf(buf.data());
+        expect(r.detected)    << "should detect upchirp with dual_chirp=false";
+        expect(eq(r.sf, 8U))  << "winning SF should be 8";
+        expect(r.up_detected) << "up_detected should be true";
+        expect(!r.dn_detected) << "dn_detected should be false with dual_chirp=false";
+    };
 };
 
 int main() { /* boost::ut auto-runs all suites */ }

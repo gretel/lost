@@ -512,7 +512,7 @@ auto& add_decode_chain(gr::Graph& graph, const TrxConfig& cfg,
 // Each decode chain has its own FrameSink.
 //
 // Returns pointer to source block's cumulative overflow counter (valid while graph lives).
-uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
+std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                          std::function<void(const std::vector<uint8_t>&, bool)> callback,
                          std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
                          std::atomic<bool>* channel_busy = nullptr) {
@@ -751,7 +751,7 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
     };
 
     // Create source and wire: 1 radio = SoapySimple, 2 radios = SoapyDual
-    uint64_t* overflow_ptr = nullptr;
+    std::atomic<uint64_t>* overflow_ptr = nullptr;
 
     if (nRadio == 1) {
         auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>({
@@ -1222,7 +1222,7 @@ int main(int argc, char* argv[]) {
 
     // --- Build and start RX graph in a background thread ---
     gr::Graph rx_graph;
-    uint64_t* overflow_ptr = build_rx_graph(rx_graph, cfg, frame_callback, spectrum,
+    std::atomic<uint64_t>* overflow_ptr = build_rx_graph(rx_graph, cfg, frame_callback, spectrum,
                                             &channel_busy);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> rx_sched;

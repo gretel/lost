@@ -505,6 +505,8 @@ struct DirectCadResult {
     double   peak_ratio_up = 0.0;
     double   peak_ratio_dn = 0.0;
     uint32_t sf_detected   = 0;
+    bool     up_detected   = false;
+    bool     dn_detected   = false;
 };
 
 // ─── Mode B: interleaved L1 snapshot + immediate L2 ─────────────────────────
@@ -675,6 +677,8 @@ static InterleavedResult interleavedSweep(
                     bestResult.peak_ratio_up = static_cast<double>(r.peak_ratio_up);
                     bestResult.peak_ratio_dn = static_cast<double>(r.peak_ratio_dn);
                     bestResult.sf_detected   = r.sf;
+                    bestResult.up_detected   = r.up_detected;
+                    bestResult.dn_detected   = r.dn_detected;
                 }
             }
 
@@ -682,8 +686,8 @@ static InterleavedResult interleavedSweep(
                 const double ratio = r.detected
                     ? static_cast<double>(r.best_ratio) : 0.0;
                 const char* chirp = !r.detected ? ""
-                    : (r.peak_ratio_up > 0 && r.peak_ratio_dn > 0) ? "both"
-                    : (r.peak_ratio_dn > r.peak_ratio_up) ? "dn" : "up";
+                    : (r.up_detected && r.dn_detected) ? "both"
+                    : r.dn_detected ? "dn" : "up";
                 bwResults.push_back({bd.bw, r.sf, ratio, chirp});
             }
 
@@ -766,9 +770,9 @@ static void emitSpectrumCbor(
         cb::kv_float64(buf, "ratio", std::max(det.peak_ratio_up, det.peak_ratio_dn));
         cb::kv_float64(buf, "ratio_up", det.peak_ratio_up);
         cb::kv_float64(buf, "ratio_dn", det.peak_ratio_dn);
-        const char* chirp = (det.peak_ratio_up > 0 && det.peak_ratio_dn > 0) ? "both"
-                          : (det.peak_ratio_dn > det.peak_ratio_up)           ? "dn"
-                          :                                                     "up";
+        const char* chirp = (det.up_detected && det.dn_detected) ? "both"
+                          : det.dn_detected                     ? "dn"
+                          :                                       "up";
         cb::kv_text(buf, "chirp", chirp);
     }
 
