@@ -4988,6 +4988,25 @@ class TestPrivateKey(unittest.TestCase):
         self.assertEqual(state.pub_key, new_pub)
         self.assertEqual(state.seed, new_seed)
 
+    def test_import_private_key_persists_to_disk(self):
+        """CMD_IMPORT_PRIVATE_KEY writes the new seed+pub to the identity file."""
+        import tempfile
+        from pathlib import Path
+
+        state = make_state()
+        _, new_pub, new_seed = make_identity()
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            tmp_path = Path(f.name)
+        state._identity_file = tmp_path
+        try:
+            cmd = bytes([bridge.CMD_IMPORT_PRIVATE_KEY]) + new_seed
+            bridge.handle_command(cmd, state, None, None)
+            written = tmp_path.read_bytes()
+            self.assertEqual(written[:32], new_seed)
+            self.assertEqual(written[32:], new_pub)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

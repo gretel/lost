@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 import cbor2
+import nacl.signing
 
 from lora_common import (
     config_agg_listen,
@@ -120,7 +121,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         pass
     return "dev"
 
@@ -1374,9 +1375,6 @@ def handle_command(
         if len(data) < 32:
             return [state.build_error()]
         new_seed = data[:32]
-        from meshcore_crypto import meshcore_expanded_key
-        import nacl.signing
-
         new_expanded = meshcore_expanded_key(new_seed)
         signing_key = nacl.signing.SigningKey(new_seed)
         new_pub = bytes(signing_key.verify_key)
@@ -1385,6 +1383,7 @@ def handle_command(
         state.pub_key = new_pub
         if state._identity_file is not None:
             state._identity_file.write_bytes(new_seed + new_pub)
+            state._identity_file.chmod(0o600)
         log.info("companion: IMPORT_PRIVATE_KEY new pub=%s..", new_pub.hex()[:8])
         return [state.build_ok()]
 
@@ -2369,7 +2368,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except (ConnectionError, OSError):
+                    except ConnectionError, OSError:
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2391,7 +2390,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except (BlockingIOError, OSError):
+                    except BlockingIOError, OSError:
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2541,7 +2540,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except (ConnectionError, OSError):
+    except ConnectionError, OSError:
         pass  # client disconnected, will be cleaned up on next recv
 
 
