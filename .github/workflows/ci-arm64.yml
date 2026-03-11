@@ -37,7 +37,9 @@ jobs:
           fetch-depth: 0
 
       - name: Fetch submodules
-        run: git submodule update --init --recursive
+        run: |
+          git config --global --add safe.directory '*'
+          git submodule update --init --recursive
 
       - name: Cache ccache
         uses: actions/cache@v5
