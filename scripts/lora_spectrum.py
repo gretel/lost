@@ -28,10 +28,10 @@ from cbor_stream import read_cbor_seq  # noqa: reportImplicitRelativeImport
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
-DET_HISTORY = 3  # number of recent detections to show in footer
+DET_HISTORY = 4  # number of recent detections to show in footer
 EMA_ALPHA = 0.3  # spectrum smoothing factor
 DB_MARGIN = 5.0  # padding above signal range
-HEADER_LINES = 4  # status + L2 + freq axis + footer
+HEADER_LINES = 2 + DET_HISTORY  # header + freq axis + footer lines
 
 # ANSI colours (basic — no xterm-256)
 C_GREEN = "\033[32m"
@@ -96,14 +96,6 @@ class State:
         # from scan_sweep_end
         self.last_sweep_ms: int = 0
 
-        # from scan_l2_probe (best result of most recent probe)
-        self.last_l2_freq: float = 0.0
-        self.last_l2_sf: int = 0
-        self.last_l2_bw: int = 0
-        self.last_l2_ratio: float = 0.0
-        self.last_l2_dur_ms: int = 0
-        self.l2_probes_this_sweep: int = 0
-
         # sweep rate (computed from scan_spectrum arrival times)
         self.sweep_rate: float = 0.0
         self._prev_spectrum_time: float = 0.0
@@ -149,22 +141,13 @@ class State:
         self.dropouts = msg.get("dropouts", self.dropouts)
 
     def on_sweep_start(self, _msg: dict[str, Any]) -> None:
-        self.l2_probes_this_sweep = 0
+        pass
 
     def on_sweep_end(self, msg: dict[str, Any]) -> None:
         self.last_sweep_ms = msg.get("duration_ms", 0)
 
-    def on_l2_probe(self, msg: dict[str, Any]) -> None:
-        self.l2_probes_this_sweep += 1
-        self.last_l2_freq = msg.get("freq", 0) / 1e6
-        self.last_l2_dur_ms = msg.get("duration_ms", 0)
-        best_ratio = 0.0
-        for r in msg.get("results", []):
-            if r.get("ratio", 0) > best_ratio:
-                best_ratio = r["ratio"]
-                self.last_l2_sf = r.get("sf", 0)
-                self.last_l2_bw = r.get("bw", 0)
-                self.last_l2_ratio = best_ratio
+    def on_l2_probe(self, _msg: dict[str, Any]) -> None:
+        pass
 
     def on_overflow(self, msg: dict[str, Any]) -> None:
         self.overflows = msg.get("count", self.overflows)
@@ -216,42 +199,18 @@ def _term_size() -> tuple[int, int]:
 
 
 def _render_header(s: State) -> str:
-    """Build status lines 1-2 (cheap, ~0.1 ms)."""
-    out: list[str] = []
-    S = " \u2502 "  # " │ "
-
-    # ── Line 1: sweep stats ──
-    ovf_str = f"{C_WARN}{s.overflows:>3}{C_DIM}" if s.overflows else "  0"
-    drop_str = f"{C_WARN}{s.dropouts:>3}{C_DIM}" if s.dropouts else "  0"
-    out.append(
-        f"{C_DIM}{s.mode}"
-        + f"{S}sw {s.sweeps:>5}{S}{s.last_sweep_ms:>5}ms"
-        + f"{S}det {s.total_det:>4}{S}L2 {s.l2_probes_this_sweep:>2}"
-        + f"{S}OVF {ovf_str}{S}DROP {drop_str}"
-        + f"{S}{s.sweep_rate:>4.1f} sw/s{S}{time.strftime('%H:%M:%S')}{C_RST}\033[K\n"
+    """Build single status line."""
+    ovf = f" {C_WARN}OVF {s.overflows}{C_DIM}" if s.overflows else ""
+    return (
+        f"{C_DIM}sw {s.sweeps:>5}  {s.last_sweep_ms:>5}ms"
+        + f"  det {s.total_det:>4}{ovf}"
+        + f"  {s.sweep_rate:>4.1f} sw/s  {time.strftime('%H:%M:%S')}{C_RST}\033[K\n"
     )
-
-    # ── Line 2: last L2 probe result ──
-    if s.last_l2_sf:
-        bw_k = s.last_l2_bw / 1000 if s.last_l2_bw else 0
-        out.append(
-            f"{C_DIM}L2 {s.last_l2_freq:>8.3f} MHz"
-            + f"{S}SF{s.last_l2_sf:<2} BW{bw_k:>3.0f}k"
-            + f"{S}ratio {s.last_l2_ratio:>6.1f}"
-            + f"{S}{s.last_l2_dur_ms:>4}ms{C_RST}\033[K\n"
-        )
-    else:
-        out.append(f"{C_DIM}L2 --{C_RST}\033[K\n")
-
-    return "".join(out)
 
 
 def _render_footer(s: State) -> str:
-    """Build footer: last N detections as a history log (newest first)."""
-    if not s.det_history:
-        return f"{C_DIM}det --{C_RST}\033[K"
-    S = "  "
-    parts: list[str] = []
+    """Build footer: last N detections, one per line, newest first."""
+    lines: list[str] = []
     for ts, det in reversed(s.det_history):
         freq_mhz = det["freq"] / 1e6
         bw_k = det["bw"] / 1000
@@ -259,21 +218,25 @@ def _render_footer(s: State) -> str:
         if ratio == 0:
             ratio = det.get("ratio", 0)
         chirp = det.get("chirp", "")
-        parts.append(
-            f"{ts} {freq_mhz:.3f} SF{det['sf']}/{bw_k:.0f}k"
+        lines.append(
+            f"{C_DIM}{ts}{C_RST} {freq_mhz:.3f} SF{det['sf']}/{bw_k:.0f}k"
             + f" r={ratio:.1f}"
             + (f" {chirp}" if chirp else "")
+            + "\033[K"
         )
-    return f"{C_DIM}det{C_RST} {(S + C_DIM + '\u2502' + C_RST + S).join(parts)}\033[K"
+    # Pad to DET_HISTORY lines so the layout is stable
+    while len(lines) < DET_HISTORY:
+        lines.append("\033[K")
+    return "\n".join(lines)
 
 
 def render_header(s: State) -> None:
-    """Update only the status lines (lines 1-2) in-place."""
+    """Update status line in-place."""
     _write(f"\033[H{_render_header(s)}")
 
 
 def render(s: State) -> None:
-    """Full redraw: header + frequency axis + bar chart + footer."""
+    """Full redraw: status + frequency axis + bar chart + detection log."""
     if s.energy is None:
         return
 
