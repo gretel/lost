@@ -6,7 +6,7 @@
 """lora_spectrum.py — real-time LoRa spectrum bar graph.
 
 Reads CBOR frames from lora_scan on stdin and renders a live spectrum
-display with detection annotations to the terminal.
+display with detection history to the terminal.
 
 Usage:
     lora_scan --cbor 2>scan.log | python3 scripts/lora_spectrum.py
@@ -28,15 +28,14 @@ from cbor_stream import read_cbor_seq  # noqa: reportImplicitRelativeImport
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
-ANNOTATION_TTL = 15.0  # seconds before detection label fades
+DET_HISTORY = 3  # number of recent detections to show in footer
 EMA_ALPHA = 0.3  # spectrum smoothing factor
 DB_MARGIN = 5.0  # padding above signal range
-HEADER_LINES = 4  # status + L2 + freq axis + annotation row
+HEADER_LINES = 4  # status + L2 + freq axis + footer
 
 # ANSI colours (basic — no xterm-256)
 C_GREEN = "\033[32m"
 C_HOT = "\033[1;33m"  # bright yellow
-C_DET = "\033[1;32m"  # bright green
 C_DIM = "\033[2m"
 C_BOLD = "\033[1m"
 C_WARN = "\033[33m"
@@ -84,7 +83,7 @@ class State:
         self.freq_step: int = 62500
         self.n_channels: int = 0
         self.hot: set[int] = set()
-        self.detections: list[tuple[dict[str, Any], float]] = []
+        self.det_history: list[tuple[str, dict[str, Any]]] = []  # (timestamp, det)
         self.ema_alpha: float = ema_alpha
 
         # from scan_status
@@ -127,18 +126,19 @@ class State:
         self.n_channels = n
         self.hot = set(msg.get("hot", []))
 
-        now = time.monotonic()
+        ts = time.strftime("%H:%M:%S")
         for det in msg.get("detections", []):
-            self.detections.append((det, now + ANNOTATION_TTL))
-        self.detections = [(d, t) for d, t in self.detections if t > now]
+            self.det_history.append((ts, det))
+        self.det_history = self.det_history[-DET_HISTORY:]
 
         self.sweeps = msg.get("sweep", self.sweeps)
+        mono = time.monotonic()
         if self._prev_spectrum_time > 0:
-            dt = now - self._prev_spectrum_time
+            dt = mono - self._prev_spectrum_time
             ds = self.sweeps - self._prev_sweep_count
             if dt > 0.1 and ds > 0:
                 self.sweep_rate = ds / dt
-        self._prev_spectrum_time = now
+        self._prev_spectrum_time = mono
         self._prev_sweep_count = self.sweeps
 
     def on_status(self, msg: dict[str, Any]) -> None:
@@ -199,14 +199,6 @@ def _resample(energy: list[float], cols: int) -> list[float]:
     return out
 
 
-def _freq_to_col(freq_hz: float, s: State, n_cols: int) -> int:
-    if s.freq_step == 0 or s.n_channels == 0:
-        return 0
-    ch = (freq_hz - s.freq_min) / s.freq_step
-    col = int(ch * n_cols / s.n_channels)
-    return max(0, min(col, n_cols - 1))
-
-
 # ─── Rendering ─────────────────────────────────────────────────────────────────
 
 # Cached fd for terminal size queries (avoid opening /dev/tty each frame)
@@ -226,29 +218,53 @@ def _term_size() -> tuple[int, int]:
 def _render_header(s: State) -> str:
     """Build status lines 1-2 (cheap, ~0.1 ms)."""
     out: list[str] = []
+    S = " \u2502 "  # " │ "
 
-    # ── Line 1: status (fixed-width columns) ──
+    # ── Line 1: sweep stats ──
     ovf_str = f"{C_WARN}{s.overflows:>3}{C_DIM}" if s.overflows else "  0"
     drop_str = f"{C_WARN}{s.dropouts:>3}{C_DIM}" if s.dropouts else "  0"
     out.append(
-        f"{C_DIM}Mode {s.mode}  sw {s.sweeps:>5}  {s.last_sweep_ms:>5}ms"
-        + f"  det {s.total_det:>4}  L2 {s.l2_probes_this_sweep:>2}"
-        + f"  OVF {ovf_str}  DROP {drop_str}"
-        + f"  {s.sweep_rate:>4.1f} sw/s  {time.strftime('%H:%M:%S')}{C_RST}\033[K\n"
+        f"{C_DIM}{s.mode}"
+        + f"{S}sw {s.sweeps:>5}{S}{s.last_sweep_ms:>5}ms"
+        + f"{S}det {s.total_det:>4}{S}L2 {s.l2_probes_this_sweep:>2}"
+        + f"{S}OVF {ovf_str}{S}DROP {drop_str}"
+        + f"{S}{s.sweep_rate:>4.1f} sw/s{S}{time.strftime('%H:%M:%S')}{C_RST}\033[K\n"
     )
 
-    # ── Line 2: last L2 result (fixed-width) ──
+    # ── Line 2: last L2 probe result ──
     if s.last_l2_sf:
         bw_k = s.last_l2_bw / 1000 if s.last_l2_bw else 0
         out.append(
-            f"{C_DET}L2: {s.last_l2_freq:>8.3f} MHz  SF{s.last_l2_sf:<2}"
-            + f" BW{bw_k:>3.0f}k  ratio {s.last_l2_ratio:>6.1f}"
-            + f"  {s.last_l2_dur_ms:>4}ms{C_RST}\033[K\n"
+            f"{C_DIM}L2 {s.last_l2_freq:>8.3f} MHz"
+            + f"{S}SF{s.last_l2_sf:<2} BW{bw_k:>3.0f}k"
+            + f"{S}ratio {s.last_l2_ratio:>6.1f}"
+            + f"{S}{s.last_l2_dur_ms:>4}ms{C_RST}\033[K\n"
         )
     else:
-        out.append("\033[K\n")
+        out.append(f"{C_DIM}L2 --{C_RST}\033[K\n")
 
     return "".join(out)
+
+
+def _render_footer(s: State) -> str:
+    """Build footer: last N detections as a history log (newest first)."""
+    if not s.det_history:
+        return f"{C_DIM}det --{C_RST}\033[K"
+    S = "  "
+    parts: list[str] = []
+    for ts, det in reversed(s.det_history):
+        freq_mhz = det["freq"] / 1e6
+        bw_k = det["bw"] / 1000
+        ratio = max(det.get("peak_ratio_up", 0), det.get("peak_ratio_dn", 0))
+        if ratio == 0:
+            ratio = det.get("ratio", 0)
+        chirp = det.get("chirp", "")
+        parts.append(
+            f"{ts} {freq_mhz:.3f} SF{det['sf']}/{bw_k:.0f}k"
+            + f" r={ratio:.1f}"
+            + (f" {chirp}" if chirp else "")
+        )
+    return f"{C_DIM}det{C_RST} {(S + C_DIM + '\u2502' + C_RST + S).join(parts)}\033[K"
 
 
 def render_header(s: State) -> None:
@@ -257,7 +273,7 @@ def render_header(s: State) -> None:
 
 
 def render(s: State) -> None:
-    """Full redraw: header + frequency axis + bar chart + annotations."""
+    """Full redraw: header + frequency axis + bar chart + footer."""
     if s.energy is None:
         return
 
@@ -289,19 +305,6 @@ def render(s: State) -> None:
     for idx in s.hot:
         col = int(idx * n_cols / s.n_channels) if s.n_channels > 0 else 0
         hot_cols.add(min(col, n_cols - 1))
-
-    # Detection columns
-    now = time.monotonic()
-    det_cols: set[int] = set()
-    annot: dict[int, str] = {}
-    for det, expire in s.detections:
-        if expire <= now:
-            continue
-        col = _freq_to_col(det["freq"], s, n_cols)
-        det_cols.add(col)
-        freq_mhz = det["freq"] / 1e6
-        bw_k = det["bw"] / 1000
-        annot[col] = f"{freq_mhz:.1f} SF{det['sf']}/{bw_k:.0f}k"
 
     out: list[str] = ["\033[H"]  # cursor home
     out.append(_render_header(s))
@@ -338,12 +341,7 @@ def render(s: State) -> None:
         run_chars = 0
         for col in range(n_cols):
             if bar_h[col] >= threshold and col_e[col] > 1e-15:
-                if col in det_cols:
-                    color = C_DET
-                elif col in hot_cols:
-                    color = C_HOT
-                else:
-                    color = C_GREEN
+                color = C_HOT if col in hot_cols else C_GREEN
                 if color != run_color:
                     if run_chars:
                         out.append(f"{run_color}{'#' * run_chars}")
@@ -361,16 +359,8 @@ def render(s: State) -> None:
             out.append(f"{run_color}{'#' * run_chars}{C_RST}")
         out.append("\033[K\n")
 
-    # ── Annotation row ──
-    annot_chars = [" "] * n_cols
-    for col in sorted(annot):
-        label = annot[col]
-        start = max(0, col - len(label) // 2)
-        for i, ch in enumerate(label):
-            pos = start + i
-            if 0 <= pos < n_cols and annot_chars[pos] == " ":
-                annot_chars[pos] = ch
-    out.append(f"{' ' * lbl_w}{C_DET}{''.join(annot_chars)}{C_RST}\033[K\n")
+    # ── Footer: recent detection history ──
+    out.append(_render_footer(s) + "\n")
 
     out.append("\033[J")  # clear below
     _write("".join(out))
