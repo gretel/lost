@@ -11,8 +11,6 @@ jobs:
   build:
     name: "arm64 | clang-20 | ${{ matrix.build-type }}"
     runs-on: ubuntu-24.04-arm
-    container:
-      image: ubuntu:25.10
     strategy:
       fail-fast: false
       matrix:
@@ -21,47 +19,57 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
       CC: clang-20
       CXX: clang++-20
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
-      - name: Install dependencies
-        run: |
-          apt-get update -y
-          apt-get install -y --no-install-recommends \
-            ca-certificates git cmake ninja-build \
-            clang-20 libc++-20-dev libc++abi-20-dev ccache \
-            libsoapysdr-dev soapysdr-module-uhd libuhd-dev
-          git config --global --add safe.directory '*'
-
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           submodules: false
           fetch-depth: 0
 
       - name: Fetch submodules
-        run: git submodule update --init --recursive --no-shallow
+        run: git submodule update --init --recursive
+
+      - name: Install dependencies
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            clang-20 libc++-20-dev libc++abi-20-dev \
+            cmake ninja-build ccache \
+            libsoapysdr-dev soapysdr-module-uhd libuhd-dev
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-arm64-clang20-${{ matrix.build-type }}-${{ github.sha }}
           restore-keys: ccache-arm64-clang20-${{ matrix.build-type }}
-        env:
-          CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=3G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=6
+          ccache --set-config=depend_mode=true
+          ccache --set-config=hash_dir=false
+          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
+          ccache -z
 
       - name: Configure
         run: |
-          cmake -S . -B build -G Ninja \
+          cmake -S . -B ../build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} \
             -DUSE_CCACHE=ON \
             -DENABLE_COVERAGE=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
       - name: Build
-        run: cmake --build build -j$(nproc)
+        run: cmake --build ../build -j$(nproc)
 
       - name: Test
-        working-directory: build
+        working-directory: ../build
         run: ctest --output-on-failure --timeout 60
 
       - name: Upload binaries
@@ -69,5 +77,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gr4-lora-arm64
-          path: build/apps/lora_trx
+          path: ../build/apps/lora_trx
           if-no-files-found: warn
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache --show-stats
