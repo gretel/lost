@@ -202,9 +202,16 @@ def _term_size() -> tuple[int, int]:
 def _render_header(s: State) -> str:
     """Build single status line."""
     ovf = f" {C_WARN}OVF {s.overflows}{C_DIM}" if s.overflows else ""
+    if s.n_channels > 0:
+        f_lo = s.freq_min / 1e6
+        f_hi = (s.freq_min + s.freq_step * s.n_channels) / 1e6
+        rng = f"  {f_lo:.3f}–{f_hi:.3f} MHz"
+    else:
+        rng = ""
     return (
         f"{C_DIM}sw {s.sweeps:>5}  {s.last_sweep_ms:>5}ms"
         + f"  det {s.total_det:>4}{ovf}"
+        + rng
         + f"  {s.sweep_rate:>4.1f} sw/s  {time.strftime('%H:%M:%S')}{C_RST}\033[K\n"
     )
 
@@ -223,8 +230,8 @@ def _render_footer(s: State) -> str:
         lines.append(
             f"{C_DIM}{ts}{C_RST}"
             + f" #{sweep:<4}"
-            + f" {freq_mhz:>7.3f} SF{det['sf']}/{bw_k:.0f}k"
-            + f"  up={ratio_up:>5.1f} dn={ratio_dn:>5.1f}"
+            + f" {freq_mhz:>7.3f} SF{det['sf']}/{bw_k:g}k"
+            + f"  ↑{ratio_up:.1f} ↓{ratio_dn:.1f}"
             + (f"  {chirp}" if chirp else "")
             + "\033[K"
         )
