@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: ISC
 //
-// lora_scan — LoRa spectral scanner
+// lora_scan — LoRa spectral scanner (GR4 graph + orchestrator)
 //
-// Layer 1: wideband FFT energy scan → candidate channels
-// Layer 2: per-channel CAD dwell with shared-buffer-per-BW detection
+// A GR4 flowgraph handles continuous streaming from the SDR with proper
+// backpressure, while an orchestrator thread drives the scan logic:
+//   Layer 1: wideband FFT energy scan → candidate channels
+//   Layer 2: per-channel CAD dwell with shared-buffer-per-BW detection
+//
+// Graph topology:
+//   SoapySource(L1 rate) → Splitter(2)
+//       → [0] SpectrumTapBlock → NullSink    (L1 energy via SpectrumState)
+//       → [1] CaptureSink                     (L2 CAD on-demand capture)
 //
 // Run `lora_scan --help` for usage.
 
@@ -14,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -22,13 +30,19 @@
 
 #include <unistd.h>
 
+#include <gnuradio-4.0/Graph.hpp>
+#include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
 #include <gnuradio-4.0/soapy/Soapy.hpp>
+#include <gnuradio-4.0/testing/NullSources.hpp>
 
 // common.hpp must come AFTER Soapy.hpp (uses soapy types, no SoapySDR include)
 #include "common.hpp"
 
+#include <gnuradio-4.0/lora/CaptureSink.hpp>
+#include <gnuradio-4.0/lora/SpectrumTapBlock.hpp>
+#include <gnuradio-4.0/lora/Splitter.hpp>
 #include <gnuradio-4.0/lora/cbor.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
@@ -37,8 +51,6 @@
 #endif
 
 using lora_apps::cf32;
-using SoapyDevice = gr::blocks::soapy::Device;
-using RxStream    = SoapyDevice::Stream<cf32, SOAPY_SDR_RX>;
 
 struct ScanStats {
     uint32_t    sweeps          = 0;
@@ -168,7 +180,7 @@ static int parseArgs(int argc, char** argv, ScanConfig& cfg) {
         const double rounded    = std::round(factor);
         if (std::abs(factor - rounded) > 0.01 || rounded < 1.0) {
             std::fprintf(stderr,
-                "L1 rate %.0f Hz / (BW %.0f Hz × os %u) = %.3f — must be an integer\n",
+                "L1 rate %.0f Hz / (BW %.0f Hz x os %u) = %.3f -- must be an integer\n",
                 cfg.l1_rate, bw, cfg.os_factor, factor);
             return 1;
         }
@@ -176,7 +188,7 @@ static int parseArgs(int argc, char** argv, ScanConfig& cfg) {
     const double scanRange = cfg.freq_stop - cfg.freq_start;
     if (scanRange > cfg.l1_rate * 0.9) {
         gr::lora::log_ts("warn ", "lora_scan",
-            "scan range %.1f MHz > L1 rate %.1f MS/s — L1 will tile multiple snapshots",
+            "scan range %.1f MHz > L1 rate %.1f MS/s -- L1 will tile multiple snapshots",
             scanRange / 1.0e6, cfg.l1_rate / 1.0e6);
     }
     return 0;
@@ -192,18 +204,116 @@ static std::vector<double> makeChannelList(double freqStart, double freqStop, do
     return channels;
 }
 
-// ─── SDR helpers ──────────────────────────────────────────────────────────────
+// ─── GR4 graph construction ──────────────────────────────────────────────────
 
-static SoapyDevice openDevice(const ScanConfig& cfg) {
-    auto args = gr::blocks::soapy::detail::buildDeviceArgs(cfg.device, cfg.device_param);
-    return SoapyDevice(args);
+struct ScanGraph {
+    std::shared_ptr<gr::lora::SpectrumState> spectrum;
+    std::shared_ptr<gr::lora::CaptureState>  capture;
+};
+
+static ScanGraph build_scan_graph(gr::Graph& graph, const ScanConfig& cfg,
+                                  const std::vector<double>& channels) {
+    auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
+    using std::string_literals::operator""s;
+
+    ScanGraph sg;
+
+    // SoapySource -- fixed L1 rate, pinned master clock
+    const double tileCentre = (channels.front() + channels.back()) / 2.0;
+    auto& source = graph.emplaceBlock<
+        gr::blocks::soapy::SoapySimpleSource<cf32>>({
+        {"device",              cfg.device},
+        {"device_parameter",    cfg.device_param},
+        {"sample_rate",         cfg.l1_rate},
+        {"master_clock_rate",   cfg.master_clock},
+        {"rx_center_frequency", gr::Tensor<double>{tileCentre}},
+        {"rx_gains",            gr::Tensor<double>{cfg.gain}},
+        {"max_chunck_size",     static_cast<uint32_t>(512U << 4U)},
+        {"max_overflow_count",  gr::Size_t{1000}},
+        {"max_consecutive_errors", gr::Size_t{500}},
+        {"max_time_out_us",     static_cast<uint32_t>(10'000U)},
+    });
+
+    // Splitter -> 2 outputs
+    auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
+        {"n_outputs", gr::Size_t{2}},
+    });
+    if (!ok(graph.connect<"out">(source).to<"in">(splitter))) {
+        gr::lora::log_ts("error", "lora_scan", "connect source -> splitter failed");
+    }
+
+    // Path 0: SpectrumTap -> NullSink (L1 energy)
+    sg.spectrum = std::make_shared<gr::lora::SpectrumState>();
+    sg.spectrum->fft_size    = 4096;
+    sg.spectrum->sample_rate = static_cast<float>(cfg.l1_rate);
+    sg.spectrum->center_freq = tileCentre;
+    sg.spectrum->init();
+
+    auto& tap = graph.emplaceBlock<gr::lora::SpectrumTapBlock>({});
+    tap._spectrum = sg.spectrum;
+
+    auto& null_sink = graph.emplaceBlock<gr::testing::NullSink<cf32>>({});
+
+    if (!ok(graph.connect(splitter, "out#0"s, tap, "in"s))) {
+        gr::lora::log_ts("error", "lora_scan", "connect splitter -> tap failed");
+    }
+    if (!ok(graph.connect<"out">(tap).to<"in">(null_sink))) {
+        gr::lora::log_ts("error", "lora_scan", "connect tap -> null_sink failed");
+    }
+
+    // Path 1: CaptureSink (L2 on-demand)
+    sg.capture = std::make_shared<gr::lora::CaptureState>();
+    // Pre-allocate for worst case: SF12 / min BW at L1 rate
+    const double minBw      = cfg.min_bw();
+    const double targetRate  = minBw * static_cast<double>(cfg.os_factor);
+    const auto   decFactor   = static_cast<uint32_t>(std::round(cfg.l1_rate / targetRate));
+    const uint32_t sf12Win   = (1U << 12U) * cfg.os_factor * 2U;
+    sg.capture->buffer.resize(sf12Win * decFactor);
+
+    auto& cap_sink = graph.emplaceBlock<gr::lora::CaptureSink>({});
+    cap_sink._state = sg.capture;
+
+    if (!ok(graph.connect(splitter, "out#1"s, cap_sink, "in"s))) {
+        gr::lora::log_ts("error", "lora_scan", "connect splitter -> capture failed");
+    }
+
+    return sg;
 }
 
-/// Frequency-only retune — sample rate stays at L1 rate throughout the scan.
-/// No deactivate/activate cycle, eliminating USB buffer overflows from rate switching.
-static void retune(SoapyDevice& dev, double freq, int settleMs) {
-    dev.setCenterFrequency(SOAPY_SDR_RX, 0, freq);
+// ─── Orchestrator helpers ────────────────────────────────────────────────────
+
+/// Retune the SoapySource frequency via GR4 settings (no stream restart).
+/// The graph keeps streaming during the settle delay -- no overflow.
+static void retune_source(std::shared_ptr<gr::BlockModel>& source,
+                          double freq, int settleMs) {
+    gr::property_map props;
+    props["rx_center_frequency"] = gr::Tensor<double>{freq};
+    std::ignore = source->settings().set(props);
     std::this_thread::sleep_for(std::chrono::milliseconds(settleMs));
+}
+
+/// Update the SpectrumState centre frequency to match a retune.
+static void update_spectrum_centre(std::shared_ptr<gr::lora::SpectrumState>& spectrum,
+                                   double freq) {
+    spectrum->center_freq = freq;
+}
+
+/// Trigger an on-demand capture via CaptureSink and wait for completion.
+/// Returns a span over the captured data, or empty span on stop.
+static std::span<const cf32> capture_samples(
+        std::shared_ptr<gr::lora::CaptureState>& state,
+        uint32_t nSamples,
+        const std::atomic<bool>& stopFlag) {
+    state->request(nSamples);
+    while (!state->done.load(std::memory_order_acquire)) {
+        if (stopFlag.load(std::memory_order_relaxed)) {
+            state->reset();
+            return {};
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    state->reset();
+    return {state->buffer.data(), nSamples};
 }
 
 /// Decimate a wideband (L1-rate) capture to a narrowband target rate.
@@ -228,105 +338,76 @@ static std::vector<cf32> decimate(const cf32* src, uint32_t nSamples,
     return out;
 }
 
-static void capture(RxStream& stream, cf32* buf, uint32_t nSamples, ScanStats& stats) {
-    uint32_t collected = 0;
-    while (collected < nSamples) {
-        int flags = 0;
-        long long timeNs = 0;
-        std::span<cf32> slice(buf + collected, nSamples - collected);
-        int ret = stream.readStream(flags, timeNs, 1'000'000, slice);
-        if (ret > 0) {
-            collected += static_cast<uint32_t>(ret);
-        } else if (ret == SOAPY_SDR_OVERFLOW) {
-            ++stats.overflows;
-            gr::lora::log_ts("warn ", "lora_scan",
-                "USB buffer overflow (#%u)", stats.overflows);
-        } else if (ret == SOAPY_SDR_TIMEOUT) {
-            ++stats.drops;
-            gr::lora::log_ts("warn ", "lora_scan",
-                "readStream timeout / dropout (#%u)", stats.drops);
-        }
-    }
-}
-
-// ─── Layer 1: wideband FFT energy scan ───────────────────────────────────────
+// ─── Layer 1: wideband FFT energy scan via SpectrumState ─────────────────────
 
 struct Layer1Result {
     std::vector<double> energy;
     std::vector<int>    hot_idx;
 };
 
-static void measureTile(RxStream& stream, SoapyDevice& dev,
-                        const std::vector<double>& channels,
-                        double tileCentre, double tileRate,
-                        double chBw, int settleMs,
-                        std::vector<double>& energy, ScanStats& stats) {
-    retune(dev, tileCentre, settleMs);
-
-    const std::size_t nCh = channels.size();
-    constexpr std::size_t kMinBinsPerChannel = 256;
-    std::size_t fftSize = 1;
-    while (fftSize < nCh * kMinBinsPerChannel) {
-        fftSize <<= 1U;
-    }
-    if (fftSize < 4096) {
-        fftSize = 4096;
+/// Extract per-channel energy from a single SpectrumState FFT result.
+/// The spectrum must already be tuned to the tile centre and have fresh data.
+static void extractTileEnergy(
+        std::shared_ptr<gr::lora::SpectrumState>& spectrum,
+        const std::vector<double>& channels, double chBw,
+        std::vector<double>& energy) {
+    // Poll until a fresh FFT result is available
+    while (!spectrum->compute()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    std::vector<float> hann(fftSize);
-    for (std::size_t idx = 0; idx < fftSize; ++idx) {
-        hann[idx] = static_cast<float>(
-            0.5 - 0.5 * std::cos(2.0 * M_PI * static_cast<double>(idx)
-                                  / static_cast<double>(fftSize - 1)));
+    // Copy magnitude_db under lock
+    std::vector<float> mag_db;
+    {
+        std::lock_guard lock(spectrum->result_mutex);
+        mag_db = spectrum->magnitude_db;
     }
 
-    const double hzPerBin   = tileRate / static_cast<double>(fftSize);
-    const double halfChBins = (chBw / tileRate) * static_cast<double>(fftSize) / 2.0;
-    const double halfTile   = tileRate / 2.0;
+    const auto fftSize     = spectrum->fft_size;
+    const double sampleRate = static_cast<double>(spectrum->sample_rate);
+    const double centerFreq = spectrum->center_freq;
+    const double hzPerBin   = sampleRate / static_cast<double>(fftSize);
+    const double halfTile   = sampleRate / 2.0;
 
-    constexpr int kL1Snapshots = 4;
-
-    std::vector<cf32> buf(fftSize);
-    gr::algorithm::FFT<cf32> fft;
-
-    for (int snap = 0; snap < kL1Snapshots; ++snap) {
-        capture(stream, buf.data(), static_cast<uint32_t>(fftSize), stats);
-
-        for (std::size_t idx = 0; idx < fftSize; ++idx) {
-            buf[idx] *= hann[idx];
+    for (std::size_t chIdx = 0; chIdx < channels.size(); ++chIdx) {
+        const double chOffset = channels[chIdx] - centerFreq;
+        if (std::abs(chOffset) > halfTile * 0.9) {
+            continue;
         }
 
-        auto spectrum = fft.compute(std::span<const cf32>(buf.data(), fftSize));
+        // DC-centered FFT: bin 0 = -fs/2, bin fftSize/2 = DC
+        const double binCentre = static_cast<double>(fftSize) / 2.0
+                               + chOffset / hzPerBin;
+        const double halfChBins = (chBw / sampleRate)
+                                * static_cast<double>(fftSize) / 2.0;
+        const int kLo = static_cast<int>(std::round(binCentre - halfChBins));
+        const int kHi = static_cast<int>(std::round(binCentre + halfChBins));
 
-        for (std::size_t chIdx = 0; chIdx < nCh; ++chIdx) {
-            const double chOffset = channels[chIdx] - tileCentre;
-            if (std::abs(chOffset) > halfTile * 0.9) {
+        double sum = 0.0;
+        int    cnt = 0;
+        for (int k = kLo; k <= kHi; ++k) {
+            if (k < 0 || k >= static_cast<int>(fftSize)) {
                 continue;
             }
-            const double binCentre = chOffset / hzPerBin;
-            const int kLo = static_cast<int>(std::round(binCentre - halfChBins));
-            const int kHi = static_cast<int>(std::round(binCentre + halfChBins));
-
-            double sum = 0.0;
-            int    cnt = 0;
-            for (int k = kLo; k <= kHi; ++k) {
-                const auto binIdx = static_cast<std::size_t>(
-                    (k % static_cast<int>(fftSize) + static_cast<int>(fftSize))
-                    % static_cast<int>(fftSize));
-                sum += static_cast<double>(std::norm(spectrum[binIdx]));
-                ++cnt;
-            }
-            if (cnt > 0) {
-                const double snapEnergy = sum / static_cast<double>(cnt);
-                energy[chIdx] = std::max(energy[chIdx], snapEnergy);
-            }
+            // Convert dBFS back to linear power for summation
+            sum += std::pow(10.0,
+                static_cast<double>(mag_db[static_cast<std::size_t>(k)]) / 10.0);
+            ++cnt;
+        }
+        if (cnt > 0) {
+            const double snapEnergy = sum / static_cast<double>(cnt);
+            energy[chIdx] = std::max(energy[chIdx], snapEnergy);
         }
     }
 }
 
-static Layer1Result layer1Scan(RxStream& stream, SoapyDevice& dev,
-                               const std::vector<double>& channels,
-                               const ScanConfig& cfg, ScanStats& stats) {
+/// L1 scan using SpectrumState.  For single-tile configs, reads the spectrum
+/// directly.  For multi-tile, retunes the SoapySource to each tile centre.
+static Layer1Result layer1Scan(
+        std::shared_ptr<gr::lora::SpectrumState>& spectrum,
+        std::shared_ptr<gr::BlockModel>& soapy_source,
+        const std::vector<double>& channels,
+        const ScanConfig& cfg) {
     const std::size_t nCh = channels.size();
     Layer1Result result;
     result.energy.resize(nCh, 0.0);
@@ -335,20 +416,33 @@ static Layer1Result layer1Scan(RxStream& stream, SoapyDevice& dev,
     const double scanRange = channels.back() - channels.front() + chBw;
     const double usableBw  = cfg.l1_rate * 0.8;
 
+    // Take multiple FFT snapshots per tile for stability
+    constexpr int kL1Snapshots = 4;
+
     if (scanRange <= usableBw) {
-        const double centre = (channels.front() + channels.back()) / 2.0;
-        measureTile(stream, dev, channels, centre, cfg.l1_rate,
-                    chBw, cfg.settle_ms, result.energy, stats);
+        // Single tile: spectrum is already centred
+        for (int snap = 0; snap < kL1Snapshots; ++snap) {
+            extractTileEnergy(spectrum, channels, chBw, result.energy);
+        }
     } else {
-        const double step = usableBw;
+        // Multi-tile: retune to each tile centre
+        const double step  = usableBw;
         const double first = channels.front() + usableBw / 2.0;
         const double last  = channels.back()  - usableBw / 2.0;
         for (double tc = first; tc <= last + step * 0.5; tc += step) {
-            measureTile(stream, dev, channels, tc, cfg.l1_rate,
-                        chBw, cfg.settle_ms, result.energy, stats);
+            retune_source(soapy_source, tc, cfg.settle_ms);
+            update_spectrum_centre(spectrum, tc);
+            for (int snap = 0; snap < kL1Snapshots; ++snap) {
+                extractTileEnergy(spectrum, channels, chBw, result.energy);
+            }
         }
+        // Return to default tile centre
+        const double tileCentre = (channels.front() + channels.back()) / 2.0;
+        retune_source(soapy_source, tileCentre, cfg.settle_ms);
+        update_spectrum_centre(spectrum, tileCentre);
     }
 
+    // Hot channel detection (same threshold logic as before)
     constexpr double kL1Multiplier = 6.0;
     std::vector<double> sorted(result.energy.begin(), result.energy.end());
     std::ranges::sort(sorted);
@@ -357,7 +451,6 @@ static Layer1Result layer1Scan(RxStream& stream, SoapyDevice& dev,
         : (sorted[nCh / 2 - 1] + sorted[nCh / 2]) / 2.0;
     const double thresh = median * kL1Multiplier;
 
-    // pass 1: fine-grid detection
     std::vector<bool> isHot(nCh, false);
     for (std::size_t idx = 0; idx < nCh; ++idx) {
         if (result.energy[idx] > thresh) {
@@ -365,7 +458,7 @@ static Layer1Result layer1Scan(RxStream& stream, SoapyDevice& dev,
         }
     }
 
-    // pass 2: wideband aggregation
+    // Wideband aggregation
     for (const double bw : cfg.bws) {
         const auto groupSize = static_cast<std::size_t>(std::round(bw / chBw));
         if (groupSize <= 1) {
@@ -471,31 +564,35 @@ static Layer2Result detectOnBuffer(const cf32* buf, std::vector<SfDetector>& det
     return result;
 }
 
-static Layer2Result layer2Cad(RxStream& stream, SoapyDevice& dev,
-                               double freq, double bw,
-                               const ScanConfig& cfg, ScanStats& stats,
-                               const std::atomic<bool>& stopFlag) {
+/// L2 CAD on a single channel+BW: capture at L1 rate, decimate, run CAD.
+static Layer2Result layer2Cad(
+        ScanGraph& sg,
+        std::shared_ptr<gr::BlockModel>& soapy_source,
+        double freq, double bw,
+        const ScanConfig& cfg,
+        const std::atomic<bool>& stopFlag) {
     const double targetRate = bw * static_cast<double>(cfg.os_factor);
-    retune(dev, freq, cfg.settle_ms);
+    retune_source(soapy_source, freq, cfg.settle_ms);
 
     auto detectors = buildDetectors(bw, cfg.os_factor);
 
     Layer2Result result;
     result.windows_tried = cfg.cad_windows;
 
-    // Capture at L1 rate, then decimate to target rate for CAD.
     const uint32_t sf12Win   = (1U << 12U) * cfg.os_factor * 2U;
     const auto     decFactor = static_cast<uint32_t>(std::round(cfg.l1_rate / targetRate));
     const uint32_t l1Win     = sf12Win * decFactor;
-    std::vector<cf32> l1Buf(l1Win);
 
     for (uint32_t win = 0; win < cfg.cad_windows; ++win) {
         if (stopFlag.load(std::memory_order_relaxed)) {
             break;
         }
 
-        capture(stream, l1Buf.data(), l1Win, stats);
-        const auto cadBuf = decimate(l1Buf.data(), l1Win, cfg.l1_rate, targetRate);
+        const auto raw = capture_samples(sg.capture, l1Win, stopFlag);
+        if (raw.empty()) {
+            break;
+        }
+        const auto cadBuf = decimate(raw.data(), l1Win, cfg.l1_rate, targetRate);
         const auto r = detectOnBuffer(cadBuf.data(), detectors, freq, bw);
 
         if (r.detected) {
@@ -525,9 +622,10 @@ struct DirectCadResult {
 };
 
 static std::vector<DirectCadResult> directCadSweep(
-        RxStream& stream, SoapyDevice& dev,
+        ScanGraph& sg,
+        std::shared_ptr<gr::BlockModel>& soapy_source,
         const std::vector<double>& channels,
-        const ScanConfig& cfg, ScanStats& stats,
+        const ScanConfig& cfg,
         const std::atomic<bool>& stopFlag) {
     std::vector<DirectCadResult> results;
 
@@ -548,7 +646,7 @@ static std::vector<DirectCadResult> directCadSweep(
             break;
         }
 
-        retune(dev, freq, cfg.settle_ms);
+        retune_source(soapy_source, freq, cfg.settle_ms);
 
         double       bestRatio = 0.0;
         DirectCadResult bestResult;
@@ -567,9 +665,12 @@ static std::vector<DirectCadResult> directCadSweep(
                 }
                 const uint32_t sfWin = (1U << sd.sf) * cfg.os_factor * 2U;
                 const uint32_t l1Win = sfWin * decFactor;
-                std::vector<cf32> l1Buf(l1Win);
-                capture(stream, l1Buf.data(), l1Win, stats);
-                const auto cadBuf = decimate(l1Buf.data(), l1Win, cfg.l1_rate, targetRate);
+
+                const auto raw = capture_samples(sg.capture, l1Win, stopFlag);
+                if (raw.empty()) {
+                    break;
+                }
+                const auto cadBuf = decimate(raw.data(), l1Win, cfg.l1_rate, targetRate);
                 const auto r = sd.det.detect(cadBuf.data());
                 if (r.detected) {
                     const double ratio = std::max(
@@ -604,9 +705,10 @@ struct InterleavedResult {
 };
 
 static InterleavedResult interleavedSweep(
-        RxStream& stream, SoapyDevice& dev,
+        ScanGraph& sg,
+        std::shared_ptr<gr::BlockModel>& soapy_source,
         const std::vector<double>& channels,
-        const ScanConfig& cfg, ScanStats& stats,
+        const ScanConfig& cfg,
         const std::atomic<bool>& stopFlag) {
     InterleavedResult ir;
 
@@ -626,79 +728,31 @@ static InterleavedResult interleavedSweep(
         bwDets.push_back(std::move(bd));
     }
 
-    const double tileRate   = cfg.l1_rate;
     const double tileCentre = (channels.front() + channels.back()) / 2.0;
-
-    constexpr std::size_t kMinBinsPerChannel = 256;
-    std::size_t fftSize = 1;
-    while (fftSize < nCh * kMinBinsPerChannel) {
-        fftSize <<= 1U;
-    }
-    if (fftSize < 4096) {
-        fftSize = 4096;
-    }
-
-    std::vector<float> hann(fftSize);
-    for (std::size_t idx = 0; idx < fftSize; ++idx) {
-        hann[idx] = static_cast<float>(
-            0.5 - 0.5 * std::cos(2.0 * M_PI * static_cast<double>(idx)
-                                  / static_cast<double>(fftSize - 1)));
-    }
-
-    const double hzPerBin   = tileRate / static_cast<double>(fftSize);
-    const double halfChBins = (chBw / tileRate) * static_cast<double>(fftSize) / 2.0;
-    const double halfTile   = tileRate / 2.0;
 
     constexpr double kL1Multiplier = 6.0;
     const int kSnapshots = static_cast<int>(5U * nCh * cfg.bws.size());
 
-    std::vector<cf32> fftBuf(fftSize);
     std::vector<double> energy(nCh, 0.0);
-    gr::algorithm::FFT<cf32> fft;
-
     std::vector<bool> probed(nCh, false);
 
-    retune(dev, tileCentre, cfg.settle_ms);
+    // Ensure we're tuned to tile centre
+    retune_source(soapy_source, tileCentre, cfg.settle_ms);
+    update_spectrum_centre(sg.spectrum, tileCentre);
 
     for (int snap = 0; snap < kSnapshots; ++snap) {
         if (stopFlag.load(std::memory_order_relaxed)) {
             break;
         }
 
-        capture(stream, fftBuf.data(), static_cast<uint32_t>(fftSize), stats);
+        // L1 snapshot from SpectrumState
+        extractTileEnergy(sg.spectrum, channels, chBw, ir.energy);
 
-        for (std::size_t idx = 0; idx < fftSize; ++idx) {
-            fftBuf[idx] *= hann[idx];
-        }
-        auto spectrum = fft.compute(std::span<const cf32>(fftBuf.data(), fftSize));
-
+        // Compute per-snapshot energy for hot detection
+        // (re-read current energy from spectrum for this snapshot)
+        // Use the accumulated ir.energy as the running max
         std::ranges::fill(energy, 0.0);
-        for (std::size_t chIdx = 0; chIdx < nCh; ++chIdx) {
-            const double chOffset = channels[chIdx] - tileCentre;
-            if (std::abs(chOffset) > halfTile * 0.9) {
-                continue;
-            }
-            const double binCentre = chOffset / hzPerBin;
-            const int kLo = static_cast<int>(std::round(binCentre - halfChBins));
-            const int kHi = static_cast<int>(std::round(binCentre + halfChBins));
-
-            double sum = 0.0;
-            int    cnt = 0;
-            for (int k = kLo; k <= kHi; ++k) {
-                const auto binIdx = static_cast<std::size_t>(
-                    (k % static_cast<int>(fftSize) + static_cast<int>(fftSize))
-                    % static_cast<int>(fftSize));
-                sum += static_cast<double>(std::norm(spectrum[binIdx]));
-                ++cnt;
-            }
-            if (cnt > 0) {
-                energy[chIdx] = sum / static_cast<double>(cnt);
-            }
-        }
-
-        for (std::size_t chIdx = 0; chIdx < nCh; ++chIdx) {
-            ir.energy[chIdx] = std::max(ir.energy[chIdx], energy[chIdx]);
-        }
+        extractTileEnergy(sg.spectrum, channels, chBw, energy);
 
         std::vector<double> sorted(energy.begin(), energy.end());
         std::ranges::sort(sorted);
@@ -747,14 +801,14 @@ static InterleavedResult interleavedSweep(
         const double freq = channels[static_cast<std::size_t>(bestIdx)];
 
         gr::lora::log_ts("debug", "lora_scan",
-            "B: snap %d/%d  HOT %.0f Hz  energy=%.6f (thresh=%.6f)  → immediate L2",
+            "B: snap %d/%d  HOT %.0f Hz  energy=%.6f (thresh=%.6f)  -> immediate L2",
             snap + 1, kSnapshots, freq, bestEnergy, thresh);
 
         double bestRatio = 0.0;
         DirectCadResult bestResult;
 
-        // Retune to hot channel for L2 CAD (frequency-only, stays at L1 rate)
-        retune(dev, freq, cfg.settle_ms);
+        // Retune to hot channel for L2 CAD
+        retune_source(soapy_source, freq, cfg.settle_ms);
 
         for (auto& bd : bwDets) {
             if (stopFlag.load(std::memory_order_relaxed)) {
@@ -765,9 +819,12 @@ static InterleavedResult interleavedSweep(
             const auto     decFactor  = static_cast<uint32_t>(std::round(cfg.l1_rate / targetRate));
             const uint32_t sf12Win    = (1U << 12U) * cfg.os_factor * 2U;
             const uint32_t l1Win      = sf12Win * decFactor;
-            std::vector<cf32> l1Buf(l1Win);
-            capture(stream, l1Buf.data(), l1Win, stats);
-            const auto cadBuf = decimate(l1Buf.data(), l1Win, cfg.l1_rate, targetRate);
+
+            const auto raw = capture_samples(sg.capture, l1Win, stopFlag);
+            if (raw.empty()) {
+                break;
+            }
+            const auto cadBuf = decimate(raw.data(), l1Win, cfg.l1_rate, targetRate);
 
             const auto r = detectOnBuffer(cadBuf.data(), bd.dets, freq, bd.bw);
             if (r.detected) {
@@ -787,8 +844,9 @@ static InterleavedResult interleavedSweep(
             }
         }
 
-        // Return to tile centre for next L1 snapshot (frequency-only)
-        retune(dev, tileCentre, cfg.settle_ms);
+        // Return to tile centre for next L1 snapshot
+        retune_source(soapy_source, tileCentre, cfg.settle_ms);
+        update_spectrum_centre(sg.spectrum, tileCentre);
 
         probed[static_cast<std::size_t>(bestIdx)] = true;
 
@@ -944,7 +1002,7 @@ int main(int argc, char** argv) {
         totalDwellPerCh * static_cast<double>(channels.size()), cfg.max_l2);
 
     if (cfg.sweeps == 0) {
-        gr::lora::log_ts("info ", "lora_scan", "continuous mode — Ctrl+C to stop");
+        gr::lora::log_ts("info ", "lora_scan", "continuous mode -- Ctrl+C to stop");
     } else {
         gr::lora::log_ts("info ", "lora_scan", "%u sweep(s)", cfg.sweeps);
     }
@@ -960,31 +1018,55 @@ int main(int argc, char** argv) {
 
     lora_apps::log_hardware_info("lora_scan", cfg.device, cfg.device_param);
 
-    auto dev = openDevice(cfg);
+    // Shrink thread pool — singleThreadedBlocking doesn't use it
+    gr::thread_pool::Manager::defaultCpuPool()->setThreadBounds(1, 1);
 
-    // Pin FPGA master clock to prevent 32↔16 MHz oscillation during retune.
-    // Must be called before setSampleRate() — subsequent rate changes negotiate
-    // with a fixed master clock.
-    if (cfg.master_clock > 0.0) {
-        dev.setMasterClockRate(cfg.master_clock);
+    // Build GR4 graph
+    gr::Graph graph;
+    auto sg = build_scan_graph(graph, cfg, channels);
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> sched;
+    sched.timeout_inactivity_count = 1U;
+    sched.watchdog_min_stall_count = 10U;
+    sched.watchdog_max_warnings    = 30U;
+
+    if (auto ret = sched.exchange(std::move(graph)); !ret) {
+        gr::lora::log_ts("error", "lora_scan", "scheduler init failed");
+        return 1;
     }
 
-    dev.setGain(SOAPY_SDR_RX, 0, cfg.gain);
-
-    // Set L1 rate once and keep it for the entire scan session.
-    // L2 CAD uses software decimation instead of hardware rate switching,
-    // eliminating USB buffer overflows from AD9361 reconfiguration.
-    dev.setSampleRate(SOAPY_SDR_RX, 0, cfg.l1_rate);
-    dev.setCenterFrequency(SOAPY_SDR_RX, 0, channels.front());
-
-    auto stream = dev.setupStream<cf32, SOAPY_SDR_RX>();
-    stream.activate();
+    // Find SoapySource for runtime retune (after exchange, original refs are dangling)
+    std::shared_ptr<gr::BlockModel> soapy_source;
+    for (auto& blk : sched.blocks()) {
+        if (blk->typeName().find("Soapy") != std::string_view::npos) {
+            soapy_source = blk;
+            break;
+        }
+    }
+    if (!soapy_source) {
+        gr::lora::log_ts("error", "lora_scan", "SoapySource not found in graph");
+        return 1;
+    }
 
     if (savedStdout >= 0) {
         dup2(savedStdout, STDOUT_FILENO);
         close(savedStdout);
         savedStdout = -1;
     }
+
+    // Start scheduler in background thread
+    std::atomic<bool> sched_done{false};
+    std::thread sched_thread([&sched, &sched_done]() {
+        auto ret = sched.runAndWait();
+        if (!ret.has_value()) {
+            gr::lora::log_ts("warn ", "lora_scan",
+                "scheduler stopped: %s", std::format("{}", ret.error()).c_str());
+        }
+        sched_done.store(true, std::memory_order_relaxed);
+    });
+
+    // Give the graph a moment to start streaming before the orchestrator begins
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     ScanStats stats;
 
@@ -994,8 +1076,9 @@ int main(int argc, char** argv) {
         std::fprintf(out, "%-15s  %12s  %6s\n", "freq_hz", "energy_lin", "L1");
         std::fprintf(out, "%s\n", std::string(38, '-').c_str());
 
-        while (!g_stop.load(std::memory_order_relaxed)) {
-            const auto l1 = layer1Scan(stream, dev, channels, cfg, stats);
+        while (!g_stop.load(std::memory_order_relaxed)
+               && !sched_done.load(std::memory_order_relaxed)) {
+            const auto l1 = layer1Scan(sg.spectrum, soapy_source, channels, cfg);
             std::vector<std::size_t> hotIndices;
             for (std::size_t idx = 0; idx < channels.size(); ++idx) {
                 const bool hot = std::ranges::find(l1.hot_idx, static_cast<int>(idx)) != l1.hot_idx.end();
@@ -1011,7 +1094,8 @@ int main(int argc, char** argv) {
                 break;
             }
         }
-        stream.deactivate();
+        sched.requestStop();
+        sched_thread.join();
         std::quick_exit(0);
     }
 
@@ -1078,12 +1162,13 @@ int main(int argc, char** argv) {
     std::vector<double> sweepEnergy(channels.size(), 0.0);
     auto lastCborStatus = std::chrono::steady_clock::now();
 
-    while (!g_stop.load(std::memory_order_relaxed)) {
+    while (!g_stop.load(std::memory_order_relaxed)
+           && !sched_done.load(std::memory_order_relaxed)) {
         sweepDetections.clear();
         std::ranges::fill(sweepEnergy, 0.0);
 
         if (useInterleaved) {
-            const auto bResult = interleavedSweep(stream, dev, channels, cfg, stats, g_stop);
+            const auto bResult = interleavedSweep(sg, soapy_source, channels, cfg, g_stop);
             for (const auto& det : bResult.detections) {
                 reportDetection(det);
             }
@@ -1093,7 +1178,7 @@ int main(int argc, char** argv) {
 
         if (useDirectCad && !useInterleaved
             && !g_stop.load(std::memory_order_relaxed)) {
-            const auto cResults = directCadSweep(stream, dev, channels, cfg, stats, g_stop);
+            const auto cResults = directCadSweep(sg, soapy_source, channels, cfg, g_stop);
             for (const auto& det : cResults) {
                 reportDetection(det);
             }
@@ -1102,7 +1187,7 @@ int main(int argc, char** argv) {
 
         if (!useDirectCad && !useInterleaved
             && !g_stop.load(std::memory_order_relaxed)) {
-            const auto l1 = layer1Scan(stream, dev, channels, cfg, stats);
+            const auto l1 = layer1Scan(sg.spectrum, soapy_source, channels, cfg);
             stats.l1_hot = static_cast<uint32_t>(l1.hot_idx.size());
             sweepEnergy = l1.energy;
 
@@ -1138,7 +1223,7 @@ int main(int argc, char** argv) {
                         ? cfg.cad_windows : quickWindows;
                     ScanConfig bwCfg = cfg;
                     bwCfg.cad_windows = windows;
-                    const auto l2 = layer2Cad(stream, dev, freq, bw, bwCfg, stats, g_stop);
+                    const auto l2 = layer2Cad(sg, soapy_source, freq, bw, bwCfg, g_stop);
                     if (l2.detected) {
                         const double ratio = std::max(l2.peak_ratio_up, l2.peak_ratio_dn);
                         if (ratio > bestRatio) {
@@ -1213,8 +1298,9 @@ int main(int argc, char** argv) {
     gr::lora::log_ts("info ", "lora_scan",
         "stopped after %u sweep(s), %u overflow(s), %u drop(s)",
         stats.sweeps, stats.overflows, stats.drops);
-    stream.deactivate();
 
+    sched.requestStop();
+    sched_thread.join();
     std::quick_exit(0);
 
     } catch (const std::exception& e) {
