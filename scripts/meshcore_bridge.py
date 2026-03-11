@@ -120,7 +120,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except OSError, subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     return "dev"
 
@@ -2236,7 +2236,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except ConnectionError, OSError:
+                    except (ConnectionError, OSError):
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2258,7 +2258,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except BlockingIOError, OSError:
+                    except (BlockingIOError, OSError):
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2408,7 +2408,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except ConnectionError, OSError:
+    except (ConnectionError, OSError):
         pass  # client disconnected, will be cleaned up on next recv
 
 
