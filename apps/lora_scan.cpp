@@ -747,7 +747,7 @@ static InterleavedResult interleavedSweep(
     const double tileCentre = (channels.front() + channels.back()) / 2.0;
 
     constexpr double kL1Multiplier = 6.0;
-    const int kSnapshots = static_cast<int>(3U * nCh * cfg.bws.size());
+    const int kSnapshots = static_cast<int>(2U * nCh * cfg.bws.size());
 
     std::vector<double> energy(nCh, 0.0);
     std::vector<bool> probed(nCh, false);
@@ -1386,7 +1386,7 @@ int main(int argc, char** argv) {
 
             if (cfg.cbor_out) {
                 const auto kTotalSnaps = static_cast<uint32_t>(
-                    3U * channels.size() * cfg.bws.size());
+                    2U * channels.size() * cfg.bws.size());
                 emitSweepEndCbor(sweepNum, sweepMs, kTotalSnaps,
                                  bResult.l2_probes, bResult.l1_hot_total,
                                  static_cast<uint32_t>(sweepDetections.size()),
