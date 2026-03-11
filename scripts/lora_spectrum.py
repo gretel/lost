@@ -83,7 +83,7 @@ class State:
         self.freq_step: int = 62500
         self.n_channels: int = 0
         self.hot: set[int] = set()
-        self.det_history: list[tuple[str, dict[str, Any]]] = []  # (timestamp, det)
+        self.det_history: list[tuple[str, int, dict[str, Any]]] = []  # (ts, sweep, det)
         self.ema_alpha: float = ema_alpha
 
         # from scan_status
@@ -119,8 +119,9 @@ class State:
         self.hot = set(msg.get("hot", []))
 
         ts = time.strftime("%H:%M:%S")
+        sweep = msg.get("sweep", self.sweeps)
         for det in msg.get("detections", []):
-            self.det_history.append((ts, det))
+            self.det_history.append((ts, sweep, det))
         self.det_history = self.det_history[-DET_HISTORY:]
 
         self.sweeps = msg.get("sweep", self.sweeps)
@@ -211,17 +212,20 @@ def _render_header(s: State) -> str:
 def _render_footer(s: State) -> str:
     """Build footer: last N detections, one per line, newest first."""
     lines: list[str] = []
-    for ts, det in reversed(s.det_history):
+    for ts, sweep, det in reversed(s.det_history):
         freq_mhz = det["freq"] / 1e6
         bw_k = det["bw"] / 1000
-        ratio = max(det.get("peak_ratio_up", 0), det.get("peak_ratio_dn", 0))
-        if ratio == 0:
-            ratio = det.get("ratio", 0)
+        ratio_up = det.get("ratio_up", 0.0)
+        ratio_dn = det.get("ratio_dn", 0.0)
+        if ratio_up == 0 and ratio_dn == 0:
+            ratio_up = ratio_dn = det.get("ratio", 0.0)
         chirp = det.get("chirp", "")
         lines.append(
-            f"{C_DIM}{ts}{C_RST} {freq_mhz:.3f} SF{det['sf']}/{bw_k:.0f}k"
-            + f" r={ratio:.1f}"
-            + (f" {chirp}" if chirp else "")
+            f"{C_DIM}{ts}{C_RST}"
+            + f" #{sweep:<4}"
+            + f" {freq_mhz:>7.3f} SF{det['sf']}/{bw_k:.0f}k"
+            + f"  up={ratio_up:>5.1f} dn={ratio_dn:>5.1f}"
+            + (f"  {chirp}" if chirp else "")
             + "\033[K"
         )
     # Pad to DET_HISTORY lines so the layout is stable

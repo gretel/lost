@@ -410,4 +410,117 @@ const boost::ut::suite<"CAD minimum SNR"> snr_tests = [] {
     };
 };
 
+const boost::ut::suite<"CAD multi-SF detection"> multi_sf_tests = [] {
+    using namespace boost::ut;
+    using gr::lora::ChannelActivityDetector;
+
+    "detectMultiSf identifies correct SF from shared buffer"_test = [] {
+        // Generate an SF8 upchirp in an SF12-sized buffer.
+        // detectMultiSf should identify SF8 as the winning SF.
+        constexpr uint8_t kTargetSf = 8;
+        constexpr uint8_t kOS       = 4;
+        constexpr uint32_t kSf12Win = (1U << 12U) * kOS * 2U;
+
+        // Build SF12-sized buffer with SF8 upchirp in the prefix
+        auto chirpWin = make_upchirp_window(kTargetSf, kOS, 20.f);
+        std::vector<cf32> buf(kSf12Win, {0.f, 0.f});
+        std::copy(chirpWin.begin(), chirpWin.end(), buf.begin());
+
+        ChannelActivityDetector block;
+        block.os_factor  = kOS;
+        block.dual_chirp = true;
+        block.sf         = kTargetSf;  // needed for start()
+        block.start();
+        block.initMultiSf();
+
+        auto r = block.detectMultiSf(buf.data());
+        expect(r.detected) << "detectMultiSf should detect the SF8 chirp";
+        expect(eq(r.sf, 8U)) << "winning SF should be 8, got " << r.sf;
+        expect(gt(r.best_ratio, 4.16f)) << "best_ratio should exceed SF8 alpha";
+    };
+
+    "detectMultiSf identifies SF12 chirp"_test = [] {
+        constexpr uint8_t kTargetSf = 12;
+        constexpr uint8_t kOS       = 4;
+
+        auto chirpWin = make_upchirp_window(kTargetSf, kOS, 20.f);
+
+        ChannelActivityDetector block;
+        block.os_factor  = kOS;
+        block.dual_chirp = true;
+        block.sf         = kTargetSf;
+        block.start();
+        block.initMultiSf();
+
+        auto r = block.detectMultiSf(chirpWin.data());
+        expect(r.detected) << "detectMultiSf should detect SF12 chirp";
+        expect(eq(r.sf, 12U)) << "winning SF should be 12, got " << r.sf;
+    };
+
+    "detectMultiSf identifies SF7 chirp"_test = [] {
+        constexpr uint8_t kTargetSf = 7;
+        constexpr uint8_t kOS       = 4;
+        constexpr uint32_t kSf12Win = (1U << 12U) * kOS * 2U;
+
+        auto chirpWin = make_upchirp_window(kTargetSf, kOS, 20.f);
+        std::vector<cf32> buf(kSf12Win, {0.f, 0.f});
+        std::copy(chirpWin.begin(), chirpWin.end(), buf.begin());
+
+        ChannelActivityDetector block;
+        block.os_factor  = kOS;
+        block.dual_chirp = true;
+        block.sf         = kTargetSf;
+        block.start();
+        block.initMultiSf();
+
+        auto r = block.detectMultiSf(buf.data());
+        expect(r.detected) << "detectMultiSf should detect SF7 chirp";
+        expect(eq(r.sf, 7U)) << "winning SF should be 7, got " << r.sf;
+    };
+
+    "detectMultiSf returns sf=0 on noise"_test = [] {
+        constexpr uint8_t kOS = 4;
+        constexpr uint32_t kSf12Win = (1U << 12U) * kOS * 2U;
+
+        // Pure noise
+        std::mt19937 rng(99U);
+        std::normal_distribution<float> dist(0.f, 1.f);
+        std::vector<cf32> buf(kSf12Win);
+        for (auto& s : buf) s = {dist(rng), dist(rng)};
+
+        ChannelActivityDetector block;
+        block.os_factor  = kOS;
+        block.dual_chirp = true;
+        block.sf         = 8;
+        block.start();
+        block.initMultiSf();
+
+        auto r = block.detectMultiSf(buf.data());
+        expect(!r.detected) << "detectMultiSf should not detect on noise";
+        expect(eq(r.sf, 0U)) << "sf should be 0 when nothing detected";
+    };
+
+    "detectMultiSf detects downchirp"_test = [] {
+        constexpr uint8_t kTargetSf = 10;
+        constexpr uint8_t kOS       = 4;
+        constexpr uint32_t kSf12Win = (1U << 12U) * kOS * 2U;
+
+        auto chirpWin = make_downchirp_window(kTargetSf, kOS, 20.f);
+        std::vector<cf32> buf(kSf12Win, {0.f, 0.f});
+        std::copy(chirpWin.begin(), chirpWin.end(), buf.begin());
+
+        ChannelActivityDetector block;
+        block.os_factor  = kOS;
+        block.dual_chirp = true;
+        block.sf         = kTargetSf;
+        block.start();
+        block.initMultiSf();
+
+        auto r = block.detectMultiSf(buf.data());
+        expect(r.detected) << "detectMultiSf should detect SF10 downchirp";
+        expect(eq(r.sf, 10U)) << "winning SF should be 10, got " << r.sf;
+        expect(r.dn_detected) << "dn_detected should be true";
+    };
+};
+
 int main() { /* boost::ut auto-runs all suites */ }

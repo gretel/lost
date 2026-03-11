@@ -94,6 +94,19 @@ struct ChannelActivityDetector
         bool     detected{false};
     };
 
+    /// Result of multi-SF detection on a shared buffer.
+    struct MultiSfResult {
+        float    best_ratio{0.f};       ///< max(peak_ratio_up, peak_ratio_dn) of winning SF
+        float    peak_ratio_up{0.f};
+        float    peak_ratio_dn{0.f};
+        uint32_t peak_bin_up{0};
+        uint32_t peak_bin_dn{0};
+        uint32_t sf{0};                 ///< winning SF (0 = no detection)
+        bool     up_detected{false};
+        bool     dn_detected{false};
+        bool     detected{false};
+    };
+
     /// Compute the best peak_ratio = max|Y|/mean|Y| across os_factor sub-chip
     /// timing offsets for one oversampled symbol window.
     ///
@@ -138,6 +151,48 @@ struct ChannelActivityDetector
         return r;
     }
 
+    /// Detect chirp activity across SF7-12 on a shared SF12-sized buffer.
+    ///
+    /// The buffer must contain at least `2 * (1<<12) * os_factor` samples at
+    /// the target BW's sample rate.  Each SF trial reads only its required
+    /// prefix (`2 * 2^sf * os_factor` samples).  Returns the SF with the
+    /// highest peak ratio among those that pass the α threshold.
+    ///
+    /// Call `initMultiSf()` once before using this method (builds reference
+    /// chirps for all 6 SFs).
+    [[nodiscard]] MultiSfResult detectMultiSf(const std::complex<float>* samples) {
+        MultiSfResult best;
+        for (auto& sr : _sf_table) {
+            const float thresh = default_alpha(sr.sf);
+            const auto r = detect_with_refs(samples, sr, thresh);
+            if (!r.detected) continue;
+
+            const float winRatio = std::max(r.peak_ratio_up, r.peak_ratio_dn);
+            if (winRatio > best.best_ratio) {
+                best.best_ratio    = winRatio;
+                best.peak_ratio_up = r.peak_ratio_up;
+                best.peak_ratio_dn = r.peak_ratio_dn;
+                best.peak_bin_up   = r.peak_bin_up;
+                best.peak_bin_dn   = r.peak_bin_dn;
+                best.sf            = sr.sf;
+                best.up_detected   = r.up_detected;
+                best.dn_detected   = r.dn_detected;
+                best.detected      = true;
+            }
+        }
+        return best;
+    }
+
+    /// Pre-build reference chirps for SF7-12.  Must be called once before
+    /// `detectMultiSf()`.  Uses the block's current `os_factor` and
+    /// `dual_chirp` settings.
+    void initMultiSf() {
+        _sf_table.clear();
+        for (uint32_t trySf = 7; trySf <= 12; ++trySf) {
+            _sf_table.push_back(build_sf_refs(trySf));
+        }
+    }
+
 private:
     uint32_t _sym_len{0};  ///< N * os_factor: samples per oversampled symbol
     uint32_t _win_len{0};  ///< 2 * sym_len: samples in a full 2-symbol window
@@ -157,6 +212,93 @@ private:
 
     std::atomic<bool>* _channel_busy{nullptr};  ///< external LBT flag (nullable)
 
+    struct PeakResult {
+        float    ratio{0.f};
+        uint32_t bin{0};
+    };
+
+    /// Pre-built reference chirps and workspace for one SF (used by detectMultiSf).
+    struct SfRefs {
+        uint32_t sf{0};
+        uint32_t N{0};         ///< 2^sf
+        uint32_t sym_len{0};   ///< N * os_factor
+        std::vector<std::complex<float>> up_ref{};    ///< upchirp 1x
+        std::vector<std::complex<float>> down_ref{};  ///< downchirp 1x
+        std::vector<std::complex<float>> scratch{};    ///< FFT workspace (length N)
+        gr::algorithm::FFT<std::complex<float>> fft{};
+    };
+
+    std::vector<SfRefs> _sf_table{};  ///< SF7-12 refs (populated by initMultiSf)
+
+    [[nodiscard]] SfRefs build_sf_refs(uint32_t trySf) const {
+        SfRefs sr;
+        sr.sf      = trySf;
+        sr.N       = 1U << trySf;
+        sr.sym_len = sr.N * os_factor;
+        sr.up_ref.resize(sr.N);
+        sr.down_ref.resize(sr.N);
+        build_ref_chirps(sr.up_ref.data(), sr.down_ref.data(),
+                         static_cast<uint8_t>(trySf), /*os_factor=*/1U);
+        sr.scratch.resize(sr.N);
+        sr.fft = gr::algorithm::FFT<std::complex<float>>{};
+        return sr;
+    }
+
+    /// Run peak_ratio computation using an SfRefs' workspace (not the block's _scratch/_fft).
+    [[nodiscard]] PeakResult peak_ratio_with_refs(
+            const std::complex<float>* samples,
+            SfRefs& sr,
+            const std::complex<float>* ref) {
+        PeakResult best;
+        const auto os = static_cast<uint32_t>(os_factor);
+        for (uint32_t l = 0; l < os; ++l) {
+            for (uint32_t m = 0; m < sr.N; ++m) {
+                sr.scratch[m] = samples[l + m * os] * ref[m];
+            }
+            auto fft_out = sr.fft.compute(
+                std::span<const std::complex<float>>(sr.scratch.data(), sr.N));
+
+            float    peak = 0.f, total = 0.f;
+            uint32_t peak_idx = 0;
+            for (uint32_t i = 0; i < sr.N; ++i) {
+                float mag = std::abs(fft_out[i]);
+                total += mag;
+                if (mag > peak) { peak = mag; peak_idx = i; }
+            }
+            float mean  = total / static_cast<float>(sr.N);
+            float ratio = (mean > 0.f) ? (peak / mean) : 0.f;
+            if (ratio > best.ratio) { best.ratio = ratio; best.bin = peak_idx; }
+        }
+        return best;
+    }
+
+    /// Run full 2-window detection using pre-built SfRefs (for detectMultiSf).
+    [[nodiscard]] DetectResult detect_with_refs(
+            const std::complex<float>* samples,
+            SfRefs& sr,
+            float thresh) {
+        const std::complex<float>* w1 = samples;
+        const std::complex<float>* w2 = samples + sr.sym_len;
+
+        DetectResult r;
+        const auto p1_up = peak_ratio_with_refs(w1, sr, sr.down_ref.data());
+        const auto p2_up = peak_ratio_with_refs(w2, sr, sr.down_ref.data());
+        r.peak_ratio_up = std::max(p1_up.ratio, p2_up.ratio);
+        r.peak_bin_up   = (p1_up.ratio >= p2_up.ratio) ? p1_up.bin : p2_up.bin;
+        r.up_detected   = (p1_up.ratio > thresh) && (p2_up.ratio > thresh);
+
+        if (dual_chirp) {
+            const auto p1_dn = peak_ratio_with_refs(w1, sr, sr.up_ref.data());
+            const auto p2_dn = peak_ratio_with_refs(w2, sr, sr.up_ref.data());
+            r.peak_ratio_dn = std::max(p1_dn.ratio, p2_dn.ratio);
+            r.peak_bin_dn   = (p1_dn.ratio >= p2_dn.ratio) ? p1_dn.bin : p2_dn.bin;
+            r.dn_detected   = (p1_dn.ratio > thresh) && (p2_dn.ratio > thresh);
+        }
+
+        r.detected = r.up_detected || r.dn_detected;
+        return r;
+    }
+
     void rebuild_refs() {
         _N       = 1U << sf;
         _sym_len = _N * os_factor;
@@ -171,13 +313,7 @@ private:
         _buf.assign(_win_len, {0.f, 0.f});
         _buf_fill = 0U;
         _fft      = gr::algorithm::FFT<std::complex<float>>{};
-
     }
-
-    struct PeakResult {
-        float    ratio{0.f};
-        uint32_t bin{0};
-    };
 
     /// Core dechirp+FFT peak-ratio computation, no buffer side-effects.
     /// Tries os_factor sub-chip timing offsets; returns the best ratio and its bin.

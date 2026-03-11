@@ -74,12 +74,9 @@ struct ScanConfig {
     int                  settle_ms    = 5;
     double               l1_rate      = 16.0e6;
     double               master_clock = 32.0e6;
-    uint32_t             cad_windows  = 8;
-    uint32_t             max_l2       = 8;
     float                min_ratio    = 8.0F;
     uint32_t             sweeps       = 0;
     bool                 layer1_only  = false;
-    bool                 all_channels = false;
     bool                 cbor_out     = false;
 
     [[nodiscard]] double min_bw() const { return *std::ranges::min_element(bws); }
@@ -102,12 +99,9 @@ static void print_usage() {
         "  --settle-ms <ms>      PLL settle delay after retune (default: 5)\n"
         "  --l1-rate <Hz>        L1 wideband sample rate (default: 16e6)\n"
         "  --master-clock <Hz>   FPGA master clock rate (default: 32e6)\n"
-        "  --cad-windows <K>     CAD windows per BW per channel (default: 8)\n"
-        "  --max-l2 <N>          Max L2 candidates per sweep (default: 8)\n"
         "  --min-ratio <f>       Min peak ratio to report (default: 8.0)\n"
         "  --sweeps <N>          Stop after N sweeps (default: 0 = infinite)\n"
         "  --layer1-only         Stop after Layer 1 (energy scan only)\n"
-        "  --all-channels        Run CAD on all channels, not just hot ones\n"
         "  --cbor                Emit CBOR frames on stdout (pipe to lora_spectrum.py)\n"
         "  --log-level <level>   Log level: DEBUG, INFO, WARNING, ERROR\n"
         "  --version             Show version and exit\n"
@@ -156,12 +150,9 @@ static int parseArgs(int argc, char** argv, ScanConfig& cfg) {
         else if (arg == "--settle-ms")     cfg.settle_ms    = std::stoi(next());
         else if (arg == "--l1-rate")       cfg.l1_rate      = std::stod(next());
         else if (arg == "--master-clock")  cfg.master_clock = std::stod(next());
-        else if (arg == "--cad-windows")   cfg.cad_windows  = static_cast<uint32_t>(std::stoul(next()));
-        else if (arg == "--max-l2")        cfg.max_l2       = static_cast<uint32_t>(std::stoul(next()));
         else if (arg == "--min-ratio")     cfg.min_ratio    = std::stof(next());
         else if (arg == "--sweeps")        cfg.sweeps       = static_cast<uint32_t>(std::stoul(next()));
         else if (arg == "--layer1-only")   cfg.layer1_only  = true;
-        else if (arg == "--all-channels")  cfg.all_channels = true;
         else if (arg == "--cbor")          cfg.cbor_out     = true;
         else {
             std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
@@ -185,12 +176,6 @@ static int parseArgs(int argc, char** argv, ScanConfig& cfg) {
                 cfg.l1_rate, bw, cfg.os_factor, factor);
             return 1;
         }
-    }
-    const double scanRange = cfg.freq_stop - cfg.freq_start;
-    if (scanRange > cfg.l1_rate * 0.9) {
-        gr::lora::log_ts("warn ", "lora_scan",
-            "scan range %.1f MHz > L1 rate %.1f MS/s -- L1 will tile multiple snapshots",
-            scanRange / 1.0e6, cfg.l1_rate / 1.0e6);
     }
     return 0;
 }
@@ -500,119 +485,19 @@ static Layer1Result layer1Scan(
 
 // ─── Layer 2: per-channel CAD dwell — multi-SF on each window ────────────────
 
-struct Layer2Result {
-    double   peak_ratio_up = 0.0;
-    double   peak_ratio_dn = 0.0;
-    uint32_t sf_detected    = 0;
-    uint32_t detections     = 0;
-    uint32_t windows_tried  = 0;
-    bool     detected       = false;
-};
-
-struct SfDetector {
-    gr::lora::ChannelActivityDetector det;
-    uint32_t sf;
-};
-
-static std::vector<SfDetector> buildDetectors(double bw, uint32_t osFactor) {
-    std::vector<SfDetector> detectors;
-    for (uint32_t trySf = 7; trySf <= 12; ++trySf) {
-        SfDetector sd;
-        sd.sf              = trySf;
-        sd.det.sf          = trySf;
-        sd.det.bandwidth   = static_cast<uint32_t>(bw);
-        sd.det.os_factor   = osFactor;
-        sd.det.alpha       = gr::lora::ChannelActivityDetector::default_alpha(trySf);
-        sd.det.dual_chirp  = true;
-        sd.det.debug       = false;
-        sd.det.start();
-        detectors.push_back(std::move(sd));
-    }
-    return detectors;
+/// Build a ChannelActivityDetector pre-initialized for multi-SF detection.
+static gr::lora::ChannelActivityDetector buildMultiSfDetector(
+        double bw, uint32_t osFactor) {
+    gr::lora::ChannelActivityDetector cad;
+    cad.sf         = 12U;  // start() needs a valid SF; detectMultiSf uses its own table
+    cad.bandwidth  = static_cast<uint32_t>(bw);
+    cad.os_factor  = osFactor;
+    cad.dual_chirp = true;
+    cad.debug      = false;
+    cad.start();
+    cad.initMultiSf();
+    return cad;
 }
-
-static Layer2Result detectOnBuffer(const cf32* buf, std::vector<SfDetector>& detectors,
-                                   double freq, double bw) {
-    Layer2Result result;
-    result.windows_tried = 1;
-
-    float    bestUp = 0.0F;
-    float    bestDn = 0.0F;
-    uint32_t bestSf = 0;
-
-    for (auto& sd : detectors) {
-        const auto r = sd.det.detect(buf);
-        const float winRatio = std::max(r.peak_ratio_up, r.peak_ratio_dn);
-        if (r.detected && winRatio > std::max(bestUp, bestDn)) {
-            bestUp = r.peak_ratio_up;
-            bestDn = r.peak_ratio_dn;
-            bestSf = sd.sf;
-        }
-    }
-
-    if (bestSf != 0) {
-        result.detected      = true;
-        result.detections    = 1;
-        result.sf_detected   = bestSf;
-        result.peak_ratio_up = static_cast<double>(bestUp);
-        result.peak_ratio_dn = static_cast<double>(bestDn);
-
-        gr::lora::log_ts("debug", "lora_scan",
-            "CAD %.0f Hz BW=%.0f SF%u  ratio_up=%.2f ratio_dn=%.2f",
-            freq, bw, bestSf,
-            static_cast<double>(bestUp), static_cast<double>(bestDn));
-    }
-    return result;
-}
-
-/// L2 CAD on a single channel+BW: capture at L1 rate, decimate, run CAD.
-static Layer2Result layer2Cad(
-        ScanGraph& sg,
-        std::shared_ptr<gr::BlockModel>& soapy_source,
-        double freq, double bw,
-        const ScanConfig& cfg,
-        const std::atomic<bool>& stopFlag) {
-    const double targetRate = bw * static_cast<double>(cfg.os_factor);
-    retune_source(soapy_source, freq, cfg.settle_ms);
-
-    auto detectors = buildDetectors(bw, cfg.os_factor);
-
-    Layer2Result result;
-    result.windows_tried = cfg.cad_windows;
-
-    const uint32_t sf12Win   = (1U << 12U) * cfg.os_factor * 2U;
-    const auto     decFactor = static_cast<uint32_t>(std::round(cfg.l1_rate / targetRate));
-    const uint32_t l1Win     = sf12Win * decFactor;
-
-    for (uint32_t win = 0; win < cfg.cad_windows; ++win) {
-        if (stopFlag.load(std::memory_order_relaxed)) {
-            break;
-        }
-
-        const auto raw = capture_samples(sg.capture, l1Win, stopFlag);
-        if (raw.empty()) {
-            break;
-        }
-        const auto cadBuf = decimate(raw.data(), l1Win, cfg.l1_rate, targetRate);
-        const auto r = detectOnBuffer(cadBuf.data(), detectors, freq, bw);
-
-        if (r.detected) {
-            const double ratio = std::max(r.peak_ratio_up, r.peak_ratio_dn);
-            if (ratio > std::max(result.peak_ratio_up, result.peak_ratio_dn)) {
-                result.detected      = true;
-                result.detections   += 1;
-                result.sf_detected   = r.sf_detected;
-                result.peak_ratio_up = std::max(result.peak_ratio_up, r.peak_ratio_up);
-                result.peak_ratio_dn = std::max(result.peak_ratio_dn, r.peak_ratio_dn);
-            }
-            break;
-        }
-    }
-
-    return result;
-}
-
-// ─── Mode C: direct-CAD sweep (no L1) ───────────────────────────────────────
 
 struct DirectCadResult {
     double   freq          = 0.0;
@@ -621,81 +506,6 @@ struct DirectCadResult {
     double   peak_ratio_dn = 0.0;
     uint32_t sf_detected   = 0;
 };
-
-static std::vector<DirectCadResult> directCadSweep(
-        ScanGraph& sg,
-        std::shared_ptr<gr::BlockModel>& soapy_source,
-        const std::vector<double>& channels,
-        const ScanConfig& cfg,
-        const std::atomic<bool>& stopFlag) {
-    std::vector<DirectCadResult> results;
-
-    struct BwDetectors {
-        double bw;
-        std::vector<SfDetector> dets;
-    };
-    std::vector<BwDetectors> bwDets;
-    for (const double bw : cfg.bws) {
-        BwDetectors bd;
-        bd.bw   = bw;
-        bd.dets = buildDetectors(bw, cfg.os_factor);
-        bwDets.push_back(std::move(bd));
-    }
-
-    for (const double freq : channels) {
-        if (stopFlag.load(std::memory_order_relaxed)) {
-            break;
-        }
-
-        retune_source(soapy_source, freq, cfg.settle_ms);
-
-        double       bestRatio = 0.0;
-        DirectCadResult bestResult;
-
-        for (auto& bd : bwDets) {
-            if (stopFlag.load(std::memory_order_relaxed)) {
-                break;
-            }
-
-            const double targetRate = bd.bw * static_cast<double>(cfg.os_factor);
-            const auto   decFactor  = static_cast<uint32_t>(std::round(cfg.l1_rate / targetRate));
-
-            for (auto& sd : bd.dets) {
-                if (stopFlag.load(std::memory_order_relaxed)) {
-                    break;
-                }
-                const uint32_t sfWin = (1U << sd.sf) * cfg.os_factor * 2U;
-                const uint32_t l1Win = sfWin * decFactor;
-
-                const auto raw = capture_samples(sg.capture, l1Win, stopFlag);
-                if (raw.empty()) {
-                    break;
-                }
-                const auto cadBuf = decimate(raw.data(), l1Win, cfg.l1_rate, targetRate);
-                const auto r = sd.det.detect(cadBuf.data());
-                if (r.detected) {
-                    const double ratio = std::max(
-                        static_cast<double>(r.peak_ratio_up),
-                        static_cast<double>(r.peak_ratio_dn));
-                    if (ratio > bestRatio) {
-                        bestRatio         = ratio;
-                        bestResult.freq   = freq;
-                        bestResult.bw     = bd.bw;
-                        bestResult.peak_ratio_up = static_cast<double>(r.peak_ratio_up);
-                        bestResult.peak_ratio_dn = static_cast<double>(r.peak_ratio_dn);
-                        bestResult.sf_detected   = sd.sf;
-                    }
-                }
-            }
-        }
-
-        if (bestRatio > 0.0) {
-            results.push_back(bestResult);
-        }
-    }
-
-    return results;
-}
 
 // ─── Mode B: interleaved L1 snapshot + immediate L2 ─────────────────────────
 
@@ -732,16 +542,13 @@ static InterleavedResult interleavedSweep(
     const double      chBw   = cfg.min_bw();
     ir.energy.resize(nCh, 0.0);
 
-    struct BwDetectors {
+    struct BwDetector {
         double bw;
-        std::vector<SfDetector> dets;
+        gr::lora::ChannelActivityDetector cad;
     };
-    std::vector<BwDetectors> bwDets;
+    std::vector<BwDetector> bwDets;
     for (const double bw : cfg.bws) {
-        BwDetectors bd;
-        bd.bw      = bw;
-        bd.dets    = buildDetectors(bw, cfg.os_factor);
-        bwDets.push_back(std::move(bd));
+        bwDets.push_back({bw, buildMultiSfDetector(bw, cfg.os_factor)});
     }
 
     const double tileCentre = (channels.front() + channels.back()) / 2.0;
@@ -858,26 +665,26 @@ static InterleavedResult interleavedSweep(
             // Decimate a prefix of the single capture
             const auto cadBuf = decimate(l2Raw.data(), l1Win, cfg.l1_rate, targetRate);
 
-            const auto r = detectOnBuffer(cadBuf.data(), bd.dets, freq, bd.bw);
+            const auto r = bd.cad.detectMultiSf(cadBuf.data());
             if (r.detected) {
-                const double ratio = std::max(r.peak_ratio_up, r.peak_ratio_dn);
+                const double ratio = static_cast<double>(r.best_ratio);
                 if (ratio > bestRatio) {
                     bestRatio         = ratio;
                     bestResult.freq   = freq;
                     bestResult.bw     = bd.bw;
-                    bestResult.peak_ratio_up = r.peak_ratio_up;
-                    bestResult.peak_ratio_dn = r.peak_ratio_dn;
-                    bestResult.sf_detected   = r.sf_detected;
+                    bestResult.peak_ratio_up = static_cast<double>(r.peak_ratio_up);
+                    bestResult.peak_ratio_dn = static_cast<double>(r.peak_ratio_dn);
+                    bestResult.sf_detected   = r.sf;
                 }
             }
 
             {
                 const double ratio = r.detected
-                    ? std::max(r.peak_ratio_up, r.peak_ratio_dn) : 0.0;
+                    ? static_cast<double>(r.best_ratio) : 0.0;
                 const char* chirp = !r.detected ? ""
                     : (r.peak_ratio_up > 0 && r.peak_ratio_dn > 0) ? "both"
                     : (r.peak_ratio_dn > r.peak_ratio_up) ? "dn" : "up";
-                bwResults.push_back({bd.bw, r.sf_detected, ratio, chirp});
+                bwResults.push_back({bd.bw, r.sf, ratio, chirp});
             }
 
             if (bestRatio > 10.0) {
@@ -952,11 +759,13 @@ static void emitSpectrumCbor(
     cb::encode_text(buf, "detections");
     cb::encode_array_begin(buf, detections.size());
     for (const auto& det : detections) {
-        cb::encode_map_begin(buf, 5);
+        cb::encode_map_begin(buf, 7);
         cb::kv_uint(buf, "freq", static_cast<uint64_t>(det.freq));
         cb::kv_uint(buf, "sf", det.sf_detected);
         cb::kv_uint(buf, "bw", static_cast<uint64_t>(det.bw));
         cb::kv_float64(buf, "ratio", std::max(det.peak_ratio_up, det.peak_ratio_dn));
+        cb::kv_float64(buf, "ratio_up", det.peak_ratio_up);
+        cb::kv_float64(buf, "ratio_dn", det.peak_ratio_dn);
         const char* chirp = (det.peak_ratio_up > 0 && det.peak_ratio_dn > 0) ? "both"
                           : (det.peak_ratio_dn > det.peak_ratio_up)           ? "dn"
                           :                                                     "up";
@@ -1110,10 +919,6 @@ int main(int argc, char** argv) {
     try {
     const auto channels = makeChannelList(cfg.freq_start, cfg.freq_stop, cfg.min_bw());
 
-    constexpr uint32_t kSF12Len = 4096U;
-    const double dwellPerCh = static_cast<double>(kSF12Len * cfg.os_factor * 2U * cfg.cad_windows)
-                              / (cfg.min_bw() * static_cast<double>(cfg.os_factor));
-
     std::string bwListStr;
     for (std::size_t i = 0; i < cfg.bws.size(); ++i) {
         if (i > 0) bwListStr += ",";
@@ -1128,15 +933,6 @@ int main(int argc, char** argv) {
         "%zu channel(s) SF7-12 BW=[%s] Hz os=%u L1=%.1f MS/s",
         channels.size(), bwListStr.c_str(),
         cfg.os_factor, cfg.l1_rate / 1.0e6);
-
-    const uint32_t qw = std::max(4U, cfg.cad_windows / 8U);
-    const double totalDwellPerCh = dwellPerCh
-        + dwellPerCh * static_cast<double>(qw) / static_cast<double>(cfg.cad_windows)
-          * static_cast<double>(cfg.bws.size() > 1 ? cfg.bws.size() - 1 : 0);
-    gr::lora::log_ts("info ", "lora_scan",
-        "%u CAD windows/ch  ~%.0f ms dwell/ch  ~%.1f s/sweep  max-l2=%u",
-        cfg.cad_windows, totalDwellPerCh * 1000.0,
-        totalDwellPerCh * static_cast<double>(channels.size()), cfg.max_l2);
 
     if (cfg.sweeps == 0) {
         gr::lora::log_ts("info ", "lora_scan", "continuous mode -- Ctrl+C to stop");
@@ -1248,18 +1044,20 @@ int main(int argc, char** argv) {
 
     const double scanRange = channels.back() - channels.front() + cfg.min_bw();
     const double usableBw  = cfg.l1_rate * 0.8;
-    const bool   singleTile = scanRange <= usableBw;
 
-    constexpr std::size_t kDirectCadMaxChannels = 64;
-    const bool useDirectCad = channels.size() <= kDirectCadMaxChannels;
-    const bool useInterleaved = singleTile;
+    if (scanRange > usableBw) {
+        gr::lora::log_ts("error", "lora_scan",
+            "scan range %.1f MHz exceeds usable BW %.1f MHz at L1 rate %.1f MS/s "
+            "-- increase --l1-rate or narrow --freq-start/--freq-stop",
+            scanRange / 1.0e6, usableBw / 1.0e6, cfg.l1_rate / 1.0e6);
+        sched.requestStop();
+        sched_thread.join();
+        return 1;
+    }
 
-    const char* modeName = useInterleaved
-        ? "single-pass"
-        : (useDirectCad ? "direct-CAD" : "multi-tile");
     gr::lora::log_ts("info ", "lora_scan",
-        "scan mode: %s  (%zu ch, range=%.1f MHz, tile=%.1f MHz)",
-        modeName, channels.size(), scanRange / 1.0e6, usableBw / 1.0e6);
+        "scan mode: single-pass  (%zu ch, range=%.1f MHz, tile=%.1f MHz)",
+        channels.size(), scanRange / 1.0e6, usableBw / 1.0e6);
 
     std::vector<DirectCadResult> sweepDetections;
 
@@ -1290,8 +1088,6 @@ int main(int argc, char** argv) {
         stats.last_det_freq = freqBuf;
         stats.last_det_time = ts;
     };
-
-    const uint32_t quickWindows = std::max(4U, cfg.cad_windows / 8U);
 
     std::vector<double> sweepEnergy(channels.size(), 0.0);
     auto lastCborStatus = std::chrono::steady_clock::now();
@@ -1324,102 +1120,30 @@ int main(int argc, char** argv) {
         const auto sweepStart = std::chrono::steady_clock::now();
         uint32_t l2Probes = 0;
 
-        if (useInterleaved) {
-            if (cfg.cbor_out) {
-                emitSweepStartCbor(sweepNum);
-            }
-
-            SweepCallbacks callbacks;
-            if (cfg.cbor_out) {
-                callbacks.onRetune = [sweepNum](double freq, const char* reason) {
-                    emitRetuneCbor(sweepNum, freq, reason);
-                };
-                callbacks.onL2Probe = [&, sweepNum](double freq, uint32_t ms,
-                        std::vector<L2BwResult> results) {
-                    emitL2ProbeCbor(sweepNum, freq, ms, results);
-                    checkOverflows(sweepNum);
-                };
-            }
-
-            const auto bResult = interleavedSweep(sg, soapy_source, channels, cfg,
-                                                   g_stop, callbacks);
-            for (const auto& det : bResult.detections) {
-                reportDetection(det);
-            }
-            stats.l1_hot = bResult.l1_hot_total;
-            sweepEnergy = bResult.energy;
-            l2Probes = bResult.l2_probes;
+        if (cfg.cbor_out) {
+            emitSweepStartCbor(sweepNum);
         }
 
-        if (useDirectCad && !useInterleaved
-            && !g_stop.load(std::memory_order_relaxed)) {
-            const auto cResults = directCadSweep(sg, soapy_source, channels, cfg, g_stop);
-            for (const auto& det : cResults) {
-                reportDetection(det);
-            }
-            stats.l1_hot = static_cast<uint32_t>(cResults.size());
+        SweepCallbacks callbacks;
+        if (cfg.cbor_out) {
+            callbacks.onRetune = [sweepNum](double freq, const char* reason) {
+                emitRetuneCbor(sweepNum, freq, reason);
+            };
+            callbacks.onL2Probe = [&, sweepNum](double freq, uint32_t ms,
+                    std::vector<L2BwResult> results) {
+                emitL2ProbeCbor(sweepNum, freq, ms, results);
+                checkOverflows(sweepNum);
+            };
         }
 
-        if (!useDirectCad && !useInterleaved
-            && !g_stop.load(std::memory_order_relaxed)) {
-            const auto l1 = layer1Scan(sg.spectrum, soapy_source, channels, cfg);
-            stats.l1_hot = static_cast<uint32_t>(l1.hot_idx.size());
-            sweepEnergy = l1.energy;
-
-            std::vector<std::size_t> l2_candidates;
-            if (cfg.all_channels) {
-                for (std::size_t i = 0; i < channels.size(); ++i) {
-                    l2_candidates.push_back(i);
-                }
-            } else {
-                for (int hi : l1.hot_idx) {
-                    l2_candidates.push_back(static_cast<std::size_t>(hi));
-                }
-            }
-            if (l2_candidates.size() > cfg.max_l2) {
-                l2_candidates.resize(cfg.max_l2);
-            }
-
-            for (std::size_t idx : l2_candidates) {
-                if (g_stop.load(std::memory_order_relaxed)) {
-                    break;
-                }
-                const double freq = channels[idx];
-                double       bestRatio = 0.0;
-                Layer2Result bestL2;
-                double       bestBw = 0.0;
-
-                for (std::size_t bwIdx = 0; bwIdx < cfg.bws.size(); ++bwIdx) {
-                    if (g_stop.load(std::memory_order_relaxed)) {
-                        break;
-                    }
-                    const double bw = cfg.bws[bwIdx];
-                    const uint32_t windows = (bwIdx == 0)
-                        ? cfg.cad_windows : quickWindows;
-                    ScanConfig bwCfg = cfg;
-                    bwCfg.cad_windows = windows;
-                    const auto l2 = layer2Cad(sg, soapy_source, freq, bw, bwCfg, g_stop);
-                    if (l2.detected) {
-                        const double ratio = std::max(l2.peak_ratio_up, l2.peak_ratio_dn);
-                        if (ratio > bestRatio) {
-                            bestRatio = ratio;
-                            bestBw    = bw;
-                            bestL2    = l2;
-                        }
-                    }
-                }
-
-                if (bestRatio >= static_cast<double>(cfg.min_ratio)) {
-                    DirectCadResult det;
-                    det.freq          = freq;
-                    det.bw            = bestBw;
-                    det.peak_ratio_up = bestL2.peak_ratio_up;
-                    det.peak_ratio_dn = bestL2.peak_ratio_dn;
-                    det.sf_detected   = bestL2.sf_detected;
-                    reportDetection(det);
-                }
-            }
+        const auto bResult = interleavedSweep(sg, soapy_source, channels, cfg,
+                                               g_stop, callbacks);
+        for (const auto& det : bResult.detections) {
+            reportDetection(det);
         }
+        stats.l1_hot = bResult.l1_hot_total;
+        sweepEnergy = bResult.energy;
+        l2Probes = bResult.l2_probes;
 
         ++stats.sweeps;
 
@@ -1447,25 +1171,21 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (useInterleaved) {
-                const auto kTotalSnaps = static_cast<uint32_t>(
-                    2U * channels.size() * cfg.bws.size());
-                emitSweepEndCbor(sweepNum, sweepMs, kTotalSnaps,
-                                 l2Probes, stats.l1_hot,
-                                 static_cast<uint32_t>(sweepDetections.size()),
-                                 stats.overflows);
-            }
+            const auto kTotalSnaps = static_cast<uint32_t>(
+                2U * channels.size() * cfg.bws.size());
+            emitSweepEndCbor(sweepNum, sweepMs, kTotalSnaps,
+                             l2Probes, stats.l1_hot,
+                             static_cast<uint32_t>(sweepDetections.size()),
+                             stats.overflows);
 
             emitSpectrumCbor(channels, sweepEnergy, hotIndices,
                              sweepDetections, stats.sweeps);
 
             const auto now2 = std::chrono::steady_clock::now();
-            const std::string modeStr = useInterleaved ? "single-pass"
-                : (useDirectCad ? "direct-CAD" : "multi-tile");
             if (stats.sweeps == 1
                 || (now2 - lastCborStatus) >= std::chrono::seconds(5)) {
                 lastCborStatus = now2;
-                emitStatusCbor(cfg, stats, modeStr);
+                emitStatusCbor(cfg, stats, "single-pass");
             }
         }
 
