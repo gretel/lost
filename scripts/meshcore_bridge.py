@@ -120,7 +120,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         pass
     return "dev"
 
@@ -452,10 +452,10 @@ class BridgeState:
         buf.extend(self.pub_key)  # pubkey (32 bytes)
         buf.extend(struct.pack("<i", self.lat_e6))  # lat (int32 * 1e6)
         buf.extend(struct.pack("<i", self.lon_e6))  # lon (int32 * 1e6)
-        buf.append(0)  # multi_acks
-        buf.append(0)  # adv_loc_policy
-        buf.append(0)  # telemetry_mode
-        buf.append(0)  # manual_add_contacts
+        buf.append(self.multi_acks)
+        buf.append(self.adv_loc_policy)
+        buf.append(self.telemetry_mode)
+        buf.append(self.manual_add_contacts)
         buf.extend(struct.pack("<I", freq_field))  # radio_freq
         buf.extend(struct.pack("<I", bw_field))  # radio_bw
         buf.append(self.sf)  # radio_sf
@@ -2092,7 +2092,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except (ConnectionError, OSError):
+                    except ConnectionError, OSError:
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2114,7 +2114,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except (BlockingIOError, OSError):
+                    except BlockingIOError, OSError:
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2264,7 +2264,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except (ConnectionError, OSError):
+    except ConnectionError, OSError:
         pass  # client disconnected, will be cleaned up on next recv
 
 

@@ -4606,5 +4606,21 @@ class TestCtrlRx(unittest.TestCase):
         self.assertEqual(msg[4:], ctrl_payload)
 
 
+class TestSelfInfoFields(unittest.TestCase):
+    def test_self_info_reflects_set_other_params(self):
+        """SELF_INFO returns live state values set via CMD_SET_OTHER_PARAMS."""
+        state = make_state()
+        state.manual_add_contacts = 1
+        state.telemetry_mode = 0x42
+        state.adv_loc_policy = 2
+        state.multi_acks = 1
+        payload = state.build_self_info()
+        base = 44  # offset of multi_acks field
+        self.assertEqual(payload[base + 0], 1)  # multi_acks
+        self.assertEqual(payload[base + 1], 2)  # adv_loc_policy
+        self.assertEqual(payload[base + 2], 0x42)  # telemetry_mode
+        self.assertEqual(payload[base + 3], 1)  # manual_add_contacts
+
+
 if __name__ == "__main__":
     unittest.main()
