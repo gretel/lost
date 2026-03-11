@@ -352,6 +352,13 @@ class BridgeState:
         # Message queue for inbound RX frames (companion protocol messages)
         self.msg_queue: collections.deque[bytes] = collections.deque(maxlen=256)
         self.msg_seq = 0  # TX sequence counter
+        # Packet counters for STATS_TYPE_PACKETS (type 2)
+        self.pkt_recv: int = 0
+        self.pkt_sent: int = 0
+        self.pkt_flood_tx: int = 0
+        self.pkt_direct_tx: int = 0
+        self.pkt_flood_rx: int = 0
+        self.pkt_direct_rx: int = 0
 
         # Contact store (pubkey_hex -> contact_bytes for companion protocol)
         self.contacts: dict[str, bytes] = {}
@@ -579,7 +586,17 @@ class BridgeState:
             buf.extend(struct.pack("<I", 0))  # tx_air_secs
             buf.extend(struct.pack("<I", 0))  # rx_air_secs
         elif stats_type == 2:  # packets
-            buf.extend(b"\x00" * 24)  # all zeros
+            buf.extend(
+                struct.pack(
+                    "<IIIIII",
+                    self.pkt_recv,
+                    self.pkt_sent,
+                    self.pkt_flood_tx,
+                    self.pkt_direct_tx,
+                    self.pkt_flood_rx,
+                    self.pkt_direct_rx,
+                )
+            )
         return bytes(buf)
 
 
@@ -668,6 +685,13 @@ def lora_frame_to_companion_msgs(
     rssi = phy.get("rssi_dbm")
     if rssi is not None:
         state.last_rssi_dbm = max(-128, min(127, int(rssi)))
+
+    # Count received frames by route type
+    state.pkt_recv += 1
+    if route in (ROUTE_FLOOD, ROUTE_T_FLOOD):
+        state.pkt_flood_rx += 1
+    else:
+        state.pkt_direct_rx += 1
 
     # For ADVERT: push as NEW_ADVERT + auto-learn key + auto-add contact
     if ptype == PAYLOAD_ADVERT:
@@ -1593,6 +1617,11 @@ def _handle_send_txt_msg(
     # Send via UDP CBOR
     cbor_msg = make_cbor_tx_request(packet)
     udp_sock.sendto(cbor_msg, udp_addr)
+    state.pkt_sent += 1
+    if use_flood:
+        state.pkt_flood_tx += 1
+    else:
+        state.pkt_direct_tx += 1
 
     # Build response and register expected ACK hash for tracking.
     # The companion device ACKs with SHA-256(plaintext + sender_pub)[:4].
@@ -1647,6 +1676,8 @@ def _handle_send_advert(
 
     cbor_msg = make_cbor_tx_request(packet)
     udp_sock.sendto(cbor_msg, udp_addr)
+    state.pkt_sent += 1
+    state.pkt_flood_tx += 1
     log.info("TX: ADVERT '%s' %dB", state.name, len(packet))
 
     return [state.build_ok()]
@@ -1716,6 +1747,8 @@ def _handle_send_chan_txt_msg(
 
     cbor_msg = make_cbor_tx_request(packet)
     udp_sock.sendto(cbor_msg, udp_addr)
+    state.pkt_sent += 1
+    state.pkt_flood_tx += 1
     log.info("TX: %dB GRP_TXT to #%s", len(packet), channel.name)
 
     return [state.build_ok()]
@@ -1750,6 +1783,8 @@ def _handle_send_control_data(
 
     cbor_msg = make_cbor_tx_request(packet)
     udp_sock.sendto(cbor_msg, udp_addr)
+    state.pkt_sent += 1
+    state.pkt_flood_tx += 1
     log.info("TX: %dB CTRL type=0x%02x", len(packet), data[0])
 
     return [state.build_ok()]

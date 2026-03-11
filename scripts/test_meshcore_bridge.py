@@ -4622,5 +4622,36 @@ class TestSelfInfoFields(unittest.TestCase):
         self.assertEqual(payload[base + 3], 1)  # manual_add_contacts
 
 
+class TestPacketStats(unittest.TestCase):
+    def test_stats_type2_has_26_bytes(self):
+        state = make_state()
+        payload = state.build_stats(2)
+        self.assertEqual(len(payload), 26)
+
+    def test_stats_type2_counts_flood_tx(self):
+        state = make_state()
+        state.pkt_flood_tx += 1
+        state.pkt_sent += 1
+        payload = state.build_stats(2)
+        recv, sent, flood_tx, direct_tx, flood_rx, direct_rx = struct.unpack_from(
+            "<IIIIII", payload, 2
+        )
+        self.assertEqual(sent, 1)
+        self.assertEqual(flood_tx, 1)
+        self.assertEqual(direct_tx, 0)
+
+    def test_stats_type2_counts_flood_rx(self):
+        state = make_state()
+        state.pkt_recv += 1
+        state.pkt_flood_rx += 1
+        payload = state.build_stats(2)
+        recv, sent, flood_tx, direct_tx, flood_rx, direct_rx = struct.unpack_from(
+            "<IIIIII", payload, 2
+        )
+        self.assertEqual(recv, 1)
+        self.assertEqual(flood_rx, 1)
+        self.assertEqual(direct_rx, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
