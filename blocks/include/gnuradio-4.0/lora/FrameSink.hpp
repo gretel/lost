@@ -114,7 +114,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
             static_cast<unsigned>((hi >> 16) & 0xFFFFU),
             static_cast<unsigned>(hi & 0xFFFFU),
             static_cast<unsigned>(lo >> 48),
-            static_cast<uint64_t>(lo & 0x0000FFFFFFFFFFFFULL));
+            static_cast<unsigned long long>(lo & 0x0000FFFFFFFFFFFFULL));
         return out;
     }
 
