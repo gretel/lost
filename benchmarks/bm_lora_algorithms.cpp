@@ -421,7 +421,7 @@ const boost::ut::suite performance_assertions = [] {
     };
 
     "CRC-16 (14 bytes) must complete under 1 us"_test = [] {
-        gr::lora::crc16(PAYLOAD); // warm up
+        std::ignore = gr::lora::crc16(PAYLOAD); // warm up
 
         double best_ns = min_of_batches_ns([&] {
             g_sink = gr::lora::crc16(PAYLOAD);
