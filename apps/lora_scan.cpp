@@ -761,14 +761,13 @@ static InterleavedResult interleavedSweep(
             break;
         }
 
-        // L1 snapshot from SpectrumState
-        extractTileEnergy(sg.spectrum, channels, chBw, ir.energy);
-
-        // Compute per-snapshot energy for hot detection
-        // (re-read current energy from spectrum for this snapshot)
-        // Use the accumulated ir.energy as the running max
+        // Single FFT snapshot: extract fresh per-channel energy, then
+        // update running-max for CBOR spectrum output.
         std::ranges::fill(energy, 0.0);
         extractTileEnergy(sg.spectrum, channels, chBw, energy);
+        for (std::size_t i = 0; i < nCh; ++i) {
+            ir.energy[i] = std::max(ir.energy[i], energy[i]);
+        }
 
         std::vector<double> sorted(energy.begin(), energy.end());
         std::ranges::sort(sorted);
