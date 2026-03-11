@@ -68,11 +68,6 @@ volatile std::sig_atomic_t g_running = 1;  // NOLINT(cppcoreguidelines-avoid-non
 
 void signal_handler(int /*sig*/) { g_running = 0; }
 
-// (ChannelMap, DecodeConfig, TrxConfig, SharedStatus, toml_to_property_map,
-//  merge_properties, filter_properties, kFrameSyncOverrides, kDemodDecoderOverrides,
-//  print_usage, parse_args, load_config, build_config_cbor, build_status_cbor,
-//  build_spectrum_cbor are in config.hpp / config.cpp)
-
 // --- UDP state (owned by main thread) ---
 
 static constexpr uint32_t kMaxSendFailures = 10;
@@ -189,7 +184,6 @@ struct UdpState {
     }
 };
 
-// (print_usage, parse_args, load_config are in config.cpp)
 
 // --- TX ---
 
@@ -516,7 +510,7 @@ auto& add_decode_chain(gr::Graph& graph, const TrxConfig& cfg,
 //                                     ─out#M─→ CAD (first radio only)
 //
 // CAD monitors the first radio channel for listen-before-talk (LBT).
-// Each decode chain has its own FrameSink (no DiversityCombiner).
+// Each decode chain has its own FrameSink.
 //
 // Returns pointer to source block's cumulative overflow counter (valid while graph lives).
 uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
@@ -598,7 +592,7 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
         return &source._totalOverFlowCount;
     }
 
-    // --- Multi-chain path: per-chain FrameSinks (no DiversityCombiner) ---
+    // multi-chain path: per-chain FrameSinks
 
     // Wire decode chains for a given source block.
     // connectPort(r, downstream) connects source output `r` to downstream's "in".
@@ -808,8 +802,6 @@ uint64_t* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
     return overflow_ptr;
 }
 
-// (SharedStatus, build_config_cbor, build_status_cbor, build_spectrum_cbor
-//  are in config.hpp / config.cpp)
 
 // --- Runtime reconfig: block references after scheduler exchange ---
 
