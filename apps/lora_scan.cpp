@@ -1255,8 +1255,8 @@ int main(int argc, char** argv) {
     const bool useInterleaved = singleTile;
 
     const char* modeName = useInterleaved
-        ? "B (interleaved L1+L2)"
-        : (useDirectCad ? "C (direct CAD)" : "A (full L1+L2 sweep)");
+        ? "single-pass"
+        : (useDirectCad ? "direct-CAD" : "multi-tile");
     gr::lora::log_ts("info ", "lora_scan",
         "scan mode: %s  (%zu ch, range=%.1f MHz, tile=%.1f MHz)",
         modeName, channels.size(), scanRange / 1.0e6, usableBw / 1.0e6);
@@ -1279,7 +1279,6 @@ int main(int argc, char** argv) {
             ? ("SF" + std::to_string(det.sf_detected)) : "-";
 
         auto* out = cfg.cbor_out ? stderr : stdout;
-        std::fprintf(stderr, "\r%s\r", std::string(80, ' ').c_str());
         std::fprintf(out, "%-13s  %10.3f  %6.1f  %6.1f  %6.1f  %6s  %4s\n",
                     ts.c_str(), det.freq / 1.0e6, det.bw / 1.0e3,
                     det.peak_ratio_up, det.peak_ratio_dn,
@@ -1321,52 +1320,26 @@ int main(int argc, char** argv) {
         sweepDetections.clear();
         std::ranges::fill(sweepEnergy, 0.0);
 
-        if (useInterleaved) {
-            const uint32_t sweepNum = stats.sweeps + 1;
-            const auto sweepStart = std::chrono::steady_clock::now();
+        const uint32_t sweepNum = stats.sweeps + 1;
+        const auto sweepStart = std::chrono::steady_clock::now();
+        uint32_t l2Probes = 0;
 
+        if (useInterleaved) {
             if (cfg.cbor_out) {
                 emitSweepStartCbor(sweepNum);
             }
-
-            // Status bar state updated by callbacks
-            uint32_t lastL2ProbeMs = 0;
-            double   lastL2Freq    = 0.0;
-            std::string lastL2Bw;
 
             SweepCallbacks callbacks;
             if (cfg.cbor_out) {
                 callbacks.onRetune = [sweepNum](double freq, const char* reason) {
                     emitRetuneCbor(sweepNum, freq, reason);
                 };
-            }
-            callbacks.onL2Probe = [&, sweepNum](double freq, uint32_t ms,
-                    std::vector<L2BwResult> results) {
-                lastL2ProbeMs = ms;
-                lastL2Freq    = freq;
-                double bestRatio = 0.0;
-                for (const auto& r : results) {
-                    if (r.ratio > bestRatio) {
-                        bestRatio = r.ratio;
-                        char tmp[16];
-                        std::snprintf(tmp, sizeof(tmp), "BW%.0fk", r.bw / 1e3);
-                        lastL2Bw = tmp;
-                    }
-                }
-                if (cfg.cbor_out) {
+                callbacks.onL2Probe = [&, sweepNum](double freq, uint32_t ms,
+                        std::vector<L2BwResult> results) {
                     emitL2ProbeCbor(sweepNum, freq, ms, results);
-                }
-                checkOverflows(sweepNum);
-            };
-            callbacks.onProgress = [&](int snap, int total, uint32_t hotCount) {
-                std::fprintf(stderr,
-                    "\rsweep %u  L1 %d/%d  hot %u  L2: %.3f %s (%ums)  OVF %u  %.1fs/sw   ",
-                    sweepNum, snap, total, hotCount,
-                    lastL2Freq / 1e6,
-                    lastL2Bw.empty() ? "-" : lastL2Bw.c_str(),
-                    lastL2ProbeMs, stats.overflows,
-                    avgSweepMs / 1000.0);
-            };
+                    checkOverflows(sweepNum);
+                };
+            }
 
             const auto bResult = interleavedSweep(sg, soapy_source, channels, cfg,
                                                    g_stop, callbacks);
@@ -1375,23 +1348,7 @@ int main(int argc, char** argv) {
             }
             stats.l1_hot = bResult.l1_hot_total;
             sweepEnergy = bResult.energy;
-
-            const auto sweepEnd = std::chrono::steady_clock::now();
-            const auto sweepMs  = static_cast<uint32_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    sweepEnd - sweepStart).count());
-            avgSweepMs = (stats.sweeps == 0)
-                ? static_cast<double>(sweepMs)
-                : avgSweepMs * 0.8 + static_cast<double>(sweepMs) * 0.2;
-
-            if (cfg.cbor_out) {
-                const auto kTotalSnaps = static_cast<uint32_t>(
-                    2U * channels.size() * cfg.bws.size());
-                emitSweepEndCbor(sweepNum, sweepMs, kTotalSnaps,
-                                 bResult.l2_probes, bResult.l1_hot_total,
-                                 static_cast<uint32_t>(sweepDetections.size()),
-                                 stats.overflows);
-            }
+            l2Probes = bResult.l2_probes;
         }
 
         if (useDirectCad && !useInterleaved
@@ -1466,6 +1423,13 @@ int main(int argc, char** argv) {
 
         ++stats.sweeps;
 
+        const auto sweepMs = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - sweepStart).count());
+        avgSweepMs = (stats.sweeps <= 1)
+            ? static_cast<double>(sweepMs)
+            : avgSweepMs * 0.8 + static_cast<double>(sweepMs) * 0.2;
+
         if (cfg.cbor_out) {
             std::vector<std::size_t> hotIndices;
             if (!sweepEnergy.empty()) {
@@ -1482,12 +1446,22 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+
+            if (useInterleaved) {
+                const auto kTotalSnaps = static_cast<uint32_t>(
+                    2U * channels.size() * cfg.bws.size());
+                emitSweepEndCbor(sweepNum, sweepMs, kTotalSnaps,
+                                 l2Probes, stats.l1_hot,
+                                 static_cast<uint32_t>(sweepDetections.size()),
+                                 stats.overflows);
+            }
+
             emitSpectrumCbor(channels, sweepEnergy, hotIndices,
                              sweepDetections, stats.sweeps);
 
             const auto now2 = std::chrono::steady_clock::now();
-            const std::string modeStr = useInterleaved ? "B"
-                : (useDirectCad ? "C" : "A");
+            const std::string modeStr = useInterleaved ? "single-pass"
+                : (useDirectCad ? "direct-CAD" : "multi-tile");
             if (stats.sweeps == 1
                 || (now2 - lastCborStatus) >= std::chrono::seconds(5)) {
                 lastCborStatus = now2;
@@ -1501,18 +1475,12 @@ int main(int argc, char** argv) {
             break;
         }
 
-        if (!g_stop.load(std::memory_order_relaxed)) {
-            const std::string lastDet = stats.last_det_freq.empty()
-                ? "none"
-                : (stats.last_det_freq + " " + stats.last_det_time);
-            std::fprintf(stderr,
-                "\rsweep %u  hot %u/%zu  OVF %u  %.1fs/sw  last: %s   ",
-                stats.sweeps, stats.l1_hot, channels.size(),
-                stats.overflows, avgSweepMs / 1000.0, lastDet.c_str());
-        }
+        gr::lora::log_ts("info ", "lora_scan",
+            "sweep %u  dur %ums  hot %u/%zu  det %zu  OVF %u",
+            stats.sweeps, sweepMs, stats.l1_hot, channels.size(),
+            sweepDetections.size(), stats.overflows);
     }
 
-    std::fputc('\n', stderr);
     gr::lora::log_ts("info ", "lora_scan",
         "stopped after %u sweep(s), %u overflow(s), %u drop(s)",
         stats.sweeps, stats.overflows, stats.drops);
