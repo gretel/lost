@@ -120,7 +120,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         pass
     return "dev"
 
@@ -161,6 +161,7 @@ CMD_SET_TUNING_PARAMS = 0x15
 CMD_DEVICE_QUERY = 0x16
 CMD_LOGIN = 0x1A
 CMD_STATUS_REQ = 0x1B
+CMD_LOGOUT = 0x1D
 CMD_GET_CHANNEL = 0x1F
 CMD_SET_CHANNEL = 0x20
 CMD_TRACE = 0x24
@@ -1288,6 +1289,26 @@ def _build_self_advert_push(state: BridgeState) -> bytes | None:
     return bytes([PUSH_NEW_ADVERT]) + record
 
 
+def _send_cli_txt_msg(
+    dst_pub: bytes,
+    text: str,
+    state: BridgeState,
+    udp_sock: socket.socket,
+    udp_addr: tuple[str, int],
+) -> list[bytes]:
+    """Send a TXT_TYPE_CLI (msg_type=1) message to a known contact.
+
+    Builds the companion CMD_SEND_TXT_MSG data format and delegates to
+    _handle_send_txt_msg. Returns MSG_SENT or ERROR.
+    """
+    ts = int(time.time())
+    # Companion format: [msg_type(1)=1][attempt(1)=0][ts(4 LE)][dst_prefix(6)][text]
+    data = (
+        bytes([0x01, 0x00]) + struct.pack("<I", ts) + dst_pub[:6] + text.encode("utf-8")
+    )
+    return _handle_send_txt_msg(data, state, udp_sock, udp_addr)
+
+
 def handle_command(
     cmd_payload: bytes,
     state: BridgeState,
@@ -1542,7 +1563,35 @@ def handle_command(
     if cmd in (CMD_RESET_PATH, CMD_SET_TUNING_PARAMS, CMD_REBOOT):
         return [state.build_ok()]
 
-    if cmd in (CMD_LOGIN, CMD_STATUS_REQ, CMD_TRACE, CMD_PATH_DISCOVERY):
+    if cmd == CMD_LOGIN:
+        assert udp_sock is not None and udp_addr is not None
+        if len(data) < 32:
+            return [state.build_error()]
+        dst_pub = data[:32]
+        password = data[32:].decode("utf-8", errors="replace")
+        log.info("companion: LOGIN to %s.. pwd='%s'", dst_pub.hex()[:8], password)
+        return _send_cli_txt_msg(
+            dst_pub, f"login {password}", state, udp_sock, udp_addr
+        )
+
+    if cmd == CMD_STATUS_REQ:
+        assert udp_sock is not None and udp_addr is not None
+        if len(data) < 32:
+            return [state.build_error()]
+        dst_pub = data[:32]
+        log.info("companion: STATUS_REQ to %s..", dst_pub.hex()[:8])
+        return _send_cli_txt_msg(dst_pub, "status", state, udp_sock, udp_addr)
+
+    if cmd == CMD_LOGOUT:
+        assert udp_sock is not None and udp_addr is not None
+        if len(data) < 32:
+            return [state.build_error()]
+        dst_pub = data[:32]
+        log.info("companion: LOGOUT from %s..", dst_pub.hex()[:8])
+        _send_cli_txt_msg(dst_pub, "logout", state, udp_sock, udp_addr)
+        return [state.build_ok()]
+
+    if cmd in (CMD_TRACE, CMD_PATH_DISCOVERY):
         log.debug("companion: unimplemented repeater cmd 0x%02x (stub MSG_SENT)", cmd)
         return [state.build_msg_sent(flood=True)]
 
@@ -2185,7 +2234,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except (ConnectionError, OSError):
+                    except ConnectionError, OSError:
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2207,7 +2256,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except (BlockingIOError, OSError):
+                    except BlockingIOError, OSError:
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2357,7 +2406,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except (ConnectionError, OSError):
+    except ConnectionError, OSError:
         pass  # client disconnected, will be cleaned up on next recv
 
 

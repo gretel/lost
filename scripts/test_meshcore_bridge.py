@@ -373,19 +373,19 @@ class TestCommandHandler(unittest.TestCase):
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0][0], bridge.RESP_STATS)
 
-    def test_login_returns_msg_sent(self):
-        """CMD_LOGIN stub returns RESP_MSG_SENT (mccli awaits MSG_SENT)."""
-        cmd = bytes([bridge.CMD_LOGIN]) + b"payload"
-        responses = bridge.handle_command(cmd, self.state, None, None)
+    def test_login_short_payload_returns_error(self):
+        """CMD_LOGIN with too-short payload (< 32 bytes) returns RESP_ERROR."""
+        cmd = bytes([bridge.CMD_LOGIN]) + b"payload"  # only 7 bytes, need 32+
+        responses = bridge.handle_command(cmd, self.state, self.udp_sock, self.udp_addr)
         self.assertEqual(len(responses), 1)
-        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
 
-    def test_status_req_returns_msg_sent(self):
-        """CMD_STATUS_REQ stub returns RESP_MSG_SENT."""
-        cmd = bytes([bridge.CMD_STATUS_REQ]) + b"payload"
-        responses = bridge.handle_command(cmd, self.state, None, None)
+    def test_status_req_short_payload_returns_error(self):
+        """CMD_STATUS_REQ with too-short payload (< 32 bytes) returns RESP_ERROR."""
+        cmd = bytes([bridge.CMD_STATUS_REQ]) + b"payload"  # only 7 bytes, need 32+
+        responses = bridge.handle_command(cmd, self.state, self.udp_sock, self.udp_addr)
         self.assertEqual(len(responses), 1)
-        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
 
     def test_trace_returns_msg_sent(self):
         """CMD_TRACE stub returns RESP_MSG_SENT."""
@@ -4215,11 +4215,9 @@ setattr(
 
 
 def _w1_test_stub_cmds_return_msg_sent_flood_routing(self):
-    """Stub cmds (LOGIN, STATUS_REQ, TRACE, PATH_DISCOVERY) have routing_type=1."""
+    """Remaining stub cmds (TRACE, PATH_DISCOVERY) have routing_type=1."""
     state = make_state()
     for cmd_byte in [
-        bridge.CMD_LOGIN,
-        bridge.CMD_STATUS_REQ,
         bridge.CMD_TRACE,
         bridge.CMD_PATH_DISCOVERY,
     ]:
@@ -4233,13 +4231,15 @@ def _w1_test_stub_cmds_return_msg_sent_flood_routing(self):
 
 
 def _w2_test_stub_cmds_increment_msg_seq(self):
-    """Stub cmds increment state.msg_seq."""
+    """Remaining stub cmds increment state.msg_seq."""
     state = make_state()
-    self.assertEqual(state.msg_seq, 0)
-    bridge.handle_command(bytes([bridge.CMD_LOGIN]) + b"x", state, None, None)
-    self.assertEqual(state.msg_seq, 1)
-    bridge.handle_command(bytes([bridge.CMD_STATUS_REQ]) + b"x", state, None, None)
-    self.assertEqual(state.msg_seq, 2)
+    initial_seq = state.msg_seq
+    bridge.handle_command(bytes([bridge.CMD_TRACE]) + b"payload", state, None, None)
+    self.assertEqual(state.msg_seq, initial_seq + 1)
+    bridge.handle_command(
+        bytes([bridge.CMD_PATH_DISCOVERY]) + b"payload", state, None, None
+    )
+    self.assertEqual(state.msg_seq, initial_seq + 2)
 
 
 setattr(
@@ -4787,6 +4787,60 @@ class TestPacketStats(unittest.TestCase):
         self.assertEqual(recv, 1)
         self.assertEqual(flood_rx, 1)
         self.assertEqual(direct_rx, 0)
+
+
+class TestRepeaterCommands(unittest.TestCase):
+    def _make_peer_contact(self, state):
+        """Add a peer contact to state, return peer_pub."""
+        _, peer_pub, _ = make_identity()
+        record = bridge._build_contact_record(peer_pub, name="repeater")
+        state.contacts[peer_pub.hex()] = record
+        from meshcore_crypto import save_pubkey
+
+        save_pubkey(state.keys_dir, peer_pub)
+        state.known_keys[peer_pub.hex()] = peer_pub
+        return peer_pub
+
+    def test_cmd_login_sends_udp_and_returns_msg_sent(self):
+        """CMD_LOGIN sends a TXT_MSG CLI and returns MSG_SENT."""
+        state = make_state()
+        peer_pub = self._make_peer_contact(state)
+        sock = _FakeUDPSock()
+        cmd = bytes([bridge.CMD_LOGIN]) + peer_pub + b"secret"
+        responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        self.assertGreater(len(sock.sent), 0)
+
+    def test_cmd_status_req_sends_udp_and_returns_msg_sent(self):
+        """CMD_STATUS_REQ sends a TXT_MSG CLI and returns MSG_SENT."""
+        state = make_state()
+        peer_pub = self._make_peer_contact(state)
+        sock = _FakeUDPSock()
+        cmd = bytes([bridge.CMD_STATUS_REQ]) + peer_pub
+        responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        self.assertGreater(len(sock.sent), 0)
+
+    def test_cmd_logout_sends_udp_and_returns_ok(self):
+        """CMD_LOGOUT sends a TXT_MSG CLI and returns RESP_OK."""
+        state = make_state()
+        peer_pub = self._make_peer_contact(state)
+        sock = _FakeUDPSock()
+        cmd = bytes([bridge.CMD_LOGOUT]) + peer_pub
+        responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_OK)
+        self.assertGreater(len(sock.sent), 0)
+
+    def test_cmd_login_short_payload_returns_error(self):
+        """CMD_LOGIN with too-short payload returns error."""
+        state = make_state()
+        sock = _FakeUDPSock()
+        cmd = bytes([bridge.CMD_LOGIN]) + b"\x00" * 10  # too short
+        responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
 
 
 if __name__ == "__main__":
