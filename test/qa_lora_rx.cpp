@@ -433,7 +433,7 @@ const boost::ut::suite<"Multi-config RX pipeline"> multi_config_rx_tests = [] {
             // === Stage 6: Dewhitening via dewhiten() ===
             std::size_t data_nibs = hdr.payload_len * 2 + (hdr.has_crc ? 4 : 0);
             std::vector<uint8_t> data_nibbles(nibbles.begin() + 5,
-                nibbles.begin() + std::min(nibbles.size(), 5 + data_nibs));
+                nibbles.begin() + static_cast<std::ptrdiff_t>(std::min(nibbles.size(), 5 + data_nibs)));
             auto decoded_bytes = dewhiten(data_nibbles, hdr.payload_len);
 
             // === Stage 7: CRC verify ===
