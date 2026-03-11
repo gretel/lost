@@ -53,6 +53,8 @@
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/soapy/Soapy.hpp>
 #include <gnuradio-4.0/soapy/SoapySink.hpp>
+
+#include "common.hpp"
 #include <gnuradio-4.0/testing/NullSources.hpp>
 
 #include <gnuradio-4.0/lora/FrameSink.hpp>
@@ -64,9 +66,6 @@ using namespace lora_trx;
 
 namespace {
 
-volatile std::sig_atomic_t g_running = 1;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-
-void signal_handler(int /*sig*/) { g_running = 0; }
 
 // --- UDP state (owned by main thread) ---
 
@@ -1032,23 +1031,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
+    auto& stop_flag = lora_apps::install_signal_handler();
 
-    // Homebrew UHD patches B2XX_FPGA_FILE_NAME to use full absolute Cellar paths.
-    // These break after Homebrew revision bumps (e.g. 4.9.0.1 → 4.9.0.1_1).
-    // Override with bare filenames so find_image_path() resolves via UHD_IMAGES_DIR.
-    if (cfg.device == "uhd" && cfg.device_param.find("fpga=") == std::string::npos) {
-        cfg.device_param += ",fpga=usrp_b210_fpga.bin";
-    }
+    lora_apps::apply_fpga_workaround(cfg.device, cfg.device_param);
 
     auto os = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdate-time"
-    gr::lora::log_ts("info ", "lora_trx",
-        "starting lora_trx %s (built " __DATE__ " " __TIME__ ")", GIT_REV);
-#pragma GCC diagnostic pop
+    lora_apps::log_version_banner("lora_trx", GIT_REV);
     gr::lora::log_ts("info ", "lora_trx",
         "config %s (%zu set%s)  set '%s'",
         config_path.c_str(), configs.size(),
@@ -1059,25 +1048,7 @@ int main(int argc, char* argv[]) {
         cfg.device.c_str(),
         cfg.device_param.empty() ? "(none)" : cfg.device_param.c_str());
 
-    // Query hardware info (FPGA version, serial) via the GR4 RAII wrapper.
-    {
-        auto args = gr::blocks::soapy::detail::buildDeviceArgs(cfg.device, cfg.device_param);
-        gr::blocks::soapy::Device dev(args);
-        if (dev.get() != nullptr) {
-            auto info = dev.getHardwareInfo();
-            std::string fpga_ver, serial;
-            if (auto it = info.find("fpga_version"); it != info.end())
-                fpga_ver = it->second;
-            if (auto it = info.find("serial"); it != info.end())
-                serial = it->second;
-            if (!fpga_ver.empty() || !serial.empty()) {
-                gr::lora::log_ts("info ", "lora_trx",
-                    "hardware: FPGA v%s  serial %s",
-                    fpga_ver.empty() ? "?" : fpga_ver.c_str(),
-                    serial.empty() ? "?" : serial.c_str());
-            }
-        }
-    }
+    lora_apps::log_hardware_info("lora_trx", cfg.device, cfg.device_param);
 
     // Build RX channel string
     {
@@ -1243,10 +1214,7 @@ int main(int argc, char* argv[]) {
     tx_spectrum->center_freq = cfg.freq;
     tx_spectrum->init();
 
-    // --- Shrink the global CPU thread pool ---
-    // The default pool spawns hardware_concurrency() threads (8 on M1), all idle.
-    // On macOS, each idle thread polls at 10μs (no condvar support) — ~100% wasted CPU.
-    // singleThreadedBlocking runs on the calling thread, so the pool is unused.
+    // singleThreadedBlocking doesn't use the pool; shrink to avoid idle thread CPU waste
     gr::thread_pool::Manager::defaultCpuPool()->setThreadBounds(1, 1);
 
     // --- LBT: channel-busy flag updated by CAD in the RX graph ---
@@ -1372,7 +1340,7 @@ int main(int argc, char* argv[]) {
     std::vector<uint8_t> recv_buf(65536);
     auto last_status = std::chrono::steady_clock::now();
 
-    while (g_running && !rx_done.load(std::memory_order_relaxed)) {
+    while (!stop_flag.load(std::memory_order_relaxed) && !rx_done.load(std::memory_order_relaxed)) {
         struct sockaddr_storage sender{};
         socklen_t slen = sizeof(sender);
         auto n = ::recvfrom(udp.fd, recv_buf.data(), recv_buf.size(), 0,
