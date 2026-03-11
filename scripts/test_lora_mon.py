@@ -108,6 +108,66 @@ class TestFormatFrame(unittest.TestCase):
         text = lora_mon.format_frame(make_frame())
         self.assertNotIn("NF=", text)
 
+    def test_bw_shown(self):
+        text = lora_mon.format_frame(make_frame(bw=125000))
+        self.assertIn("BW125k", text)
+
+    def test_bw_62500_shown(self):
+        text = lora_mon.format_frame(make_frame(bw=62500))
+        self.assertIn("BW62.5k", text)
+
+    def test_decode_label_shown(self):
+        msg = make_frame()
+        msg["decode_label"] = "SF8-sync12"
+        text = lora_mon.format_frame(msg)
+        self.assertIn("[SF8-sync12]", text)
+
+    def test_no_decode_label_when_absent(self):
+        msg = make_frame()
+        # sync_word=0xFF → no MeshCore summary, so no "[" from any source
+        msg["phy"]["sync_word"] = 0xFF
+        text = lora_mon.format_frame(msg)
+        self.assertNotIn("[SF", text)
+
+    def test_diversity_shown(self):
+        msg = make_frame()
+        msg["diversity"] = {
+            "n_candidates": 2,
+            "decoded_channel": 1,
+            "rx_channels": [0, 1],
+            "snr_db": [3.2, 5.1],
+            "crc_mask": 3,
+            "gap_us": 20000,
+            "source_ids": ["a", "b"],
+        }
+        text = lora_mon.format_frame(msg)
+        self.assertIn("div:", text)
+        self.assertIn("2 chains", text)
+        self.assertIn("gap=20ms", text)
+        self.assertIn("ch=1 won", text)
+        self.assertIn("SNR:", text)
+
+    def test_no_diversity_when_absent(self):
+        text = lora_mon.format_frame(make_frame())
+        self.assertNotIn("div:", text)
+
+    def test_diversity_single_chain(self):
+        msg = make_frame()
+        msg["diversity"] = {
+            "n_candidates": 1,
+            "decoded_channel": 0,
+            "rx_channels": [0],
+            "snr_db": [5.0],
+            "crc_mask": 1,
+            "gap_us": 0,
+            "source_ids": ["x"],
+        }
+        text = lora_mon.format_frame(msg)
+        self.assertIn("1 chain", text)
+        self.assertNotIn("chains", text)
+        self.assertNotIn("ch=", text)  # no "won" line for single chain
+        self.assertNotIn("gap=", text)  # gap_us == 0, omitted
+
 
 # ---- Decryption display ----
 

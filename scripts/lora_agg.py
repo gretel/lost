@@ -316,6 +316,7 @@ def run(args: argparse.Namespace) -> None:
     # Aggregation state
     pending: dict[int, PendingGroup] = {}
     recently_emitted: dict[int, float] = {}  # hash -> emit timestamp (cooldown)
+    _last_window_ms: int = -1  # sentinel: log config only on change
     last_keepalive = time.monotonic()
     last_evict = last_keepalive
     frames_total = 0
@@ -371,12 +372,14 @@ def run(args: argparse.Namespace) -> None:
             del recently_emitted[h]
 
     def handle_upstream_frame(msg: dict[str, Any]) -> None:
-        nonlocal window_s
+        nonlocal window_s, _last_window_ms
         if msg.get("type") == "config":
             raw = apply_config(msg)
             new_window_ms = config_agg_window_ms(raw)
             window_s = new_window_ms / 1000.0
-            log.debug("config received: window=%dms", new_window_ms)
+            if new_window_ms != _last_window_ms:
+                log.debug("config: window=%dms", new_window_ms)
+                _last_window_ms = new_window_ms
             data = cbor2.dumps(msg)
             server.broadcast(data)
             return

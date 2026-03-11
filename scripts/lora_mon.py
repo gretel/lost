@@ -121,6 +121,29 @@ def parse_meshcore_summary(data: bytes) -> str:
 # ---- Frame formatting ----
 
 
+def format_diversity(div: dict[str, Any]) -> str:
+    """Format the diversity sub-map from an aggregated lora_frame as a single line."""
+    n = div.get("n_candidates", 0)
+    gap_us = div.get("gap_us", 0)
+    decoded_ch = div.get("decoded_channel")
+    snrs = div.get("snr_db", [])
+    crc_mask = div.get("crc_mask", 0)
+
+    parts = [f"{n} chain{'s' if n != 1 else ''}"]
+    if gap_us > 0:
+        parts.append(f"gap={gap_us / 1000:.0f}ms")
+    if n > 1 and decoded_ch is not None:
+        parts.append(f"ch={decoded_ch} won")
+    if n > 1 and snrs:
+        snr_str = ", ".join(f"{s:.1f}" for s in snrs)
+        parts.append(f"[SNR: {snr_str} dB]")
+    # Only show crc_mask when not all candidates passed
+    all_ok_mask = (1 << n) - 1
+    if n > 1 and crc_mask != all_ok_mask:
+        parts.append(f"crc={bin(crc_mask)}")
+    return "div: " + "  ".join(parts)
+
+
 def format_frame(
     msg: dict[str, Any],
     *,
@@ -146,6 +169,7 @@ def format_frame(
     crc_str = "CRC_OK" if crc_ok else "CRC_FAIL"
     seq = msg.get("seq", 0)
     cr = phy.get("cr", 0)
+    bw = phy.get("bw")
     sync_word = phy.get("sync_word", 0)
     sw_label = sync_word_name(sync_word)
     snr_db = phy.get("snr_db")
@@ -153,10 +177,20 @@ def format_frame(
     noise_floor_db = phy.get("noise_floor_db")
     peak_db = phy.get("peak_db")
     rx_ch = msg.get("rx_channel")
+    decode_label = msg.get("decode_label")
     dc = " (downchirp)" if msg.get("is_downchirp") else ""
 
+    # BW field: 62500 → "62.5k", 125000 → "125k", etc.
+    bw_str = f"BW{bw / 1e3:g}k" if bw is not None else ""
+
     # Line 1: identity + PHY essentials + signal quality
-    header = f"#{seq} {len(payload)}B {crc_str} SF{phy.get('sf', '?')}/CR4:{4 + cr} {sw_label}"
+    sf_bw_cr = f"SF{phy.get('sf', '?')}"
+    if bw_str:
+        sf_bw_cr += f"/{bw_str}"
+    sf_bw_cr += f"/CR4:{4 + cr}"
+    header = f"#{seq} {len(payload)}B {crc_str} {sf_bw_cr} {sw_label}"
+    if decode_label:
+        header += f" [{sanitize_text(decode_label)}]"
     if rx_ch is not None:
         header += f" ch={rx_ch}"
     if snr_db is not None:
@@ -193,6 +227,11 @@ def format_frame(
     # Hex dump: show when there's no decrypted content (raw/unknown frames)
     if payload and not decrypt_line:
         lines.append(format_hexdump(payload, max_bytes=48, indent="  "))
+
+    # Diversity line (aggregated frames from lora_agg only)
+    div = msg.get("diversity")
+    if div:
+        lines.append(f"  {format_diversity(div)}")
 
     return "\n".join(lines)
 
@@ -298,10 +337,12 @@ def format_config(msg: dict[str, Any]) -> str:
     rate_ks = rate / 1e3 if rate else 0
     si = server.get("status_interval", 0)
 
-    cr_label = f"CR4/{4 + cr}" if isinstance(cr, int) else f"CR4/{cr}"
+    cr_label = f"CR4:{4 + cr}" if isinstance(cr, int) else f"CR4:{cr}"
+    bw_str = f"BW{bw_khz:g}k" if bw_khz else "BW?"
+    status_str = f"status every {si}s" if si else "status off"
     lines = [
-        f"--- config: {freq_mhz:.3f} MHz SF{sf} BW {bw_khz:.1f}k {cr_label} {sw_name}",
-        f"    gain: RX={rx_g} dB  TX={tx_g} dB  |  {device} @ {rate_ks:.0f} kS/s  status every {si}s",
+        f"--- config: {freq_mhz:.3f} MHz SF{sf} {bw_str} {cr_label} {sw_name}",
+        f"    gain: RX={rx_g} dB  TX={tx_g} dB  |  {device} @ {rate_ks:.0f} kS/s  {status_str}",
     ]
     return "\n".join(lines)
 
