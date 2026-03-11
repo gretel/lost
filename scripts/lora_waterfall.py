@@ -18,6 +18,7 @@ Usage:
     lora_waterfall.py                          # default: 127.0.0.1:5555
     lora_waterfall.py --connect 192.168.1.10:5555
     lora_waterfall.py --bw-factor 1.5          # show 1.5x bandwidth
+    lora_waterfall.py --delay 2.0              # longer delay for SF12 frames
 """
 
 from __future__ import annotations
@@ -698,6 +699,28 @@ def _compute_gain_scale(rx_gain: float, db_range: float) -> tuple[float, float]:
     return db_min, db_max
 
 
+def _frame_duration(decode: dict[str, Any]) -> float:
+    """Estimate LoRa frame air-time in seconds from a lora_frame CBOR message.
+
+    Uses SF, BW, CR, and payload_len.  The estimate is intentionally generous
+    (adds preamble + header symbols) so the tinting window fully covers the
+    frame even under timing jitter.
+    """
+    phy = decode.get("phy", {})
+    sf = phy.get("sf", 8)
+    bw = phy.get("bw", 125000)
+    cr = phy.get("cr", 4)  # coding rate 1-4 → denominator is 4+cr
+    payload_len = decode.get("payload_len", 0)
+    if bw <= 0:
+        bw = 125000
+    symbol_duration = (2**sf) / bw  # seconds per symbol
+    # Data symbols: ceil((8*payload + 28 - 4*sf + 20) / (4*(sf-2))) * (4+cr)
+    # Simplified conservative estimate: payload symbols + 20 overhead symbols
+    data_syms = max(8, int(payload_len * 8 / max(sf - 2, 1)) + 20)
+    preamble_syms = 12  # 8 preamble + 4.25 sync, rounded up
+    return symbol_duration * (preamble_syms + data_syms)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Console waterfall display for lora_trx"
@@ -744,6 +767,18 @@ def main() -> None:
         default=0.3,
         help="EMA smoothing alpha, 0.0-1.0 (default: 0.3, lower=smoother)",
     )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.0,
+        help=(
+            "Display delay in seconds (default: 1.0). "
+            "Rows are held in a pending queue and flushed after this delay, "
+            "allowing decode events to arrive before their rows are rendered "
+            "so frame tinting aligns with the actual frame in the waterfall. "
+            "Increase for SF12 frames (~4s air-time)."
+        ),
+    )
     add_logging_args(parser)
     args = parser.parse_args()
 
@@ -789,11 +824,18 @@ def main() -> None:
     ema_alpha: float = max(0.01, min(1.0, args.smoothing))
     rx_ema: list[float] | None = None
 
-    # Frame activity: track most recent decode for header + row tinting
-    frame_marker_duration: float = 0.8  # seconds to tint rows after decode
-    last_decode: dict | None = None  # most recent decode metadata
+    # Frame activity: track decodes for header line 3 and delayed row tinting.
+    # recent_decodes holds the last few decoded frames with their arrival times.
+    # Rows are held in pending_rows for display_delay seconds before rendering;
+    # at flush time each row's palette is chosen by checking whether any recent
+    # decode's frame window covers the row's capture time.
+    display_delay: float = max(0.0, args.delay)
+    last_decode: dict | None = None  # most recent decode (for header line 3)
+    recent_decodes: deque[dict] = deque(maxlen=8)  # for delayed tint lookup
     last_tx_time: float = 0.0
     last_status: dict | None = None  # most recent status heartbeat
+    # pending_rows: (capture_time, ema_snapshot) pairs awaiting flush
+    pending_rows: deque[tuple[float, list[float]]] = deque()
 
     # Scrolling state (terminal scroll region)
     scroll_region_set: bool = False
@@ -981,11 +1023,12 @@ def main() -> None:
                 # repaints on every status heartbeat caused visible flicker.
                 continue
 
-            # Track frame decodes for tinting + header line 3
+            # Track frame decodes for header line 3 and delayed tinting
             if msg_type == "lora_frame":
                 last_decode = dict(msg)
                 last_decode["_time"] = time.monotonic()
                 last_decode["_wall_time"] = time.time()
+                recent_decodes.append(last_decode)
                 header_printed = False  # update line 3
                 continue
 
@@ -1038,13 +1081,18 @@ def main() -> None:
             if not db_max_manual:
                 db_max = db_min + args.db_range
 
-            # Throttle rendering to target FPS
+            # Throttle spectrum ingestion to target FPS
             now = time.monotonic()
             if now - last_render_time < min_frame_interval:
                 skip_count += 1
-                continue
-            last_render_time = now
+                # Still flush pending rows even when skipping new spectrum
+            else:
+                last_render_time = now
+                # Enqueue a snapshot of the current EMA for delayed rendering
+                pending_rows.append((now, list(rx_ema)))
 
+            # ---- Flush pending rows that have aged past display_delay ----
+            now_flush = time.monotonic()
             tw, th = get_terminal_size()
 
             # Set up scroll region on first use or terminal resize
@@ -1064,52 +1112,102 @@ def main() -> None:
             if not scroll_region_set:
                 continue
 
-            # Compute visible bins
+            # Compute visible bin parameters (same for all flushed rows this cycle)
             rx_n = len(rx_ema)
             rx_visible = int(rx_n * min(args.bw_factor, 1.0))
             if rx_visible < 1:
                 rx_visible = rx_n
             rx_center = rx_n // 2
 
-            # Select palette based on recent frame activity
-            active_palette: int = PALETTE_NORMAL
-            now_mono = time.monotonic()
+            # Flush rows whose display_delay has elapsed
+            while pending_rows and (now_flush - pending_rows[0][0]) >= display_delay:
+                capture_time, snap = pending_rows.popleft()
 
-            if last_decode is not None:
-                decode_age = now_mono - last_decode["_time"]
-                if decode_age < frame_marker_duration:
-                    if last_decode["crc_valid"]:
-                        active_palette = PALETTE_DECODE_OK
-                    else:
-                        active_palette = PALETTE_DECODE_FAIL
+                # Select palette: check if this row's capture time falls within
+                # any recent decode's frame window.  The decode arrives after
+                # the frame completes, so the frame window is
+                # [decode_time - frame_duration, decode_time + 0.1s].
+                # The 0.1s overhang absorbs UDP jitter between spectrum and decode.
+                active_palette = PALETTE_NORMAL
+                for dec in recent_decodes:
+                    dur = _frame_duration(dec)
+                    dec_t = dec["_time"]
+                    if (dec_t - dur) <= capture_time <= (dec_t + 0.1):
+                        if dec.get("crc_valid", False):
+                            active_palette = PALETTE_DECODE_OK
+                        else:
+                            active_palette = PALETTE_DECODE_FAIL
+                        break
+                if active_palette == PALETTE_NORMAL:
+                    tx_age = capture_time - last_tx_time
+                    if -0.1 <= tx_age <= 0.5:
+                        active_palette = PALETTE_TX
 
-            if active_palette == PALETTE_NORMAL:
-                if now_mono - last_tx_time < frame_marker_duration:
-                    active_palette = PALETTE_TX
+                row = render_row(
+                    snap,
+                    tw,
+                    db_min,
+                    db_max,
+                    rx_center,
+                    rx_visible,
+                    palette=active_palette,
+                )
 
-            row = render_row(
-                rx_ema,
-                tw,
-                db_min,
-                db_max,
-                rx_center,
-                rx_visible,
-                palette=active_palette,
-            )
+                # Store row in history for scroll-back
+                history.append(row)
 
-            # Store row in history for scroll-back
-            history.append(row)
+                # If paused, accumulate history but don't update the live display.
+                # On resize, repaint from history so the layout stays clean.
+                if scroll_offset > 0:
+                    if need_scroll_region:
+                        waterfall_rows = th - HEADER_LINES
+                        max_offset = max(0, len(history) - waterfall_rows)
+                        scroll_offset = min(scroll_offset, max_offset)
+                        parts: list[str] = ["\033[r"]  # reset scroll region
+                        parts.append(
+                            format_header(
+                                center_freq_mhz,
+                                sample_rate,
+                                args.bw_factor,
+                                db_min,
+                                db_max,
+                                fft_size,
+                                tw,
+                                rx_gain,
+                                last_decode,
+                                last_status,
+                                paused=True,
+                                scroll_offset=scroll_offset,
+                                history_len=len(history),
+                            )
+                        )
+                        parts.append(
+                            redraw_from_history(history, scroll_offset, th, tw)
+                        )
+                        sys.stdout.write("".join(parts))
+                        sys.stdout.flush()
+                        header_printed = True
+                        need_scroll_region = False  # done once per cycle
+                    frame_count += 1
+                    continue
 
-            # If paused (scrolled back), don't update the display --
-            # just keep accumulating history.  On resize, repaint from
-            # history so the layout stays clean (rows may be old width).
-            if scroll_offset > 0:
+                # Periodic header repaint for status counters / dB scale changes
+                now_mono = time.monotonic()
+                if (
+                    header_printed
+                    and now_mono - last_header_repaint >= header_repaint_interval
+                ):
+                    header_printed = False
+
+                # Build single atomic output: scroll region + header + row
+                # Batching into one write avoids intermediate terminal states
+                # that cause flicker (wezterm redraws on DECSTBM / cursor moves).
+                frame_buf: list[str] = []
                 if need_scroll_region:
-                    waterfall_rows = th - HEADER_LINES
-                    max_offset = max(0, len(history) - waterfall_rows)
-                    scroll_offset = min(scroll_offset, max_offset)
-                    parts: list[str] = ["\033[r"]  # reset scroll region
-                    parts.append(
+                    frame_buf.append(f"\033[{HEADER_LINES + 1};{th}r")
+                    need_scroll_region = False  # done once per cycle
+                if not header_printed:
+                    frame_buf.append(
                         format_header(
                             center_freq_mhz,
                             sample_rate,
@@ -1121,52 +1219,14 @@ def main() -> None:
                             rx_gain,
                             last_decode,
                             last_status,
-                            paused=True,
-                            scroll_offset=scroll_offset,
-                            history_len=len(history),
                         )
                     )
-                    parts.append(redraw_from_history(history, scroll_offset, th, tw))
-                    sys.stdout.write("".join(parts))
-                    sys.stdout.flush()
                     header_printed = True
+                    last_header_repaint = now_mono
+                frame_buf.append(f"\033[{th};1H{row}\n")
+                sys.stdout.write("".join(frame_buf))
+                sys.stdout.flush()
                 frame_count += 1
-                continue
-
-            # Periodic header repaint for status counters / dB scale changes
-            if (
-                header_printed
-                and now_mono - last_header_repaint >= header_repaint_interval
-            ):
-                header_printed = False
-
-            # Build single atomic output: scroll region + header + row
-            # Batching into one write avoids intermediate terminal states
-            # that cause flicker (wezterm redraws on DECSTBM / cursor moves).
-            frame_buf: list[str] = []
-            if need_scroll_region:
-                frame_buf.append(f"\033[{HEADER_LINES + 1};{th}r")
-            if not header_printed:
-                frame_buf.append(
-                    format_header(
-                        center_freq_mhz,
-                        sample_rate,
-                        args.bw_factor,
-                        db_min,
-                        db_max,
-                        fft_size,
-                        tw,
-                        rx_gain,
-                        last_decode,
-                        last_status,
-                    )
-                )
-                header_printed = True
-                last_header_repaint = now_mono
-            frame_buf.append(f"\033[{th};1H{row}\n")
-            sys.stdout.write("".join(frame_buf))
-            sys.stdout.flush()
-            frame_count += 1
 
     except KeyboardInterrupt:
         pass
