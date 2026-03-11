@@ -22,7 +22,7 @@ import socket
 import sys
 import tomllib
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Callable
 from urllib.parse import quote
 
 import cbor2
@@ -207,6 +207,126 @@ def utf8_truncate(s: str, max_bytes: int) -> bytes:
     if trunc and trunc[-1] >= 0xC0:
         trunc = trunc[:-1]
     return trunc
+
+
+# ---- LoRa frame formatting ----
+
+
+def format_diversity(div: dict[str, Any]) -> str:
+    """Format the diversity sub-map from an aggregated lora_frame as a single line."""
+    n = div.get("n_candidates", 0)
+    gap_us = div.get("gap_us", 0)
+    decoded_ch = div.get("decoded_channel")
+    snrs = div.get("snr_db", [])
+    crc_mask = div.get("crc_mask", 0)
+
+    parts = [f"{n} chain{'s' if n != 1 else ''}"]
+    if gap_us > 0:
+        parts.append(f"gap={gap_us / 1000:.0f}ms")
+    if n > 1 and decoded_ch is not None:
+        parts.append(f"ch={decoded_ch} won")
+    if n > 1 and snrs:
+        snr_str = ", ".join(f"{s:.1f}" for s in snrs)
+        parts.append(f"[SNR: {snr_str} dB]")
+    # Only show crc_mask when not all candidates passed
+    all_ok_mask = (1 << n) - 1
+    if n > 1 and crc_mask != all_ok_mask:
+        parts.append(f"crc={bin(crc_mask)}")
+    return "div: " + "  ".join(parts)
+
+
+def format_frame(
+    msg: dict[str, Any],
+    *,
+    our_prv: bytes | None = None,
+    our_pub: bytes | None = None,
+    known_keys: dict[str, bytes] | None = None,
+    channels: list[Any] | None = None,
+    _parse_summary: Callable[[bytes], str] | None = None,
+    _decrypt: Callable[..., str | None] | None = None,
+) -> str:
+    """Format a single lora_frame CBOR message as human-readable text.
+
+    Layout (each on its own line):
+
+    1. Header: ``#seq sizeB CRC SF/BW/CR sync [label] [ch=N] SNR NF peak``
+    2. Protocol + decrypted content (MeshCore only, via _parse_summary/_decrypt)
+    3. Hex dump (compact, omitted when decrypted content is shown)
+    4. Diversity line (aggregated frames from lora_agg only)
+
+    _parse_summary and _decrypt are optional callables injected by lora_mon.py
+    for MeshCore protocol parsing and decryption. When None, those blocks are skipped.
+    """
+    payload = msg.get("payload", b"")
+    phy = msg.get("phy", {})
+    crc_ok = msg.get("crc_valid", False)
+    crc_str = "CRC_OK" if crc_ok else "CRC_FAIL"
+    seq = msg.get("seq", 0)
+    cr = phy.get("cr", 0)
+    bw = phy.get("bw")
+    sync_word = phy.get("sync_word", 0)
+    sw_label = sync_word_name(sync_word)
+    snr_db = phy.get("snr_db")
+    snr_db_td = phy.get("snr_db_td")
+    noise_floor_db = phy.get("noise_floor_db")
+    peak_db = phy.get("peak_db")
+    rx_ch = msg.get("rx_channel")
+    decode_label = msg.get("decode_label")
+    dc = " (downchirp)" if msg.get("is_downchirp") else ""
+
+    # BW field: 62500 → "62.5k", 125000 → "125k", etc.
+    bw_str = f"BW{bw / 1e3:g}k" if bw is not None else ""
+
+    # Line 1: identity + PHY essentials + signal quality
+    sf_bw_cr = f"SF{phy.get('sf', '?')}"
+    if bw_str:
+        sf_bw_cr += f"/{bw_str}"
+    sf_bw_cr += f"/CR4:{4 + cr}"
+    header = f"#{seq} {len(payload)}B {crc_str} {sf_bw_cr} {sw_label}"
+    if decode_label:
+        header += f" [{sanitize_text(decode_label)}]"
+    if rx_ch is not None:
+        header += f" ch={rx_ch}"
+    if snr_db is not None:
+        header += f" SNR={snr_db:.1f}dB"
+    if snr_db_td is not None:
+        header += f" SNR_td={snr_db_td:.1f}dB"
+    if noise_floor_db is not None:
+        header += f" NF={noise_floor_db:.1f}dBFS"
+    if peak_db is not None:
+        header += f" peak={peak_db:.1f}dBFS"
+    header += dc
+
+    lines = [header]
+
+    # Line 2: protocol summary + decrypted content
+    mc_summary = ""
+    if _parse_summary is not None and sync_word == 0x12 and payload:
+        mc_summary = _parse_summary(payload)
+
+    decrypt_line = None
+    if _decrypt is not None and crc_ok and sync_word == 0x12 and payload:
+        decrypt_line = _decrypt(
+            payload, our_prv, our_pub, known_keys or {}, channels or []
+        )
+
+    if mc_summary and decrypt_line:
+        lines.append(f"  {mc_summary} | {decrypt_line}")
+    elif mc_summary:
+        lines.append(f"  {mc_summary}")
+    elif decrypt_line:
+        lines.append(f"  {decrypt_line}")
+
+    # Hex dump: show when there's no decrypted content (raw/unknown frames)
+    if payload and not decrypt_line:
+        lines.append(format_hexdump(payload, max_bytes=48, indent="  "))
+
+    # Diversity line (aggregated frames from lora_agg only)
+    div = msg.get("diversity")
+    if div:
+        lines.append(f"  {format_diversity(div)}")
+
+    return "\n".join(lines)
 
 
 # ---- Logging ----

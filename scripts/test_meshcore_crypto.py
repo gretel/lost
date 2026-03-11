@@ -779,7 +779,12 @@ class TestFormatFrameGrpTxt(unittest.TestCase):
 
         import lora_mon
 
-        text = lora_mon.format_frame(msg, channels=channels)
+        text = lora_mon.format_frame(
+            msg,
+            channels=channels,
+            _parse_summary=lora_mon.parse_meshcore_summary,
+            _decrypt=lora_mon._try_decrypt,
+        )
         self.assertIn("GRP_TXT #public", text)
         self.assertIn("TestUser: Hello group", text)
 
@@ -819,7 +824,12 @@ class TestFormatFrameGrpTxt(unittest.TestCase):
         import lora_mon
 
         # No our_prv, no our_pub — group decryption should still work
-        text = lora_mon.format_frame(msg, channels=channels)
+        text = lora_mon.format_frame(
+            msg,
+            channels=channels,
+            _parse_summary=lora_mon.parse_meshcore_summary,
+            _decrypt=lora_mon._try_decrypt,
+        )
         self.assertIn("GRP_TXT #public", text)
         self.assertIn("NoID: Works without identity", text)
 
@@ -859,7 +869,12 @@ class TestFormatFrameGrpTxt(unittest.TestCase):
         import lora_mon
 
         # No matching channel — should show unknown hash
-        text = lora_mon.format_frame(msg, channels=_seed_channels())
+        text = lora_mon.format_frame(
+            msg,
+            channels=_seed_channels(),
+            _parse_summary=lora_mon.parse_meshcore_summary,
+            _decrypt=lora_mon._try_decrypt,
+        )
         self.assertIn("unknown channel", text)
         self.assertIn(f"ch={unknown_ch.hash.hex()}", text)
 

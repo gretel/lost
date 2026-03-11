@@ -63,70 +63,70 @@ def find_free_port() -> int:
 
 class TestFormatFrame(unittest.TestCase):
     def test_text_contains_essentials(self):
-        text = lora_mon.format_frame(make_frame())
+        text = lora_common.format_frame(make_frame())
         self.assertIn("#1", text)
         self.assertIn("CRC_OK", text)
         self.assertIn("SF8", text)
 
     def test_crc_fail(self):
-        text = lora_mon.format_frame(make_frame(crc_valid=False))
+        text = lora_common.format_frame(make_frame(crc_valid=False))
         self.assertIn("CRC_FAIL", text)
 
     def test_sync_word_label(self):
-        self.assertIn("0x12", lora_mon.format_frame(make_frame(sync_word=0x12)))
-        self.assertIn("0x2B", lora_mon.format_frame(make_frame(sync_word=0x2B)))
-        self.assertIn("0x34", lora_mon.format_frame(make_frame(sync_word=0x34)))
-        self.assertIn("0xFF", lora_mon.format_frame(make_frame(sync_word=0xFF)))
+        self.assertIn("0x12", lora_common.format_frame(make_frame(sync_word=0x12)))
+        self.assertIn("0x2B", lora_common.format_frame(make_frame(sync_word=0x2B)))
+        self.assertIn("0x34", lora_common.format_frame(make_frame(sync_word=0x34)))
+        self.assertIn("0xFF", lora_common.format_frame(make_frame(sync_word=0xFF)))
 
     def test_snr_shown(self):
         msg = make_frame()
         msg["phy"]["snr_db"] = 12.5
-        text = lora_mon.format_frame(msg)
+        text = lora_common.format_frame(msg)
         self.assertIn("SNR=12.5dB", text)
 
     def test_rx_channel_shown(self):
         msg = make_frame()
         msg["rx_channel"] = 1
-        text = lora_mon.format_frame(msg)
+        text = lora_common.format_frame(msg)
         self.assertIn("ch=1", text)
 
     def test_no_snr_when_absent(self):
-        text = lora_mon.format_frame(make_frame())
+        text = lora_common.format_frame(make_frame())
         self.assertNotIn("SNR=", text)
 
     def test_no_channel_when_absent(self):
-        text = lora_mon.format_frame(make_frame())
+        text = lora_common.format_frame(make_frame())
         self.assertNotIn("ch=", text)
 
     def test_noise_floor_shown(self):
         msg = make_frame()
         msg["phy"]["noise_floor_db"] = -45.3
-        text = lora_mon.format_frame(msg)
+        text = lora_common.format_frame(msg)
         self.assertIn("NF=-45.3dBFS", text)
 
     def test_no_noise_floor_when_absent(self):
-        text = lora_mon.format_frame(make_frame())
+        text = lora_common.format_frame(make_frame())
         self.assertNotIn("NF=", text)
 
     def test_bw_shown(self):
-        text = lora_mon.format_frame(make_frame(bw=125000))
+        text = lora_common.format_frame(make_frame(bw=125000))
         self.assertIn("BW125k", text)
 
     def test_bw_62500_shown(self):
-        text = lora_mon.format_frame(make_frame(bw=62500))
+        text = lora_common.format_frame(make_frame(bw=62500))
         self.assertIn("BW62.5k", text)
 
     def test_decode_label_shown(self):
         msg = make_frame()
         msg["decode_label"] = "SF8-sync12"
-        text = lora_mon.format_frame(msg)
+        text = lora_common.format_frame(msg)
         self.assertIn("[SF8-sync12]", text)
 
     def test_no_decode_label_when_absent(self):
         msg = make_frame()
         # sync_word=0xFF → no MeshCore summary, so no "[" from any source
         msg["phy"]["sync_word"] = 0xFF
-        text = lora_mon.format_frame(msg)
+        text = lora_common.format_frame(msg)
         self.assertNotIn("[SF", text)
 
     def test_diversity_shown(self):
@@ -140,7 +140,7 @@ class TestFormatFrame(unittest.TestCase):
             "gap_us": 20000,
             "source_ids": ["a", "b"],
         }
-        text = lora_mon.format_frame(msg)
+        text = lora_common.format_frame(msg)
         self.assertIn("div:", text)
         self.assertIn("2 chains", text)
         self.assertIn("gap=20ms", text)
@@ -148,7 +148,7 @@ class TestFormatFrame(unittest.TestCase):
         self.assertIn("SNR:", text)
 
     def test_no_diversity_when_absent(self):
-        text = lora_mon.format_frame(make_frame())
+        text = lora_common.format_frame(make_frame())
         self.assertNotIn("div:", text)
 
     def test_diversity_single_chain(self):
@@ -162,7 +162,7 @@ class TestFormatFrame(unittest.TestCase):
             "gap_us": 0,
             "source_ids": ["x"],
         }
-        text = lora_mon.format_frame(msg)
+        text = lora_common.format_frame(msg)
         self.assertIn("1 chain", text)
         self.assertNotIn("chains", text)
         self.assertNotIn("ch=", text)  # no "won" line for single chain
@@ -199,11 +199,13 @@ class TestFormatFrameDecryption(unittest.TestCase):
         )
         msg = make_frame(payload=pkt, crc_valid=True, sync_word=0x12)
         known_keys = {self.sender_pub.hex(): self.sender_pub}
-        text = lora_mon.format_frame(
+        text = lora_common.format_frame(
             msg,
             our_prv=self.dest_expanded,
             our_pub=self.dest_pub,
             known_keys=known_keys,
+            _parse_summary=lora_mon.parse_meshcore_summary,
+            _decrypt=lora_mon._try_decrypt,
         )
         self.assertIn("TXT_MSG from", text)
         self.assertIn("Hello World", text)
@@ -216,11 +218,13 @@ class TestFormatFrameDecryption(unittest.TestCase):
             self.sender_expanded, self.sender_pub, self.dest_pub, b"AnonMsg"
         )
         msg = make_frame(payload=pkt, crc_valid=True, sync_word=0x12)
-        text = lora_mon.format_frame(
+        text = lora_common.format_frame(
             msg,
             our_prv=self.dest_expanded,
             our_pub=self.dest_pub,
             known_keys={},
+            _parse_summary=lora_mon.parse_meshcore_summary,
+            _decrypt=lora_mon._try_decrypt,
         )
         self.assertIn("ANON_REQ from", text)
         self.assertIn("AnonMsg", text)
@@ -233,7 +237,7 @@ class TestFormatFrameDecryption(unittest.TestCase):
             self.sender_expanded, self.sender_pub, self.dest_pub, "Secret"
         )
         msg = make_frame(payload=pkt, crc_valid=True, sync_word=0x12)
-        text = lora_mon.format_frame(msg)
+        text = lora_common.format_frame(msg)
         self.assertNotIn("TXT_MSG from", text)
         self.assertNotIn("ANON_REQ from", text)
 
@@ -246,11 +250,13 @@ class TestFormatFrameDecryption(unittest.TestCase):
         )
         msg = make_frame(payload=pkt, crc_valid=False, sync_word=0x12)
         known_keys = {self.sender_pub.hex(): self.sender_pub}
-        text = lora_mon.format_frame(
+        text = lora_common.format_frame(
             msg,
             our_prv=self.dest_expanded,
             our_pub=self.dest_pub,
             known_keys=known_keys,
+            _parse_summary=lora_mon.parse_meshcore_summary,
+            _decrypt=lora_mon._try_decrypt,
         )
         self.assertNotIn("TXT_MSG from", text)
 
@@ -263,11 +269,13 @@ class TestFormatFrameDecryption(unittest.TestCase):
         )
         msg = make_frame(payload=pkt, crc_valid=True, sync_word=0x2B)
         known_keys = {self.sender_pub.hex(): self.sender_pub}
-        text = lora_mon.format_frame(
+        text = lora_common.format_frame(
             msg,
             our_prv=self.dest_expanded,
             our_pub=self.dest_pub,
             known_keys=known_keys,
+            _parse_summary=lora_mon.parse_meshcore_summary,
+            _decrypt=lora_mon._try_decrypt,
         )
         self.assertNotIn("TXT_MSG from", text)
 
@@ -331,7 +339,7 @@ class TestConnectUdp(unittest.TestCase):
             try:
                 data, _ = client_sock.recvfrom(65536)
                 msg = cbor2.loads(data)
-                results.append(lora_mon.format_frame(msg))
+                results.append(lora_common.format_frame(msg))
             except socket.timeout:
                 pass
             finally:
@@ -626,11 +634,11 @@ class TestFormatFramePeak(unittest.TestCase):
     def test_peak_shown(self):
         msg = make_frame()
         msg["phy"]["peak_db"] = -6.2
-        text = lora_mon.format_frame(msg)
+        text = lora_common.format_frame(msg)
         self.assertIn("peak=-6.2dBFS", text)
 
     def test_no_peak_when_absent(self):
-        text = lora_mon.format_frame(make_frame())
+        text = lora_common.format_frame(make_frame())
         self.assertNotIn("peak=", text)
 
 
