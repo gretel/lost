@@ -4842,6 +4842,14 @@ class TestRepeaterCommands(unittest.TestCase):
         responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
         self.assertEqual(responses[0][0], bridge.RESP_ERROR)
 
+    def test_cmd_logout_short_payload_returns_error(self):
+        """CMD_LOGOUT with payload shorter than 32 bytes returns RESP_ERROR."""
+        state = make_state()
+        sock = _FakeUDPSock()
+        cmd = bytes([bridge.CMD_LOGOUT]) + b"\xaa" * 10  # only 10 bytes, need 32
+        responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
 
 if __name__ == "__main__":
     unittest.main()

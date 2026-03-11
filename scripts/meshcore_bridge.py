@@ -120,7 +120,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         pass
     return "dev"
 
@@ -1588,7 +1588,9 @@ def handle_command(
             return [state.build_error()]
         dst_pub = data[:32]
         log.info("companion: LOGOUT from %s..", dst_pub.hex()[:8])
-        _send_cli_txt_msg(dst_pub, "logout", state, udp_sock, udp_addr)
+        result = _send_cli_txt_msg(dst_pub, "logout", state, udp_sock, udp_addr)
+        if result and result[0][0] == state.build_error()[0]:
+            return result
         return [state.build_ok()]
 
     if cmd in (CMD_TRACE, CMD_PATH_DISCOVERY):
@@ -2234,7 +2236,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except (ConnectionError, OSError):
+                    except ConnectionError, OSError:
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2256,7 +2258,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except (BlockingIOError, OSError):
+                    except BlockingIOError, OSError:
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2406,7 +2408,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except (ConnectionError, OSError):
+    except ConnectionError, OSError:
         pass  # client disconnected, will be cleaned up on next recv
 
 
