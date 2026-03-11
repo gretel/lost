@@ -204,8 +204,12 @@ static void capture(RxStream& stream, cf32* buf, uint32_t nSamples, ScanStats& s
             collected += static_cast<uint32_t>(ret);
         } else if (ret == SOAPY_SDR_OVERFLOW) {
             ++stats.overflows;
+            gr::lora::log_ts("warn ", "lora_scan",
+                "USB buffer overflow (#%u)", stats.overflows);
         } else if (ret == SOAPY_SDR_TIMEOUT) {
             ++stats.drops;
+            gr::lora::log_ts("warn ", "lora_scan",
+                "readStream timeout / dropout (#%u)", stats.drops);
         }
     }
 }
@@ -238,45 +242,60 @@ static void measureTile(RxStream& stream, SoapyDevice& dev,
         fftSize = 4096;  // minimum for wideband to get reasonable resolution
     }
 
-    std::vector<cf32> buf(fftSize);
-    capture(stream, buf.data(), static_cast<uint32_t>(fftSize), stats);
-
-    // Hann window.
+    // Pre-compute Hann window.
+    std::vector<float> hann(fftSize);
     for (std::size_t idx = 0; idx < fftSize; ++idx) {
-        const auto w = static_cast<float>(
+        hann[idx] = static_cast<float>(
             0.5 - 0.5 * std::cos(2.0 * M_PI * static_cast<double>(idx)
                                   / static_cast<double>(fftSize - 1)));
-        buf[idx] *= w;
     }
-
-    gr::algorithm::FFT<cf32> fft;
-    auto spectrum = fft.compute(std::span<const cf32>(buf.data(), fftSize));
 
     const double hzPerBin   = tileRate / static_cast<double>(fftSize);
     const double halfChBins = (chBw / tileRate) * static_cast<double>(fftSize) / 2.0;
     const double halfTile   = tileRate / 2.0;
 
-    for (std::size_t chIdx = 0; chIdx < nCh; ++chIdx) {
-        const double chOffset = channels[chIdx] - tileCentre;
-        // Skip channels outside this tile's bandwidth (with 10% margin).
-        if (std::abs(chOffset) > halfTile * 0.9) {
-            continue;
-        }
-        const double binCentre = chOffset / hzPerBin;
-        const int kLo = static_cast<int>(std::round(binCentre - halfChBins));
-        const int kHi = static_cast<int>(std::round(binCentre + halfChBins));
+    // Take kL1Snapshots consecutive FFT snapshots and max-hold per-channel
+    // energy.  A short LoRa burst (SF7 ~330 ms) may only appear in one of
+    // the snapshots; max-hold ensures it is detected.  Each snapshot costs
+    // fftSize/tileRate seconds (e.g. 16384/8e6 = 2 ms), so 4 snapshots add
+    // only ~8 ms per tile.
+    constexpr int kL1Snapshots = 4;
 
-        double sum = 0.0;
-        int    cnt = 0;
-        for (int k = kLo; k <= kHi; ++k) {
-            const auto binIdx = static_cast<std::size_t>(
-                (k % static_cast<int>(fftSize) + static_cast<int>(fftSize))
-                % static_cast<int>(fftSize));
-            sum += static_cast<double>(std::norm(spectrum[binIdx]));
-            ++cnt;
+    std::vector<cf32> buf(fftSize);
+    gr::algorithm::FFT<cf32> fft;
+
+    for (int snap = 0; snap < kL1Snapshots; ++snap) {
+        capture(stream, buf.data(), static_cast<uint32_t>(fftSize), stats);
+
+        // Apply Hann window.
+        for (std::size_t idx = 0; idx < fftSize; ++idx) {
+            buf[idx] *= hann[idx];
         }
-        if (cnt > 0) {
-            energy[chIdx] = sum / static_cast<double>(cnt);
+
+        auto spectrum = fft.compute(std::span<const cf32>(buf.data(), fftSize));
+
+        for (std::size_t chIdx = 0; chIdx < nCh; ++chIdx) {
+            const double chOffset = channels[chIdx] - tileCentre;
+            if (std::abs(chOffset) > halfTile * 0.9) {
+                continue;
+            }
+            const double binCentre = chOffset / hzPerBin;
+            const int kLo = static_cast<int>(std::round(binCentre - halfChBins));
+            const int kHi = static_cast<int>(std::round(binCentre + halfChBins));
+
+            double sum = 0.0;
+            int    cnt = 0;
+            for (int k = kLo; k <= kHi; ++k) {
+                const auto binIdx = static_cast<std::size_t>(
+                    (k % static_cast<int>(fftSize) + static_cast<int>(fftSize))
+                    % static_cast<int>(fftSize));
+                sum += static_cast<double>(std::norm(spectrum[binIdx]));
+                ++cnt;
+            }
+            if (cnt > 0) {
+                const double snapEnergy = sum / static_cast<double>(cnt);
+                energy[chIdx] = std::max(energy[chIdx], snapEnergy);
+            }
         }
     }
 }
@@ -329,9 +348,49 @@ static Layer1Result layer1Scan(RxStream& stream, SoapyDevice& dev,
     gr::lora::log_ts("debug", "lora_scan",
         "L1 median=%.6f thresh=%.6f (%zu ch)", median, thresh, nCh);
 
-    for (int idx = 0; idx < static_cast<int>(nCh); ++idx) {
-        if (result.energy[static_cast<std::size_t>(idx)] > thresh) {
-            result.hot_idx.push_back(idx);
+    // Pass 1: fine-grid detection (narrowest BW).
+    std::vector<bool> isHot(nCh, false);
+    for (std::size_t idx = 0; idx < nCh; ++idx) {
+        if (result.energy[idx] > thresh) {
+            isHot[idx] = true;
+        }
+    }
+
+    // Pass 2: wideband aggregation.  A signal at BW > min_bw spreads its
+    // energy across bw/min_bw adjacent fine-grid channels.  Sum groups of
+    // that width and compare to threshold × group_size (energy scales
+    // linearly with the number of channels if noise is flat).
+    for (const double bw : cfg.bws) {
+        const auto groupSize = static_cast<std::size_t>(
+            std::round(bw / chBw));
+        if (groupSize <= 1) {
+            continue;  // already handled in pass 1
+        }
+        // Sliding window of groupSize channels.  Mark the center channel
+        // as hot when the group's average energy exceeds the per-channel
+        // threshold (equiv. to group sum > thresh × groupSize).
+        for (std::size_t start = 0; start + groupSize <= nCh; ++start) {
+            double groupSum = 0.0;
+            for (std::size_t k = 0; k < groupSize; ++k) {
+                groupSum += result.energy[start + k];
+            }
+            const double groupAvg = groupSum / static_cast<double>(groupSize);
+            if (groupAvg > thresh) {
+                // Mark center channel of the group as hot.
+                const std::size_t center = start + groupSize / 2;
+                if (!isHot[center]) {
+                    isHot[center] = true;
+                    gr::lora::log_ts("debug", "lora_scan",
+                        "L1 wideband HOT %.0f Hz  BW=%.0f  group_avg=%.6f (thresh=%.6f, %zu ch group)",
+                        channels[center], bw, groupAvg, thresh, groupSize);
+                }
+            }
+        }
+    }
+
+    for (std::size_t idx = 0; idx < nCh; ++idx) {
+        if (isHot[idx]) {
+            result.hot_idx.push_back(static_cast<int>(idx));
         }
     }
     // Sort hot channels by energy (highest first) so the strongest signal
@@ -352,12 +411,16 @@ static Layer1Result layer1Scan(RxStream& stream, SoapyDevice& dev,
 
 // ─── Layer 2: per-channel CAD dwell — multi-SF on each window ────────────────
 //
-// Retune to the given BW, capture K SF12-sized windows, and for each window
-// try every SF (7–12).  First SF that fires is the detection.  This merges the
-// old L2 (single-SF CAD) and L3 (post-detection SF sweep) into one step.
+// Retune to the given BW, capture K windows, and for each window try every
+// SF (7–12).  The first SF that fires is the detection.
 //
-// Each capture is big enough for SF12 (4096×os×2 samples).  For lower SFs
-// the detector only reads the first 2^sf × os × 2 samples of the buffer.
+// Two capture strategies:
+//   - "per-SF" (default): each SF trial gets its own correctly-sized capture.
+//     Accurate for long dwells where the signal persists across all trials.
+//   - "shared" (sharedBuf mode): one SF12-sized capture per window, all SFs
+//     tested on the same data.  The chirp present in the buffer matches
+//     exactly one SF.  Avoids temporal offset between SF trials — critical
+//     for short bursts that may end mid-dwell.
 
 struct Layer2Result {
     double   peak_ratio_up = 0.0;
@@ -368,74 +431,100 @@ struct Layer2Result {
     bool     detected       = false;
 };
 
-static Layer2Result layer2Cad(RxStream& stream, SoapyDevice& dev,
-                              double freq, double bw,
-                              const ScanConfig& cfg, ScanStats& stats) {
-    const double sampleRate = bw * static_cast<double>(cfg.os_factor);
-    retune(stream, dev, freq, sampleRate, cfg.settle_ms);
+struct SfDetector {
+    gr::lora::ChannelActivityDetector det;
+    uint32_t sf;
+};
 
-    // Pre-build detectors for SF7–12, reuse across all windows.
-    struct SfDetector {
-        gr::lora::ChannelActivityDetector det;
-        uint32_t sf;
-    };
+/// Build detectors for SF7–12 at the given BW.
+static std::vector<SfDetector> buildDetectors(double bw, uint32_t osFactor) {
     std::vector<SfDetector> detectors;
     for (uint32_t trySf = 7; trySf <= 12; ++trySf) {
         SfDetector sd;
         sd.sf              = trySf;
         sd.det.sf          = trySf;
         sd.det.bandwidth   = static_cast<uint32_t>(bw);
-        sd.det.os_factor   = cfg.os_factor;
+        sd.det.os_factor   = osFactor;
         sd.det.alpha       = gr::lora::ChannelActivityDetector::default_alpha(trySf);
         sd.det.dual_chirp  = true;
         sd.det.debug       = false;
         sd.det.start();
         detectors.push_back(std::move(sd));
     }
+    return detectors;
+}
+
+/// Run all-SF detection on a pre-captured SF12-sized buffer.
+/// Returns the SF with the highest peak ratio, or 0 if none detected.
+static Layer2Result detectOnBuffer(const cf32* buf, std::vector<SfDetector>& detectors,
+                                   double freq, double bw) {
+    Layer2Result result;
+    result.windows_tried = 1;
+
+    float    bestUp = 0.0F;
+    float    bestDn = 0.0F;
+    uint32_t bestSf = 0;
+
+    for (auto& sd : detectors) {
+        const auto r = sd.det.detect(buf);
+        const float winRatio = std::max(r.peak_ratio_up, r.peak_ratio_dn);
+        if (r.detected && winRatio > std::max(bestUp, bestDn)) {
+            bestUp = r.peak_ratio_up;
+            bestDn = r.peak_ratio_dn;
+            bestSf = sd.sf;
+        }
+    }
+
+    if (bestSf != 0) {
+        result.detected      = true;
+        result.detections    = 1;
+        result.sf_detected   = bestSf;
+        result.peak_ratio_up = static_cast<double>(bestUp);
+        result.peak_ratio_dn = static_cast<double>(bestDn);
+
+        gr::lora::log_ts("debug", "lora_scan",
+            "CAD %.0f Hz BW=%.0f SF%u  ratio_up=%.2f ratio_dn=%.2f",
+            freq, bw, bestSf,
+            static_cast<double>(bestUp), static_cast<double>(bestDn));
+    }
+    return result;
+}
+
+static Layer2Result layer2Cad(RxStream& stream, SoapyDevice& dev,
+                              double freq, double bw,
+                              const ScanConfig& cfg, ScanStats& stats) {
+    const double sampleRate = bw * static_cast<double>(cfg.os_factor);
+    retune(stream, dev, freq, sampleRate, cfg.settle_ms);
+
+    auto detectors = buildDetectors(bw, cfg.os_factor);
 
     Layer2Result result;
     result.windows_tried = cfg.cad_windows;
+
+    // Use shared SF12-sized buffer: capture once, test all SFs on same data.
+    // The chirp in the buffer matches exactly one SF.  This avoids the
+    // temporal offset between per-SF captures that causes SF misidentification
+    // on short bursts.
+    const uint32_t sf12Win = (1U << 12U) * cfg.os_factor * 2U;
+    std::vector<cf32> buf(sf12Win);
 
     for (uint32_t win = 0; win < cfg.cad_windows; ++win) {
         if (g_stop.load(std::memory_order_relaxed)) {
             break;
         }
 
-        // Try all SFs on this window and pick the one with the highest peak
-        // ratio.  Each SF gets its own correctly-sized capture: 2×2^sf×os_factor
-        // samples.  A shared SF12 buffer causes lower SFs to examine only the
-        // first fraction (e.g. SF8 reads 2048 of 32768 samples), producing weak
-        // false SF12 matches (~9 ratio) instead of the true SF at 100+.
-        float    bestWinRatioUp = 0.0F;
-        float    bestWinRatioDn = 0.0F;
-        uint32_t bestWinSf      = 0;
+        capture(stream, buf.data(), sf12Win, stats);
+        const auto r = detectOnBuffer(buf.data(), detectors, freq, bw);
 
-        for (auto& sd : detectors) {
-            const uint32_t sfWin = (1U << sd.sf) * cfg.os_factor * 2U;
-            std::vector<cf32> sfBuf(sfWin);
-            capture(stream, sfBuf.data(), sfWin, stats);
-            const auto r = sd.det.detect(sfBuf.data());
-            const float winRatio = std::max(r.peak_ratio_up, r.peak_ratio_dn);
-
-            if (r.detected && winRatio > std::max(bestWinRatioUp, bestWinRatioDn)) {
-                bestWinRatioUp = r.peak_ratio_up;
-                bestWinRatioDn = r.peak_ratio_dn;
-                bestWinSf      = sd.sf;
-
-                gr::lora::log_ts("debug", "lora_scan",
-                    "L2 %.0f Hz BW=%.0f SF%u  ratio_up=%.2f ratio_dn=%.2f (candidate)",
-                    freq, bw, sd.sf,
-                    static_cast<double>(r.peak_ratio_up),
-                    static_cast<double>(r.peak_ratio_dn));
+        if (r.detected) {
+            const double ratio = std::max(r.peak_ratio_up, r.peak_ratio_dn);
+            if (ratio > std::max(result.peak_ratio_up, result.peak_ratio_dn)) {
+                result.detected      = true;
+                result.detections   += 1;
+                result.sf_detected   = r.sf_detected;
+                result.peak_ratio_up = std::max(result.peak_ratio_up, r.peak_ratio_up);
+                result.peak_ratio_dn = std::max(result.peak_ratio_dn, r.peak_ratio_dn);
             }
-        }
-
-        if (bestWinSf != 0) {
-            ++result.detections;
-            result.detected      = true;
-            result.sf_detected   = bestWinSf;
-            result.peak_ratio_up = std::max(result.peak_ratio_up, static_cast<double>(bestWinRatioUp));
-            result.peak_ratio_dn = std::max(result.peak_ratio_dn, static_cast<double>(bestWinRatioDn));
             break;  // one confirmed window is enough
         }
     }
@@ -447,6 +536,336 @@ static Layer2Result layer2Cad(RxStream& stream, SoapyDevice& dev,
         result.peak_ratio_up, result.peak_ratio_dn);
 
     return result;
+}
+
+// ─── Mode C: direct-CAD sweep (no L1) ───────────────────────────────────────
+//
+// For narrow scan windows where all channels can be probed directly.
+// Iterates every channel × every BW with one SF12-sized CAD window each.
+// No L1 FFT, no retune-per-snapshot overhead — just sequential CAD.
+//
+// Sweep time at BW=62.5k, os=4, 33 channels, 3 BWs:
+//   SF12 window = 4096*4*2 = 32768 samples → 32768/(62500*4) = 131 ms
+//   33 ch × 3 BW × (131 ms capture + 5 ms settle) ≈ 13.5 s per sweep
+//   — still too slow for short bursts, but each individual BW-trial on a
+//     channel is a continuous 131 ms capture that catches any chirp present.
+//
+// Optimisation: for wider BWs, the SF12 capture is shorter (32768/(125k*4)
+// = 65 ms at BW125k, 33 ms at BW250k), so wider BWs sweep faster.
+
+struct DirectCadResult {
+    double   freq          = 0.0;
+    double   bw            = 0.0;
+    double   peak_ratio_up = 0.0;
+    double   peak_ratio_dn = 0.0;
+    uint32_t sf_detected   = 0;
+};
+
+static std::vector<DirectCadResult> directCadSweep(
+        RxStream& stream, SoapyDevice& dev,
+        const std::vector<double>& channels,
+        const ScanConfig& cfg, ScanStats& stats) {
+    std::vector<DirectCadResult> results;
+
+    // Pre-build detectors for each BW.
+    struct BwDetectors {
+        double bw;
+        std::vector<SfDetector> dets;
+    };
+    std::vector<BwDetectors> bwDets;
+    for (const double bw : cfg.bws) {
+        BwDetectors bd;
+        bd.bw   = bw;
+        bd.dets = buildDetectors(bw, cfg.os_factor);
+        bwDets.push_back(std::move(bd));
+    }
+
+    for (const double freq : channels) {
+        if (g_stop.load(std::memory_order_relaxed)) {
+            break;
+        }
+
+        double       bestRatio = 0.0;
+        DirectCadResult bestResult;
+
+        for (auto& bd : bwDets) {
+            if (g_stop.load(std::memory_order_relaxed)) {
+                break;
+            }
+
+            const double sampleRate = bd.bw * static_cast<double>(cfg.os_factor);
+            retune(stream, dev, freq, sampleRate, cfg.settle_ms);
+
+            // Per-SF capture: each SF trial gets its own correctly-sized
+            // buffer.  This avoids SF misidentification from chirp boundary
+            // misalignment in a shared buffer, at the cost of slightly more
+            // capture time.  Mode C is the "thorough" path, so accuracy
+            // matters more than speed here.
+            for (auto& sd : bd.dets) {
+                if (g_stop.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                const uint32_t sfWin = (1U << sd.sf) * cfg.os_factor * 2U;
+                std::vector<cf32> sfBuf(sfWin);
+                capture(stream, sfBuf.data(), sfWin, stats);
+                const auto r = sd.det.detect(sfBuf.data());
+                if (r.detected) {
+                    const double ratio = std::max(
+                        static_cast<double>(r.peak_ratio_up),
+                        static_cast<double>(r.peak_ratio_dn));
+                    if (ratio > bestRatio) {
+                        bestRatio         = ratio;
+                        bestResult.freq   = freq;
+                        bestResult.bw     = bd.bw;
+                        bestResult.peak_ratio_up = static_cast<double>(r.peak_ratio_up);
+                        bestResult.peak_ratio_dn = static_cast<double>(r.peak_ratio_dn);
+                        bestResult.sf_detected   = sd.sf;
+
+                        gr::lora::log_ts("debug", "lora_scan",
+                            "C: %.0f Hz BW=%.0f SF%u  ratio_up=%.2f ratio_dn=%.2f",
+                            freq, bd.bw, sd.sf,
+                            static_cast<double>(r.peak_ratio_up),
+                            static_cast<double>(r.peak_ratio_dn));
+                    }
+                }
+            }
+        }
+
+        if (bestRatio > 0.0) {
+            results.push_back(bestResult);
+        }
+    }
+
+    return results;
+}
+
+// ─── Mode B: interleaved L1 snapshot + immediate L2 ─────────────────────────
+//
+// Take one L1 FFT snapshot, check for HOT channels, immediately run L2 CAD
+// on the top-1 HOT channel before taking the next snapshot.  This cuts the
+// L1→L2 gap from ~2s (full sweep) to ~8ms (single FFT + retune).
+//
+// After the interleaved pass, any remaining un-probed HOT channels from the
+// last snapshot are processed in a conventional L2 pass.
+
+struct InterleavedResult {
+    std::vector<DirectCadResult> detections;
+    uint32_t                     l1_hot_total = 0;
+};
+
+static InterleavedResult interleavedSweep(
+        RxStream& stream, SoapyDevice& dev,
+        const std::vector<double>& channels,
+        const ScanConfig& cfg, ScanStats& stats) {
+    InterleavedResult ir;
+
+    const std::size_t nCh    = channels.size();
+    const double      chBw   = cfg.min_bw();
+
+    // Pre-build detectors for each BW (reused across snapshots).
+    struct BwDetectors {
+        double bw;
+        std::vector<SfDetector> dets;
+    };
+    std::vector<BwDetectors> bwDets;
+    for (const double bw : cfg.bws) {
+        BwDetectors bd;
+        bd.bw      = bw;
+        bd.dets    = buildDetectors(bw, cfg.os_factor);
+        bwDets.push_back(std::move(bd));
+    }
+
+    // L1 FFT infrastructure — same as measureTile but for single snapshots.
+    const double tileRate   = cfg.l1_rate;
+    const double tileCentre = (channels.front() + channels.back()) / 2.0;
+
+    constexpr std::size_t kMinBinsPerChannel = 256;
+    std::size_t fftSize = 1;
+    while (fftSize < nCh * kMinBinsPerChannel) {
+        fftSize <<= 1U;
+    }
+    if (fftSize < 4096) {
+        fftSize = 4096;
+    }
+
+    std::vector<float> hann(fftSize);
+    for (std::size_t idx = 0; idx < fftSize; ++idx) {
+        hann[idx] = static_cast<float>(
+            0.5 - 0.5 * std::cos(2.0 * M_PI * static_cast<double>(idx)
+                                  / static_cast<double>(fftSize - 1)));
+    }
+
+    const double hzPerBin   = tileRate / static_cast<double>(fftSize);
+    const double halfChBins = (chBw / tileRate) * static_cast<double>(fftSize) / 2.0;
+    const double halfTile   = tileRate / 2.0;
+
+    constexpr double kL1Multiplier = 6.0;
+    // Snapshot count scales with channel count × BWs to give each channel
+    // multiple chances to be caught.  At ~1 ms per L1 snapshot (+ ~300 ms
+    // per L2 retune/capture when HOT), 5 × nCh × nBW snapshots covers the
+    // equivalent dwell time that mode C would use sequentially, but with
+    // continuous L1 monitoring throughout.
+    const int kSnapshots = static_cast<int>(
+        5U * nCh * cfg.bws.size());
+
+    std::vector<cf32> fftBuf(fftSize);
+    std::vector<double> energy(nCh, 0.0);
+    gr::algorithm::FFT<cf32> fft;
+
+    // Track which channels have already been probed this sweep.
+    std::vector<bool> probed(nCh, false);
+
+    // Tune to wideband for L1.
+    retune(stream, dev, tileCentre, tileRate, cfg.settle_ms);
+
+    for (int snap = 0; snap < kSnapshots; ++snap) {
+        if (g_stop.load(std::memory_order_relaxed)) {
+            break;
+        }
+
+        // If we're not at L1 rate (because we just did an L2 retune), retune back.
+        // We track this with a flag to avoid unnecessary retunes.
+        // (First snapshot is already tuned from above.)
+
+        // Take one L1 FFT snapshot.
+        capture(stream, fftBuf.data(), static_cast<uint32_t>(fftSize), stats);
+
+        for (std::size_t idx = 0; idx < fftSize; ++idx) {
+            fftBuf[idx] *= hann[idx];
+        }
+        auto spectrum = fft.compute(std::span<const cf32>(fftBuf.data(), fftSize));
+
+        // Compute per-channel energy for this snapshot.
+        std::ranges::fill(energy, 0.0);
+        for (std::size_t chIdx = 0; chIdx < nCh; ++chIdx) {
+            const double chOffset = channels[chIdx] - tileCentre;
+            if (std::abs(chOffset) > halfTile * 0.9) {
+                continue;
+            }
+            const double binCentre = chOffset / hzPerBin;
+            const int kLo = static_cast<int>(std::round(binCentre - halfChBins));
+            const int kHi = static_cast<int>(std::round(binCentre + halfChBins));
+
+            double sum = 0.0;
+            int    cnt = 0;
+            for (int k = kLo; k <= kHi; ++k) {
+                const auto binIdx = static_cast<std::size_t>(
+                    (k % static_cast<int>(fftSize) + static_cast<int>(fftSize))
+                    % static_cast<int>(fftSize));
+                sum += static_cast<double>(std::norm(spectrum[binIdx]));
+                ++cnt;
+            }
+            if (cnt > 0) {
+                energy[chIdx] = sum / static_cast<double>(cnt);
+            }
+        }
+
+        // Median threshold.
+        std::vector<double> sorted(energy.begin(), energy.end());
+        std::ranges::sort(sorted);
+        const double median = (nCh % 2 == 1)
+            ? sorted[nCh / 2]
+            : (sorted[nCh / 2 - 1] + sorted[nCh / 2]) / 2.0;
+        const double thresh = median * kL1Multiplier;
+
+        // Find the hottest un-probed channel (fine-grid or wideband-aggregated).
+        int    bestIdx    = -1;
+        double bestEnergy = 0.0;
+
+        // Fine-grid check.
+        for (std::size_t idx = 0; idx < nCh; ++idx) {
+            if (!probed[idx] && energy[idx] > thresh && energy[idx] > bestEnergy) {
+                bestIdx    = static_cast<int>(idx);
+                bestEnergy = energy[idx];
+            }
+        }
+
+        // Wideband aggregation check.
+        for (const double bw : cfg.bws) {
+            const auto groupSize = static_cast<std::size_t>(std::round(bw / chBw));
+            if (groupSize <= 1) {
+                continue;
+            }
+            for (std::size_t start = 0; start + groupSize <= nCh; ++start) {
+                const std::size_t center = start + groupSize / 2;
+                if (probed[center]) {
+                    continue;
+                }
+                double groupSum = 0.0;
+                for (std::size_t k = 0; k < groupSize; ++k) {
+                    groupSum += energy[start + k];
+                }
+                const double groupAvg = groupSum / static_cast<double>(groupSize);
+                if (groupAvg > thresh && groupAvg > bestEnergy) {
+                    bestIdx    = static_cast<int>(center);
+                    bestEnergy = groupAvg;
+                }
+            }
+        }
+
+        if (bestIdx < 0) {
+            continue;  // nothing hot this snapshot
+        }
+
+        ++ir.l1_hot_total;
+        const double freq = channels[static_cast<std::size_t>(bestIdx)];
+
+        gr::lora::log_ts("debug", "lora_scan",
+            "B: snap %d/%d  HOT %.0f Hz  energy=%.6f (thresh=%.6f)  → immediate L2",
+            snap + 1, kSnapshots, freq, bestEnergy, thresh);
+
+        // Run L2 on this channel at each BW (narrowest first).
+        // Within each BW: capture one SF12-sized buffer, test all SFs on
+        // the same data.  This ensures the correct SF always produces the
+        // highest ratio (full 2-symbol correlation vs partial for wrong SFs).
+        // Per-BW retune prevents cross-BW false detections.
+        double bestRatio = 0.0;
+        DirectCadResult bestResult;
+
+        for (auto& bd : bwDets) {
+            if (g_stop.load(std::memory_order_relaxed)) {
+                break;
+            }
+
+            const double sampleRate = bd.bw * static_cast<double>(cfg.os_factor);
+            retune(stream, dev, freq, sampleRate, cfg.settle_ms);
+
+            const uint32_t sf12Win = (1U << 12U) * cfg.os_factor * 2U;
+            std::vector<cf32> cadBuf(sf12Win);
+            capture(stream, cadBuf.data(), sf12Win, stats);
+
+            const auto r = detectOnBuffer(cadBuf.data(), bd.dets, freq, bd.bw);
+            if (r.detected) {
+                const double ratio = std::max(r.peak_ratio_up, r.peak_ratio_dn);
+                if (ratio > bestRatio) {
+                    bestRatio         = ratio;
+                    bestResult.freq   = freq;
+                    bestResult.bw     = bd.bw;
+                    bestResult.peak_ratio_up = r.peak_ratio_up;
+                    bestResult.peak_ratio_dn = r.peak_ratio_dn;
+                    bestResult.sf_detected   = r.sf_detected;
+                }
+            }
+
+            // Early exit: if we got a strong match at this BW, don't try
+            // wider BWs (which could produce weaker cross-BW false hits).
+            if (bestRatio > 10.0) {
+                break;
+            }
+        }
+
+        // Retune back to wideband for next L1 snapshot.
+        retune(stream, dev, tileCentre, tileRate, cfg.settle_ms);
+
+        // Record result.
+        probed[static_cast<std::size_t>(bestIdx)] = true;
+
+        if (bestRatio > 0.0) {
+            ir.detections.push_back(bestResult);
+        }
+    }
+
+    return ir;
 }
 
 // ─── UTC time helper for stdout table: "HH:MM:SS.mmm" ────────────────────────
@@ -550,7 +969,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // ── Full scan: L1 + L2 + (optional) L3, continuous ──────────────────────
+    // ── Full scan: adaptive mode selection ─────────────────────────────────
 
     // Print header once.
     std::printf("%-13s  %10s  %6s  %6s  %6s  %6s  %4s\n",
@@ -558,100 +977,152 @@ int main(int argc, char** argv) {
     std::printf("%s\n", std::string(60, '-').c_str());
     std::fflush(stdout);
 
-    const double nearMissThresh = static_cast<double>(cfg.min_ratio) * 0.9;
     auto lastStatusUpdate = std::chrono::steady_clock::now();
 
-    // For secondary BWs, use fewer CAD windows (quick yes/no, not full dwell).
+    // Select scan mode based on scan range and channel count.
+    //
+    // Mode C (direct CAD): skip L1, probe every channel × BW directly.
+    //   Best for narrow windows (≤ ~40 channels).  Each channel gets a
+    //   131 ms SF12-sized capture — no L1→L2 timing gap.
+    //
+    // Mode B (interleaved): take one L1 FFT snapshot, immediately run L2
+    //   on the top-1 HOT channel, repeat.  Cuts L1→L2 gap to ~8 ms.
+    //   Used when scan range fits in one L1 tile but is too wide for C.
+    //
+    // Mode A (full sweep): L1 tiles + sequential L2.  For wide scans.
+    //
+    // B+C combination: run C first (catches signals present now), then
+    // run B for the remainder of the sweep (catches signals that appear
+    // during the B phase).  This maximises detection probability.
+
+    const double scanRange = channels.back() - channels.front() + cfg.min_bw();
+    const double usableBw  = cfg.l1_rate * 0.8;
+    const bool   singleTile = scanRange <= usableBw;
+
+    constexpr std::size_t kDirectCadMaxChannels = 64;
+    const bool useDirectCad = channels.size() <= kDirectCadMaxChannels;
+    const bool useInterleaved = singleTile;
+
+    // Mode B subsumes C when both apply (B runs enough snapshots to cover
+    // the full dwell).  C is only standalone for non-interleaved narrow scans.
+    const char* modeName = useInterleaved
+        ? "B (interleaved L1+L2)"
+        : (useDirectCad ? "C (direct CAD)" : "A (full L1+L2 sweep)");
+    gr::lora::log_ts("info ", "lora_scan",
+        "scan mode: %s  (%zu ch, range=%.1f MHz, tile=%.1f MHz)",
+        modeName, channels.size(), scanRange / 1.0e6, usableBw / 1.0e6);
+
+    // Helper: report a detection result to stdout and update stats.
+    auto reportDetection = [&](const DirectCadResult& det) {
+        const double ratio = std::max(det.peak_ratio_up, det.peak_ratio_dn);
+        if (ratio < static_cast<double>(cfg.min_ratio)) {
+            return;
+        }
+
+        const auto ts = ts_short();
+        const std::string sfStr = det.sf_detected
+            ? ("SF" + std::to_string(det.sf_detected)) : "-";
+
+        std::fprintf(stderr, "\r%s\r", std::string(80, ' ').c_str());
+        std::printf("%-13s  %10.3f  %6.1f  %6.1f  %6.1f  %6s  %4s\n",
+                    ts.c_str(), det.freq / 1.0e6, det.bw / 1.0e3,
+                    det.peak_ratio_up, det.peak_ratio_dn,
+                    "1/1", sfStr.c_str());
+        std::fflush(stdout);
+
+        char freqBuf[32];
+        std::snprintf(freqBuf, sizeof(freqBuf), "%.3f MHz", det.freq / 1.0e6);
+        stats.last_det_freq = freqBuf;
+        stats.last_det_time = ts;
+    };
+
+    // For mode A fallback: secondary BWs get fewer CAD windows.
     const uint32_t quickWindows = std::max(4U, cfg.cad_windows / 8U);
 
     while (!g_stop.load(std::memory_order_relaxed)) {
-        const auto l1 = layer1Scan(stream, dev, channels, cfg, stats);
-        stats.l1_hot = static_cast<uint32_t>(l1.hot_idx.size());
 
-        // Build L2 candidate list: hot channels (energy-sorted) or all channels.
-        std::vector<std::size_t> l2_candidates;
-        if (cfg.all_channels) {
-            for (std::size_t i = 0; i < channels.size(); ++i) {
-                l2_candidates.push_back(i);
+        // ── Phase 1: Mode B (interleaved L1+L2)
+        // When available, mode B is the primary scan mode.  Its snapshot
+        // count scales with the channel/BW count so it covers the full
+        // expected dwell time with continuous L1 monitoring.  Mode C is
+        // only used as a standalone fallback for very small channel counts
+        // where the overhead of L1 FFTs is worse than sequential probing.
+        if (useInterleaved) {
+            const auto bResult = interleavedSweep(stream, dev, channels, cfg, stats);
+            for (const auto& det : bResult.detections) {
+                reportDetection(det);
             }
-        } else {
-            for (int hi : l1.hot_idx) {
-                l2_candidates.push_back(static_cast<std::size_t>(hi));
-            }
+            stats.l1_hot = bResult.l1_hot_total;
         }
 
-        if (l2_candidates.size() > cfg.max_l2) {
-            l2_candidates.resize(cfg.max_l2);
+        // ── Phase 2: Mode C (direct CAD) — only when B is not available
+        if (useDirectCad && !useInterleaved
+            && !g_stop.load(std::memory_order_relaxed)) {
+            const auto cResults = directCadSweep(stream, dev, channels, cfg, stats);
+            for (const auto& det : cResults) {
+                reportDetection(det);
+            }
+            stats.l1_hot = static_cast<uint32_t>(cResults.size());
         }
 
-        for (std::size_t idx : l2_candidates) {
-            if (g_stop.load(std::memory_order_relaxed)) {
-                break;
+        // ── Phase 3: Mode A fallback (full L1 + sequential L2) ─────────
+        if (!useDirectCad && !useInterleaved
+            && !g_stop.load(std::memory_order_relaxed)) {
+            const auto l1 = layer1Scan(stream, dev, channels, cfg, stats);
+            stats.l1_hot = static_cast<uint32_t>(l1.hot_idx.size());
+
+            std::vector<std::size_t> l2_candidates;
+            if (cfg.all_channels) {
+                for (std::size_t i = 0; i < channels.size(); ++i) {
+                    l2_candidates.push_back(i);
+                }
+            } else {
+                for (int hi : l1.hot_idx) {
+                    l2_candidates.push_back(static_cast<std::size_t>(hi));
+                }
+            }
+            if (l2_candidates.size() > cfg.max_l2) {
+                l2_candidates.resize(cfg.max_l2);
             }
 
-            const double freq = channels[idx];
-
-            // Try all BWs and pick the best match (highest peak ratio).
-            // A chirp partially correlates with CAD at any BW, so we can't
-            // break on first detection — the matched BW produces the strongest
-            // peak ratio and correctly identifies the signal's true bandwidth.
-            // Each L2 call now tries all SFs (7–12) internally.
-            double       bestRatio = 0.0;
-            double       bestBw    = 0.0;
-            Layer2Result bestL2;
-
-            for (std::size_t bwIdx = 0; bwIdx < cfg.bws.size(); ++bwIdx) {
+            for (std::size_t idx : l2_candidates) {
                 if (g_stop.load(std::memory_order_relaxed)) {
                     break;
                 }
+                const double freq = channels[idx];
+                double       bestRatio = 0.0;
+                Layer2Result bestL2;
+                double       bestBw = 0.0;
 
-                const double bw = cfg.bws[bwIdx];
-                // First BW gets full dwell; others get quick probe.
-                const uint32_t windows = (bwIdx == 0) ? cfg.cad_windows : quickWindows;
-
-                ScanConfig bwCfg = cfg;
-                bwCfg.cad_windows = windows;
-
-                const auto l2 = layer2Cad(stream, dev, freq, bw, bwCfg, stats);
-
-                if (l2.detected) {
-                    const double ratio = std::max(l2.peak_ratio_up, l2.peak_ratio_dn);
-                    if (ratio > bestRatio) {
-                        bestRatio = ratio;
-                        bestBw    = bw;
-                        bestL2    = l2;
+                for (std::size_t bwIdx = 0; bwIdx < cfg.bws.size(); ++bwIdx) {
+                    if (g_stop.load(std::memory_order_relaxed)) {
+                        break;
                     }
-                } else {
-                    const double maxRatio = std::max(l2.peak_ratio_up, l2.peak_ratio_dn);
-                    if (maxRatio > nearMissThresh) {
-                        gr::lora::log_ts("debug", "lora_scan",
-                            "near-miss %.0f Hz BW=%.0f  ratio=%.2f (min_ratio=%.1f)",
-                            freq, bw, maxRatio, static_cast<double>(cfg.min_ratio));
+                    const double bw = cfg.bws[bwIdx];
+                    const uint32_t windows = (bwIdx == 0)
+                        ? cfg.cad_windows : quickWindows;
+                    ScanConfig bwCfg = cfg;
+                    bwCfg.cad_windows = windows;
+                    const auto l2 = layer2Cad(stream, dev, freq, bw, bwCfg, stats);
+                    if (l2.detected) {
+                        const double ratio = std::max(l2.peak_ratio_up, l2.peak_ratio_dn);
+                        if (ratio > bestRatio) {
+                            bestRatio = ratio;
+                            bestBw    = bw;
+                            bestL2    = l2;
+                        }
                     }
                 }
-            }
 
-            // Report the best-matching BW if above min_ratio threshold.
-            if (bestRatio >= static_cast<double>(cfg.min_ratio)) {
-                const auto ts = ts_short();
-                const std::string sfStr = bestL2.sf_detected
-                    ? ("SF" + std::to_string(bestL2.sf_detected)) : "-";
-                const std::string winsStr =
-                    std::to_string(bestL2.detections) + "/" + std::to_string(bestL2.windows_tried);
-
-                // Clear the \r status line before printing a detection row.
-                std::fprintf(stderr, "\r%s\r", std::string(80, ' ').c_str());
-
-                std::printf("%-13s  %10.3f  %6.1f  %6.1f  %6.1f  %6s  %4s\n",
-                            ts.c_str(), freq / 1.0e6, bestBw / 1.0e3,
-                            bestL2.peak_ratio_up, bestL2.peak_ratio_dn,
-                            winsStr.c_str(), sfStr.c_str());
-                std::fflush(stdout);
-
-                char freqBuf[32];
-                std::snprintf(freqBuf, sizeof(freqBuf), "%.3f MHz", freq / 1.0e6);
-                stats.last_det_freq = freqBuf;
-                stats.last_det_time = ts;
+                if (bestRatio >= static_cast<double>(cfg.min_ratio)) {
+                    DirectCadResult det;
+                    det.freq          = freq;
+                    det.bw            = bestBw;
+                    det.peak_ratio_up = bestL2.peak_ratio_up;
+                    det.peak_ratio_dn = bestL2.peak_ratio_dn;
+                    det.sf_detected   = bestL2.sf_detected;
+                    reportDetection(det);
+                }
             }
         }
 
