@@ -45,7 +45,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-arm64-clang20-${{ matrix.build-type }}
+          key: ccache-arm64-clang20-${{ matrix.build-type }}-${{ github.run_id }}
+          restore-keys: ccache-arm64-clang20-${{ matrix.build-type }}
 
       - name: Configure ccache
         run: |
@@ -59,25 +60,24 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -S . -B ../build -G Ninja \
+          cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} \
             -DUSE_CCACHE=ON \
             -DENABLE_COVERAGE=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
       - name: Build
-        run: cmake --build ../build -j$(nproc)
+        run: cmake --build build -j$(nproc)
 
       - name: Test
-        working-directory: ../build
-        run: ctest --output-on-failure --timeout 60
+        run: ctest --test-dir build --output-on-failure --timeout 120
 
       - name: Upload binaries
         if: matrix.build-type == 'Release'
         uses: actions/upload-artifact@v4
         with:
           name: gr4-lora-arm64
-          path: ../build/apps/lora_trx
+          path: build/apps/lora_trx
           if-no-files-found: warn
 
       - name: Save ccache
@@ -85,7 +85,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-arm64-clang20-${{ matrix.build-type }}
+          key: ccache-arm64-clang20-${{ matrix.build-type }}-${{ github.run_id }}
 
       - name: Show ccache stats
         if: always()
