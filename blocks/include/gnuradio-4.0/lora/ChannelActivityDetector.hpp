@@ -85,11 +85,13 @@ struct ChannelActivityDetector
     }
 
     struct DetectResult {
-        float peak_ratio_up{0.f};
-        float peak_ratio_dn{0.f};
-        bool  up_detected{false};
-        bool  dn_detected{false};
-        bool  detected{false};
+        float    peak_ratio_up{0.f};
+        float    peak_ratio_dn{0.f};
+        uint32_t peak_bin_up{0};    ///< FFT bin of best upchirp peak (0..N-1)
+        uint32_t peak_bin_dn{0};    ///< FFT bin of best downchirp peak (0..N-1)
+        bool     up_detected{false};
+        bool     dn_detected{false};
+        bool     detected{false};
     };
 
     /// Compute the best peak_ratio = max|Y|/mean|Y| across os_factor sub-chip
@@ -106,7 +108,7 @@ struct ChannelActivityDetector
                                            RefType ref_type) {
         const std::complex<float>* ref =
             (ref_type == RefType::UpchirpRef) ? _down_ref.data() : _up_ref.data();
-        return peak_ratio_impl(samples, ref);
+        return peak_ratio_impl(samples, ref).ratio;
     }
 
     /// Run full 2-window detection on a buffer of 2*sym_len oversampled samples.
@@ -118,16 +120,18 @@ struct ChannelActivityDetector
         const float thresh = static_cast<float>(alpha);
 
         DetectResult r;
-        const float r1_up = peak_ratio_impl(w1, _down_ref.data());
-        const float r2_up = peak_ratio_impl(w2, _down_ref.data());
-        r.peak_ratio_up = std::max(r1_up, r2_up);
-        r.up_detected   = (r1_up > thresh) && (r2_up > thresh);
+        const auto p1_up = peak_ratio_impl(w1, _down_ref.data());
+        const auto p2_up = peak_ratio_impl(w2, _down_ref.data());
+        r.peak_ratio_up = std::max(p1_up.ratio, p2_up.ratio);
+        r.peak_bin_up   = (p1_up.ratio >= p2_up.ratio) ? p1_up.bin : p2_up.bin;
+        r.up_detected   = (p1_up.ratio > thresh) && (p2_up.ratio > thresh);
 
         if (dual_chirp) {
-            const float r1_dn = peak_ratio_impl(w1, _up_ref.data());
-            const float r2_dn = peak_ratio_impl(w2, _up_ref.data());
-            r.peak_ratio_dn = std::max(r1_dn, r2_dn);
-            r.dn_detected   = (r1_dn > thresh) && (r2_dn > thresh);
+            const auto p1_dn = peak_ratio_impl(w1, _up_ref.data());
+            const auto p2_dn = peak_ratio_impl(w2, _up_ref.data());
+            r.peak_ratio_dn = std::max(p1_dn.ratio, p2_dn.ratio);
+            r.peak_bin_dn   = (p1_dn.ratio >= p2_dn.ratio) ? p1_dn.bin : p2_dn.bin;
+            r.dn_detected   = (p1_dn.ratio > thresh) && (p2_dn.ratio > thresh);
         }
 
         r.detected = r.up_detected || r.dn_detected;
@@ -170,11 +174,16 @@ private:
 
     }
 
+    struct PeakResult {
+        float    ratio{0.f};
+        uint32_t bin{0};
+    };
+
     /// Core dechirp+FFT peak-ratio computation, no buffer side-effects.
-    /// Tries os_factor sub-chip timing offsets; returns the best ratio found.
-    [[nodiscard]] float peak_ratio_impl(const std::complex<float>* samples,
-                                        const std::complex<float>* ref) {
-        float best = 0.f;
+    /// Tries os_factor sub-chip timing offsets; returns the best ratio and its bin.
+    [[nodiscard]] PeakResult peak_ratio_impl(const std::complex<float>* samples,
+                                             const std::complex<float>* ref) {
+        PeakResult best;
         for (uint32_t l = 0; l < static_cast<uint32_t>(os_factor); ++l) {
             for (uint32_t m = 0; m < _N; ++m) {
                 _scratch[m] = samples[l + m * os_factor] * ref[m];
@@ -182,15 +191,16 @@ private:
             auto fft_out = _fft.compute(
                 std::span<const std::complex<float>>(_scratch.data(), _N));
 
-            float peak = 0.f, total = 0.f;
+            float    peak = 0.f, total = 0.f;
+            uint32_t peak_idx = 0;
             for (uint32_t i = 0; i < _N; ++i) {
                 float mag = std::abs(fft_out[i]);
                 total += mag;
-                if (mag > peak) peak = mag;
+                if (mag > peak) { peak = mag; peak_idx = i; }
             }
             float mean  = total / static_cast<float>(_N);
             float ratio = (mean > 0.f) ? (peak / mean) : 0.f;
-            if (ratio > best) best = ratio;
+            if (ratio > best.ratio) { best.ratio = ratio; best.bin = peak_idx; }
         }
         return best;
     }

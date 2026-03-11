@@ -8,26 +8,7 @@
 // Layer 2: per-channel CAD dwell with K consecutive 2-symbol windows
 // Layer 3: (optional) SF sweep on CAD-detected channels
 //
-// Usage:
-//   lora_scan [options]
-//
-//   --device <args>       SoapySDR device string (default: "uhd")
-//   --device-param <args> Device parameters (default: "type=b200")
-//   --freq-start <Hz>     Scan start frequency (default: 863e6)
-//   --freq-stop  <Hz>     Scan stop  frequency (default: 870e6)
-//   --bw <Hz>             Channel bandwidth (default: 62500)
-//   --os <n>              Oversampling factor (default: 4)
-//   --sf <n>              Spreading factor for CAD (default: 8)
-//   --alpha <f>           CAD threshold (default: SF table)
-//   --gain <dB>           RX gain (default: 40)
-//   --settle-ms <ms>      PLL settle delay after retune (default: 5)
-//   --l1-rate <Hz>        L1 wideband sample rate (default: 8e6)
-//   --cad-windows <K>     CAD windows per channel per sweep (default: 64)
-//   --sweeps <N>          Stop after N sweeps (default: 0 = infinite)
-//   --sf-sweep            Enable Layer 3: SF sweep on detected channels
-//   --layer1-only         Stop after Layer 1 (energy scan only)
-//   --all-channels        Run CAD on all channels, not just hot ones
-//   --debug               Verbose stderr output
+// Run `lora_scan --help` for usage.
 
 #include <algorithm>
 #include <atomic>
@@ -39,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -71,35 +53,56 @@ struct ScanStats {
     std::string last_det_time;         // last YES detection timestamp
 };
 
-// SF-dependent alpha table (Vangelista & Calvagno 2022, P_fa = 1e-3).
-static const std::array<float, 13> kAlphaTable = {
-    0.F, 0.F, 0.F, 0.F, 0.F, 0.F, 0.F,
-    4.23F, 4.16F, 4.09F, 4.04F, 3.98F, 3.91F,
-};
-
 struct ScanConfig {
-    std::string device       = "uhd";
-    std::string device_param = "type=b200";
-    double      freq_start   = 863.0e6;
-    double      freq_stop    = 870.0e6;
-    double      bw           = 62500.0;
-    uint32_t    sf           = 8;
-    uint32_t    os_factor    = 4;
-    float       alpha        = 0.F;
-    double      gain         = 40.0;
-    int         settle_ms    = 5;
-    double      l1_rate      = 8.0e6;   // wideband L1 sample rate (even B210 decimation)
-    uint32_t    cad_windows  = 64;
-    uint32_t    sweeps       = 0;       // 0 = infinite
-    bool        sf_sweep     = false;
-    bool        layer1_only  = false;
-    bool        all_channels = false;
-    bool        debug        = false;
+    std::string          device       = "uhd";
+    std::string          device_param = "type=b200";
+    double               freq_start   = 863.0e6;
+    double               freq_stop    = 870.0e6;
+    std::vector<double>  bws          = {62500.0, 125000.0, 250000.0};  // sorted narrowest first
+    uint32_t             os_factor    = 4;
+    double               gain         = 40.0;
+    int                  settle_ms    = 5;
+    double               l1_rate      = 8.0e6;   // wideband L1 sample rate (even B210 decimation)
+    uint32_t             cad_windows  = 8;
+    uint32_t             max_l2       = 8;        // max L2 candidates per sweep
+    float                min_ratio    = 8.0F;     // minimum peak ratio to report (noise floor ~4)
+    uint32_t             sweeps       = 0;        // 0 = infinite
+    bool                 layer1_only  = false;
+    bool                 all_channels = false;
+
+    /// Narrowest bandwidth (used for channel grid and L1).
+    [[nodiscard]] double min_bw() const { return *std::ranges::min_element(bws); }
 };
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
-static bool parseArgs(int argc, char** argv, ScanConfig& cfg) {
+static void print_usage() {
+    std::fprintf(stderr,
+        "Usage: lora_scan [options]\n\n"
+        "LoRa spectral scanner: sweep channels and detect chirp activity.\n\n"
+        "Options:\n"
+        "  --device <args>       SoapySDR device string (default: uhd)\n"
+        "  --device-param <args> Device parameters (default: type=b200)\n"
+        "  --freq-start <Hz>     Scan start frequency (default: 863e6)\n"
+        "  --freq-stop <Hz>      Scan stop frequency (default: 870e6)\n"
+        "  --bw <Hz[,Hz,...]>    Channel bandwidth(s) (default: 62500,125000,250000)\n"
+        "  --os <n>              Oversampling factor (default: 4)\n"
+        "  --gain <dB>           RX gain (default: 40)\n"
+        "  --settle-ms <ms>      PLL settle delay after retune (default: 5)\n"
+        "  --l1-rate <Hz>        L1 wideband sample rate (default: 8e6)\n"
+        "  --cad-windows <K>     CAD windows per BW per channel (default: 8)\n"
+        "  --max-l2 <N>          Max L2 candidates per sweep (default: 8)\n"
+        "  --min-ratio <f>       Min peak ratio to report (default: 8.0)\n"
+        "  --sweeps <N>          Stop after N sweeps (default: 0 = infinite)\n"
+        "  --layer1-only         Stop after Layer 1 (energy scan only)\n"
+        "  --all-channels        Run CAD on all channels, not just hot ones\n"
+        "  --log-level <level>   Log level: DEBUG, INFO, WARNING, ERROR\n"
+        "  --version             Show version and exit\n"
+        "  -h, --help            Show this help\n");
+}
+
+/// Returns 0 on success, 1 on error, 2 on --help/--version.
+static int parseArgs(int argc, char** argv, ScanConfig& cfg) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         auto next = [&]() -> std::string {
@@ -109,34 +112,52 @@ static bool parseArgs(int argc, char** argv, ScanConfig& cfg) {
             }
             return argv[i];
         };
+        if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 2;
+        }
+        if (arg == "--version") {
+            std::fprintf(stderr, "lora_scan %s\n", GIT_REV);
+            return 2;
+        }
+        if (arg == "--log-level") {
+            std::string lvl = next();
+            for (auto& ch : lvl) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            gr::lora::set_log_level(lvl);
+            continue;
+        }
         if      (arg == "--device")        cfg.device       = next();
         else if (arg == "--device-param")  cfg.device_param = next();
         else if (arg == "--freq-start")    cfg.freq_start   = std::stod(next());
         else if (arg == "--freq-stop")     cfg.freq_stop    = std::stod(next());
-        else if (arg == "--bw")            cfg.bw           = std::stod(next());
-        else if (arg == "--sf")            cfg.sf           = static_cast<uint32_t>(std::stoul(next()));
+        else if (arg == "--bw") {
+            cfg.bws.clear();
+            std::istringstream ss(next());
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                cfg.bws.push_back(std::stod(tok));
+            }
+            std::ranges::sort(cfg.bws);  // narrowest first
+        }
         else if (arg == "--os")            cfg.os_factor    = static_cast<uint32_t>(std::stoul(next()));
-        else if (arg == "--alpha")         cfg.alpha        = std::stof(next());
         else if (arg == "--gain")          cfg.gain         = std::stod(next());
         else if (arg == "--settle-ms")     cfg.settle_ms    = std::stoi(next());
         else if (arg == "--l1-rate")       cfg.l1_rate      = std::stod(next());
         else if (arg == "--cad-windows")   cfg.cad_windows  = static_cast<uint32_t>(std::stoul(next()));
+        else if (arg == "--max-l2")        cfg.max_l2       = static_cast<uint32_t>(std::stoul(next()));
+        else if (arg == "--min-ratio")     cfg.min_ratio    = std::stof(next());
         else if (arg == "--sweeps")        cfg.sweeps       = static_cast<uint32_t>(std::stoul(next()));
-        else if (arg == "--sf-sweep")      cfg.sf_sweep     = true;
         else if (arg == "--layer1-only")   cfg.layer1_only  = true;
         else if (arg == "--all-channels")  cfg.all_channels = true;
-        else if (arg == "--debug")         cfg.debug        = true;
         else {
-            std::fprintf(stderr, "unknown option: %s\n", arg.c_str());
-            return false;
+            std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
+            print_usage();
+            return 1;
         }
     }
-    if (cfg.sf < 6 || cfg.sf > 12) {
-        std::fprintf(stderr, "sf must be 6..12\n");
-        return false;
-    }
-    if (cfg.alpha == 0.F) {
-        cfg.alpha = kAlphaTable[cfg.sf];
+    if (cfg.bws.empty()) {
+        std::fprintf(stderr, "--bw requires at least one bandwidth\n");
+        return 1;
     }
     const double scanRange = cfg.freq_stop - cfg.freq_start;
     if (scanRange > cfg.l1_rate * 0.9) {
@@ -144,7 +165,7 @@ static bool parseArgs(int argc, char** argv, ScanConfig& cfg) {
             "scan range %.1f MHz > L1 rate %.1f MS/s — L1 will tile multiple snapshots",
             scanRange / 1.0e6, cfg.l1_rate / 1.0e6);
     }
-    return true;
+    return 0;
 }
 
 // ─── channel list ─────────────────────────────────────────────────────────────
@@ -267,18 +288,17 @@ static Layer1Result layer1Scan(RxStream& stream, SoapyDevice& dev,
     Layer1Result result;
     result.energy.resize(nCh, 0.0);
 
-    const double scanRange = channels.back() - channels.front() + cfg.bw;
+    const double chBw      = cfg.min_bw();
+    const double scanRange = channels.back() - channels.front() + chBw;
     const double usableBw  = cfg.l1_rate * 0.8;  // 80% usable (roll-off at edges)
 
     if (scanRange <= usableBw) {
         const double centre = (channels.front() + channels.back()) / 2.0;
         measureTile(stream, dev, channels, centre, cfg.l1_rate,
-                    cfg.bw, cfg.settle_ms, result.energy, stats);
-        if (cfg.debug) {
-            gr::lora::log_ts("debug", "lora_scan",
-                "L1 centre=%.0f rate=%.0f fftBw=%.0f (single tile)",
-                centre, cfg.l1_rate, cfg.l1_rate);
-        }
+                    chBw, cfg.settle_ms, result.energy, stats);
+        gr::lora::log_ts("debug", "lora_scan",
+            "L1 centre=%.0f rate=%.0f fftBw=%.0f (single tile)",
+            centre, cfg.l1_rate, cfg.l1_rate);
     } else {
         const double step = usableBw;
         const double first = channels.front() + usableBw / 2.0;
@@ -286,14 +306,12 @@ static Layer1Result layer1Scan(RxStream& stream, SoapyDevice& dev,
         int nTiles = 0;
         for (double tc = first; tc <= last + step * 0.5; tc += step) {
             measureTile(stream, dev, channels, tc, cfg.l1_rate,
-                        cfg.bw, cfg.settle_ms, result.energy, stats);
+                        chBw, cfg.settle_ms, result.energy, stats);
             ++nTiles;
         }
-        if (cfg.debug) {
-            gr::lora::log_ts("debug", "lora_scan",
-                "L1 %d tile(s) at %.0f MS/s usable=%.0f Hz",
-                nTiles, cfg.l1_rate / 1.0e6, usableBw);
-        }
+        gr::lora::log_ts("debug", "lora_scan",
+            "L1 %d tile(s) at %.0f MS/s usable=%.0f Hz",
+            nTiles, cfg.l1_rate / 1.0e6, usableBw);
     }
 
     // Median-based threshold: robust to chirp energy spreading across bins.
@@ -308,10 +326,8 @@ static Layer1Result layer1Scan(RxStream& stream, SoapyDevice& dev,
         : (sorted[nCh / 2 - 1] + sorted[nCh / 2]) / 2.0;
     const double thresh = median * kL1Multiplier;
 
-    if (cfg.debug) {
-        gr::lora::log_ts("debug", "lora_scan",
-            "L1 median=%.6f thresh=%.6f (%zu ch)", median, thresh, nCh);
-    }
+    gr::lora::log_ts("debug", "lora_scan",
+        "L1 median=%.6f thresh=%.6f (%zu ch)", median, thresh, nCh);
 
     for (int idx = 0; idx < static_cast<int>(nCh); ++idx) {
         if (result.energy[static_cast<std::size_t>(idx)] > thresh) {
@@ -325,115 +341,112 @@ static Layer1Result layer1Scan(RxStream& stream, SoapyDevice& dev,
         return result.energy[static_cast<std::size_t>(a)]
              > result.energy[static_cast<std::size_t>(b)];
     });
-    if (cfg.debug) {
-        for (int idx : result.hot_idx) {
-            gr::lora::log_ts("debug", "lora_scan",
-                "L1 HOT %.0f Hz  energy=%.6f (thresh=%.6f)",
-                channels[static_cast<std::size_t>(idx)],
-                result.energy[static_cast<std::size_t>(idx)], thresh);
-        }
+    for (int idx : result.hot_idx) {
+        gr::lora::log_ts("debug", "lora_scan",
+            "L1 HOT %.0f Hz  energy=%.6f (thresh=%.6f)",
+            channels[static_cast<std::size_t>(idx)],
+            result.energy[static_cast<std::size_t>(idx)], thresh);
     }
     return result;
 }
 
-// ─── Layer 2: per-channel CAD dwell with K consecutive windows ───────────────
+// ─── Layer 2: per-channel CAD dwell — multi-SF on each window ────────────────
+//
+// Retune to the given BW, capture K SF12-sized windows, and for each window
+// try every SF (7–12).  First SF that fires is the detection.  This merges the
+// old L2 (single-SF CAD) and L3 (post-detection SF sweep) into one step.
+//
+// Each capture is big enough for SF12 (4096×os×2 samples).  For lower SFs
+// the detector only reads the first 2^sf × os × 2 samples of the buffer.
 
 struct Layer2Result {
     double   peak_ratio_up = 0.0;
     double   peak_ratio_dn = 0.0;
+    uint32_t sf_detected    = 0;     // which SF triggered (0 = none)
     uint32_t detections     = 0;     // how many windows fired
     uint32_t windows_tried  = 0;
     bool     detected       = false;
 };
 
 static Layer2Result layer2Cad(RxStream& stream, SoapyDevice& dev,
-                              double freq, uint32_t sf, const ScanConfig& cfg,
-                              ScanStats& stats) {
-    const double sampleRate = cfg.bw * static_cast<double>(cfg.os_factor);
-
-    // Retune only once per channel dwell.
+                              double freq, double bw,
+                              const ScanConfig& cfg, ScanStats& stats) {
+    const double sampleRate = bw * static_cast<double>(cfg.os_factor);
     retune(stream, dev, freq, sampleRate, cfg.settle_ms);
 
-    const uint32_t nSymSamples = (1U << sf) * cfg.os_factor;
-    const uint32_t winLen      = nSymSamples * 2U;  // 2-symbol window
-
-    // Build detector once, reuse across all K windows.
-    gr::lora::ChannelActivityDetector det;
-    det.sf         = sf;
-    det.bandwidth  = static_cast<uint32_t>(cfg.bw);
-    det.os_factor  = cfg.os_factor;
-    det.alpha      = cfg.alpha;
-    det.dual_chirp = true;
-    det.debug      = false;  // too noisy per-window; use outer debug
-    det.start();
-
-    using RefType = gr::lora::ChannelActivityDetector::RefType;
+    // Pre-build detectors for SF7–12, reuse across all windows.
+    struct SfDetector {
+        gr::lora::ChannelActivityDetector det;
+        uint32_t sf;
+    };
+    std::vector<SfDetector> detectors;
+    for (uint32_t trySf = 7; trySf <= 12; ++trySf) {
+        SfDetector sd;
+        sd.sf              = trySf;
+        sd.det.sf          = trySf;
+        sd.det.bandwidth   = static_cast<uint32_t>(bw);
+        sd.det.os_factor   = cfg.os_factor;
+        sd.det.alpha       = gr::lora::ChannelActivityDetector::default_alpha(trySf);
+        sd.det.dual_chirp  = true;
+        sd.det.debug       = false;
+        sd.det.start();
+        detectors.push_back(std::move(sd));
+    }
 
     Layer2Result result;
     result.windows_tried = cfg.cad_windows;
-
-    std::vector<cf32> buf(winLen);
 
     for (uint32_t win = 0; win < cfg.cad_windows; ++win) {
         if (g_stop.load(std::memory_order_relaxed)) {
             break;
         }
 
-        capture(stream, buf.data(), winLen, stats);
+        // Try all SFs on this window and pick the one with the highest peak
+        // ratio.  Each SF gets its own correctly-sized capture: 2×2^sf×os_factor
+        // samples.  A shared SF12 buffer causes lower SFs to examine only the
+        // first fraction (e.g. SF8 reads 2048 of 32768 samples), producing weak
+        // false SF12 matches (~9 ratio) instead of the true SF at 100+.
+        float    bestWinRatioUp = 0.0F;
+        float    bestWinRatioDn = 0.0F;
+        uint32_t bestWinSf      = 0;
 
-        const cf32* w1 = buf.data();
-        const cf32* w2 = buf.data() + nSymSamples;
+        for (auto& sd : detectors) {
+            const uint32_t sfWin = (1U << sd.sf) * cfg.os_factor * 2U;
+            std::vector<cf32> sfBuf(sfWin);
+            capture(stream, sfBuf.data(), sfWin, stats);
+            const auto r = sd.det.detect(sfBuf.data());
+            const float winRatio = std::max(r.peak_ratio_up, r.peak_ratio_dn);
 
-        const float r1Up = det.compute_peak_ratio(w1, RefType::UpchirpRef);
-        const float r2Up = det.compute_peak_ratio(w2, RefType::UpchirpRef);
-        const float r1Dn = det.compute_peak_ratio(w1, RefType::DownchirpRef);
-        const float r2Dn = det.compute_peak_ratio(w2, RefType::DownchirpRef);
+            if (r.detected && winRatio > std::max(bestWinRatioUp, bestWinRatioDn)) {
+                bestWinRatioUp = r.peak_ratio_up;
+                bestWinRatioDn = r.peak_ratio_dn;
+                bestWinSf      = sd.sf;
 
-        const bool upDet = (r1Up > cfg.alpha) && (r2Up > cfg.alpha);
-        const bool dnDet = (r1Dn > cfg.alpha) && (r2Dn > cfg.alpha);
-
-        if (upDet || dnDet) {
-            ++result.detections;
-            result.detected = true;
+                gr::lora::log_ts("debug", "lora_scan",
+                    "L2 %.0f Hz BW=%.0f SF%u  ratio_up=%.2f ratio_dn=%.2f (candidate)",
+                    freq, bw, sd.sf,
+                    static_cast<double>(r.peak_ratio_up),
+                    static_cast<double>(r.peak_ratio_dn));
+            }
         }
 
-        result.peak_ratio_up = std::max(result.peak_ratio_up, static_cast<double>(std::max(r1Up, r2Up)));
-        result.peak_ratio_dn = std::max(result.peak_ratio_dn, static_cast<double>(std::max(r1Dn, r2Dn)));
+        if (bestWinSf != 0) {
+            ++result.detections;
+            result.detected      = true;
+            result.sf_detected   = bestWinSf;
+            result.peak_ratio_up = std::max(result.peak_ratio_up, static_cast<double>(bestWinRatioUp));
+            result.peak_ratio_dn = std::max(result.peak_ratio_dn, static_cast<double>(bestWinRatioDn));
+            break;  // one confirmed window is enough
+        }
     }
 
-    if (cfg.debug) {
-        gr::lora::log_ts("debug", "lora_scan",
-            "L2 %.0f Hz SF%u  %u/%u detected  max_up=%.2f max_dn=%.2f  alpha=%.2f",
-            freq, sf, result.detections, result.windows_tried,
-            result.peak_ratio_up, result.peak_ratio_dn,
-            static_cast<double>(cfg.alpha));
-    }
+    gr::lora::log_ts("debug", "lora_scan",
+        "L2 %.0f Hz BW=%.0f  %u/%u detected  SF=%u  max_up=%.2f max_dn=%.2f",
+        freq, bw, result.detections, result.windows_tried,
+        result.sf_detected,
+        result.peak_ratio_up, result.peak_ratio_dn);
 
     return result;
-}
-
-// ─── Layer 3: SF sweep ────────────────────────────────────────────────────────
-
-static uint32_t layer3SfSweep(RxStream& stream, SoapyDevice& dev,
-                              double freq, const ScanConfig& cfg, ScanStats& stats) {
-    ScanConfig sweepCfg = cfg;
-    sweepCfg.cad_windows = std::max(8U, cfg.cad_windows / 4U);
-    sweepCfg.debug = false;
-
-    for (uint32_t sf = 7; sf <= 12; ++sf) {
-        sweepCfg.sf    = sf;
-        sweepCfg.alpha = kAlphaTable[sf];
-        const auto l2 = layer2Cad(stream, dev, freq, sf, sweepCfg, stats);
-        if (l2.detected) {
-            if (cfg.debug) {
-                gr::lora::log_ts("debug", "lora_scan",
-                    "L3 SF%u detected at %.0f Hz (%u/%u windows)",
-                    sf, freq, l2.detections, l2.windows_tried);
-            }
-            return sf;
-        }
-    }
-    return 0;
 }
 
 // ─── UTC time helper for stdout table: "HH:MM:SS.mmm" ────────────────────────
@@ -456,39 +469,58 @@ static std::string ts_short() {
 
 int main(int argc, char** argv) {
     ScanConfig cfg;
-    if (!parseArgs(argc, argv, cfg)) {
-        return 1;
+    int rc = parseArgs(argc, argv, cfg);
+    if (rc != 0) {
+        return rc == 2 ? 0 : 1;  // 2 = --help/--version (clean exit)
     }
 
     std::signal(SIGINT, sigintHandler);
 
-    const auto channels = makeChannelList(cfg.freq_start, cfg.freq_stop, cfg.bw);
+    const auto channels = makeChannelList(cfg.freq_start, cfg.freq_stop, cfg.min_bw());
 
     // Compute dwell time per channel for display.
-    const uint32_t symLen = (1U << cfg.sf) * cfg.os_factor;
-    const double dwellPerCh = static_cast<double>(symLen * 2U * cfg.cad_windows)
-                              / (cfg.bw * static_cast<double>(cfg.os_factor));
+    // Each window captures SF12-sized buffers (worst case); dwell at narrowest BW.
+    constexpr uint32_t kSF12Len = 4096U;  // 2^12
+    const double dwellPerCh = static_cast<double>(kSF12Len * cfg.os_factor * 2U * cfg.cad_windows)
+                              / (cfg.min_bw() * static_cast<double>(cfg.os_factor));
 
+    // Build BW list string for info log.
+    std::string bwListStr;
+    for (std::size_t i = 0; i < cfg.bws.size(); ++i) {
+        if (i > 0) bwListStr += ",";
+        char tmp[32];
+        std::snprintf(tmp, sizeof(tmp), "%.0f", cfg.bws[i]);
+        bwListStr += tmp;
+    }
     gr::lora::log_ts("info ", "lora_scan",
-        "%zu channel(s) SF%u BW=%.0f Hz alpha=%.2f os=%u L1=%.1f MS/s",
-        channels.size(), cfg.sf, cfg.bw,
-        static_cast<double>(cfg.alpha), cfg.os_factor,
-        cfg.l1_rate / 1.0e6);
+        "%zu channel(s) SF7-12 BW=[%s] Hz os=%u L1=%.1f MS/s",
+        channels.size(), bwListStr.c_str(),
+        cfg.os_factor, cfg.l1_rate / 1.0e6);
+    // Total dwell accounts for all BWs: first BW gets full windows, rest get quick.
+    const uint32_t qw = std::max(4U, cfg.cad_windows / 8U);
+    const double totalDwellPerCh = dwellPerCh
+        + dwellPerCh * static_cast<double>(qw) / static_cast<double>(cfg.cad_windows)
+          * static_cast<double>(cfg.bws.size() > 1 ? cfg.bws.size() - 1 : 0);
     gr::lora::log_ts("info ", "lora_scan",
-        "%u CAD windows/ch  ~%.0f ms dwell/ch  ~%.1f s/sweep",
-        cfg.cad_windows, dwellPerCh * 1000.0,
-        dwellPerCh * static_cast<double>(channels.size()));
+        "%u CAD windows/ch  ~%.0f ms dwell/ch  ~%.1f s/sweep  max-l2=%u",
+        cfg.cad_windows, totalDwellPerCh * 1000.0,
+        totalDwellPerCh * static_cast<double>(channels.size()), cfg.max_l2);
     if (cfg.sweeps == 0) {
         gr::lora::log_ts("info ", "lora_scan", "continuous mode — Ctrl+C to stop");
     } else {
         gr::lora::log_ts("info ", "lora_scan", "%u sweep(s)", cfg.sweeps);
     }
 
+    // FPGA workaround: append default FPGA image path for UHD devices.
+    if (cfg.device == "uhd" && cfg.device_param.find("fpga=") == std::string::npos) {
+        cfg.device_param += ",fpga=usrp_b210_fpga.bin";
+    }
+
     // Open SDR — same pattern as lora_trx.
     auto dev = openDevice(cfg);
     dev.setGain(SOAPY_SDR_RX, 0, cfg.gain);
 
-    const double initialRate = cfg.bw * static_cast<double>(cfg.os_factor);
+    const double initialRate = cfg.min_bw() * static_cast<double>(cfg.os_factor);
     dev.setSampleRate(SOAPY_SDR_RX, 0, initialRate);
     dev.setCenterFrequency(SOAPY_SDR_RX, 0, channels.front());
 
@@ -521,12 +553,16 @@ int main(int argc, char** argv) {
     // ── Full scan: L1 + L2 + (optional) L3, continuous ──────────────────────
 
     // Print header once.
-    std::printf("%-13s  %-15s  %8s  %8s  %5s  %6s  %6s\n",
-                "time", "freq_hz", "ratio_up", "ratio_dn", "det", "wins", "sf_est");
-    std::printf("%s\n", std::string(73, '-').c_str());
+    std::printf("%-13s  %10s  %6s  %6s  %6s  %6s  %4s\n",
+                "time", "freq_mhz", "bw_khz", "up", "dn", "wins", "sf");
+    std::printf("%s\n", std::string(60, '-').c_str());
     std::fflush(stdout);
 
-    const double nearMissThresh = static_cast<double>(cfg.alpha) * 0.8;
+    const double nearMissThresh = static_cast<double>(cfg.min_ratio) * 0.9;
+    auto lastStatusUpdate = std::chrono::steady_clock::now();
+
+    // For secondary BWs, use fewer CAD windows (quick yes/no, not full dwell).
+    const uint32_t quickWindows = std::max(4U, cfg.cad_windows / 8U);
 
     while (!g_stop.load(std::memory_order_relaxed)) {
         const auto l1 = layer1Scan(stream, dev, channels, cfg, stats);
@@ -544,43 +580,78 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (l2_candidates.size() > cfg.max_l2) {
+            l2_candidates.resize(cfg.max_l2);
+        }
+
         for (std::size_t idx : l2_candidates) {
             if (g_stop.load(std::memory_order_relaxed)) {
                 break;
             }
 
             const double freq = channels[idx];
-            const auto l2 = layer2Cad(stream, dev, freq, cfg.sf, cfg, stats);
 
-            uint32_t sfEst = 0;
-            if (l2.detected && cfg.sf_sweep) {
-                sfEst = layer3SfSweep(stream, dev, freq, cfg, stats);
-            }
+            // Try all BWs and pick the best match (highest peak ratio).
+            // A chirp partially correlates with CAD at any BW, so we can't
+            // break on first detection — the matched BW produces the strongest
+            // peak ratio and correctly identifies the signal's true bandwidth.
+            // Each L2 call now tries all SFs (7–12) internally.
+            double       bestRatio = 0.0;
+            double       bestBw    = 0.0;
+            Layer2Result bestL2;
 
-            const double maxRatio = std::max(l2.peak_ratio_up, l2.peak_ratio_dn);
-            const bool nearMiss = !l2.detected && (maxRatio > nearMissThresh);
+            for (std::size_t bwIdx = 0; bwIdx < cfg.bws.size(); ++bwIdx) {
+                if (g_stop.load(std::memory_order_relaxed)) {
+                    break;
+                }
 
-            // Only print YES detections and near-misses (ratio > 80% of alpha).
-            if (l2.detected || nearMiss) {
-                const auto ts = ts_short();
-                const std::string sfStr = sfEst ? ("SF" + std::to_string(sfEst)) : "-";
-                const char* detLabel = l2.detected ? "YES" : "???";
-                const std::string winsStr = l2.detected
-                    ? std::to_string(l2.detections) + "/" + std::to_string(l2.windows_tried)
-                    : "-";
+                const double bw = cfg.bws[bwIdx];
+                // First BW gets full dwell; others get quick probe.
+                const uint32_t windows = (bwIdx == 0) ? cfg.cad_windows : quickWindows;
 
-                std::printf("%-13s  %-15.0f  %8.2f  %8.2f  %5s  %6s  %6s\n",
-                            ts.c_str(), freq,
-                            l2.peak_ratio_up, l2.peak_ratio_dn,
-                            detLabel, winsStr.c_str(), sfStr.c_str());
-                std::fflush(stdout);
+                ScanConfig bwCfg = cfg;
+                bwCfg.cad_windows = windows;
+
+                const auto l2 = layer2Cad(stream, dev, freq, bw, bwCfg, stats);
 
                 if (l2.detected) {
-                    char freqBuf[32];
-                    std::snprintf(freqBuf, sizeof(freqBuf), "%.3f MHz", freq / 1.0e6);
-                    stats.last_det_freq = freqBuf;
-                    stats.last_det_time = ts;
+                    const double ratio = std::max(l2.peak_ratio_up, l2.peak_ratio_dn);
+                    if (ratio > bestRatio) {
+                        bestRatio = ratio;
+                        bestBw    = bw;
+                        bestL2    = l2;
+                    }
+                } else {
+                    const double maxRatio = std::max(l2.peak_ratio_up, l2.peak_ratio_dn);
+                    if (maxRatio > nearMissThresh) {
+                        gr::lora::log_ts("debug", "lora_scan",
+                            "near-miss %.0f Hz BW=%.0f  ratio=%.2f (min_ratio=%.1f)",
+                            freq, bw, maxRatio, static_cast<double>(cfg.min_ratio));
+                    }
                 }
+            }
+
+            // Report the best-matching BW if above min_ratio threshold.
+            if (bestRatio >= static_cast<double>(cfg.min_ratio)) {
+                const auto ts = ts_short();
+                const std::string sfStr = bestL2.sf_detected
+                    ? ("SF" + std::to_string(bestL2.sf_detected)) : "-";
+                const std::string winsStr =
+                    std::to_string(bestL2.detections) + "/" + std::to_string(bestL2.windows_tried);
+
+                // Clear the \r status line before printing a detection row.
+                std::fprintf(stderr, "\r%s\r", std::string(80, ' ').c_str());
+
+                std::printf("%-13s  %10.3f  %6.1f  %6.1f  %6.1f  %6s  %4s\n",
+                            ts.c_str(), freq / 1.0e6, bestBw / 1.0e3,
+                            bestL2.peak_ratio_up, bestL2.peak_ratio_dn,
+                            winsStr.c_str(), sfStr.c_str());
+                std::fflush(stdout);
+
+                char freqBuf[32];
+                std::snprintf(freqBuf, sizeof(freqBuf), "%.3f MHz", freq / 1.0e6);
+                stats.last_det_freq = freqBuf;
+                stats.last_det_time = ts;
             }
         }
 
@@ -589,8 +660,11 @@ int main(int argc, char** argv) {
             break;
         }
 
-        // Status line on stderr (overwritten in place).
-        if (!g_stop.load(std::memory_order_relaxed)) {
+        // Status line on stderr — rate-limited to avoid jitter.
+        const auto now = std::chrono::steady_clock::now();
+        if (!g_stop.load(std::memory_order_relaxed)
+            && (now - lastStatusUpdate) >= std::chrono::milliseconds(500)) {
+            lastStatusUpdate = now;
             const std::string lastDet = stats.last_det_freq.empty()
                 ? "none"
                 : (stats.last_det_freq + " " + stats.last_det_time);
@@ -606,5 +680,7 @@ int main(int argc, char** argv) {
         "stopped after %u sweep(s), %u overflow(s), %u drop(s)",
         stats.sweeps, stats.overflows, stats.drops);
     stream.deactivate();
-    return 0;
+
+    // Avoid SoapySDR unloadModules() hang on exit.
+    std::quick_exit(0);
 }
