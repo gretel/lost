@@ -961,20 +961,20 @@ def _handle_path_rx(
     idx = 1 + path_bytes
     return_path = plaintext[1 : 1 + path_bytes]
 
-    if idx >= len(plaintext):
-        log.debug("PATH: no extra data after return path")
-        return []
-
-    extra_type = plaintext[idx] & 0x0F
-    extra = plaintext[idx + 1 :]
-
     results: list[bytes] = []
 
-    # Learn the path: update contact record and emit PUSH_PATH_UPDATE
-    if sender_pub is not None:
+    # Learn the path even if there's no extra data (PATH-only is valid)
+    if path_bytes > 0 and sender_pub is not None:
         path_push = _update_contact_path(state, sender_pub, return_path)
         if path_push is not None:
             results.append(path_push)
+
+    if idx >= len(plaintext):
+        log.debug("PATH: no extra data after return path")
+        return results  # Return with any path update, no ACK
+
+    extra_type = plaintext[idx] & 0x0F
+    extra = plaintext[idx + 1 :]
 
     if extra_type == PAYLOAD_ACK and len(extra) >= 4:
         ack_bytes = extra[:4]

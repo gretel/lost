@@ -4732,6 +4732,31 @@ class TestPathLearning(unittest.TestCase):
         # ACK still matched even without a contact record
         self.assertNotIn(ack_hash, state.pending_acks)
 
+    def test_path_rx_reverses_multi_hop_path(self):
+        """Return path is correctly reversed to produce forward path."""
+        state = make_state()
+        peer_expanded_prv, peer_pub, _ = make_identity()
+        from meshcore_crypto import save_pubkey
+
+        save_pubkey(state.keys_dir, peer_pub)
+        state.known_keys[peer_pub.hex()] = peer_pub
+        record = bridge._build_contact_record(peer_pub, name="peer")
+        state.contacts[peer_pub.hex()] = record
+
+        # 3-hop return path: [h1, h2, h3]
+        # Forward path (reversed) should be: [h3, h2, h1]
+        h1, h2, h3 = 0xAA, 0xBB, 0xCC
+        return_path = bytes([h1, h2, h3])
+        # Call _update_contact_path directly
+        push = bridge._update_contact_path(state, peer_pub, return_path)
+        self.assertIsNotNone(push)
+        updated = state.contacts[peer_pub.hex()]
+        new_path_len = struct.unpack_from("<b", updated, 34)[0]
+        self.assertEqual(new_path_len, 3)
+        # Forward path at offsets 35..37 should be [h3, h2, h1]
+        forward = updated[35:38]
+        self.assertEqual(forward, bytes([h3, h2, h1]))
+
 
 class TestPacketStats(unittest.TestCase):
     def test_stats_type2_has_26_bytes(self):
