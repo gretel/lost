@@ -168,6 +168,12 @@ jobs:
           echo "Bundle contents:"
           ls -lh bundle/
 
+      - name: Smoke-test bundled binaries
+        run: |
+          cd bundle
+          LD_LIBRARY_PATH=. ./lora_trx --version
+          LD_LIBRARY_PATH=. ./lora_scan --version
+
       - name: Upload deploy artifact
         uses: actions/upload-artifact@v4
         with:
