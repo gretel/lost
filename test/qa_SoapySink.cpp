@@ -137,7 +137,7 @@ const boost::ut::suite<"SoapySink Block API"> soapySinkBlockAPI = [] {
             {"timed_tx", true},                             //
             {"wait_burst_ack", true},                       //
         });
-        expect(eq(gr::ConnectionResult::SUCCESS, flow.connect<"out">(source).to<"in">(sink)));
+        expect(flow.connect<"out", "in">(source, sink).has_value());
 
         scheduler sched;
         if (auto ret = sched.exchange(std::move(flow)); !ret) {

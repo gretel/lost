@@ -473,9 +473,9 @@ const boost::ut::suite<"Graph-level loopback"> graph_loopback_tests = [] {
             {"log_tags", true}
         });
 
-        (void)graph.connect<"out">(src).template to<"in">(sync);
-        (void)graph.connect<"out">(sync).template to<"in">(demod);
-        (void)graph.connect<"out">(demod).template to<"in">(sink);
+        (void)graph.connect<"out", "in">(src, sync);
+        (void)graph.connect<"out", "in">(sync, demod);
+        (void)graph.connect<"out", "in">(demod, sink);
 
         scheduler::Simple sched;
         if (auto ret = sched.exchange(std::move(graph)); !ret) {

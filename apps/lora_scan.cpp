@@ -199,7 +199,7 @@ struct ScanGraph {
 
 static ScanGraph build_scan_graph(gr::Graph& graph, const ScanConfig& cfg,
                                   const std::vector<double>& channels) {
-    auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
+    auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
     using std::string_literals::operator""s;
 
     ScanGraph sg;
@@ -225,7 +225,7 @@ static ScanGraph build_scan_graph(gr::Graph& graph, const ScanConfig& cfg,
     auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
         {"n_outputs", gr::Size_t{2}},
     });
-    if (!ok(graph.connect<"out">(source).to<"in">(splitter))) {
+    if (!ok(graph.connect<"out", "in">(source, splitter))) {
         gr::lora::log_ts("error", "lora_scan", "connect source -> splitter failed");
     }
 
@@ -244,7 +244,7 @@ static ScanGraph build_scan_graph(gr::Graph& graph, const ScanConfig& cfg,
     if (!ok(graph.connect(splitter, "out#0"s, tap, "in"s))) {
         gr::lora::log_ts("error", "lora_scan", "connect splitter -> tap failed");
     }
-    if (!ok(graph.connect<"out">(tap).to<"in">(null_sink))) {
+    if (!ok(graph.connect<"out", "in">(tap, null_sink))) {
         gr::lora::log_ts("error", "lora_scan", "connect tap -> null_sink failed");
     }
 

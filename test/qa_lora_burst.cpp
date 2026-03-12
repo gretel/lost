@@ -105,9 +105,9 @@ DecodeResult run_decode(const std::vector<std::complex<float>>& iq) {
         {"log_tags", true}
     });
 
-    (void)graph.connect<"out">(src).template to<"in">(sync);
-    (void)graph.connect<"out">(sync).template to<"in">(demod);
-    (void)graph.connect<"out">(demod).template to<"in">(sink);
+    (void)graph.connect<"out", "in">(src, sync);
+    (void)graph.connect<"out", "in">(sync, demod);
+    (void)graph.connect<"out", "in">(demod, sink);
 
     scheduler::Simple sched;
     if (auto ret = sched.exchange(std::move(graph)); !ret) {
@@ -184,8 +184,8 @@ const boost::ut::suite<"Decode pipeline algorithm-level"> decode_algo_tests = []
             {"log_tags", true}
         });
 
-        expect(eq(graph.connect<"out">(source).template to<"in">(demod), ConnectionResult::SUCCESS));
-        expect(eq(graph.connect<"out">(demod).template to<"in">(sink), ConnectionResult::SUCCESS));
+        expect(graph.connect<"out", "in">(source, demod).has_value());
+        expect(graph.connect<"out", "in">(demod, sink).has_value());
 
         scheduler::Simple sched;
         if (auto ret = sched.exchange(std::move(graph)); !ret) {
@@ -563,9 +563,9 @@ DecodeResult run_decode_os(const std::string& payload_str, uint8_t test_os_facto
         {"log_tags", true}
     });
 
-    (void)graph.connect<"out">(src).template to<"in">(sync);
-    (void)graph.connect<"out">(sync).template to<"in">(demod);
-    (void)graph.connect<"out">(demod).template to<"in">(sink);
+    (void)graph.connect<"out", "in">(src, sync);
+    (void)graph.connect<"out", "in">(sync, demod);
+    (void)graph.connect<"out", "in">(demod, sink);
 
     scheduler::Simple sched;
     if (auto ret = sched.exchange(std::move(graph)); !ret) {

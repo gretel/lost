@@ -54,7 +54,7 @@ SplitResult runSplitter(
     src.values = inputSamples;
     src._tags = inputTags;
 
-    if (graph.connect(src, "out"s, splitter, "in"s) != ConnectionResult::SUCCESS) {
+    if (!graph.connect(src, "out"s, splitter, "in"s)) {
         throw std::runtime_error("failed to connect source -> splitter");
     }
 
@@ -73,7 +73,7 @@ SplitResult runSplitter(
         sinks.push_back(&sink);
 
         auto portName = "out#"s + std::to_string(i);
-        if (graph.connect(splitter, portName, sink, "in"s) != ConnectionResult::SUCCESS) {
+        if (!graph.connect(splitter, portName, sink, "in"s)) {
             throw std::runtime_error(
                 std::format("failed to connect splitter.out[{}] -> sink[{}]", i, i));
         }

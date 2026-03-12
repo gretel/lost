@@ -143,10 +143,10 @@ CadResult run_cad(const std::vector<cf32>& window,
         {"log_tags",    true},
     });
 
-    if (graph.connect(src, "out"s, cad, "in"s) != ConnectionResult::SUCCESS) {
+    if (!graph.connect(src, "out"s, cad, "in"s)) {
         throw std::runtime_error("failed to connect source -> CAD");
     }
-    if (graph.connect(cad, "out"s, sink, "in"s) != ConnectionResult::SUCCESS) {
+    if (!graph.connect(cad, "out"s, sink, "in"s)) {
         throw std::runtime_error("failed to connect CAD -> sink");
     }
 

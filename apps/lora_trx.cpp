@@ -462,8 +462,8 @@ DecodePair add_decode_pair(gr::Graph& graph, const TrxConfig& cfg,
     merge_properties(demod_props, filter_properties(dc.block_overrides, kDemodDecoderOverrides));
     auto& demod = graph.emplaceBlock<gr::lora::DemodDecoder>(std::move(demod_props));
 
-    auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
-    if (!ok(graph.connect<"out">(sync).to<"in">(demod))) {
+    auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
+    if (!ok(graph.connect<"out", "in">(sync, demod))) {
         gr::lora::log_ts("error", "lora_trx",
             "failed to connect FrameSync -> DemodDecoder for rx_channel %d",
             rx_channel);
@@ -487,8 +487,8 @@ auto& add_decode_chain(gr::Graph& graph, const TrxConfig& cfg,
     });
     sink._frame_callback = callback;
 
-    auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
-    if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
+    auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
+    if (!ok(graph.connect<"out", "in">(demod, sink))) {
         gr::lora::log_ts("error", "lora_trx",
             "failed to connect DemodDecoder -> FrameSink for rx_channel %d",
             rx_channel);
@@ -516,7 +516,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                          std::function<void(const std::vector<uint8_t>&, bool)> callback,
                          std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
                          std::atomic<bool>* channel_busy = nullptr) {
-    auto ok = [](gr::ConnectionResult r) { return r == gr::ConnectionResult::SUCCESS; };
+    auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
     using std::string_literals::operator""s;
 
     const auto& decodes = cfg.decode_configs;
@@ -554,7 +554,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
         auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
             {"n_outputs", gr::Size_t{2}},
         });
-        if (!ok(graph.connect<"out">(source).to<"in">(splitter))) {
+        if (!ok(graph.connect<"out", "in">(source, splitter))) {
             gr::lora::log_ts("error", "lora_trx",
                 "failed to connect source -> Splitter");
         }
@@ -583,7 +583,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                 "failed to connect Splitter -> CAD");
         }
         auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
-        if (!ok(graph.connect<"out">(cad).to<"in">(cad_sink))) {
+        if (!ok(graph.connect<"out", "in">(cad, cad_sink))) {
             gr::lora::log_ts("error", "lora_trx",
                 "failed to connect CAD -> NullSink");
         }
@@ -639,7 +639,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                                 "failed to connect Splitter -> CAD");
                         }
                         auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
-                        if (!ok(graph.connect<"out">(cad).to<"in">(cad_sink))) {
+                        if (!ok(graph.connect<"out", "in">(cad, cad_sink))) {
                             gr::lora::log_ts("error", "lora_trx",
                                 "failed to connect CAD -> NullSink");
                         }
@@ -653,7 +653,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         {"label", decodes[0].label},
                     });
                     sink._frame_callback = callback;
-                    if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
+                    if (!ok(graph.connect<"out", "in">(demod, sink))) {
                         gr::lora::log_ts("error", "lora_trx",
                             "failed to connect DemodDecoder -> FrameSink (chain %zu)",
                             chain_idx);
@@ -676,7 +676,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         {"label", decodes[0].label},
                     });
                     sink._frame_callback = callback;
-                    if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
+                    if (!ok(graph.connect<"out", "in">(demod, sink))) {
                         gr::lora::log_ts("error", "lora_trx",
                             "failed to connect DemodDecoder -> FrameSink (chain %zu)",
                             chain_idx);
@@ -717,7 +717,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                         {"label", decodes[d].label},
                     });
                     sink._frame_callback = callback;
-                    if (!ok(graph.connect<"out">(demod).to<"in">(sink))) {
+                    if (!ok(graph.connect<"out", "in">(demod, sink))) {
                         gr::lora::log_ts("error", "lora_trx",
                             "failed to connect DemodDecoder -> FrameSink (chain %zu)",
                             chain_idx);
@@ -741,7 +741,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                             "failed to connect Splitter -> CAD");
                     }
                     auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
-                    if (!ok(graph.connect<"out">(cad).to<"in">(cad_sink))) {
+                    if (!ok(graph.connect<"out", "in">(cad, cad_sink))) {
                         gr::lora::log_ts("error", "lora_trx",
                             "failed to connect CAD -> NullSink");
                     }
@@ -770,7 +770,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
         });
         overflow_ptr = &source._totalOverFlowCount;
         wireDecodeChains([&graph, &source](std::size_t /*r*/, auto& downstream) {
-            return graph.connect<"out">(source).to<"in">(downstream) == gr::ConnectionResult::SUCCESS;
+            return graph.connect<"out", "in">(source, downstream).has_value();
         });
     } else {
         auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapyDualSimpleSource<std::complex<float>>>({
@@ -790,7 +790,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
         overflow_ptr = &source._totalOverFlowCount;
         wireDecodeChains([&graph, &source](std::size_t r, auto& downstream) {
             auto portName = "out#"s + std::to_string(r);
-            return graph.connect(source, portName, downstream, "in"s) == gr::ConnectionResult::SUCCESS;
+            return graph.connect(source, portName, downstream, "in"s).has_value();
         });
     }
 
