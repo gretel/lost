@@ -218,6 +218,7 @@ static ScanGraph build_scan_graph(gr::Graph& graph, const ScanConfig& cfg,
         {"max_overflow_count",  gr::Size_t{1000}},
         {"max_consecutive_errors", gr::Size_t{500}},
         {"max_time_out_us",     static_cast<uint32_t>(10'000U)},
+        {"verbose_overflow",    false},
     });
 
     // Splitter -> 2 outputs
