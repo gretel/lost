@@ -343,14 +343,14 @@ def _render_footer(s: State, term_w: int) -> str:
         rc = _ratio_color(best_ratio)
 
         ts = _ts_hires(wall)
-        chirp_label = {"both": "detected bothchirps", "up": "detected upchirp", "down": "detected downchirp"}.get(
+        chirp_label = {"both": "detected bothchirps", "up": "detected upchirp", "dn": "detected downchirp"}.get(
             chirp, chirp
         )
         line = (
             f"{C_GRAY}{ts}{C_RST}"
             f"  {C_BLUE}#{sweep:<5}{C_RST}"
             f"  {C_CYAN}{freq_mhz:>7.3f} MHz{C_RST}"
-            f"  {C_WHITE}SF{det['sf']}{C_RST}/{C_CYAN}{bw_str}{C_RST}"
+            f"  {C_WHITE}SF{det['sf']}{C_RST} / {C_CYAN}{bw_str}{C_RST}"
             f"  {rc}up {ratio_up:>5.1f}{C_RST}"
             f"  {rc}dn {ratio_dn:>5.1f}{C_RST}"
         )
