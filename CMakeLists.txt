@@ -57,12 +57,18 @@ endif()
 
 # gnuradio-blocklib-core (STATIC) and gnuradio-core (STATIC) have a circular
 # symbol dependency: core's PluginLoader.cpp references globalBlockRegistry()
-# defined in blocklib-core. Create an interface target that wraps both in a
-# linker rescan group so the static linker resolves symbols across both archives.
+# defined in blocklib-core. On Linux, wrap both in a RESCAN group so the GNU
+# linker resolves symbols across both archives. On macOS, ld64 rescans by
+# default — just list both libraries and let the linker handle it.
 if(TARGET gnuradio-blocklib-core AND TARGET gnuradio-core)
     add_library(gnuradio-core-group INTERFACE)
-    target_link_libraries(gnuradio-core-group
-        INTERFACE "$<LINK_GROUP:RESCAN,gnuradio-blocklib-core,gnuradio-core>")
+    if(APPLE)
+        target_link_libraries(gnuradio-core-group
+            INTERFACE gnuradio-blocklib-core gnuradio-core)
+    else()
+        target_link_libraries(gnuradio-core-group
+            INTERFACE "$<LINK_GROUP:RESCAN,gnuradio-blocklib-core,gnuradio-core>")
+    endif()
 endif()
 
 # --- LoRa block library ---

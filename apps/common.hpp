@@ -13,8 +13,8 @@
 
 #include <gnuradio-4.0/lora/log.hpp>
 
-// log_hardware_info() uses gr::blocks::soapy types — include Soapy.hpp
-// or SoapyRaiiWrapper.hpp before this header.
+// log_hardware_info() and soapy_reliability_defaults() use gr::blocks::soapy
+// types — include Soapy.hpp before this header.
 
 namespace lora_apps {
 
@@ -62,6 +62,22 @@ inline void log_hardware_info(const char* app_name,
             fpga_ver.empty() ? "?" : fpga_ver.c_str(),
             serial.empty() ? "?" : serial.c_str());
     }
+}
+
+// --- SoapyBlock reliability defaults (shared by lora_trx and lora_scan) ---
+
+constexpr uint32_t kSoapyChunkSize       = 512U << 4U;   // 8192 samples per poll
+constexpr uint32_t kSoapyMaxOverflow     = 1000U;        // consecutive overflows before fatal
+constexpr uint32_t kSoapyMaxConsecErrors = 500U;         // any-error stall limit
+constexpr uint32_t kSoapyTimeoutUs       = 10'000U;      // readStream timeout
+
+inline gr::property_map soapy_reliability_defaults() {
+    return {
+        {"max_chunck_size",        kSoapyChunkSize},
+        {"max_overflow_count",     gr::Size_t{kSoapyMaxOverflow}},
+        {"max_consecutive_errors", gr::Size_t{kSoapyMaxConsecErrors}},
+        {"max_time_out_us",        kSoapyTimeoutUs},
+    };
 }
 
 inline void log_version_banner(const char* app_name, const char* git_rev) {

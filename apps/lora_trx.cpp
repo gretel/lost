@@ -535,7 +535,8 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
 
     // --- Simple path: 1 radio, 1 decode, no combiner ---
     if (nRadio == 1 && nDecode == 1) {
-        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>({
+        auto source_props = lora_apps::soapy_reliability_defaults();
+        source_props.merge(gr::property_map{
             {"device", cfg.device},
             {"device_parameter", cfg.device_param},
             {"sample_rate", cfg.rate},
@@ -544,11 +545,9 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
             {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
             {"rx_antennae", antennae},
             {"clock_source", cfg.clock},
-            {"max_chunck_size", static_cast<uint32_t>(512U << 4U)},
-            {"max_overflow_count", gr::Size_t{1000}},
-            {"max_consecutive_errors", gr::Size_t{500}},
-            {"max_time_out_us", static_cast<uint32_t>(10'000U)},
         });
+        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>(
+            std::move(source_props));
 
         // Splitter: fanout to decode chain + CAD
         auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
@@ -754,7 +753,8 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
     std::atomic<uint64_t>* overflow_ptr = nullptr;
 
     if (nRadio == 1) {
-        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>({
+        auto props = lora_apps::soapy_reliability_defaults();
+        props.merge(gr::property_map{
             {"device", cfg.device},
             {"device_parameter", cfg.device_param},
             {"sample_rate", cfg.rate},
@@ -763,17 +763,16 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
             {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
             {"rx_antennae", antennae},
             {"clock_source", cfg.clock},
-            {"max_chunck_size", static_cast<uint32_t>(512U << 4U)},
-            {"max_overflow_count", gr::Size_t{1000}},
-            {"max_consecutive_errors", gr::Size_t{500}},
-            {"max_time_out_us", static_cast<uint32_t>(10'000U)},
         });
+        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>(
+            std::move(props));
         overflow_ptr = &source._totalOverFlowCount;
         wireDecodeChains([&graph, &source](std::size_t /*r*/, auto& downstream) {
             return graph.connect<"out", "in">(source, downstream).has_value();
         });
     } else {
-        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapyDualSimpleSource<std::complex<float>>>({
+        auto props = lora_apps::soapy_reliability_defaults();
+        props.merge(gr::property_map{
             {"device", cfg.device},
             {"device_parameter", cfg.device_param},
             {"sample_rate", cfg.rate},
@@ -782,11 +781,9 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
             {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
             {"rx_antennae", antennae},
             {"clock_source", cfg.clock},
-            {"max_chunck_size", static_cast<uint32_t>(512U << 4U)},
-            {"max_overflow_count", gr::Size_t{1000}},
-            {"max_consecutive_errors", gr::Size_t{500}},
-            {"max_time_out_us", static_cast<uint32_t>(10'000U)},
         });
+        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapyDualSimpleSource<std::complex<float>>>(
+            std::move(props));
         overflow_ptr = &source._totalOverFlowCount;
         wireDecodeChains([&graph, &source](std::size_t r, auto& downstream) {
             auto portName = "out#"s + std::to_string(r);

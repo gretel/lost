@@ -206,20 +206,18 @@ static ScanGraph build_scan_graph(gr::Graph& graph, const ScanConfig& cfg,
 
     // SoapySource -- fixed L1 rate, pinned master clock
     const double tileCentre = (channels.front() + channels.back()) / 2.0;
-    auto& source = graph.emplaceBlock<
-        gr::blocks::soapy::SoapySimpleSource<cf32>>({
+    auto source_props = lora_apps::soapy_reliability_defaults();
+    source_props.merge(gr::property_map{
         {"device",              cfg.device},
         {"device_parameter",    cfg.device_param},
         {"sample_rate",         cfg.l1_rate},
         {"master_clock_rate",   cfg.master_clock},
         {"rx_center_frequency", gr::Tensor<double>{tileCentre}},
         {"rx_gains",            gr::Tensor<double>{cfg.gain}},
-        {"max_chunck_size",     static_cast<uint32_t>(512U << 4U)},
-        {"max_overflow_count",  gr::Size_t{1000}},
-        {"max_consecutive_errors", gr::Size_t{500}},
-        {"max_time_out_us",     static_cast<uint32_t>(10'000U)},
         {"verbose_overflow",    false},
     });
+    auto& source = graph.emplaceBlock<
+        gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
 
     // Splitter -> 2 outputs
     auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
