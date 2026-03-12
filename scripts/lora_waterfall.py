@@ -66,7 +66,7 @@ def _cube(r: int, g: int, b: int) -> int:
     return 16 + 36 * r + 6 * g + b
 
 
-# Base ramp stops: navy → teal → green → yellow → warm orange (64 entries)
+# Base ramp stops: navy → teal → green → yellow → orange → red → hot white (64 entries)
 _BASE_STOPS: list[tuple[int, int, int]] = [
     # Dark navy (0-7)
     (0, 0, 1),
@@ -77,53 +77,34 @@ _BASE_STOPS: list[tuple[int, int, int]] = [
     (0, 1, 2),
     (0, 1, 3),
     (0, 1, 3),
-    # Teal (8-19)
+    # Teal (8-15)
     (0, 2, 3),
     (0, 2, 3),
     (0, 2, 2),
-    (0, 2, 2),
-    (0, 3, 2),
     (0, 3, 2),
     (0, 3, 1),
-    (0, 3, 1),
-    (0, 3, 0),
     (0, 3, 0),
     (0, 4, 0),
     (0, 4, 0),
-    # Green (20-31)
-    (0, 4, 0),
+    # Green (16-27)
     (0, 5, 0),
     (0, 5, 0),
     (1, 5, 0),
     (1, 5, 0),
-    (1, 5, 0),
     (2, 5, 0),
     (2, 5, 0),
-    (2, 5, 0),
     (3, 5, 0),
     (3, 5, 0),
-    (3, 5, 0),
-    # Yellow (32-47)
-    (3, 5, 0),
-    (4, 5, 0),
-    (4, 5, 0),
     (4, 5, 0),
     (4, 5, 0),
     (5, 5, 0),
     (5, 5, 0),
+    # Yellow → orange (28-39)
     (5, 5, 0),
-    (5, 5, 0),
-    (5, 5, 0),
-    (5, 4, 0),
-    (5, 4, 0),
     (5, 4, 0),
     (5, 4, 0),
     (5, 3, 0),
     (5, 3, 0),
-    # Warm orange (48-63)
-    (5, 3, 0),
-    (5, 3, 0),
-    (5, 2, 0),
     (5, 2, 0),
     (5, 2, 0),
     (5, 2, 0),
@@ -131,12 +112,32 @@ _BASE_STOPS: list[tuple[int, int, int]] = [
     (5, 1, 0),
     (5, 1, 0),
     (5, 1, 0),
-    (5, 1, 0),
-    (5, 1, 0),
-    (5, 1, 0),
+    # Orange → red (40-51)
     (5, 0, 0),
     (5, 0, 0),
     (5, 0, 0),
+    (5, 0, 0),
+    (5, 0, 0),
+    (5, 0, 0),
+    (5, 0, 1),
+    (5, 0, 1),
+    (5, 0, 2),
+    (5, 0, 2),
+    (5, 0, 3),
+    (5, 0, 3),
+    # Red → hot white (52-63)
+    (5, 1, 3),
+    (5, 1, 4),
+    (5, 2, 4),
+    (5, 2, 5),
+    (5, 3, 5),
+    (5, 3, 5),
+    (5, 4, 5),
+    (5, 4, 5),
+    (5, 5, 5),
+    (5, 5, 5),
+    (5, 5, 5),
+    (5, 5, 5),
 ]
 
 N_COLORS: int = len(_BASE_STOPS)
@@ -219,10 +220,16 @@ def render_row(
         return " " * width
 
     parts: list[str] = []
+    prev_ci = -1
     for col in range(width):
         src_idx = min(col * n // width, n - 1)
         ci = db_to_color_index(visible[src_idx], db_min, db_max)
-        parts.append(f"\033[48;5;{RAMP_BASE[ci]}m{_LEVEL_CHARS[ci]}")
+        if ci != prev_ci:
+            c = RAMP_BASE[ci]
+            parts.append(f"\033[38;5;{c}m\u2588")
+            prev_ci = ci
+        else:
+            parts.append("\u2588")
     parts.append("\033[0m")
     return "".join(parts)
 
@@ -274,7 +281,7 @@ def format_db_legend(db_min: float, db_max: float) -> str:
     for i in range(n_samples):
         ci = i * (N_COLORS - 1) // (n_samples - 1)
         color = RAMP_BASE[ci]
-        parts.append(f"\033[48;5;{color}m \033[0m")
+        parts.append(f"\033[38;5;{color}m\u2588\033[0m")
     parts.append(f" {db_max:.0f}dB")
     return "".join(parts)
 
@@ -872,21 +879,31 @@ def main() -> None:
                 for i in range(n_bins):
                     rx_ema[i] += ema_alpha * (bins[i] - rx_ema[i])
 
-            # One-shot scale calibration: on the first spectrum frame, set db_min
+            # Adaptive scale calibration: on the first spectrum frame, set db_min
             # so the observed noise floor maps to ~20% up the ramp (just above
-            # the invisible "space" zone).  After that the scale is frozen.
-            # This keeps chirps bright and noise visible without continuous drift.
+            # the invisible "space" zone).  After that, db_max tracks the actual
+            # peak with slow decay so strong local signals use the full gradient
+            # (red at the top) instead of clipping to white.
+            nf = _estimate_noise_floor(rx_ema)
+            peak = max(rx_ema)
             if not _scale_calibrated:
-                nf = _estimate_noise_floor(rx_ema)
                 if not db_min_manual:
-                    # Place noise floor at the 20% ramp breakpoint (ci=12/64)
-                    # db at 20% = db_min + 0.20 * db_range  →  db_min = nf - 0.20*range
                     db_min = nf - 0.20 * args.db_range
                 if not db_max_manual:
-                    db_max = db_min + args.db_range
+                    db_max = max(db_min + args.db_range, peak + 3.0)
                 _scale_calibrated = True
-            elif not db_max_manual:
-                db_max = db_min + args.db_range
+            else:
+                # Slowly track noise floor (prevents drift on short spikes)
+                if not db_min_manual:
+                    new_floor = nf - 0.20 * args.db_range
+                    db_min = db_min + 0.02 * (new_floor - db_min)
+                # Expand db_max instantly to accommodate peaks, decay slowly
+                if not db_max_manual:
+                    target_max = max(db_min + args.db_range, peak + 3.0)
+                    if target_max > db_max:
+                        db_max = target_max  # instant expand
+                    else:
+                        db_max = db_max + 0.01 * (target_max - db_max)  # slow decay
 
             # Throttle spectrum ingestion to target FPS
             now = time.monotonic()
