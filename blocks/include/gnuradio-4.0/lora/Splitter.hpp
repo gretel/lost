@@ -53,28 +53,15 @@ struct Splitter : gr::Block<Splitter, gr::NoDefaultTagForwarding> {
             }
         }
 
-        // Determine how many samples ALL outputs can accept — consume only
-        // that many to avoid silent sample loss on backpressured paths.
-        auto nCopy = nSamples;
-        for (std::size_t i = 0; i < outs.size(); i++) {
-            nCopy = std::min(nCopy, std::span(outs[i]).size());
-        }
-
-        if (nCopy == 0) {
-            std::ignore = inSpan.consume(0UZ);
-            for (std::size_t i = 0; i < outs.size(); i++) {
-                outs[i].publish(0UZ);
-            }
-            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
-        }
-
         // Copy samples to all outputs
         for (std::size_t i = 0; i < outs.size(); i++) {
-            std::copy_n(inData.begin(), nCopy, std::span(outs[i]).begin());
+            auto outData = std::span(outs[i]);
+            const auto nCopy = std::min(nSamples, outData.size());
+            std::copy_n(inData.begin(), nCopy, outData.begin());
             outs[i].publish(nCopy);
         }
 
-        std::ignore = inSpan.consume(nCopy);
+        std::ignore = inSpan.consume(nSamples);
         return gr::work::Status::OK;
     }
 };

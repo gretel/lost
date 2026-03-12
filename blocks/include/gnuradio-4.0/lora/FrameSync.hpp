@@ -550,20 +550,6 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         }
         _idle_call_count = 0;
 
-        // Overflow tag from SoapyBlock: sample discontinuity occurred.
-        // In SYNC or OUTPUT, the accumulated state is invalid — reset
-        // immediately rather than wasting symbols on corrupt data.
-        if (this->inputTagsPresent()) {
-            const auto& tag = this->mergedInputTag();
-            if (tag.map.contains("overflow") && _state != DETECT) {
-                if (debug) {
-                    std::fprintf(stderr, "FrameSync: overflow tag in %s state — resetting\n",
-                        _state == SYNC ? "SYNC" : "OUTPUT");
-                }
-                resetToDetect();
-            }
-        }
-
         int items_to_output = 0;
         _items_to_consume = static_cast<int>(_sps);
 
