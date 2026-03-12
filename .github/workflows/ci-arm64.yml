@@ -22,7 +22,7 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: false
           fetch-depth: 0
@@ -42,7 +42,7 @@ jobs:
 
       - name: Restore ccache
         id: restore-ccache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-arm64-clang20-${{ matrix.build-type }}-${{ github.run_id }}
@@ -67,7 +67,7 @@ jobs:
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
       - name: Build
-        run: cmake --build build -j$(nproc)
+        run: cmake --build build -j"$(nproc)"
 
       - name: Test
         if: matrix.build-type == 'Release'
@@ -75,7 +75,7 @@ jobs:
 
       - name: Save ccache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-arm64-clang20-${{ matrix.build-type }}-${{ github.run_id }}
@@ -95,7 +95,7 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: false
           fetch-depth: 0
@@ -115,7 +115,7 @@ jobs:
 
       - name: Restore ccache
         id: restore-ccache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-arm64-clang20-Release-${{ github.run_id }}
@@ -142,27 +142,44 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -static-libc++"
 
       - name: Build lora_trx
-        run: cmake --build build --target lora_trx lora_scan -j$(nproc)
+        run: cmake --build build --target lora_trx lora_scan -j"$(nproc)"
 
       - name: Verify linkage
         run: |
-          echo "=== ldd ==="
+          echo "=== ldd lora_trx ==="
           ldd build/apps/lora_trx
           echo "=== file ==="
           file build/apps/lora_trx
+
+      - name: Bundle binaries and runtime libraries
+        run: |
+          mkdir -p bundle
+          cp build/apps/lora_trx build/apps/lora_scan bundle/
+          # Copy runtime .so deps of each binary, excluding fundamental system libs
+          for bin in bundle/lora_trx bundle/lora_scan; do
+            ldd "$bin" \
+              | awk '/=> \// {print $3}' \
+              | grep -v 'libc\.so\|libm\.so\|libdl\.so\|libpthread\|librt\.so\|ld-linux' \
+              | tr '\n' '\0' | xargs -0 -I{} cp -L {} bundle/ 2>/dev/null || true
+          done
+          # Also include any .so files built by the project itself
+          find build -name "*.so*" -not -name "*.so*.dbg" -print0 \
+            | xargs -0 -I{} cp -L {} bundle/ 2>/dev/null || true
+          echo "Bundle contents:"
+          ls -lh bundle/
+          tar -czf gr4-lora-arm64.tar.gz -C bundle .
 
       - name: Upload deploy artifact
         uses: actions/upload-artifact@v4
         with:
           name: gr4-lora-arm64-deploy
-          path: |
-            build/apps/lora_trx
-            build/apps/lora_scan
+          path: gr4-lora-arm64.tar.gz
           if-no-files-found: error
+          retention-days: 14
 
       - name: Save ccache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-arm64-clang20-Release-${{ github.run_id }}
