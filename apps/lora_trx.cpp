@@ -272,12 +272,12 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
 
     if (!tx_on_ch1) {
         // IQ -> sink.in#0 (ch0=TRX_A), zeros -> sink.in#1 (ch1=TRX_B)
-        graph.connect(src, "out0"s, sink, "in#0"s);
-        graph.connect(src, "out1"s, sink, "in#1"s);
+        std::ignore = graph.connect(src, "out0"s, sink, "in#0"s);
+        std::ignore = graph.connect(src, "out1"s, sink, "in#1"s);
     } else {
         // zeros -> sink.in#0 (ch0=TRX_A), IQ -> sink.in#1 (ch1=TRX_B)
-        graph.connect(src, "out1"s, sink, "in#0"s);
-        graph.connect(src, "out0"s, sink, "in#1"s);
+        std::ignore = graph.connect(src, "out1"s, sink, "in#0"s);
+        std::ignore = graph.connect(src, "out0"s, sink, "in#1"s);
     }
 
     auto sched = std::make_unique<
