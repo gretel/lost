@@ -55,6 +55,15 @@ if(NOT TARGET gnuradio-core)
     add_subdirectory(gnuradio4)
 endif()
 
+# gnuradio-blocklib-core (STATIC) and gnuradio-core (STATIC) have a circular
+# symbol dependency: core's PluginLoader.cpp references globalBlockRegistry()
+# defined in blocklib-core. Wrap them in a linker rescan group so the static
+# linker resolves symbols across both archives regardless of order.
+if(TARGET gnuradio-blocklib-core AND TARGET gnuradio-core)
+    target_link_libraries(gnuradio-blocklib-core
+        INTERFACE "$<LINK_GROUP:RESCAN,gnuradio-blocklib-core,gnuradio-core>")
+endif()
+
 # --- LoRa block library ---
 add_subdirectory(blocks)
 

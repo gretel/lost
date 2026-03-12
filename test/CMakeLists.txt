@@ -3,7 +3,7 @@
 # --- Local test helpers (independent of GR4 core test infrastructure) ---
 function(setup_test TEST_NAME)
     target_link_libraries(${TEST_NAME} PRIVATE
-        gr-lora gnuradio-options gr-testing ut gnuradio-blocklib-core)
+        gr-lora gnuradio-options gnuradio-blocklib-core gr-testing ut)
     add_test(NAME ${TEST_NAME}
              COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/${TEST_NAME})
     set_tests_properties(${TEST_NAME} PROPERTIES TIMEOUT 30)
@@ -56,7 +56,7 @@ target_link_libraries(generate_vectors PRIVATE gr-lora)
 if(TARGET gr-soapy)
     add_executable(qa_SoapySink qa_SoapySink.cpp)
     target_link_libraries(qa_SoapySink PRIVATE
-        gnuradio-options gnuradio-core gr-lora gr-soapy gr-testing ut gnuradio-blocklib-core)
+        gnuradio-options gnuradio-core gnuradio-blocklib-core gr-lora gr-soapy gr-testing ut)
     add_test(NAME qa_SoapySink
              COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/qa_SoapySink)
     set_tests_properties(qa_SoapySink PROPERTIES
