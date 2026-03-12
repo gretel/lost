@@ -106,6 +106,11 @@ def emit_sweep(sweep_end: dict, current: SweepState) -> str:
     sweep_num = sweep_end.get("sweep", 0)
 
     probes_str = ",".join(str(d) for d in current.probe_durations)
+    freqs_str = (
+        ",".join(f"{f / 1e6:.3f}" for f in current.probe_freqs)
+        if current.probe_freqs
+        else "-"
+    )
     avg_p = int(_avg(current.probe_durations)) if current.probe_durations else 0
     max_p = max(current.probe_durations) if current.probe_durations else 0
     l2_total = sum(current.probe_durations)
@@ -120,7 +125,8 @@ def emit_sweep(sweep_end: dict, current: SweepState) -> str:
         f"probes={probes_str or '-'}ms "
         f"avg_probe={avg_p}ms max_probe={max_p}ms "
         f"retunes={current.retune_count} "
-        f"l2_pct={l2_pct:.1f} l1_pct={l1_pct:.1f} retune_pct={retune_pct:.1f}"
+        f"l2_pct={l2_pct:.1f} l1_pct={l1_pct:.1f} retune_pct={retune_pct:.1f} "
+        f"hot_freqs={freqs_str}"
     )
 
 

@@ -45,7 +45,9 @@ struct SpectrumState {
     std::vector<std::complex<float>> windowed;
 
     void init() {
-        ring.resize(fft_size * 4, {0.f, 0.f});
+        // 64× fft_size gives ~16ms headroom at 16 MS/s, enough for FFT copy + scheduler jitter
+        static constexpr uint32_t kRingMultiplier = 64;
+        ring.resize(fft_size * kRingMultiplier, {0.f, 0.f});
         magnitude_db.resize(fft_size, -120.f);
         windowed.resize(fft_size);
         fft = gr::algorithm::FFT<std::complex<float>>{};

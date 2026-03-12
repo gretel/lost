@@ -33,7 +33,7 @@ T1_BL=$(wezterm cli split-pane --pane-id "$T1_L" --bottom --percent 50 --cwd "$C
 T1_BR=$(wezterm cli split-pane --pane-id "$T1_R" --bottom --percent 50 --cwd "$CWD" -- elvish)
 
 send "$T1_L"  "$D lora_trx"
-send "$T1_R"  "sleep 5; uv run meshcore-cli -t 127.0.0.1 -p 7834"
+send "$T1_R"  "sleep 10; uv run meshcore-cli -t 127.0.0.1 -p 7834"
 send "$T1_BL" "$D lora_mon.py"
 send "$T1_BR" "$D lora_waterfall.py"
 
