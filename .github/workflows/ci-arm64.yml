@@ -139,7 +139,7 @@ jobs:
             -DENABLE_COVERAGE=OFF \
             -DENABLE_LORA_TESTING=OFF \
             -DENABLE_LORA_BENCHMARKS=OFF \
-            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -static-libc++"
+            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -Wl,-Bstatic -lc++ -lc++abi -Wl,-Bdynamic"
 
       - name: Build lora_trx
         run: cmake --build build --target lora_trx lora_scan -j"$(nproc)"
