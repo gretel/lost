@@ -68,7 +68,7 @@ inline void log_hardware_info(const char* app_name,
 
 constexpr uint32_t kSoapyChunkSize       = 512U << 4U;   // 8192 samples per poll
 constexpr uint32_t kSoapyMaxOverflow     = 1000U;        // consecutive overflows before fatal
-constexpr uint32_t kSoapyMaxConsecErrors = 500U;         // any-error stall limit
+constexpr uint32_t kSoapyMaxConsecErrors = 0U;            // disabled — restart kills MIMO streams
 constexpr uint32_t kSoapyTimeoutUs       = 10'000U;      // readStream timeout
 
 inline gr::property_map soapy_reliability_defaults() {
