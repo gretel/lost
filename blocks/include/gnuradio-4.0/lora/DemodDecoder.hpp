@@ -145,7 +145,7 @@ struct DemodDecoder : gr::Block<DemodDecoder, gr::NoDefaultTagForwarding> {
             gray_syms.push_back(grayMap(s));
         }
 
-        if (is_header_block) {
+        if (sf_app != sf) {
             for (auto& s : gray_syms) {
                 s >>= (sf - sf_app);
             }

@@ -13,8 +13,6 @@
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
 #include <gnuradio-4.0/lora/MultiSfDecoder.hpp>
-#include <gnuradio-4.0/lora/FrameSync.hpp>
-#include <gnuradio-4.0/lora/DemodDecoder.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
 using namespace gr::lora::test;
@@ -176,18 +174,19 @@ const boost::ut::suite<"MultiSfDecoder single-SF"> single_sf_tests = [] {
     };
 
     "SF12 decode"_test = [] {
-        // SF12/BW125k has LDRO active — graph-level decode has a pre-existing
-        // garbled-payload issue at LDRO (both reference chain and MultiSfDecoder).
-        // Verify detection + correct byte count; payload content checked via
-        // LDRO reference comparison test.
         std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o'};
         auto result = run_multisf_loopback(payload, 12, 4, 125000, 4,
                                             0x12, 8, 12, 12);
         expect(result.ok) << "graph ran";
         std::printf("  SF12: %zu bytes decoded (expected %zu)\n",
                     result.decoded.size(), payload.size());
-        expect(eq(result.decoded.size(), payload.size()))
-            << "output byte count";
+        expect(ge(result.decoded.size(), payload.size())) << "output size";
+        if (result.decoded.size() >= payload.size()) {
+            std::string decoded(result.decoded.begin(),
+                                result.decoded.begin()
+                                + static_cast<std::ptrdiff_t>(payload.size()));
+            expect(eq(decoded, std::string("Hello"))) << "payload";
+        }
     };
 };
 
@@ -286,86 +285,11 @@ const boost::ut::suite<"MultiSfDecoder cross-validate"> cross_validate_tests = [
     "SF7/CR4/BW125k"_test = [&run_config] { run_config(7, 4, 125000, "SF7/CR4/BW125k"); };
     "SF8/CR4/BW62.5k"_test = [&run_config] { run_config(8, 4, 62500, "SF8/CR4/BW62.5k"); };
     "SF9/CR2/BW125k"_test = [&run_config] { run_config(9, 2, 125000, "SF9/CR2/BW125k"); };
-    // LDRO configs: the existing FrameSync+DemodDecoder graph-level chain also
-    // produces garbled payload for these configs (pre-existing issue, not
-    // introduced by MultiSfDecoder). Verify we match the reference output.
-    "SF10/CR4/BW62.5k (LDRO, non-LDRO BW)"_test = [&run_config] {
-        // SF10/BW125k: symbol_dur = 8.19ms < 16ms → no LDRO
-        run_config(10, 4, 125000, "SF10/CR4/BW125k");
-    };
-};
-
-// ============================================================================
-// Debug: reference chain comparison for LDRO
-// ============================================================================
-const boost::ut::suite<"LDRO reference comparison"> ldro_ref_tests = [] {
-    using namespace boost::ut;
-    using namespace gr;
-    using namespace gr::lora;
-
-    "SF10/BW62.5k reference vs MultiSf"_test = [] {
-        constexpr uint8_t  test_sf = 10;
-        constexpr uint8_t  test_cr = 4;
-        constexpr uint32_t test_bw = 62500;
-        constexpr uint8_t  test_os = 4;
-        std::vector<uint8_t> payload = {'H','e','l','l','o',' ','M','e','s','h','C','o','r','e'};
-        uint32_t sps = (1u << test_sf) * test_os;
-
-        auto iq = generate_frame_iq(payload, test_sf, test_cr, test_os,
-                                     0x12, 8, true, sps * 5, 2, test_bw, false);
-
-        // --- Reference chain ---
-        std::vector<uint8_t> ref_payload;
-        {
-            Graph graph;
-            auto& src = graph.emplaceBlock<testing::TagSource<std::complex<float>,
-                testing::ProcessFunction::USE_PROCESS_BULK>>({
-                {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
-                {"repeat_tags", false}, {"mark_tag", false}
-            });
-            src.values = iq;
-
-            auto& sync = graph.emplaceBlock<FrameSync>();
-            sync.center_freq = CENTER_FREQ; sync.bandwidth = test_bw;
-            sync.sf = test_sf; sync.sync_word = 0x12; sync.os_factor = test_os;
-            sync.preamble_len = 8;
-
-            auto& demod = graph.emplaceBlock<DemodDecoder>();
-            demod.sf = test_sf; demod.bandwidth = test_bw;
-
-            auto& sink = graph.emplaceBlock<testing::TagSink<uint8_t,
-                testing::ProcessFunction::USE_PROCESS_BULK>>({
-                {"log_samples", true}, {"log_tags", true}
-            });
-
-            (void)graph.connect<"out", "in">(src, sync);
-            (void)graph.connect<"out", "in">(sync, demod);
-            (void)graph.connect<"out", "in">(demod, sink);
-
-            scheduler::Simple sched;
-            (void)sched.exchange(std::move(graph));
-            sched.runAndWait();
-            ref_payload.assign(sink._samples.begin(), sink._samples.end());
-        }
-
-        // --- MultiSfDecoder ---
-        auto result = run_multisf_loopback(payload, test_sf, test_cr, test_bw, test_os,
-                                            0x12, 8, test_sf, test_sf);
-
-        std::printf("  Reference: %zu bytes, MultiSf: %zu bytes\n",
-                    ref_payload.size(), result.decoded.size());
-
-        expect(eq(ref_payload.size(), payload.size())) << "reference should decode";
-        expect(eq(result.decoded.size(), payload.size())) << "multisf should decode";
-
-        if (ref_payload.size() >= payload.size() && result.decoded.size() >= payload.size()) {
-            std::string ref_str(ref_payload.begin(), ref_payload.begin() + 14);
-            std::string msf_str(result.decoded.begin(), result.decoded.begin() + 14);
-            std::printf("  Reference: \"%s\"\n  MultiSf:   \"%s\"\n",
-                        ref_str.c_str(), msf_str.c_str());
-            expect(eq(ref_str, msf_str)) << "payloads should match";
-        }
-    };
+    // LDRO configs — payload blocks use reduced rate (sf_app = sf-2)
+    "SF10/CR4/BW125k (no LDRO)"_test = [&run_config] { run_config(10, 4, 125000, "SF10/CR4/BW125k"); };
+    "SF10/CR4/BW62.5k (LDRO)"_test = [&run_config] { run_config(10, 4, 62500, "SF10/CR4/BW62.5k"); };
+    "SF11/CR4/BW62.5k (LDRO)"_test = [&run_config] { run_config(11, 4, 62500, "SF11/CR4/BW62.5k"); };
+    "SF12/CR4/BW125k (LDRO)"_test = [&run_config] { run_config(12, 4, 125000, "SF12/CR4/BW125k"); };
 };
 
 int main() { /* boost::ut auto-runs all suites */ }

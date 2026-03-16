@@ -377,7 +377,7 @@ struct SfLane {
         std::vector<uint16_t> gray_syms;
         gray_syms.reserve(symbols.size());
         for (auto s : symbols) gray_syms.push_back(grayMap(s));
-        if (is_header_block) {
+        if (sf_app != sf) {
             for (auto& s : gray_syms) s >>= (sf - sf_app);
         }
         auto codewords = deinterleave_block(gray_syms, sf, cw_len, sf_app);

@@ -547,6 +547,25 @@ const boost::ut::suite<"Graph-level loopback"> graph_loopback_tests = [] {
         run_graph_loopback(payload, SF, CR, BW, OS_FACTOR,
                            SYNC_WORD, PREAMBLE_LEN, "Single byte (1B)");
     };
+
+    // LDRO configs — graph-level decode with reduced-rate payload blocks
+    "SF10/BW62.5k LDRO through graph"_test = [&run_graph_loopback] {
+        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o', ' ', 'L', 'D', 'R', 'O'};
+        run_graph_loopback(payload, 10, 4, 62500, 4,
+                           SYNC_WORD, PREAMBLE_LEN, "SF10/BW62.5k LDRO (10B)");
+    };
+
+    "SF11/BW62.5k LDRO through graph"_test = [&run_graph_loopback] {
+        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o', ' ', 'L', 'D', 'R', 'O'};
+        run_graph_loopback(payload, 11, 4, 62500, 4,
+                           SYNC_WORD, PREAMBLE_LEN, "SF11/BW62.5k LDRO (10B)");
+    };
+
+    "SF12/BW125k LDRO through graph"_test = [&run_graph_loopback] {
+        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o', ' ', 'L', 'D', 'R', 'O'};
+        run_graph_loopback(payload, 12, 4, 125000, 4,
+                           SYNC_WORD, PREAMBLE_LEN, "SF12/BW125k LDRO (10B)");
+    };
 };
 
 int main() { /* boost::ut auto-runs all suites */ }
