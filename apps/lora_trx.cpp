@@ -2,12 +2,12 @@
 //
 // lora_trx: full-duplex LoRa transceiver using native GR4 SoapySDR blocks.
 //
-// 1-ch RX: SoapySimpleSource -> FrameSync -> DemodDecoder -> FrameSink
-// 2-ch RX: SoapyDualSimpleSource -+-> FrameSync -> DemodDecoder -> FrameSink (per-chain)
-//                                 +-> FrameSync -> DemodDecoder -> FrameSink (per-chain)
+// 1-ch RX: SoapySimpleSource -> MultiSfDecoder -> FrameSink
+// 2-ch RX: SoapyDualSimpleSource -+-> MultiSfDecoder -> FrameSink
+//                                 +-> MultiSfDecoder -> FrameSink
 // TX: bounded request queue with dedicated worker thread; LBT defers TX until channel clear
 //
-// Dual-RX uses a single MIMO stream (one device handle, two output ports).
+// MultiSfDecoder decodes all SFs (7-12) simultaneously on each channel.
 // Full-duplex TX in both modes: RX runs continuously while TX uses an
 // ephemeral graph with a separate device handle.
 //
@@ -46,16 +46,12 @@
 #include <gnuradio-4.0/Tensor.hpp>
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
-#include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
-#include <gnuradio-4.0/lora/FrameSync.hpp>
-#include <gnuradio-4.0/lora/DemodDecoder.hpp>
-#include <gnuradio-4.0/lora/Splitter.hpp>
+#include <gnuradio-4.0/lora/MultiSfDecoder.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/soapy/Soapy.hpp>
 #include <gnuradio-4.0/soapy/SoapySink.hpp>
 
 #include "common.hpp"
-#include <gnuradio-4.0/testing/NullSources.hpp>
 
 #include <gnuradio-4.0/lora/FrameSink.hpp>
 #include <gnuradio-4.0/lora/TxQueueSource.hpp>
@@ -428,104 +424,71 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
 
 // --- RX graph builder ---
 
-// Creates FrameSync + DemodDecoder in the graph and returns references to both.
-// Does NOT create a FrameSink — caller is responsible for downstream wiring.
-//
-// `rx_channel`: unique ID for this decode chain (radio_idx * 100 + decode_idx)
-// `dc`: decode config (SF, sync_word) — may differ from the codec defaults
-struct DecodePair {
-    gr::lora::FrameSync&    sync;
-    gr::lora::DemodDecoder& demod;
-};
-
-DecodePair add_decode_pair(gr::Graph& graph, const TrxConfig& cfg,
-                           int32_t rx_channel, const DecodeConfig& dc,
-                           std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr) {
+// Creates a MultiSfDecoder → FrameSink chain.
+// Returns reference to the MultiSfDecoder (for connecting upstream).
+gr::lora::MultiSfDecoder& add_multisf_chain(
+        gr::Graph& graph, const TrxConfig& cfg,
+        int32_t rx_channel, const DecodeConfig& dc,
+        std::function<void(const std::vector<uint8_t>&, bool)> callback) {
     auto os = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
-    gr::property_map sync_props = {
-        {"center_freq", static_cast<uint32_t>(cfg.freq)},
-        {"bandwidth", cfg.bw},
-        {"sf", dc.sf},
-        {"sync_word", dc.sync_word},
-        {"os_factor", os},
-        {"preamble_len", cfg.preamble},
-        {"rx_channel", rx_channel},
-        {"debug", cfg.debug},
-    };
-    merge_properties(sync_props, filter_properties(dc.block_overrides, kFrameSyncOverrides));
-    auto& sync = graph.emplaceBlock<gr::lora::FrameSync>(std::move(sync_props));
-    sync._spectrum_state = std::move(spectrum);
+    auto& decoder = graph.emplaceBlock<gr::lora::MultiSfDecoder>();
+    decoder.bandwidth    = cfg.bw;
+    decoder.sync_word    = dc.sync_word;
+    decoder.os_factor    = os;
+    decoder.preamble_len = cfg.preamble;
+    decoder.center_freq  = static_cast<uint32_t>(cfg.freq);
+    decoder.rx_channel   = rx_channel;
+    decoder.sf_min       = 7;
+    decoder.sf_max       = 12;
+    decoder.debug        = cfg.debug;
 
-    gr::property_map demod_props = {
-        {"sf", dc.sf},
-        {"bandwidth", cfg.bw},
-        {"debug", cfg.debug},
-    };
-    merge_properties(demod_props, filter_properties(dc.block_overrides, kDemodDecoderOverrides));
-    auto& demod = graph.emplaceBlock<gr::lora::DemodDecoder>(std::move(demod_props));
-
-    auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
-    if (!ok(graph.connect<"out", "in">(sync, demod))) {
-        gr::lora::log_ts("error", "lora_trx",
-            "failed to connect FrameSync -> DemodDecoder for rx_channel %d",
-            rx_channel);
+    // Apply block-level overrides from config
+    if (auto it = dc.block_overrides.find("energy_thresh"); it != dc.block_overrides.end()) {
+        decoder.energy_thresh = it->second.template value_or<float>(1e-6f);
     }
-    return {sync, demod};
-}
-
-// Adds FrameSync -> DemodDecoder -> FrameSink chain for the simple case
-// (1 radio channel, 1 decode config, no Splitter/Combiner needed).
-auto& add_decode_chain(gr::Graph& graph, const TrxConfig& cfg,
-                       int32_t rx_channel, const DecodeConfig& dc,
-                       std::function<void(const std::vector<uint8_t>&, bool)> callback,
-                       std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr) {
-    auto [sync, demod] = add_decode_pair(graph, cfg, rx_channel, dc, std::move(spectrum));
+    if (auto it = dc.block_overrides.find("min_snr_db"); it != dc.block_overrides.end()) {
+        decoder.min_snr_db = it->second.template value_or<float>(-10.f);
+    }
+    if (auto it = dc.block_overrides.find("max_symbols"); it != dc.block_overrides.end()) {
+        decoder.max_symbols = static_cast<uint32_t>(it->second.template value_or<int64_t>(600));
+    }
 
     auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
         {"sync_word", dc.sync_word},
-        {"phy_sf", dc.sf},
+        {"phy_sf", uint8_t{0}},  // MultiSf: SF varies per frame, reported in tag
         {"phy_bw", cfg.bw},
         {"label", dc.label},
     });
     sink._frame_callback = callback;
 
     auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
-    if (!ok(graph.connect<"out", "in">(demod, sink))) {
+    if (!ok(graph.connect<"out", "in">(decoder, sink))) {
         gr::lora::log_ts("error", "lora_trx",
-            "failed to connect DemodDecoder -> FrameSink for rx_channel %d",
+            "failed to connect MultiSfDecoder -> FrameSink for rx_channel %d",
             rx_channel);
     }
-    return sync;
+    return decoder;
 }
 
 // Generalised RX graph builder.
 //
-// Topology depends on the number of radio channels and decode configs:
+// Topology (per radio channel):
+//   Source → MultiSfDecoder → FrameSink
 //
-//   1 radio, 1 decode:
-//     Source → Splitter(2) → FrameSync → DemodDecoder → FrameSink
-//                          → CAD (channel activity)
-//
-//   N radio × M decode (total chains > 1):
-//     Source ─out#r─→ [Splitter(M+1)] ─out#0..M-1─→ FrameSync → DemodDecoder → FrameSink
-//                                     ─out#M─→ CAD (first radio only)
-//
-// CAD monitors the first radio channel for listen-before-talk (LBT).
-// Each decode chain has its own FrameSink.
+// MultiSfDecoder decodes all SFs (7-12) simultaneously on one channel.
+// CAD monitors the first radio channel for listen-before-talk.
 //
 // Returns pointer to source block's cumulative overflow counter (valid while graph lives).
 std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                          std::function<void(const std::vector<uint8_t>&, bool)> callback,
-                         std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
+                         std::shared_ptr<gr::lora::SpectrumState> /*spectrum*/ = nullptr,
                          std::atomic<bool>* channel_busy = nullptr) {
     auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
     using std::string_literals::operator""s;
 
     const auto& decodes = cfg.decode_configs;
     const auto nRadio = cfg.rx_channels.size();
-    const auto nDecode = decodes.size();
-    const auto nChains = nRadio * nDecode;
 
     // Translate config channels (0-3) to SoapySDR channels + antennae
     std::vector<gr::Size_t> soapy_channels;
@@ -536,218 +499,25 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
         antennae.emplace_back(map.rx_antenna);
     }
 
-    // --- Simple path: 1 radio, 1 decode, no combiner ---
-    if (nRadio == 1 && nDecode == 1) {
-        auto source_props = lora_apps::soapy_reliability_defaults();
-        source_props.merge(gr::property_map{
-            {"device", cfg.device},
-            {"device_parameter", cfg.device_param},
-            {"sample_rate", cfg.rate},
-            {"rx_center_frequency", gr::Tensor<double>{cfg.freq}},
-            {"rx_gains", gr::Tensor<double>{cfg.gain_rx}},
-            {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
-            {"rx_antennae", antennae},
-            {"clock_source", cfg.clock},
-        });
-        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>(
-            std::move(source_props));
+    // Use first decode config for sync_word/label (MultiSfDecoder handles all SFs)
+    const auto& dc = decodes[0];
 
-        // Splitter: fanout to decode chain + CAD
-        auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
-            {"n_outputs", gr::Size_t{2}},
-        });
-        if (!ok(graph.connect<"out", "in">(source, splitter))) {
-            gr::lora::log_ts("error", "lora_trx",
-                "failed to connect source -> Splitter");
-        }
-
-        auto rx_ch = static_cast<int32_t>(cfg.rx_channels[0]) * 100;
-        auto& sync = add_decode_chain(graph, cfg, rx_ch, decodes[0], callback, spectrum);
-        if (!ok(graph.connect(splitter, "out#0"s, sync, "in"s))) {
-            gr::lora::log_ts("error", "lora_trx",
-                "failed to connect Splitter -> decode chain");
-        }
-
-        // CAD block for LBT — NullSink drains the async output to prevent
-        // the scheduler from stalling on a full unread output buffer.
-        auto& cad = graph.emplaceBlock<gr::lora::ChannelActivityDetector>({
-            {"sf", cfg.sf},
-            {"bandwidth", cfg.bw},
-            {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
-            {"alpha", gr::lora::ChannelActivityDetector::default_alpha(cfg.sf)},
-            {"dual_chirp", true},
-        });
-        if (channel_busy != nullptr) {
-            cad.set_channel_busy_flag(channel_busy);
-        }
-        if (!ok(graph.connect(splitter, "out#1"s, cad, "in"s))) {
-            gr::lora::log_ts("error", "lora_trx",
-                "failed to connect Splitter -> CAD");
-        }
-        auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
-        if (!ok(graph.connect<"out", "in">(cad, cad_sink))) {
-            gr::lora::log_ts("error", "lora_trx",
-                "failed to connect CAD -> NullSink");
-        }
-
-        return &source._totalOverFlowCount;
-    }
-
-    // multi-chain path: per-chain FrameSinks
-
-    // Wire decode chains for a given source block.
-    // connectPort(r, downstream) connects source output `r` to downstream's "in".
-    // Both lambdas preserve concrete types for graph.connect() template deduction.
-    // Each decode chain gets its own FrameSink wired directly to DemodDecoder.
+    // Wire one MultiSfDecoder per radio channel via connectPort lambda.
+    // No Splitter needed — MultiSfDecoder handles all SFs and provides
+    // channel-busy detection for LBT internally.
     auto wireDecodeChains = [&](auto connectPort) {
-        std::size_t chain_idx = 0;
         for (std::size_t r = 0; r < nRadio; r++) {
-            bool firstChain = (r == 0);
-            // CAD gets one extra Splitter output on the first radio
-            const bool addCad = firstChain && (channel_busy != nullptr);
+            auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
+            auto& decoder = add_multisf_chain(graph, cfg, rx_ch, dc, callback);
 
-            if (nDecode == 1) {
-                // Insert Splitter(1 decode + optional CAD)
-                auto nOut = static_cast<gr::Size_t>(addCad ? 2 : 1);
-                if (nOut > 1) {
-                    auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
-                        {"n_outputs", nOut},
-                    });
-                    if (!connectPort(r, splitter)) {
-                        gr::lora::log_ts("error", "lora_trx",
-                            "failed to connect source -> Splitter (radio %zu)", r);
-                    }
+            // First radio channel provides LBT channel-busy flag
+            if (r == 0 && channel_busy != nullptr) {
+                decoder.set_channel_busy_flag(channel_busy);
+            }
 
-                    auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
-                    auto [sync, demod] = add_decode_pair(
-                        graph, cfg, rx_ch, decodes[0],
-                        firstChain ? spectrum : nullptr);
-                    if (!ok(graph.connect(splitter, "out#0"s, sync, "in"s))) {
-                        gr::lora::log_ts("error", "lora_trx",
-                            "failed to connect Splitter -> FrameSync (radio %zu)", r);
-                    }
-
-                    if (addCad) {
-                        auto& cad = graph.emplaceBlock<gr::lora::ChannelActivityDetector>({
-                            {"sf", cfg.sf},
-                            {"bandwidth", cfg.bw},
-                            {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
-                            {"alpha", gr::lora::ChannelActivityDetector::default_alpha(cfg.sf)},
-                            {"dual_chirp", true},
-                        });
-                        cad.set_channel_busy_flag(channel_busy);
-                        if (!ok(graph.connect(splitter, "out#1"s, cad, "in"s))) {
-                            gr::lora::log_ts("error", "lora_trx",
-                                "failed to connect Splitter -> CAD");
-                        }
-                        auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
-                        if (!ok(graph.connect<"out", "in">(cad, cad_sink))) {
-                            gr::lora::log_ts("error", "lora_trx",
-                                "failed to connect CAD -> NullSink");
-                        }
-                    }
-
-                    // Per-chain sink
-                    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-                        {"sync_word", decodes[0].sync_word},
-                        {"phy_sf", decodes[0].sf},
-                        {"phy_bw", cfg.bw},
-                        {"label", decodes[0].label},
-                    });
-                    sink._frame_callback = callback;
-                    if (!ok(graph.connect<"out", "in">(demod, sink))) {
-                        gr::lora::log_ts("error", "lora_trx",
-                            "failed to connect DemodDecoder -> FrameSink (chain %zu)",
-                            chain_idx);
-                    }
-                } else {
-                    // No CAD, no splitter needed — direct connection
-                    auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
-                    auto [sync, demod] = add_decode_pair(
-                        graph, cfg, rx_ch, decodes[0],
-                        firstChain ? spectrum : nullptr);
-                    if (!connectPort(r, sync)) {
-                        gr::lora::log_ts("error", "lora_trx",
-                            "failed to connect source -> FrameSync (radio %zu)", r);
-                    }
-
-                    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-                        {"sync_word", decodes[0].sync_word},
-                        {"phy_sf", decodes[0].sf},
-                        {"phy_bw", cfg.bw},
-                        {"label", decodes[0].label},
-                    });
-                    sink._frame_callback = callback;
-                    if (!ok(graph.connect<"out", "in">(demod, sink))) {
-                        gr::lora::log_ts("error", "lora_trx",
-                            "failed to connect DemodDecoder -> FrameSink (chain %zu)",
-                            chain_idx);
-                    }
-                }
-                chain_idx++;
-            } else {
-                // nDecode > 1: Splitter with nDecode outputs + optional CAD
-                auto nOut = static_cast<gr::Size_t>(nDecode + (addCad ? 1 : 0));
-                auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
-                    {"n_outputs", nOut},
-                });
-
-                if (!connectPort(r, splitter)) {
-                    gr::lora::log_ts("error", "lora_trx",
-                        "failed to connect source -> Splitter (radio %zu)", r);
-                }
-
-                for (std::size_t d = 0; d < nDecode; d++) {
-                    auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100
-                               + static_cast<int32_t>(d);
-                    auto [sync, demod] = add_decode_pair(
-                        graph, cfg, rx_ch, decodes[d],
-                        (firstChain && d == 0) ? spectrum : nullptr);
-
-                    auto splitterPort = "out#"s + std::to_string(d);
-                    if (!ok(graph.connect(splitter, splitterPort, sync, "in"s))) {
-                        gr::lora::log_ts("error", "lora_trx",
-                            "failed to connect Splitter -> FrameSync (chain %zu)",
-                            chain_idx);
-                    }
-
-                    // Per-chain sink
-                    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-                        {"sync_word", decodes[d].sync_word},
-                        {"phy_sf", decodes[d].sf},
-                        {"phy_bw", cfg.bw},
-                        {"label", decodes[d].label},
-                    });
-                    sink._frame_callback = callback;
-                    if (!ok(graph.connect<"out", "in">(demod, sink))) {
-                        gr::lora::log_ts("error", "lora_trx",
-                            "failed to connect DemodDecoder -> FrameSink (chain %zu)",
-                            chain_idx);
-                    }
-                    chain_idx++;
-                }
-
-                // Wire CAD to the extra Splitter output (first radio only)
-                if (addCad) {
-                    auto cadPort = "out#"s + std::to_string(nDecode);
-                    auto& cad = graph.emplaceBlock<gr::lora::ChannelActivityDetector>({
-                        {"sf", cfg.sf},
-                        {"bandwidth", cfg.bw},
-                        {"os_factor", static_cast<uint32_t>(cfg.rate / cfg.bw)},
-                        {"alpha", gr::lora::ChannelActivityDetector::default_alpha(cfg.sf)},
-                        {"dual_chirp", true},
-                    });
-                    cad.set_channel_busy_flag(channel_busy);
-                    if (!ok(graph.connect(splitter, cadPort, cad, "in"s))) {
-                        gr::lora::log_ts("error", "lora_trx",
-                            "failed to connect Splitter -> CAD");
-                    }
-                    auto& cad_sink = graph.emplaceBlock<gr::testing::NullSink<uint8_t>>();
-                    if (!ok(graph.connect<"out", "in">(cad, cad_sink))) {
-                        gr::lora::log_ts("error", "lora_trx",
-                            "failed to connect CAD -> NullSink");
-                    }
-                }
+            if (!connectPort(r, decoder)) {
+                gr::lora::log_ts("error", "lora_trx",
+                    "failed to connect source -> MultiSfDecoder (radio %zu)", r);
             }
         }
     };
@@ -795,8 +565,7 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
     }
 
     gr::lora::log_ts("debug", "lora_trx",
-        "RX graph: %zu radio(s) x %zu decode(s) = %zu chains",
-        nRadio, nDecode, nChains);
+        "RX graph: %zu radio(s), MultiSfDecoder (SF7-12)", nRadio);
 
     return overflow_ptr;
 }
@@ -809,11 +578,8 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
 // emplaceBlock references are dangling — we must use rx_sched.blocks() to
 // locate them by typeName().
 struct RxBlocks {
-    std::vector<std::shared_ptr<gr::BlockModel>> frame_sync;
-    std::vector<std::shared_ptr<gr::BlockModel>> demod_decoder;
-    std::vector<std::shared_ptr<gr::BlockModel>> splitters;
+    std::vector<std::shared_ptr<gr::BlockModel>> multisf_decoders;
     std::shared_ptr<gr::BlockModel>              soapy_source;
-    std::shared_ptr<gr::BlockModel>              cad_block;
 };
 
 // Scan the scheduler's block span and collect references by type name.
@@ -821,14 +587,8 @@ RxBlocks find_rx_blocks(std::span<std::shared_ptr<gr::BlockModel>> blocks) {
     RxBlocks rx;
     for (auto& blk : blocks) {
         auto tn = blk->typeName();
-        if (tn.find("FrameSync") != std::string_view::npos) {
-            rx.frame_sync.push_back(blk);
-        } else if (tn.find("DemodDecoder") != std::string_view::npos) {
-            rx.demod_decoder.push_back(blk);
-        } else if (tn.find("Splitter") != std::string_view::npos) {
-            rx.splitters.push_back(blk);
-        } else if (tn.find("ChannelActivityDetector") != std::string_view::npos) {
-            rx.cad_block = blk;
+        if (tn.find("MultiSfDecoder") != std::string_view::npos) {
+            rx.multisf_decoders.push_back(blk);
         } else if (tn.find("Soapy") != std::string_view::npos) {
             rx.soapy_source = blk;
         }
@@ -837,7 +597,7 @@ RxBlocks find_rx_blocks(std::span<std::shared_ptr<gr::BlockModel>> blocks) {
 }
 
 // Convert CBOR lora_config values to a property_map suitable for
-// FrameSync / DemodDecoder settings.  CBOR uint -> narrowed to the exact
+// MultiSfDecoder settings.  CBOR uint -> narrowed to the exact
 // C++ type expected by the block's Annotated<> field.
 // Returns empty map if validation fails (e.g. SF out of range).
 gr::property_map cbor_to_phy_props(const gr::lora::cbor::Map& msg, bool& valid) {
@@ -889,31 +649,14 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
     double new_rx_gain = cbor::get_float64_or(msg, "rx_gain", 0.0);
     double new_tx_gain = cbor::get_float64_or(msg, "tx_gain", 0.0);
 
-    // Apply PHY parameters to all FrameSync blocks
+    // Apply PHY parameters to all MultiSfDecoder blocks
     if (!phy_props.empty()) {
-        for (auto& blk : rx_blocks.frame_sync) {
+        for (auto& blk : rx_blocks.multisf_decoders) {
             auto rejected = blk->settings().set(phy_props);
             if (!rejected.empty()) {
                 gr::lora::log_ts("warn ", "lora_trx",
-                    "lora_config: FrameSync rejected %zu key(s)", rejected.size());
+                    "lora_config: MultiSfDecoder rejected %zu key(s)", rejected.size());
                 any_rejected = true;
-            }
-        }
-        // DemodDecoder only cares about sf and bandwidth
-        gr::property_map demod_props;
-        if (auto it = phy_props.find("sf"); it != phy_props.end())
-            demod_props["sf"] = it->second;
-        if (auto it = phy_props.find("bandwidth"); it != phy_props.end())
-            demod_props["bandwidth"] = it->second;
-        if (!demod_props.empty()) {
-            for (auto& blk : rx_blocks.demod_decoder) {
-                auto rejected = blk->settings().set(demod_props);
-                if (!rejected.empty()) {
-                    gr::lora::log_ts("warn ", "lora_trx",
-                        "lora_config: DemodDecoder rejected %zu key(s)",
-                        rejected.size());
-                    any_rejected = true;
-                }
             }
         }
     }
@@ -921,15 +664,13 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
     // Retune SoapySource center frequency
     if (freq_changed && rx_blocks.soapy_source) {
         gr::property_map freq_props;
-        // SoapySource uses Tensor<double> for rx_center_frequency
         freq_props["rx_center_frequency"] = gr::Tensor<double>{new_freq};
         auto rejected = rx_blocks.soapy_source->settings().set(freq_props);
         if (!rejected.empty()) {
             gr::lora::log_ts("warn ", "lora_trx",
                 "lora_config: SoapySource rejected freq change");
         }
-        // Also update FrameSync center_freq (used for debug/display only)
-        for (auto& blk : rx_blocks.frame_sync) {
+        for (auto& blk : rx_blocks.multisf_decoders) {
             std::ignore = blk->settings().set({{"center_freq", static_cast<uint32_t>(new_freq)}});
         }
     }
@@ -1202,7 +943,7 @@ int main(int argc, char* argv[]) {
     });
 
     // --- Spectrum taps for waterfall display ---
-    // RX spectrum: fed by FrameSync in the RX graph
+    // TODO: MultiSfDecoder doesn't support spectrum tap yet
     auto spectrum = std::make_shared<gr::lora::SpectrumState>();
     spectrum->sample_rate = cfg.rate;
     spectrum->center_freq = cfg.freq;
@@ -1242,10 +983,8 @@ int main(int argc, char* argv[]) {
     // we find them by scanning typeName().
     auto rx_blocks = find_rx_blocks(rx_sched.blocks());
     gr::lora::log_ts("info ", "lora_trx",
-        "RX blocks: %zu FrameSync  %zu DemodDecoder  %zu Splitter  CAD=%s  soapy=%s",
-        rx_blocks.frame_sync.size(), rx_blocks.demod_decoder.size(),
-        rx_blocks.splitters.size(),
-        rx_blocks.cad_block ? "yes" : "no",
+        "RX blocks: %zu MultiSfDecoder (SF7-12)  soapy=%s",
+        rx_blocks.multisf_decoders.size(),
         rx_blocks.soapy_source ? "yes" : "no");
 
     std::atomic<bool> rx_done{false};

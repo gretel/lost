@@ -385,13 +385,7 @@ std::vector<TrxConfig> load_config(const std::string& path,
                 DecodeConfig dc;
 
                 auto sf_opt = dtbl["sf"].value<int64_t>();
-                if (!sf_opt) {
-                    gr::lora::log_ts("error", "lora_trx",
-                        "[[%s.decode]] entry missing required key 'sf'",
-                        skey.c_str());
-                    return {};
-                }
-                dc.sf = static_cast<uint8_t>(*sf_opt);
+                dc.sf = sf_opt ? static_cast<uint8_t>(*sf_opt) : cfg.sf;
 
                 auto sw_opt = dtbl["sync_word"].value<int64_t>();
                 if (!sw_opt) {
@@ -439,7 +433,7 @@ std::vector<TrxConfig> load_config(const std::string& path,
         if (cfg.decode_configs.empty()) {
             gr::lora::log_ts("error", "lora_trx",
                 "[%s] requires at least one [[%s.decode]] entry "
-                "(sf, sync_word, label are required)",
+                "(sync_word, label are required; sf is optional)",
                 skey.c_str(), skey.c_str());
             return {};
         }
@@ -457,7 +451,7 @@ std::vector<TrxConfig> load_config(const std::string& path,
                 if (i > 0) dec_list += ",";
                 const auto& dc = cfg.decode_configs[i];
                 char tmp[32];
-                std::snprintf(tmp, sizeof(tmp), "SF%u/0x%02X", dc.sf, dc.sync_word);
+                std::snprintf(tmp, sizeof(tmp), "SF7-12/0x%02X", dc.sync_word);
                 dec_list += tmp;
                 if (!dc.label.empty()) { dec_list += "("; dec_list += dc.label; dec_list += ")"; }
             }
