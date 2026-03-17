@@ -53,6 +53,20 @@ target_compile_definitions(qa_lora_multisf PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
 set_tests_properties(qa_lora_multisf PROPERTIES TIMEOUT 120)
 
+add_ut_test(qa_lora_udp)
+
+# Config test: needs config.cpp (from apps/) + toml++ (not part of gr-lora)
+add_executable(qa_lora_config qa_lora_config.cpp ${PROJECT_SOURCE_DIR}/apps/config.cpp)
+setup_test(qa_lora_config)
+target_link_libraries(qa_lora_config PRIVATE tomlplusplus::tomlplusplus)
+target_compile_definitions(qa_lora_config PRIVATE
+    CONFIG_TOML_PATH="${PROJECT_SOURCE_DIR}/apps/config.toml"
+    GIT_REV="test")
+
+add_ut_test(qa_lora_framesink)
+target_compile_definitions(qa_lora_framesink PRIVATE
+    TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
+
 # Test vector generator (not a test — run manually to regenerate vectors)
 add_executable(generate_vectors generate_vectors.cpp)
 target_link_libraries(generate_vectors PRIVATE gr-lora)
