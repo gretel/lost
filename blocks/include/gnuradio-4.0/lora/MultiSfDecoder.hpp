@@ -17,6 +17,7 @@
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/Message.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
+#include <gnuradio-4.0/lora/algorithm/SpectrumTap.hpp>
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
@@ -523,6 +524,7 @@ struct MultiSfDecoder
     float    _noise_ema{0.f};
     bool     _noise_ema_init{false};
     std::atomic<bool>* _channel_busy{nullptr};  // LBT: set by any lane in SYNC/OUTPUT
+    std::shared_ptr<SpectrumState> _spectrum_state;  // spectrum tap for waterfall display
 
     /// Set external channel-busy flag for listen-before-talk.
     void set_channel_busy_flag(std::atomic<bool>* flag) { _channel_busy = flag; }
@@ -572,6 +574,12 @@ struct MultiSfDecoder
             std::ignore = input.consume(0UZ);
             output.publish(0UZ);
             return gr::work::Status::OK;
+        }
+
+        // Push raw IQ to spectrum tap (waterfall display)
+        if (_spectrum_state) {
+            _spectrum_state->push(in_span.data(),
+                std::min(in_span.size(), static_cast<std::size_t>(_min_sps)));
         }
 
         // Always consume the full input. Each lane appends to its own

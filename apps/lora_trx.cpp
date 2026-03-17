@@ -429,7 +429,8 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
 gr::lora::MultiSfDecoder& add_multisf_chain(
         gr::Graph& graph, const TrxConfig& cfg,
         int32_t rx_channel, const DecodeConfig& dc,
-        std::function<void(const std::vector<uint8_t>&, bool)> callback) {
+        std::function<void(const std::vector<uint8_t>&, bool)> callback,
+        std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr) {
     auto os = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
     auto& decoder = graph.emplaceBlock<gr::lora::MultiSfDecoder>();
@@ -442,6 +443,7 @@ gr::lora::MultiSfDecoder& add_multisf_chain(
     decoder.sf_min       = 7;
     decoder.sf_max       = 12;
     decoder.debug        = cfg.debug;
+    decoder._spectrum_state = std::move(spectrum);
 
     // Apply block-level overrides from config
     if (auto it = dc.block_overrides.find("energy_thresh"); it != dc.block_overrides.end()) {
@@ -482,7 +484,7 @@ gr::lora::MultiSfDecoder& add_multisf_chain(
 // Returns pointer to source block's cumulative overflow counter (valid while graph lives).
 std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                          std::function<void(const std::vector<uint8_t>&, bool)> callback,
-                         std::shared_ptr<gr::lora::SpectrumState> /*spectrum*/ = nullptr,
+                         std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
                          std::atomic<bool>* channel_busy = nullptr) {
     auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
     using std::string_literals::operator""s;
@@ -508,7 +510,9 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
     auto wireDecodeChains = [&](auto connectPort) {
         for (std::size_t r = 0; r < nRadio; r++) {
             auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
-            auto& decoder = add_multisf_chain(graph, cfg, rx_ch, dc, callback);
+            // First radio channel gets the spectrum tap for waterfall
+            auto spec = (r == 0) ? spectrum : nullptr;
+            auto& decoder = add_multisf_chain(graph, cfg, rx_ch, dc, callback, spec);
 
             // First radio channel provides LBT channel-busy flag
             if (r == 0 && channel_busy != nullptr) {
@@ -943,7 +947,6 @@ int main(int argc, char* argv[]) {
     });
 
     // --- Spectrum taps for waterfall display ---
-    // TODO: MultiSfDecoder doesn't support spectrum tap yet
     auto spectrum = std::make_shared<gr::lora::SpectrumState>();
     spectrum->sample_rate = cfg.rate;
     spectrum->center_freq = cfg.freq;
