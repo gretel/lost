@@ -5,11 +5,11 @@
 # pyright: reportUnknownVariableType=false, reportUnknownArgumentType=false
 """lora_spectrum.py — real-time LoRa spectrum bar graph.
 
-Reads CBOR frames from lora_scan on stdin and renders a live spectrum
+Subscribes to lora_scan CBOR events via UDP and renders a live spectrum
 display with detection anchors and history to the terminal.
 
 Usage:
-    lora_scan --cbor 2>scan.log | python3 scripts/lora_spectrum.py
+    python3 scripts/lora_spectrum.py [--host HOST] [--port PORT]
 """
 
 from __future__ import annotations
@@ -24,7 +24,9 @@ import sys
 import time
 from typing import Any
 
-from cbor_stream import read_cbor_seq  # noqa: reportImplicitRelativeImport
+import cbor2
+
+from lora_common import create_udp_subscriber  # noqa: reportImplicitRelativeImport
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
@@ -343,9 +345,11 @@ def _render_footer(s: State, term_w: int) -> str:
         rc = _ratio_color(best_ratio)
 
         ts = _ts_hires(wall)
-        chirp_label = {"both": "detected bothchirps", "up": "detected upchirp", "dn": "detected downchirp"}.get(
-            chirp, chirp
-        )
+        chirp_label = {
+            "both": "detected bothchirps",
+            "up": "detected upchirp",
+            "dn": "detected downchirp",
+        }.get(chirp, chirp)
         line = (
             f"{C_GRAY}{ts}{C_RST}"
             f"  {C_BLUE}#{sweep:<5}{C_RST}"
@@ -534,8 +538,13 @@ def render(s: State) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="LoRa spectrum bar graph. Reads CBOR from lora_scan on stdin.",
-        usage="lora_scan --cbor 2>scan.log | %(prog)s [options]",
+        description="LoRa spectrum bar graph. Subscribes to lora_scan via UDP.",
+    )
+    _ = parser.add_argument(
+        "--host", default="127.0.0.1", help="lora_scan UDP host (default: 127.0.0.1)"
+    )
+    _ = parser.add_argument(
+        "--port", type=int, default=5557, help="lora_scan UDP port (default: 5557)"
     )
     _ = parser.add_argument(
         "--ema",
@@ -546,6 +555,8 @@ def main() -> None:
     args = parser.parse_args()
 
     _write("\033[?25l")  # hide cursor
+
+    sock, _sub_msg, _addr = create_udp_subscriber(args.host, args.port)
 
     state = State(ema_alpha=args.ema)
     first = True
@@ -568,7 +579,9 @@ def main() -> None:
     }
 
     try:
-        for msg in read_cbor_seq(sys.stdin.buffer):
+        while True:
+            data, _ = sock.recvfrom(65536)
+            msg = cbor2.loads(data)
             if not isinstance(msg, dict):
                 continue
 
@@ -586,6 +599,8 @@ def main() -> None:
                 render_header(state)
     except KeyboardInterrupt:
         pass
+    finally:
+        sock.close()
 
 
 if __name__ == "__main__":

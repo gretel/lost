@@ -3,12 +3,12 @@
 """
 lora_perf.py -- lora_scan sweep performance analyzer.
 
-Reads CBOR Sequence events from stdin (piped from lora_scan --cbor) and prints
-per-sweep metrics and rolling summaries to stdout.  Designed for observation
-via pty_read(pattern=...) during long-running scans.
+Subscribes to lora_scan CBOR events via UDP and prints per-sweep metrics
+and rolling summaries to stdout.  Designed for observation via
+pty_read(pattern=...) during long-running scans.
 
 Usage:
-    lora_scan --cbor 2>scan.log | python3 scripts/lora_perf.py
+    python3 scripts/lora_perf.py [--host HOST] [--port PORT]
 
 Output lines (grep-friendly):
     SWEEP sweep=1 dur=5832ms ...        # per-sweep metrics
@@ -20,13 +20,16 @@ CBOR event types consumed:
 
 from __future__ import annotations
 
+import argparse
 import atexit
 import signal
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from cbor_stream import read_cbor_seq
+import cbor2
+
+from lora_common import create_udp_subscriber  # noqa: reportImplicitRelativeImport
 
 
 @dataclass
@@ -170,6 +173,19 @@ def emit_summary(stats: RunningStats) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="lora_scan sweep performance analyzer. Subscribes via UDP.",
+    )
+    _ = parser.add_argument(
+        "--host", default="127.0.0.1", help="lora_scan UDP host (default: 127.0.0.1)"
+    )
+    _ = parser.add_argument(
+        "--port", type=int, default=5557, help="lora_scan UDP port (default: 5557)"
+    )
+    args = parser.parse_args()
+
+    sock, _sub_msg, _addr = create_udp_subscriber(args.host, args.port)
+
     stats = RunningStats()
     current = SweepState()
     summary_interval = 10
@@ -182,7 +198,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
-    for msg in read_cbor_seq(sys.stdin.buffer):
+    while True:
+        data, _ = sock.recvfrom(65536)
+        msg = cbor2.loads(data)
         if not isinstance(msg, dict):
             continue
 
