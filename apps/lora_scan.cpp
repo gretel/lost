@@ -39,11 +39,14 @@
 #include <gnuradio-4.0/lora/cbor.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
+#include "udp_state.hpp"
+
 #ifndef GIT_REV
 #define GIT_REV "dev"
 #endif
 
 using lora_apps::cf32;
+using lora_apps::UdpState;
 using lora_config::ScanSetConfig;
 using lora_graph::ScanGraph;
 
@@ -560,6 +563,18 @@ static InterleavedResult interleavedSweep(
 
 // ─── CBOR output ──────────────────────────────────────────────────────────────
 
+// Shared output state — set in main(), used by all emitters.
+static UdpState* g_udp = nullptr;
+static bool      g_cbor_stdout = false;
+
+static void sendCbor(const std::vector<uint8_t>& buf) {
+    if (g_udp) g_udp->broadcast_all(buf);
+    if (g_cbor_stdout) {
+        std::fwrite(buf.data(), 1, buf.size(), stdout);
+        std::fflush(stdout);
+    }
+}
+
 static void emitSpectrumCbor(
     const std::vector<double>& channels,
     const std::vector<double>& energy,
@@ -613,8 +628,7 @@ static void emitSpectrumCbor(
         cb::kv_text(buf, "chirp", chirp);
     }
 
-    std::fwrite(buf.data(), 1, buf.size(), stdout);
-    std::fflush(stdout);
+    sendCbor(buf);
 }
 
 static void emitStatusCbor(const ScanSetConfig& cfg, const ScanStats& stats,
@@ -638,8 +652,7 @@ static void emitStatusCbor(const ScanSetConfig& cfg, const ScanStats& stats,
     cb::encode_uint(buf, static_cast<uint64_t>(cfg.freq_start));
     cb::encode_uint(buf, static_cast<uint64_t>(cfg.freq_stop));
 
-    std::fwrite(buf.data(), 1, buf.size(), stdout);
-    std::fflush(stdout);
+    sendCbor(buf);
 }
 
 // ─── CBOR event emitters (real-time diagnostics) ─────────────────────────────
@@ -652,8 +665,7 @@ static void emitSweepStartCbor(uint32_t sweep) {
     cb::kv_text(buf, "type", "scan_sweep_start");
     cb::kv_text(buf, "ts", gr::lora::ts_now());
     cb::kv_uint(buf, "sweep", sweep);
-    std::fwrite(buf.data(), 1, buf.size(), stdout);
-    std::fflush(stdout);
+    sendCbor(buf);
 }
 
 static void emitSweepEndCbor(uint32_t sweep, uint32_t durationMs,
@@ -673,8 +685,7 @@ static void emitSweepEndCbor(uint32_t sweep, uint32_t durationMs,
     cb::kv_uint(buf, "hot_count", hotCount);
     cb::kv_uint(buf, "detections", detections);
     cb::kv_uint(buf, "overflows", overflows);
-    std::fwrite(buf.data(), 1, buf.size(), stdout);
-    std::fflush(stdout);
+    sendCbor(buf);
 }
 
 static void emitL2ProbeCbor(uint32_t sweep, double freq, uint32_t durationMs,
@@ -697,8 +708,7 @@ static void emitL2ProbeCbor(uint32_t sweep, double freq, uint32_t durationMs,
         cb::kv_float64(buf, "ratio", r.ratio);
         cb::kv_text(buf, "chirp", r.chirp);
     }
-    std::fwrite(buf.data(), 1, buf.size(), stdout);
-    std::fflush(stdout);
+    sendCbor(buf);
 }
 
 static void emitRetuneCbor(uint32_t sweep, double freq, const char* reason) {
@@ -711,8 +721,7 @@ static void emitRetuneCbor(uint32_t sweep, double freq, const char* reason) {
     cb::kv_uint(buf, "sweep", sweep);
     cb::kv_uint(buf, "freq", static_cast<uint64_t>(freq));
     cb::kv_text(buf, "reason", reason);
-    std::fwrite(buf.data(), 1, buf.size(), stdout);
-    std::fflush(stdout);
+    sendCbor(buf);
 }
 
 static void emitOverflowCbor(uint32_t sweep, uint64_t count) {
@@ -724,8 +733,7 @@ static void emitOverflowCbor(uint32_t sweep, uint64_t count) {
     cb::kv_text(buf, "ts", gr::lora::ts_now());
     cb::kv_uint(buf, "sweep", sweep);
     cb::kv_uint(buf, "count", count);
-    std::fwrite(buf.data(), 1, buf.size(), stdout);
-    std::fflush(stdout);
+    sendCbor(buf);
 }
 
 // ─── UTC time helper: "HH:MM:SS.mmm" ─────────────────────────────────────────
@@ -762,6 +770,13 @@ int main(int argc, char** argv) {
     cfg.cbor_out = cbor_out;
 
     auto& g_stop = lora_apps::install_signal_handler();
+
+    // --- UDP socket for CBOR event broadcast ---
+    UdpState udp;
+    udp.fd = lora_apps::create_udp_socket(cfg.udp_listen, cfg.udp_port);
+    if (udp.fd < 0) return 1;
+    g_udp = &udp;
+    g_cbor_stdout = cfg.cbor_out;
 
     int savedStdout = -1;
 
@@ -848,7 +863,7 @@ int main(int argc, char** argv) {
 
     // ── Layer 1 only mode ────────────────────────────────────────────────────
     if (cfg.layer1_only) {
-        auto* out = cfg.cbor_out ? stderr : stdout;
+        auto* out = stderr;
         std::fprintf(out, "%-15s  %12s  %6s\n", "freq_hz", "energy_lin", "L1");
         std::fprintf(out, "%s\n", std::string(38, '-').c_str());
 
@@ -863,9 +878,7 @@ int main(int argc, char** argv) {
                             channels[idx], l1.energy[idx], hot ? "HOT" : "");
             }
             std::fflush(out);
-            if (cfg.cbor_out) {
-                emitSpectrumCbor(channels, l1.energy, hotIndices, {}, stats.sweeps);
-            }
+            emitSpectrumCbor(channels, l1.energy, hotIndices, {}, stats.sweeps);
             if (++stats.sweeps >= cfg.sweeps && cfg.sweeps > 0) {
                 break;
             }
@@ -878,7 +891,7 @@ int main(int argc, char** argv) {
     // ── Full scan: adaptive mode selection ─────────────────────────────────
 
     {
-        auto* out = cfg.cbor_out ? stderr : stdout;
+        auto* out = stderr;
         std::fprintf(out, "%-13s  %10s  %6s  %6s  %6s  %6s  %4s\n",
                     "time", "freq_mhz", "bw_khz", "up", "dn", "wins", "sf");
         std::fprintf(out, "%s\n", std::string(60, '-').c_str());
@@ -911,15 +924,13 @@ int main(int argc, char** argv) {
         }
 
         ++stats.total_detections;
-        if (cfg.cbor_out) {
-            sweepDetections.push_back(det);
-        }
+        sweepDetections.push_back(det);
 
         const auto ts = ts_short();
         const std::string sfStr = det.sf_detected
             ? ("SF" + std::to_string(det.sf_detected)) : "-";
 
-        auto* out = cfg.cbor_out ? stderr : stdout;
+        auto* out = stderr;
         std::fprintf(out, "%-13s  %10.3f  %6.1f  %6.1f  %6.1f  %6s  %4s\n",
                     ts.c_str(), det.freq / 1.0e6, det.bw / 1.0e3,
                     det.peak_ratio_up, det.peak_ratio_dn,
@@ -947,15 +958,25 @@ int main(int argc, char** argv) {
         const uint64_t current = wrapper->blockRef().totalOverflowCount();
         if (current > lastOverflowCount) {
             stats.overflows = static_cast<uint32_t>(current);
-            if (cfg.cbor_out) {
-                emitOverflowCbor(sweep, current);
-            }
+            emitOverflowCbor(sweep, current);
             lastOverflowCount = current;
         }
     };
 
     while (!g_stop.load(std::memory_order_relaxed)
            && !sched_done.load(std::memory_order_relaxed)) {
+        // Accept UDP subscriptions (non-blocking)
+        {
+            struct sockaddr_storage sender{};
+            socklen_t sender_len = sizeof(sender);
+            char tmp[256];
+            auto n = ::recvfrom(udp.fd, tmp, sizeof(tmp), 0,
+                                reinterpret_cast<struct sockaddr*>(&sender), &sender_len);
+            if (n >= 0) {
+                udp.subscribe(sender);
+            }
+        }
+
         sweepDetections.clear();
         std::ranges::fill(sweepEnergy, 0.0);
 
@@ -963,21 +984,17 @@ int main(int argc, char** argv) {
         const auto sweepStart = std::chrono::steady_clock::now();
         uint32_t l2Probes = 0;
 
-        if (cfg.cbor_out) {
-            emitSweepStartCbor(sweepNum);
-        }
+        emitSweepStartCbor(sweepNum);
 
         SweepCallbacks callbacks;
-        if (cfg.cbor_out) {
-            callbacks.onRetune = [sweepNum](double freq, const char* reason) {
-                emitRetuneCbor(sweepNum, freq, reason);
-            };
-            callbacks.onL2Probe = [&, sweepNum](double freq, uint32_t ms,
-                    std::vector<L2BwResult> results) {
-                emitL2ProbeCbor(sweepNum, freq, ms, results);
-                checkOverflows(sweepNum);
-            };
-        }
+        callbacks.onRetune = [sweepNum](double freq, const char* reason) {
+            emitRetuneCbor(sweepNum, freq, reason);
+        };
+        callbacks.onL2Probe = [&, sweepNum](double freq, uint32_t ms,
+                std::vector<L2BwResult> results) {
+            emitL2ProbeCbor(sweepNum, freq, ms, results);
+            checkOverflows(sweepNum);
+        };
 
         const auto bResult = interleavedSweep(sg, soapy_source, channels, cfg,
                                                g_stop, callbacks);
@@ -997,7 +1014,7 @@ int main(int argc, char** argv) {
             ? static_cast<double>(sweepMs)
             : avgSweepMs * 0.8 + static_cast<double>(sweepMs) * 0.2;
 
-        if (cfg.cbor_out) {
+        {
             std::vector<std::size_t> hotIndices;
             if (!sweepEnergy.empty()) {
                 std::vector<double> sorted(sweepEnergy.begin(), sweepEnergy.end());
@@ -1057,6 +1074,9 @@ int main(int argc, char** argv) {
             close(savedStdout);
         }
         std::fprintf(stderr, "fatal: %s\n", e.what());
+        if (udp.fd >= 0) ::close(udp.fd);
         return 1;
     }
+
+    if (udp.fd >= 0) ::close(udp.fd);
 }

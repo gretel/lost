@@ -138,3 +138,7 @@ min_ratio    = 8.0                      # CAD detection threshold
 settle_ms    = 5                        # PLL settle delay (ms)
 # sweeps     = 0                        # 0 = infinite (default)
 # layer1_only = false                   # set true for energy-only mode
+
+[scan.network]
+udp_listen = "127.0.0.1"
+udp_port   = 5557                       # separate from lora_trx (5556)

@@ -155,6 +155,10 @@ struct ScanSetConfig {
     bool         layer1_only{false};
     bool         cbor_out{false};           ///< CBOR on stdout
 
+    // From [scan.network]
+    std::string  udp_listen{"127.0.0.1"};
+    uint16_t     udp_port{5557};            ///< separate from lora_trx (5556)
+
     [[nodiscard]] double min_bw() const {
         return static_cast<double>(*std::ranges::min_element(bws));
     }

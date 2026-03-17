@@ -490,6 +490,12 @@ std::vector<ScanSetConfig> load_scan_config(const std::string& path,
     cfg.sweeps      = static_cast<uint32_t>(scan_tbl->at_path("sweeps").value_or(int64_t{0}));
     cfg.layer1_only = scan_tbl->at_path("layer1_only").value_or(false);
 
+    // [scan.network]
+    if (auto* net_tbl = scan_tbl->at_path("network").as_table()) {
+        cfg.udp_listen = net_tbl->at_path("udp_listen").value_or(std::string{"127.0.0.1"});
+        cfg.udp_port   = static_cast<uint16_t>(net_tbl->at_path("udp_port").value_or(int64_t{5557}));
+    }
+
     // BWs
     cfg.bws.clear();
     if (auto* bw_arr = scan_tbl->at_path("bws").as_array()) {
