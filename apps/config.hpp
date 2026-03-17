@@ -10,6 +10,7 @@
 #ifndef GR4_LORA_CONFIG_HPP
 #define GR4_LORA_CONFIG_HPP
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -130,6 +131,35 @@ struct TrxConfig {
     RawConfig                 raw{};             ///< passthrough sections for Python scripts
 };
 
+/// Scan-specific configuration (parsed from [set_*] sections).
+/// Shares device/radio fields with TrxConfig; adds scan parameters.
+struct ScanSetConfig {
+    // From [device]
+    std::string  device{"uhd"};
+    std::string  device_param{"type=b200"};
+    double       l1_rate{16.0e6};           ///< L1 wideband sample rate
+    double       master_clock{32.0e6};      ///< FPGA master clock rate
+    std::string  clock{};
+
+    // From [radio_*]
+    double       freq_start{863.0e6};       ///< scan band start
+    double       freq_stop{870.0e6};        ///< scan band stop
+    double       gain{40.0};
+
+    // From [set_*] scan keys
+    std::vector<uint32_t> bws{62500, 125000, 250000};  ///< BWs to probe
+    uint32_t     os_factor{4};              ///< oversampling factor
+    float        min_ratio{8.0F};           ///< CAD detection threshold
+    int          settle_ms{5};              ///< PLL settle delay after retune (ms)
+    uint32_t     sweeps{0};                 ///< 0 = infinite
+    bool         layer1_only{false};
+    bool         cbor_out{false};           ///< CBOR on stdout
+
+    [[nodiscard]] double min_bw() const {
+        return static_cast<double>(*std::ranges::min_element(bws));
+    }
+};
+
 // Shared RX status counters (updated by frame callback, read by main loop).
 struct SharedStatus {
     std::atomic<uint32_t> frame_count{0};
@@ -153,6 +183,11 @@ int parse_args(int argc, char* argv[], std::string& config_path,
 /// Returns empty vector on error (messages printed to stderr).
 std::vector<TrxConfig> load_config(const std::string& path,
                                    const std::string& cli_log_level = "");
+
+/// Load TOML config file for scan mode.
+/// Returns empty vector on error (messages printed to stderr).
+std::vector<ScanSetConfig> load_scan_config(const std::string& path,
+                                            const std::string& cli_log_level = "");
 
 // --- Property map utilities ---
 
