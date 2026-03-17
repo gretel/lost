@@ -10,7 +10,14 @@
 # [logging]     Python script log configuration
 #
 # The first [set_*] (by file order) is used at runtime.
-# CR is the denominator (5-8) of the LoRa coding rate 4/N.
+#
+# RX decode capabilities (automatic, no per-parameter config needed):
+#   SF:  7-12  (simultaneous, per MultiSfDecoder lane)
+#   CR:  4/5 through 4/8  (auto-detected from explicit header)
+#   BW:  per decode_bws list (one MultiSfDecoder per BW via Splitter)
+#   LDRO: automatic (from symbol duration vs 16ms threshold)
+#
+# TX uses the codec's sf/cr/bw for transmission.
 #
 # B210/B220 channel mapping:
 #   0 = TRX_A  (TX/RX)    1 = RX_A  (RX only)
@@ -29,7 +36,7 @@ udp_listen      = "127.0.0.1"
 udp_port        = 5556          # lora_trx raw port; lora_agg subscribes here
 status_interval = 10
 
-# Listen-before-talk: defer TX until CAD detects no channel activity
+# Listen-before-talk: defer TX until MultiSfDecoder detects no channel activity
 lbt            = true
 lbt_timeout_ms = 2000           # max wait for channel clear before rejecting TX
 tx_queue_depth = 8              # max queued TX requests (rejects when full)
@@ -41,7 +48,7 @@ window_ms = 200                 # diversity combining window (ms)
 
 [meshcore]
 # port              = 7834                         # TCP listen port (avoid 5000 on macOS)
-name          = "DO2THX 📡"                    # node display name (SET_ADVERT_NAME)
+name          = "DO2THX \U0001f4e1"                    # node display name (SET_ADVERT_NAME)
 # model             = "lora_trx"                   # device model string in DEVICE_INFO
 # identity_file     = "scripts/data/meshcore/identity.bin"
 # keys_dir          = "scripts/data/meshcore/keys"
@@ -60,13 +67,13 @@ flood_scope       = "de-hh"                        # flood scope (SET_FLOOD_SCOP
 level = "INFO"
 
 # --- PHY codecs ---
-# [codec_*] contains PHY-only parameters: bw, cr, sync_word, preamble_len.
-# MultiSfDecoder decodes all SFs (7-12) simultaneously — no sf setting needed.
-# Block-level overrides (min_snr_db, energy_thresh) belong in [[set_*.decode]].
+# Codec defines TX parameters (sf, bw, cr) and shared RX defaults (sync_word, preamble).
+# RX is multi-SF (7-12) and multi-CR (auto) — only BW and sync_word matter for RX matching.
 
 [codec_meshcore_868]
-bw           = 62500
-cr           = 8
+sf           = 8               # TX spreading factor (RX decodes SF7-12 automatically)
+bw           = 62500           # TX bandwidth (RX BWs configured via decode_bws)
+cr           = 8               # TX coding rate 4/N (RX auto-detects CR from header)
 sync_word    = 0x12
 preamble_len = 8
 
@@ -80,38 +87,46 @@ rx_gain    = 40
 tx_gain    = 75
 
 # --- Active network sets ---
-# The first [set_*] by file order is used at runtime.
-# [[set_*.decode]] entries are REQUIRED (at least one per [set_*]).
-# Each entry creates one MultiSfDecoder + FrameSink chain per radio channel.
-# MultiSfDecoder decodes SF7-12 simultaneously.  sync_word and label are required.
-# Block-level overrides (min_snr_db, energy_thresh, max_symbols) go here.
+# The first [set_*] (by file order) is used at runtime.
+#
+# [[set_*.decode]] entries: one per sync_word you want to receive.
+# Each entry creates one MultiSfDecoder (SF7-12, all CRs) per BW per radio channel.
+#
+# decode_bws: list of bandwidths to decode simultaneously.
+# Each BW gets its own MultiSfDecoder via Splitter. os = sample_rate / bw.
+# Omit for single-BW decode (uses codec bw only).
+# All BWs must divide sample_rate evenly.
 
 [set_meshcore_868]
 name  = "MeshCore 868 MHz"
 codec = "codec_meshcore_868"
 radio = "radio_868"
-
-# Decode BWs: list of bandwidths to decode simultaneously.
-# Each BW gets its own MultiSfDecoder (SF7-12). os = sample_rate / bw.
-# Omit for single-BW (uses codec bw). All must divide sample_rate evenly.
-decode_bws = [62500, 125000, 250000]
+decode_bws = [62500, 125000, 250000]   # decode all three EU868 LoRa BWs
 
 [[set_meshcore_868.decode]]
 label      = "meshcore"
-sync_word  = 0x12
+sync_word  = 0x12                       # MeshCore sync word
 min_snr_db = -19.0
 # energy_thresh = 1e-6
 # max_symbols   = 600
 
+# Example: also decode Meshtastic (different sync word) on the same radio
+# [[set_meshcore_868.decode]]
+# label      = "meshtastic"
+# sync_word  = 0x2B
+# min_snr_db = -15.0
+
 # --- Inactive networks (examples) ---
 
 # [codec_meshcore_433]
+# sf           = 11
 # bw           = 250000
 # cr           = 5
 # sync_word    = 0x12
 # preamble_len = 8
 
 # [codec_reticulum_868]
+# sf           = 8
 # bw           = 125000
 # cr           = 5
 # sync_word    = 0x12
@@ -128,8 +143,8 @@ min_snr_db = -19.0
 # name  = "MeshCore 433 MHz"
 # codec = "codec_meshcore_433"
 # radio = "radio_433"
+# decode_bws = [125000, 250000]
 # [[set_meshcore_433.decode]]
 # label      = "meshcore"
-# sf         = 11
 # sync_word  = 0x12
 # min_snr_db = -15.0
