@@ -12,6 +12,7 @@
 //       → [0] SpectrumTapBlock → NullSink    (L1 energy via SpectrumState)
 //       → [1] CaptureSink                     (L2 CAD on-demand capture)
 //
+// Configuration via TOML (shared with lora_trx).
 // Run `lora_scan --help` for usage.
 
 #include <algorithm>
@@ -24,26 +25,17 @@
 #include <functional>
 #include <memory>
 #include <numeric>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <unistd.h>
 
-#include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
-#include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
-#include <gnuradio-4.0/soapy/Soapy.hpp>
-#include <gnuradio-4.0/testing/NullSources.hpp>
 
-// common.hpp must come AFTER Soapy.hpp (uses soapy types, no SoapySDR include)
-#include "common.hpp"
+#include "graph_builder.hpp"
 
-#include <gnuradio-4.0/lora/CaptureSink.hpp>
-#include <gnuradio-4.0/lora/SpectrumTapBlock.hpp>
-#include <gnuradio-4.0/lora/Splitter.hpp>
 #include <gnuradio-4.0/lora/cbor.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
@@ -52,6 +44,8 @@
 #endif
 
 using lora_apps::cf32;
+using lora_config::ScanSetConfig;
+using lora_graph::ScanGraph;
 
 struct ScanStats {
     uint32_t    sweeps          = 0;
@@ -63,119 +57,38 @@ struct ScanStats {
     std::string last_det_time;
 };
 
-struct ScanConfig {
-    std::string          device       = "uhd";
-    std::string          device_param = "type=b200";
-    double               freq_start   = 863.0e6;
-    double               freq_stop    = 870.0e6;
-    std::vector<double>  bws          = {62500.0, 125000.0, 250000.0};
-    uint32_t             os_factor    = 4;
-    double               gain         = 40.0;
-    int                  settle_ms    = 5;
-    double               l1_rate      = 16.0e6;
-    double               master_clock = 32.0e6;
-    float                min_ratio    = 8.0F;
-    uint32_t             sweeps       = 0;
-    bool                 layer1_only  = false;
-    bool                 cbor_out     = false;
-
-    [[nodiscard]] double min_bw() const { return *std::ranges::min_element(bws); }
-};
-
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
-static void print_usage() {
-    std::fprintf(stderr,
-        "Usage: lora_scan [options]\n\n"
-        "LoRa spectral scanner: sweep channels and detect chirp activity.\n\n"
-        "Options:\n"
-        "  --device <args>       SoapySDR device string (default: uhd)\n"
-        "  --device-param <args> Device parameters (default: type=b200)\n"
-        "  --freq-start <Hz>     Scan start frequency (default: 863e6)\n"
-        "  --freq-stop <Hz>      Scan stop frequency (default: 870e6)\n"
-        "  --bw <Hz[,Hz,...]>    Channel bandwidth(s) (default: 62500,125000,250000)\n"
-        "  --os <n>              Oversampling factor (default: 4)\n"
-        "  --gain <dB>           RX gain (default: 40)\n"
-        "  --settle-ms <ms>      PLL settle delay after retune (default: 5)\n"
-        "  --l1-rate <Hz>        L1 wideband sample rate (default: 16e6)\n"
-        "  --master-clock <Hz>   FPGA master clock rate (default: 32e6)\n"
-        "  --min-ratio <f>       Min peak ratio to report (default: 8.0)\n"
-        "  --sweeps <N>          Stop after N sweeps (default: 0 = infinite)\n"
-        "  --layer1-only         Stop after Layer 1 (energy scan only)\n"
-        "  --cbor                Emit CBOR frames on stdout (pipe to lora_spectrum.py)\n"
-        "  --log-level <level>   Log level: DEBUG, INFO, WARNING, ERROR\n"
-        "  --version             Show version and exit\n"
-        "  -h, --help            Show this help\n");
-}
-
-static int parseArgs(int argc, char** argv, ScanConfig& cfg) {
+static int parse_scan_args(int argc, char** argv, std::string& config_path,
+                           std::string& log_level, bool& cbor_out) {
+    config_path = "apps/config.toml";
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        auto next = [&]() -> std::string {
-            if (++i >= argc) {
-                std::fprintf(stderr, "missing value for %s\n", arg.c_str());
-                std::exit(1);
-            }
-            return argv[i];
-        };
-        if (arg == "-h" || arg == "--help") {
-            print_usage();
-            return 2;
+        if (arg == "--config" && i + 1 < argc) { config_path = argv[++i]; continue; }
+        if (arg == "--cbor") { cbor_out = true; continue; }
+        if (arg == "--log-level" && i + 1 < argc) {
+            log_level = argv[++i];
+            for (auto& ch : log_level) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            continue;
         }
         if (arg == "--version") {
             std::fprintf(stderr, "lora_scan %s\n", GIT_REV);
             return 2;
         }
-        if (arg == "--log-level") {
-            std::string lvl = next();
-            for (auto& ch : lvl) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-            gr::lora::set_log_level(lvl);
-            continue;
-        }
-        if      (arg == "--device")        cfg.device       = next();
-        else if (arg == "--device-param")  cfg.device_param = next();
-        else if (arg == "--freq-start")    cfg.freq_start   = std::stod(next());
-        else if (arg == "--freq-stop")     cfg.freq_stop    = std::stod(next());
-        else if (arg == "--bw") {
-            cfg.bws.clear();
-            std::istringstream ss(next());
-            std::string tok;
-            while (std::getline(ss, tok, ',')) {
-                cfg.bws.push_back(std::stod(tok));
-            }
-            std::ranges::sort(cfg.bws);
-        }
-        else if (arg == "--os")            cfg.os_factor    = static_cast<uint32_t>(std::stoul(next()));
-        else if (arg == "--gain")          cfg.gain         = std::stod(next());
-        else if (arg == "--settle-ms")     cfg.settle_ms    = std::stoi(next());
-        else if (arg == "--l1-rate")       cfg.l1_rate      = std::stod(next());
-        else if (arg == "--master-clock")  cfg.master_clock = std::stod(next());
-        else if (arg == "--min-ratio")     cfg.min_ratio    = std::stof(next());
-        else if (arg == "--sweeps")        cfg.sweeps       = static_cast<uint32_t>(std::stoul(next()));
-        else if (arg == "--layer1-only")   cfg.layer1_only  = true;
-        else if (arg == "--cbor")          cfg.cbor_out     = true;
-        else {
-            std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
-            print_usage();
-            return 1;
-        }
-    }
-    if (cfg.bws.empty()) {
-        std::fprintf(stderr, "--bw requires at least one bandwidth\n");
-        return 1;
-    }
-    // Validate that L1 rate / (bw * os) is an integer for every configured BW.
-    // Software decimation requires an exact integer factor.
-    for (const double bw : cfg.bws) {
-        const double targetRate = bw * static_cast<double>(cfg.os_factor);
-        const double factor     = cfg.l1_rate / targetRate;
-        const double rounded    = std::round(factor);
-        if (std::abs(factor - rounded) > 0.01 || rounded < 1.0) {
+        if (arg == "-h" || arg == "--help") {
             std::fprintf(stderr,
-                "L1 rate %.0f Hz / (BW %.0f Hz x os %u) = %.3f -- must be an integer\n",
-                cfg.l1_rate, bw, cfg.os_factor, factor);
-            return 1;
+                "Usage: lora_scan [options]\n\n"
+                "LoRa spectral scanner: sweep channels and detect chirp activity.\n\n"
+                "Options:\n"
+                "  --config <file>       TOML configuration file (default: apps/config.toml)\n"
+                "  --cbor                Emit CBOR frames on stdout (pipe to lora_spectrum.py)\n"
+                "  --log-level <level>   Log level: DEBUG, INFO, WARNING, ERROR\n"
+                "  --version             Show version and exit\n"
+                "  -h, --help            Show this help\n");
+            return 2;
         }
+        std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
+        return 1;
     }
     return 0;
 }
@@ -188,81 +101,6 @@ static std::vector<double> makeChannelList(double freqStart, double freqStop, do
         channels.push_back(freq);
     }
     return channels;
-}
-
-// ─── GR4 graph construction ──────────────────────────────────────────────────
-
-struct ScanGraph {
-    std::shared_ptr<gr::lora::SpectrumState> spectrum;
-    std::shared_ptr<gr::lora::CaptureState>  capture;
-};
-
-static ScanGraph build_scan_graph(gr::Graph& graph, const ScanConfig& cfg,
-                                  const std::vector<double>& channels) {
-    auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
-    using std::string_literals::operator""s;
-
-    ScanGraph sg;
-
-    // SoapySource -- fixed L1 rate, pinned master clock
-    const double tileCentre = (channels.front() + channels.back()) / 2.0;
-    auto source_props = lora_apps::soapy_reliability_defaults();
-    source_props.merge(gr::property_map{
-        {"device",              cfg.device},
-        {"device_parameter",    cfg.device_param},
-        {"sample_rate",         cfg.l1_rate},
-        {"master_clock_rate",   cfg.master_clock},
-        {"rx_center_frequency", gr::Tensor<double>{tileCentre}},
-        {"rx_gains",            gr::Tensor<double>{cfg.gain}},
-        {"verbose_overflow",    false},
-    });
-    auto& source = graph.emplaceBlock<
-        gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
-
-    // Splitter -> 2 outputs
-    auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
-        {"n_outputs", gr::Size_t{2}},
-    });
-    if (!ok(graph.connect<"out", "in">(source, splitter))) {
-        gr::lora::log_ts("error", "lora_scan", "connect source -> splitter failed");
-    }
-
-    // Path 0: SpectrumTap -> NullSink (L1 energy)
-    sg.spectrum = std::make_shared<gr::lora::SpectrumState>();
-    sg.spectrum->fft_size    = 4096;
-    sg.spectrum->sample_rate = static_cast<float>(cfg.l1_rate);
-    sg.spectrum->center_freq = tileCentre;
-    sg.spectrum->init();
-
-    auto& tap = graph.emplaceBlock<gr::lora::SpectrumTapBlock>({});
-    tap._spectrum = sg.spectrum;
-
-    auto& null_sink = graph.emplaceBlock<gr::testing::NullSink<cf32>>({});
-
-    if (!ok(graph.connect(splitter, "out#0"s, tap, "in"s))) {
-        gr::lora::log_ts("error", "lora_scan", "connect splitter -> tap failed");
-    }
-    if (!ok(graph.connect<"out", "in">(tap, null_sink))) {
-        gr::lora::log_ts("error", "lora_scan", "connect tap -> null_sink failed");
-    }
-
-    // Path 1: CaptureSink (L2 on-demand)
-    sg.capture = std::make_shared<gr::lora::CaptureState>();
-    // Pre-allocate for worst case: SF12 / min BW at L1 rate
-    const double minBw      = cfg.min_bw();
-    const double targetRate  = minBw * static_cast<double>(cfg.os_factor);
-    const auto   decFactor   = static_cast<uint32_t>(std::round(cfg.l1_rate / targetRate));
-    const uint32_t sf12Win   = (1U << 12U) * cfg.os_factor * 2U;
-    sg.capture->buffer.resize(sf12Win * decFactor);
-
-    auto& cap_sink = graph.emplaceBlock<gr::lora::CaptureSink>({});
-    cap_sink._state = sg.capture;
-
-    if (!ok(graph.connect(splitter, "out#1"s, cap_sink, "in"s))) {
-        gr::lora::log_ts("error", "lora_scan", "connect splitter -> capture failed");
-    }
-
-    return sg;
 }
 
 // ─── Orchestrator helpers ────────────────────────────────────────────────────
@@ -392,7 +230,7 @@ static Layer1Result layer1Scan(
         std::shared_ptr<gr::lora::SpectrumState>& spectrum,
         std::shared_ptr<gr::BlockModel>& soapy_source,
         const std::vector<double>& channels,
-        const ScanConfig& cfg) {
+        const ScanSetConfig& cfg) {
     const std::size_t nCh = channels.size();
     Layer1Result result;
     result.energy.resize(nCh, 0.0);
@@ -534,7 +372,7 @@ static InterleavedResult interleavedSweep(
         ScanGraph& sg,
         std::shared_ptr<gr::BlockModel>& soapy_source,
         const std::vector<double>& channels,
-        const ScanConfig& cfg,
+        const ScanSetConfig& cfg,
         const std::atomic<bool>& stopFlag,
         const SweepCallbacks& callbacks = {}) {
     InterleavedResult ir;
@@ -779,7 +617,7 @@ static void emitSpectrumCbor(
     std::fflush(stdout);
 }
 
-static void emitStatusCbor(const ScanConfig& cfg, const ScanStats& stats,
+static void emitStatusCbor(const ScanSetConfig& cfg, const ScanStats& stats,
                            const std::string& mode)
 {
     namespace cb = gr::lora::cbor;
@@ -909,11 +747,19 @@ static std::string ts_short() {
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
-    ScanConfig cfg;
-    int rc = parseArgs(argc, argv, cfg);
+    std::string config_path, log_level;
+    bool cbor_out = false;
+    int rc = parse_scan_args(argc, argv, config_path, log_level, cbor_out);
     if (rc != 0) {
         return rc == 2 ? 0 : 1;
     }
+
+    auto configs = lora_config::load_scan_config(config_path, log_level);
+    if (configs.empty()) {
+        return 1;
+    }
+    auto cfg = std::move(configs[0]);
+    cfg.cbor_out = cbor_out;
 
     auto& g_stop = lora_apps::install_signal_handler();
 
@@ -926,7 +772,7 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; i < cfg.bws.size(); ++i) {
         if (i > 0) bwListStr += ",";
         char tmp[32];
-        std::snprintf(tmp, sizeof(tmp), "%.0f", cfg.bws[i]);
+        std::snprintf(tmp, sizeof(tmp), "%u", cfg.bws[i]);
         bwListStr += tmp;
     }
 
@@ -959,7 +805,7 @@ int main(int argc, char** argv) {
 
     // Build GR4 graph
     gr::Graph graph;
-    auto sg = build_scan_graph(graph, cfg, channels);
+    auto sg = lora_graph::build_scan_graph(graph, cfg, channels);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> sched;
     sched.timeout_inactivity_count = 1U;
@@ -972,13 +818,7 @@ int main(int argc, char** argv) {
     }
 
     // Find SoapySource for runtime retune (after exchange, original refs are dangling)
-    std::shared_ptr<gr::BlockModel> soapy_source;
-    for (auto& blk : sched.blocks()) {
-        if (blk->typeName().find("Soapy") != std::string_view::npos) {
-            soapy_source = blk;
-            break;
-        }
-    }
+    auto soapy_source = lora_graph::find_soapy_source(sched.blocks());
     if (!soapy_source) {
         gr::lora::log_ts("error", "lora_scan", "SoapySource not found in graph");
         return 1;

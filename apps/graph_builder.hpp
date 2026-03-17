@@ -10,7 +10,6 @@
 #define GR4_LORA_GRAPH_BUILDER_HPP
 
 #include "config.hpp"
-#include "common.hpp"
 
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Tensor.hpp>
@@ -22,8 +21,11 @@
 #include <gnuradio-4.0/lora/SpectrumTapBlock.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
+// Soapy.hpp MUST come before common.hpp (common.hpp uses soapy types)
 #include <gnuradio-4.0/soapy/Soapy.hpp>
 #include <gnuradio-4.0/testing/NullSources.hpp>
+
+#include "common.hpp"
 
 #include <atomic>
 #include <complex>

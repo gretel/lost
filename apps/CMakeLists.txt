@@ -13,8 +13,8 @@ endif()
 add_executable(lora_trx lora_trx.cpp config.cpp)
 target_link_libraries(lora_trx PRIVATE gnuradio-core-group gr-lora gr-soapy gr-testing tomlplusplus::tomlplusplus)
 
-add_executable(lora_scan lora_scan.cpp)
-target_link_libraries(lora_scan PRIVATE gnuradio-core-group gr-lora gr-soapy gr-testing)
+add_executable(lora_scan lora_scan.cpp config.cpp)
+target_link_libraries(lora_scan PRIVATE gnuradio-core-group gr-lora gr-soapy gr-testing tomlplusplus::tomlplusplus)
 
 # Version: pass -DGIT_REV=<hash> at configure time, or auto-detect from git.
 if(NOT DEFINED GIT_REV)
