@@ -279,13 +279,15 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
     }
 
     double airtime = static_cast<double>(iq.size()) / static_cast<double>(cfg.rate);
+    constexpr std::size_t kMaxHexBytes = 64;
+    auto hex_len = std::min(payload.size(), kMaxHexBytes);
+    auto hex = gr::lora::FrameSink::to_hex(
+        std::span<const uint8_t>(payload.data(), hex_len));
     gr::lora::log_ts("info ", "lora_trx",
-        "TX %zu bytes SF%u CR4/%u sync=0x%02X repeat=%d %.1f ms airtime%s",
+        "TX %zu bytes SF%u CR4/%u sync=0x%02X repeat=%d %.1f ms%s  %s%s",
         payload.size(), cfg.sf, 4u + cr, sync, repeat,
-        airtime * 1000.0, dry_run ? " (dry run)" : "");
-    auto pay_span = std::span<const uint8_t>(payload.data(), payload.size());
-    std::fprintf(stderr, "  Hex: %s\n", gr::lora::FrameSink::to_hex(pay_span).c_str());
-    std::fprintf(stderr, "  ASCII: %s\n", gr::lora::FrameSink::to_ascii(pay_span).c_str());
+        airtime * 1000.0, dry_run ? " (dry)" : "",
+        hex.c_str(), payload.size() > kMaxHexBytes ? "..." : "");
 
     // Push TX IQ to spectrum tap (if connected) for waterfall display
     if (tx_spectrum != nullptr) {

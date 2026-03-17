@@ -242,38 +242,24 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     [[nodiscard]] uint8_t effectiveSf() const { return _frame_sf > 0 ? _frame_sf : phy_sf; }
 
     void printFrameText(const std::string& ts) {
-        auto frame_span = std::span<const uint8_t>(_frame.data(), _pay_len);
+        constexpr std::size_t kMaxHexBytes = 64;
+        auto pay_actual = std::min(static_cast<std::size_t>(_pay_len), _frame.size());
+        auto hex_len = std::min(pay_actual, kMaxHexBytes);
+        auto hex = to_hex(std::span<const uint8_t>(_frame.data(), hex_len));
+        bool truncated = pay_actual > kMaxHexBytes;
 
-        const char* crc_str = _crc_valid ? "CRC_OK" : "CRC_FAIL";
-
-        std::printf("[%s] #%u  SF%u  %u bytes  CR=4/%u  %s  sync=0x%02X  SNR=%.1f dB",
+        std::fprintf(stderr, "[%s] #%u  SF%u  %u bytes  CR=4/%u  %s  sync=0x%02X  SNR=%.1f dB",
                     ts.c_str(), _frame_count,
-                    effectiveSf(), _pay_len, 4u + _cr, crc_str,
+                    effectiveSf(), _pay_len, 4u + _cr,
+                    _crc_valid ? "CRC_OK" : "CRC_FAIL",
                     sync_word, _snr_db);
-        if (_noise_floor_db > -999.0) {
-            std::printf("  NF=%.1f dBFS", _noise_floor_db);
-        }
-        if (_peak_db > -999.0) {
-            std::printf("  peak=%.1f dBFS", _peak_db);
-        }
-        if (_snr_db_td > -999.0) {
-            std::printf("  SNR_td=%.1f dB", _snr_db_td);
-        }
-        if (_rx_channel >= 0) {
-            std::printf("  ch=%d", static_cast<int>(_rx_channel));
-        }
-        if (!label.empty()) {
-            std::printf("  [%s]", label.c_str());
-        }
-        if (_is_downchirp) {
-            std::printf("  (downchirp)");
-        }
-        std::printf("\n");
-
-        std::printf("  Hex: %s\n", to_hex(frame_span).c_str());
-        std::printf("  ASCII: %s\n", to_ascii(frame_span).c_str());
-        std::printf("\n");
-        std::fflush(stdout);
+        if (_noise_floor_db > -999.0) std::fprintf(stderr, "  NF=%.1f dBFS", _noise_floor_db);
+        if (_peak_db > -999.0)        std::fprintf(stderr, "  peak=%.1f dBFS", _peak_db);
+        if (_snr_db_td > -999.0)      std::fprintf(stderr, "  SNR_td=%.1f dB", _snr_db_td);
+        if (_rx_channel >= 0)         std::fprintf(stderr, "  ch=%d", static_cast<int>(_rx_channel));
+        if (!label.empty())           std::fprintf(stderr, "  [%s]", label.c_str());
+        if (_is_downchirp)            std::fprintf(stderr, "  (downchirp)");
+        std::fprintf(stderr, "  %s%s\n", hex.c_str(), truncated ? "..." : "");
     }
 
     [[nodiscard]] std::vector<uint8_t> buildFrameCbor(const std::string& ts) {
@@ -357,12 +343,10 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
     void emitFrame() {
         _frame_count++;
-        gr::lora::log_ts("info ", "framesink",
-            "frame #%u: %u bytes CR=4/%u %s%s",
-            _frame_count, _pay_len, 4u + _cr,
-            _crc_valid ? "CRC_OK" : "CRC_FAIL",
-            _is_downchirp ? " downchirp" : "");
         auto ts = gr::lora::ts_now();
+
+        // Single-line log to stderr (always, syslog-compatible)
+        printFrameText(ts);
 
         if (_frame_callback || cbor_stdout || _udp_fd >= 0) {
             auto buf = buildFrameCbor(ts);
@@ -373,10 +357,6 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                 sendFrameStdout(buf);
             }
             sendFrameUdp(buf);
-        }
-
-        if (!cbor_stdout) {
-            printFrameText(ts);
         }
     }
 
