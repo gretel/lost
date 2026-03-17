@@ -2,9 +2,9 @@
 //
 // lora_trx: full-duplex LoRa transceiver using native GR4 SoapySDR blocks.
 //
-// 1-ch RX: SoapySimpleSource -> MultiSfDecoder -> FrameSink
-// 2-ch RX: SoapyDualSimpleSource -+-> MultiSfDecoder -> FrameSink
-//                                 +-> MultiSfDecoder -> FrameSink
+// 1-ch RX: SoapySimpleSource -> [Splitter] -> MultiSfDecoder (per BW) -> FrameSink
+// 2-ch RX: SoapyDualSimpleSource -+-> [Splitter] -> MultiSfDecoder (per BW) -> FrameSink
+//                                 +-> [Splitter] -> MultiSfDecoder (per BW) -> FrameSink
 // TX: bounded request queue with dedicated worker thread; LBT defers TX until channel clear
 //
 // MultiSfDecoder decodes all SFs (7-12) simultaneously on each channel.
@@ -47,6 +47,7 @@
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
 #include <gnuradio-4.0/lora/MultiSfDecoder.hpp>
+#include <gnuradio-4.0/lora/Splitter.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/soapy/Soapy.hpp>
 #include <gnuradio-4.0/soapy/SoapySink.hpp>
@@ -475,13 +476,18 @@ gr::lora::MultiSfDecoder& add_multisf_chain(
 
 // Generalised RX graph builder.
 //
-// Topology (per radio channel):
-//   Source → MultiSfDecoder → FrameSink
+// Topology (per radio channel, single BW):
+//   Source → MultiSfDecoder (SF7-12) → FrameSink
 //
-// MultiSfDecoder decodes all SFs (7-12) simultaneously on one channel.
-// CAD monitors the first radio channel for listen-before-talk.
+// Topology (per radio channel, multi-BW):
+//   Source → Splitter(N) → MultiSfDecoder (BW1, SF7-12) → FrameSink
+//                        → MultiSfDecoder (BW2, SF7-12) → FrameSink
+//                        → ...
 //
-// Returns pointer to source block's cumulative overflow counter (valid while graph lives).
+// Each MultiSfDecoder handles one BW at all SFs. The os_factor differs
+// per BW: os = sample_rate / bw. No decimation blocks needed.
+//
+// Returns pointer to source block's cumulative overflow counter.
 std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
                          std::function<void(const std::vector<uint8_t>&, bool)> callback,
                          std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
@@ -491,6 +497,8 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
 
     const auto& decodes = cfg.decode_configs;
     const auto nRadio = cfg.rx_channels.size();
+    const auto& bws = cfg.decode_bws;
+    const auto nBW = bws.size();
 
     // Translate config channels (0-3) to SoapySDR channels + antennae
     std::vector<gr::Size_t> soapy_channels;
@@ -501,27 +509,61 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
         antennae.emplace_back(map.rx_antenna);
     }
 
-    // Use first decode config for sync_word/label (MultiSfDecoder handles all SFs)
     const auto& dc = decodes[0];
 
-    // Wire one MultiSfDecoder per radio channel via connectPort lambda.
-    // No Splitter needed — MultiSfDecoder handles all SFs and provides
-    // channel-busy detection for LBT internally.
+    // Wire MultiSfDecoder(s) per radio channel via connectPort lambda.
     auto wireDecodeChains = [&](auto connectPort) {
         for (std::size_t r = 0; r < nRadio; r++) {
-            auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
-            // First radio channel gets the spectrum tap for waterfall
-            auto spec = (r == 0) ? spectrum : nullptr;
-            auto& decoder = add_multisf_chain(graph, cfg, rx_ch, dc, callback, spec);
+            bool firstRadio = (r == 0);
 
-            // First radio channel provides LBT channel-busy flag
-            if (r == 0 && channel_busy != nullptr) {
-                decoder.set_channel_busy_flag(channel_busy);
-            }
+            if (nBW == 1) {
+                // Single BW: direct connection, no Splitter
+                auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
+                auto spec = firstRadio ? spectrum : nullptr;
 
-            if (!connectPort(r, decoder)) {
-                gr::lora::log_ts("error", "lora_trx",
-                    "failed to connect source -> MultiSfDecoder (radio %zu)", r);
+                // Override BW for this decoder
+                TrxConfig bw_cfg = cfg;
+                bw_cfg.bw = bws[0];
+                auto& decoder = add_multisf_chain(graph, bw_cfg, rx_ch, dc, callback, spec);
+
+                if (firstRadio && channel_busy != nullptr) {
+                    decoder.set_channel_busy_flag(channel_busy);
+                }
+                if (!connectPort(r, decoder)) {
+                    gr::lora::log_ts("error", "lora_trx",
+                        "failed to connect source -> MultiSfDecoder (radio %zu)", r);
+                }
+            } else {
+                // Multi-BW: Splitter fans out to one MultiSfDecoder per BW
+                auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
+                    {"n_outputs", static_cast<gr::Size_t>(nBW)},
+                });
+                if (!connectPort(r, splitter)) {
+                    gr::lora::log_ts("error", "lora_trx",
+                        "failed to connect source -> Splitter (radio %zu)", r);
+                }
+
+                for (std::size_t b = 0; b < nBW; b++) {
+                    auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100
+                               + static_cast<int32_t>(b);
+                    auto spec = (firstRadio && b == 0) ? spectrum : nullptr;
+
+                    TrxConfig bw_cfg = cfg;
+                    bw_cfg.bw = bws[b];
+                    auto& decoder = add_multisf_chain(graph, bw_cfg, rx_ch, dc, callback, spec);
+
+                    // First BW on first radio provides LBT
+                    if (firstRadio && b == 0 && channel_busy != nullptr) {
+                        decoder.set_channel_busy_flag(channel_busy);
+                    }
+
+                    auto port = "out#"s + std::to_string(b);
+                    if (!ok(graph.connect(splitter, port, decoder, "in"s))) {
+                        gr::lora::log_ts("error", "lora_trx",
+                            "failed to connect Splitter -> MultiSfDecoder BW%u (radio %zu)",
+                            bws[b], r);
+                    }
+                }
             }
         }
     };
@@ -568,8 +610,17 @@ std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
         });
     }
 
-    gr::lora::log_ts("debug", "lora_trx",
-        "RX graph: %zu radio(s), MultiSfDecoder (SF7-12)", nRadio);
+    {
+        std::string bw_list;
+        for (std::size_t i = 0; i < nBW; i++) {
+            if (i > 0) bw_list += ",";
+            if (bws[i] >= 1000) bw_list += std::to_string(bws[i] / 1000) + "k";
+            else bw_list += std::to_string(bws[i]);
+        }
+        gr::lora::log_ts("debug", "lora_trx",
+            "RX graph: %zu radio(s) x %zu BW(s) [%s], MultiSfDecoder SF7-12",
+            nRadio, nBW, bw_list.c_str());
+    }
 
     return overflow_ptr;
 }

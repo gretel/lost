@@ -438,6 +438,18 @@ std::vector<TrxConfig> load_config(const std::string& path,
             return {};
         }
 
+        // Parse decode_bws (optional: list of BWs to decode simultaneously)
+        if (auto* bw_arr = section["decode_bws"].as_array()) {
+            for (auto& elem : *bw_arr) {
+                if (auto v = elem.value<int64_t>()) {
+                    cfg.decode_bws.push_back(static_cast<uint32_t>(*v));
+                }
+            }
+        }
+        if (cfg.decode_bws.empty()) {
+            cfg.decode_bws.push_back(cfg.bw);  // default: just the codec BW
+        }
+
         {
             std::string rx_list;
             for (std::size_t i = 0; i < cfg.rx_channels.size(); i++) {

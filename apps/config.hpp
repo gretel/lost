@@ -126,6 +126,7 @@ struct TrxConfig {
     uint32_t             tx_queue_depth{4};     ///< max queued TX requests (rejects when full)
 
     std::vector<DecodeConfig> decode_configs{};  ///< per-chain decode configs (at least one required)
+    std::vector<uint32_t>     decode_bws{};      ///< BWs to decode (empty = {bw} only)
     RawConfig                 raw{};             ///< passthrough sections for Python scripts
 };
 

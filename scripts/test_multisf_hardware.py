@@ -93,9 +93,9 @@ def cli_cmd(serial, *args):
     return r.stdout.strip()
 
 
-def set_radio(serial, sf):
-    """Set companion radio to given SF, wait for reboot."""
-    param = f"{FREQ_MHZ},{BW_KHZ},{sf},{CR}"
+def set_radio(serial, sf, bw_khz=BW_KHZ):
+    """Set companion radio to given SF and BW, wait for reboot."""
+    param = f"{FREQ_MHZ},{bw_khz},{sf},{CR}"
     result = cli_cmd(serial, "set", "radio", param)
     ok = "ok" in result.lower()
     if ok:
@@ -167,53 +167,57 @@ def run_test_matrix(serial, results_file):
     sock = subscribe_udp()
     dest = "DO2THX \U0001f421"
 
+    # (sf, bw_khz, label, send_fn, min_bytes)
     test_configs = [
-        # Start with SF8 (known working) as sanity check
-        (8, "SF8 msg (warmup)", lambda: send_message(serial, dest, "warmup"), 10),
-        (8, "SF8 advert", lambda: send_advert(serial), 20),
-        (8, "SF8 msg", lambda: send_message(serial, dest, "test SF8"), 10),
-        # SF7
-        (7, "SF7 advert", lambda: send_advert(serial), 20),
-        (7, "SF7 msg", lambda: send_message(serial, dest, "test SF7"), 10),
-        # SF10 (LDRO at BW62.5k)
-        (10, "SF10 advert", lambda: send_advert(serial), 20),
-        (10, "SF10 msg", lambda: send_message(serial, dest, "test SF10"), 10),
-        # SF12 (LDRO, very long air time)
-        (12, "SF12 advert", lambda: send_advert(serial), 20),
-        (12, "SF12 msg", lambda: send_message(serial, dest, "test SF12"), 10),
+        # BW62.5k (default MeshCore)
+        (8, 62.5, "BW62k SF8 warmup", lambda: send_message(serial, dest, "warmup"), 10),
+        (8, 62.5, "BW62k SF8 advert", lambda: send_advert(serial), 20),
+        (8, 62.5, "BW62k SF8 msg", lambda: send_message(serial, dest, "test"), 10),
+        (7, 62.5, "BW62k SF7 advert", lambda: send_advert(serial), 20),
+        (12, 62.5, "BW62k SF12 advert", lambda: send_advert(serial), 20),
+        # BW125k
+        (8, 125, "BW125k SF8 advert", lambda: send_advert(serial), 20),
+        (8, 125, "BW125k SF8 msg", lambda: send_message(serial, dest, "test125"), 10),
+        (7, 125, "BW125k SF7 advert", lambda: send_advert(serial), 20),
+        # BW250k
+        (8, 250, "BW250k SF8 advert", lambda: send_advert(serial), 20),
+        (8, 250, "BW250k SF8 msg", lambda: send_message(serial, dest, "test250"), 10),
     ]
 
     results = []
     current_sf = None
+    current_bw = None
 
     print(f"\n{'=' * 70}")
     print(f"MultiSfDecoder Hardware A/B Test  ({ATTEMPTS} attempts per config)")
     print(f"Companion: {serial}  Freq: {FREQ_MHZ} MHz  BW: {BW_KHZ} kHz  CR: {CR}")
     print(f"{'=' * 70}\n")
 
-    for sf, label, send_fn, min_bytes in test_configs:
-        if sf != current_sf:
-            print(f"\n--- Setting companion to SF{sf} ---")
-            if not set_radio(serial, sf):
-                print(f"  FAIL: could not set radio to SF{sf}")
+    for sf, bw_khz, label, send_fn, min_bytes in test_configs:
+        if sf != current_sf or bw_khz != current_bw:
+            print(f"\n--- Setting companion to SF{sf} BW{bw_khz}k ---")
+            if not set_radio(serial, sf, bw_khz):
+                print(f"  FAIL: could not set radio to SF{sf} BW{bw_khz}k")
                 results.append(
                     {
                         "label": label,
                         "sf": sf,
+                        "bw_khz": bw_khz,
                         "result": "RADIO_FAIL",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 )
                 continue
             current_sf = sf
+            current_bw = bw_khz
             drain_frames(sock)
 
         result = try_send_and_decode(sock, serial, label, sf, send_fn, min_bytes)
         results.append(result)
 
-    # Restore companion to SF8
-    print(f"\n--- Restoring companion to SF8 ---")
-    set_radio(serial, 8)
+    # Restore companion to SF8/BW62.5k
+    print(f"\n--- Restoring companion to SF8 BW62.5k ---")
+    set_radio(serial, 8, 62.5)
     sock.close()
 
     # Summary

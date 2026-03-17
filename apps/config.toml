@@ -91,6 +91,11 @@ name  = "MeshCore 868 MHz"
 codec = "codec_meshcore_868"
 radio = "radio_868"
 
+# Decode BWs: list of bandwidths to decode simultaneously.
+# Each BW gets its own MultiSfDecoder (SF7-12). os = sample_rate / bw.
+# Omit for single-BW (uses codec bw). All must divide sample_rate evenly.
+decode_bws = [62500, 125000, 250000]
+
 [[set_meshcore_868.decode]]
 label      = "meshcore"
 sync_word  = 0x12
