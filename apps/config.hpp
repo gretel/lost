@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //
-// Configuration structs, TOML parser, and CBOR serialisation for lora_trx.
+// Configuration structs, TOML parser, and CBOR serialisation for lora apps.
 //
 // Extracted from lora_trx.cpp so that config handling can be tested and
 // reused independently.  The `RawConfig` struct carries passthrough TOML
@@ -20,7 +20,7 @@
 #include <gnuradio-4.0/lora/cbor.hpp>
 #include <gnuradio-4.0/lora/algorithm/SpectrumTap.hpp>
 
-namespace lora_trx {
+namespace lora_config {
 
 // Channel mapping: follows physical connector order on UHD case.
 //   0 = TRX_A (chain A, TX/RX)   TX + RX
@@ -193,6 +193,6 @@ std::vector<uint8_t> build_status_cbor(const TrxConfig& cfg, SharedStatus& statu
 std::vector<uint8_t> build_spectrum_cbor(gr::lora::SpectrumState& spec,
                                          const char* type_name = "spectrum");
 
-}  // namespace lora_trx
+}  // namespace lora_config
 
 #endif  // GR4_LORA_CONFIG_HPP

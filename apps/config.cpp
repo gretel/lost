@@ -16,7 +16,7 @@
 
 #include <gnuradio-4.0/lora/log.hpp>
 
-namespace lora_trx {
+namespace lora_config {
 
 // --- Property map utilities (internal) ---
 
@@ -654,4 +654,4 @@ std::vector<uint8_t> build_spectrum_cbor(gr::lora::SpectrumState& spec,
     return buf;
 }
 
-}  // namespace lora_trx
+}  // namespace lora_config

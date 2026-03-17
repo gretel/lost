@@ -59,7 +59,7 @@
 #include <gnuradio-4.0/lora/cbor.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
-using namespace lora_trx;
+using namespace lora_config;
 
 namespace {
 
