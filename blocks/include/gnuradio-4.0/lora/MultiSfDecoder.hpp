@@ -115,7 +115,14 @@ struct SfLane {
     uint8_t    preamble_rotations{0};
     bool       cfo_frac_sto_frac_est{false};
     int        items_to_consume{0};
-    std::size_t lane_offset{0};  // persistent position within the global input stream
+    uint32_t   stall_count{0};   // symbols since entering SYNC/OUTPUT without frame completion
+    static constexpr uint32_t kMaxStallSymbols = 1000;  // safety timeout (must exceed max frame symbols)
+
+    // Accumulation buffer: stores samples from the ring buffer that this
+    // lane hasn't processed yet. The ring buffer cursor always advances at
+    // _min_sps rate; slow lanes (high SF) accumulate here until they have
+    // enough for one symbol period.
+    std::vector<std::complex<float>> accum;
 
     // === Preamble buffers ===
     std::vector<int>  preamb_up_vals;
@@ -179,7 +186,7 @@ struct SfLane {
         cfo_downchirp.resize(N);
         dechirped.resize(N);
 
-        lane_offset = 0;
+        accum.clear();
         fft = gr::algorithm::FFT<std::complex<float>>{};
         resetToDetect();
     }
@@ -209,6 +216,7 @@ struct SfLane {
         symb_numb = 0;
         cr = 4;
         pay_len = 0;
+        stall_count = 0;
     }
 
     // === DSP helper methods (ported from FrameSync) ===
@@ -514,6 +522,10 @@ struct MultiSfDecoder
     float    _peak_db{-999.f};
     float    _noise_ema{0.f};
     bool     _noise_ema_init{false};
+    std::atomic<bool>* _channel_busy{nullptr};  // LBT: set by any lane in SYNC/OUTPUT
+
+    /// Set external channel-busy flag for listen-before-talk.
+    void set_channel_busy_flag(std::atomic<bool>* flag) { _channel_busy = flag; }
 
     void start() { reconfigure(); }
 
@@ -556,56 +568,51 @@ struct MultiSfDecoder
 
         if (_lanes.empty()) reconfigure();
 
-        // Each lane independently tracks its position. We consume only as
-        // many samples as the slowest lane has fully processed.
         if (in_span.size() < _min_sps) {
             std::ignore = input.consume(0UZ);
             output.publish(0UZ);
             return gr::work::Status::OK;
         }
 
+        // Always consume the full input. Each lane appends to its own
+        // accumulation buffer and processes symbols from there. This keeps
+        // the ring buffer cursor advancing at full rate so the scheduler
+        // stays in its fast path (no stall/sleep on consume(0)).
+        const std::size_t n_in = in_span.size();
         std::size_t out_idx = 0;
 
-        // Each lane processes from its persistent offset within this buffer.
         for (auto& lane : _lanes) {
-            while (lane.lane_offset + lane.sps <= in_span.size()) {
-                auto consumed = processLaneSymbol(lane, in_span, lane.lane_offset, out_span, out_idx);
-                if (consumed == 0) { consumed = lane.sps; }  // safety
-                lane.lane_offset += consumed;
+            // Append new input to this lane's accumulation buffer
+            lane.accum.insert(lane.accum.end(), in_span.begin(), in_span.end());
+
+            // Process as many symbols as fit in the accumulated data
+            auto accum_span = std::span<const cf32>(lane.accum);
+            std::size_t pos = 0;
+            while (pos + lane.sps <= accum_span.size()) {
+                auto consumed = processLaneSymbol(
+                    lane, accum_span, pos, out_span, out_idx);
+                if (consumed == 0) { consumed = lane.sps; }
+                pos += consumed;
+            }
+
+            // Erase consumed samples, keep the remainder for next call
+            if (pos > 0) {
+                lane.accum.erase(lane.accum.begin(),
+                                  lane.accum.begin()
+                                  + static_cast<std::ptrdiff_t>(pos));
             }
         }
 
-        // Consume the minimum across all lanes
-        std::size_t min_advanced = in_span.size();
-        for (const auto& lane : _lanes) {
-            min_advanced = std::min(min_advanced, lane.lane_offset);
-        }
-
-        // If no lane advanced, consume all remaining input to avoid spinning.
-        // This happens when the remaining samples are less than any lane's sps.
-        if (min_advanced == 0) {
-            bool any_can_advance = false;
+        // Update LBT channel-busy flag
+        if (_channel_busy != nullptr) {
+            bool busy = false;
             for (const auto& lane : _lanes) {
-                if (lane.lane_offset + lane.sps <= in_span.size()) {
-                    any_can_advance = true;
-                    break;
-                }
+                if (lane.state != SfLane::DETECT) { busy = true; break; }
             }
-            if (!any_can_advance) {
-                // No lane can make progress — discard remaining tail samples
-                min_advanced = in_span.size();
-            }
+            _channel_busy->store(busy, std::memory_order_relaxed);
         }
 
-        for (auto& lane : _lanes) {
-            if (lane.lane_offset >= min_advanced) {
-                lane.lane_offset -= min_advanced;
-            } else {
-                lane.lane_offset = 0;
-            }
-        }
-
-        std::ignore = input.consume(min_advanced);
+        std::ignore = input.consume(n_in);
         output.publish(out_idx);
         return gr::work::Status::OK;
     }
@@ -634,9 +641,19 @@ struct MultiSfDecoder
             processDetect(lane, in_span, in_offset);
             break;
         case SfLane::SYNC:
+            lane.stall_count++;
+            if (lane.stall_count > SfLane::kMaxStallSymbols) {
+                lane.resetToDetect();
+                break;
+            }
             processSync(lane, in_span, in_offset);
             break;
         case SfLane::OUTPUT:
+            lane.stall_count++;
+            if (lane.stall_count > SfLane::kMaxStallSymbols) {
+                lane.resetToDetect();
+                break;
+            }
             processOutput(lane, in_span, in_offset, out_span, out_idx);
             break;
         }

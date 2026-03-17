@@ -52,6 +52,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
     uint32_t             _pay_len{0};
     uint8_t              _cr{4};
+    uint8_t              _frame_sf{0};  ///< per-frame SF from tag (0 = use phy_sf)
     bool                 _crc_valid{false};
     bool                 _is_downchirp{false};
     double               _snr_db{0.0};
@@ -237,14 +238,17 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         return result;
     }
 
+    /// Effective SF for the current frame: per-frame tag value if set, else phy_sf.
+    [[nodiscard]] uint8_t effectiveSf() const { return _frame_sf > 0 ? _frame_sf : phy_sf; }
+
     void printFrameText(const std::string& ts) {
         auto frame_span = std::span<const uint8_t>(_frame.data(), _pay_len);
 
         const char* crc_str = _crc_valid ? "CRC_OK" : "CRC_FAIL";
 
-        std::printf("[%s] #%u  %u bytes  CR=4/%u  %s  sync=0x%02X  SNR=%.1f dB",
+        std::printf("[%s] #%u  SF%u  %u bytes  CR=4/%u  %s  sync=0x%02X  SNR=%.1f dB",
                     ts.c_str(), _frame_count,
-                    _pay_len, 4u + _cr, crc_str,
+                    effectiveSf(), _pay_len, 4u + _cr, crc_str,
                     sync_word, _snr_db);
         if (_noise_floor_db > -999.0) {
             std::printf("  NF=%.1f dBFS", _noise_floor_db);
@@ -299,7 +303,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         if (_peak_db > -999.0) phy_fields++;
         if (_snr_db_td > -999.0) phy_fields++;
         cbor::encode_map_begin(buf, phy_fields);
-        cbor::kv_uint(buf, "sf", phy_sf);
+        cbor::kv_uint(buf, "sf", effectiveSf());
         cbor::kv_uint(buf, "bw", phy_bw);
         cbor::kv_uint(buf, "cr", _cr);
         cbor::kv_bool(buf, "crc_valid", _crc_valid);
@@ -387,6 +391,12 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
                 _pay_len = static_cast<uint32_t>(
                     it->second.value_or<int64_t>(0));
+                if (auto it2 = tag.map.find("sf"); it2 != tag.map.end()) {
+                    _frame_sf = static_cast<uint8_t>(
+                        it2->second.value_or<int64_t>(0));
+                } else {
+                    _frame_sf = 0;
+                }
                 if (auto it2 = tag.map.find("cr"); it2 != tag.map.end()) {
                     _cr = static_cast<uint8_t>(
                         it2->second.value_or<int64_t>(0));
