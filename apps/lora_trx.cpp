@@ -46,13 +46,10 @@
 #include <gnuradio-4.0/Tensor.hpp>
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
-#include <gnuradio-4.0/lora/MultiSfDecoder.hpp>
-#include <gnuradio-4.0/lora/Splitter.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
-#include <gnuradio-4.0/soapy/Soapy.hpp>
 #include <gnuradio-4.0/soapy/SoapySink.hpp>
 
-#include "common.hpp"
+#include "graph_builder.hpp"
 
 #include <gnuradio-4.0/lora/FrameSink.hpp>
 #include <gnuradio-4.0/lora/TxQueueSource.hpp>
@@ -60,6 +57,7 @@
 #include <gnuradio-4.0/lora/log.hpp>
 
 using namespace lora_config;
+using namespace lora_graph;
 
 namespace {
 
@@ -421,234 +419,6 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
     gr::lora::cbor::kv_uint(ack, "seq", seq);
     gr::lora::cbor::kv_bool(ack, "ok", ok);
     udp.sendTo(ack, sender);
-}
-
-// --- RX graph builder ---
-
-// Creates a MultiSfDecoder → FrameSink chain.
-// Returns reference to the MultiSfDecoder (for connecting upstream).
-gr::lora::MultiSfDecoder& add_multisf_chain(
-        gr::Graph& graph, const TrxConfig& cfg,
-        int32_t rx_channel, const DecodeConfig& dc,
-        std::function<void(const std::vector<uint8_t>&, bool)> callback,
-        std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr) {
-    auto os = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
-
-    auto& decoder = graph.emplaceBlock<gr::lora::MultiSfDecoder>();
-    decoder.bandwidth    = cfg.bw;
-    decoder.sync_word    = dc.sync_word;
-    decoder.os_factor    = os;
-    decoder.preamble_len = cfg.preamble;
-    decoder.center_freq  = static_cast<uint32_t>(cfg.freq);
-    decoder.rx_channel   = rx_channel;
-    decoder.sf_min       = 7;
-    decoder.sf_max       = 12;
-    decoder.debug        = cfg.debug;
-    decoder._spectrum_state = std::move(spectrum);
-
-    // Apply block-level overrides from config
-    if (auto it = dc.block_overrides.find("energy_thresh"); it != dc.block_overrides.end()) {
-        decoder.energy_thresh = it->second.template value_or<float>(1e-6f);
-    }
-    if (auto it = dc.block_overrides.find("min_snr_db"); it != dc.block_overrides.end()) {
-        decoder.min_snr_db = it->second.template value_or<float>(-10.f);
-    }
-    if (auto it = dc.block_overrides.find("max_symbols"); it != dc.block_overrides.end()) {
-        decoder.max_symbols = static_cast<uint32_t>(it->second.template value_or<int64_t>(600));
-    }
-
-    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
-        {"sync_word", dc.sync_word},
-        {"phy_sf", uint8_t{0}},  // MultiSf: SF varies per frame, reported in tag
-        {"phy_bw", cfg.bw},
-        {"label", dc.label},
-    });
-    sink._frame_callback = callback;
-
-    auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
-    if (!ok(graph.connect<"out", "in">(decoder, sink))) {
-        gr::lora::log_ts("error", "lora_trx",
-            "failed to connect MultiSfDecoder -> FrameSink for rx_channel %d",
-            rx_channel);
-    }
-    return decoder;
-}
-
-// Generalised RX graph builder.
-//
-// Topology (per radio channel, single BW):
-//   Source → MultiSfDecoder (SF7-12) → FrameSink
-//
-// Topology (per radio channel, multi-BW):
-//   Source → Splitter(N) → MultiSfDecoder (BW1, SF7-12) → FrameSink
-//                        → MultiSfDecoder (BW2, SF7-12) → FrameSink
-//                        → ...
-//
-// Each MultiSfDecoder handles one BW at all SFs. The os_factor differs
-// per BW: os = sample_rate / bw. No decimation blocks needed.
-//
-// Returns pointer to source block's cumulative overflow counter.
-std::atomic<uint64_t>* build_rx_graph(gr::Graph& graph, const TrxConfig& cfg,
-                         std::function<void(const std::vector<uint8_t>&, bool)> callback,
-                         std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
-                         std::atomic<bool>* channel_busy = nullptr) {
-    auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
-    using std::string_literals::operator""s;
-
-    const auto& decodes = cfg.decode_configs;
-    const auto nRadio = cfg.rx_channels.size();
-    const auto& bws = cfg.decode_bws;
-    const auto nBW = bws.size();
-
-    // Translate config channels (0-3) to SoapySDR channels + antennae
-    std::vector<gr::Size_t> soapy_channels;
-    std::vector<std::string> antennae;
-    for (auto ch : cfg.rx_channels) {
-        const auto& map = kChannelMap[ch];
-        soapy_channels.push_back(static_cast<gr::Size_t>(map.soapy_channel));
-        antennae.emplace_back(map.rx_antenna);
-    }
-
-    const auto& dc = decodes[0];
-
-    // Wire MultiSfDecoder(s) per radio channel via connectPort lambda.
-    auto wireDecodeChains = [&](auto connectPort) {
-        for (std::size_t r = 0; r < nRadio; r++) {
-            bool firstRadio = (r == 0);
-
-            if (nBW == 1) {
-                // Single BW: direct connection, no Splitter
-                auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100;
-                auto spec = firstRadio ? spectrum : nullptr;
-
-                // Override BW for this decoder
-                TrxConfig bw_cfg = cfg;
-                bw_cfg.bw = bws[0];
-                auto& decoder = add_multisf_chain(graph, bw_cfg, rx_ch, dc, callback, spec);
-
-                if (firstRadio && channel_busy != nullptr) {
-                    decoder.set_channel_busy_flag(channel_busy);
-                }
-                if (!connectPort(r, decoder)) {
-                    gr::lora::log_ts("error", "lora_trx",
-                        "failed to connect source -> MultiSfDecoder (radio %zu)", r);
-                }
-            } else {
-                // Multi-BW: Splitter fans out to one MultiSfDecoder per BW
-                auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
-                    {"n_outputs", static_cast<gr::Size_t>(nBW)},
-                });
-                if (!connectPort(r, splitter)) {
-                    gr::lora::log_ts("error", "lora_trx",
-                        "failed to connect source -> Splitter (radio %zu)", r);
-                }
-
-                for (std::size_t b = 0; b < nBW; b++) {
-                    auto rx_ch = static_cast<int32_t>(cfg.rx_channels[r]) * 100
-                               + static_cast<int32_t>(b);
-                    auto spec = (firstRadio && b == 0) ? spectrum : nullptr;
-
-                    TrxConfig bw_cfg = cfg;
-                    bw_cfg.bw = bws[b];
-                    auto& decoder = add_multisf_chain(graph, bw_cfg, rx_ch, dc, callback, spec);
-
-                    // First BW on first radio provides LBT
-                    if (firstRadio && b == 0 && channel_busy != nullptr) {
-                        decoder.set_channel_busy_flag(channel_busy);
-                    }
-
-                    auto port = "out#"s + std::to_string(b);
-                    if (!ok(graph.connect(splitter, port, decoder, "in"s))) {
-                        gr::lora::log_ts("error", "lora_trx",
-                            "failed to connect Splitter -> MultiSfDecoder BW%u (radio %zu)",
-                            bws[b], r);
-                    }
-                }
-            }
-        }
-    };
-
-    // Create source and wire: 1 radio = SoapySimple, 2 radios = SoapyDual
-    std::atomic<uint64_t>* overflow_ptr = nullptr;
-
-    if (nRadio == 1) {
-        auto props = lora_apps::soapy_reliability_defaults();
-        props.merge(gr::property_map{
-            {"device", cfg.device},
-            {"device_parameter", cfg.device_param},
-            {"sample_rate", cfg.rate},
-            {"rx_center_frequency", gr::Tensor<double>{cfg.freq}},
-            {"rx_gains", gr::Tensor<double>{cfg.gain_rx}},
-            {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
-            {"rx_antennae", antennae},
-            {"clock_source", cfg.clock},
-        });
-        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>(
-            std::move(props));
-        overflow_ptr = &source._totalOverFlowCount;
-        wireDecodeChains([&graph, &source](std::size_t /*r*/, auto& downstream) {
-            return graph.connect<"out", "in">(source, downstream).has_value();
-        });
-    } else {
-        auto props = lora_apps::soapy_reliability_defaults();
-        props.merge(gr::property_map{
-            {"device", cfg.device},
-            {"device_parameter", cfg.device_param},
-            {"sample_rate", cfg.rate},
-            {"rx_center_frequency", gr::Tensor<double>(gr::data_from, {cfg.freq, cfg.freq})},
-            {"rx_gains", gr::Tensor<double>(gr::data_from, {cfg.gain_rx, cfg.gain_rx})},
-            {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
-            {"rx_antennae", antennae},
-            {"clock_source", cfg.clock},
-        });
-        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapyDualSimpleSource<std::complex<float>>>(
-            std::move(props));
-        overflow_ptr = &source._totalOverFlowCount;
-        wireDecodeChains([&graph, &source](std::size_t r, auto& downstream) {
-            auto portName = "out#"s + std::to_string(r);
-            return graph.connect(source, portName, downstream, "in"s).has_value();
-        });
-    }
-
-    {
-        std::string bw_list;
-        for (std::size_t i = 0; i < nBW; i++) {
-            if (i > 0) bw_list += ",";
-            if (bws[i] >= 1000) bw_list += std::to_string(bws[i] / 1000) + "k";
-            else bw_list += std::to_string(bws[i]);
-        }
-        gr::lora::log_ts("debug", "lora_trx",
-            "RX graph: %zu radio(s) x %zu BW(s) [%s], MultiSfDecoder SF7-12",
-            nRadio, nBW, bw_list.c_str());
-    }
-
-    return overflow_ptr;
-}
-
-
-// --- Runtime reconfig: block references after scheduler exchange ---
-
-// Holds shared_ptr<BlockModel> references to RX blocks found in the live
-// scheduler graph.  After rx_sched.exchange(std::move(graph)), the original
-// emplaceBlock references are dangling — we must use rx_sched.blocks() to
-// locate them by typeName().
-struct RxBlocks {
-    std::vector<std::shared_ptr<gr::BlockModel>> multisf_decoders;
-    std::shared_ptr<gr::BlockModel>              soapy_source;
-};
-
-// Scan the scheduler's block span and collect references by type name.
-RxBlocks find_rx_blocks(std::span<std::shared_ptr<gr::BlockModel>> blocks) {
-    RxBlocks rx;
-    for (auto& blk : blocks) {
-        auto tn = blk->typeName();
-        if (tn.find("MultiSfDecoder") != std::string_view::npos) {
-            rx.multisf_decoders.push_back(blk);
-        } else if (tn.find("Soapy") != std::string_view::npos) {
-            rx.soapy_source = blk;
-        }
-    }
-    return rx;
 }
 
 // Convert CBOR lora_config values to a property_map suitable for
