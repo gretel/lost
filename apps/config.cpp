@@ -294,11 +294,15 @@ std::vector<TrxConfig> load_config(const std::string& path,
     }
 
     // --- Parse sets and build TrxConfig vector ---
+    // Only TRX sets (those with a 'codec' key) are processed here.
+    // Scan sets (no 'codec') are handled by load_scan_config().
     std::vector<std::pair<std::string, toml::source_position>> set_keys;
     for (auto&& [key, val] : tbl) {
         if (!val.is_table()) continue;
         std::string skey(key.str());
         if (!skey.starts_with("set_")) continue;
+        // Skip scan sets (no codec key — they're for lora_scan, not lora_trx)
+        if (!val.as_table()->contains("codec")) continue;
         set_keys.emplace_back(skey, val.source().begin);
     }
     std::sort(set_keys.begin(), set_keys.end(),
