@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <ranges>
@@ -483,6 +484,183 @@ std::vector<TrxConfig> load_config(const std::string& path,
     if (configs.empty()) {
         gr::lora::log_ts("error", "lora_trx",
             "no [set_*] sections found in config");
+        return {};
+    }
+
+    return configs;
+}
+
+// --- Scan config loader ---
+
+std::vector<ScanSetConfig> load_scan_config(const std::string& path,
+                                            const std::string& cli_log_level) {
+    toml::table tbl;
+    try {
+        tbl = toml::parse_file(path);
+    } catch (const toml::parse_error& err) {
+        gr::lora::log_ts("error", "config", "%s: %s",
+                         path.c_str(), err.description().data());
+        return {};
+    }
+
+    // --- [device] section ---
+    auto* dev_tbl = tbl["device"].as_table();
+    auto dev_or_s = [&](std::string_view key, std::string def) -> std::string {
+        if (dev_tbl) {
+            if (auto v = dev_tbl->at_path(key).value<std::string>()) return *v;
+        }
+        if (auto v = tbl[key].value<std::string>()) return *v;
+        return def;
+    };
+    auto dev_or_d = [&](std::string_view key, double def) -> double {
+        if (dev_tbl) {
+            if (auto v = dev_tbl->at_path(key).value<double>()) return *v;
+        }
+        if (auto v = tbl[key].value<double>()) return *v;
+        return def;
+    };
+    std::string g_device = dev_or_s("driver", dev_or_s("device", "uhd"));
+    std::string g_param  = dev_or_s("param", "type=b200");
+    std::string g_clock  = dev_or_s("clock", "");
+
+    // Scan-specific device keys
+    double g_l1_rate      = dev_or_d("l1_rate", 16.0e6);
+    double g_master_clock = dev_or_d("master_clock", 32.0e6);
+
+    // --- [logging] section ---
+    auto* log_tbl = tbl["logging"].as_table();
+    std::string log_level = "INFO";
+    if (log_tbl) {
+        log_level = log_tbl->at_path("level").value_or(std::string{"INFO"});
+    }
+    if (!cli_log_level.empty()) {
+        log_level = cli_log_level;
+    }
+    gr::lora::set_log_level(log_level);
+
+    // --- Collect radio sections ---
+    struct RadioCfg {
+        double freq{866'500'000.0};
+        double rx_gain{40.0};
+    };
+    std::map<std::string, RadioCfg> radios;
+    for (auto&& [key, val] : tbl) {
+        if (!val.is_table()) continue;
+        std::string skey(key.str());
+        if (!skey.starts_with("radio_")) continue;
+        auto& section = *val.as_table();
+        RadioCfg r;
+        r.freq    = section["freq"].value_or(866'500'000.0);
+        r.rx_gain = section["rx_gain"].value_or(40.0);
+        radios[skey] = r;
+    }
+
+    // --- Parse [set_*] sections with scan keys ---
+    std::vector<std::pair<std::string, toml::source_position>> set_keys;
+    for (auto&& [key, val] : tbl) {
+        if (!val.is_table()) continue;
+        std::string skey(key.str());
+        if (!skey.starts_with("set_")) continue;
+        // Scan sets have freq_start; TRX sets have codec — skip TRX sets
+        if (val.as_table()->contains("codec")) continue;
+        set_keys.emplace_back(skey, val.source().begin);
+    }
+    std::sort(set_keys.begin(), set_keys.end(),
+              [](const auto& a, const auto& b) { return a.second.line < b.second.line; });
+
+    std::vector<ScanSetConfig> configs;
+
+    for (const auto& [skey, _pos] : set_keys) {
+        auto& section = *tbl[skey].as_table();
+
+        // Radio reference (optional for scan)
+        RadioCfg radio;
+        if (auto radio_ref = section["radio"].value<std::string>()) {
+            auto rit = radios.find(*radio_ref);
+            if (rit == radios.end()) {
+                gr::lora::log_ts("error", "config",
+                    "[%s] references unknown radio '%s'",
+                    skey.c_str(), radio_ref->c_str());
+                return {};
+            }
+            radio = rit->second;
+        }
+
+        ScanSetConfig cfg;
+
+        // Device
+        cfg.device       = g_device;
+        cfg.device_param = g_param;
+        cfg.clock        = g_clock;
+        cfg.l1_rate      = section["l1_rate"].value_or(g_l1_rate);
+        cfg.master_clock = section["master_clock"].value_or(g_master_clock);
+
+        // Radio / set overrides
+        cfg.gain       = section["rx_gain"].value_or(radio.rx_gain);
+        cfg.freq_start = section["freq_start"].value_or(radio.freq);
+        cfg.freq_stop  = section["freq_stop"].value_or(cfg.freq_start);
+
+        if (cfg.freq_start >= cfg.freq_stop) {
+            gr::lora::log_ts("error", "config",
+                "[%s] freq_start (%.0f) must be < freq_stop (%.0f)",
+                skey.c_str(), cfg.freq_start, cfg.freq_stop);
+            return {};
+        }
+
+        // Scan keys
+        cfg.os_factor  = static_cast<uint32_t>(section["os_factor"].value_or(int64_t{4}));
+        cfg.min_ratio  = static_cast<float>(section["min_ratio"].value_or(8.0));
+        cfg.settle_ms  = static_cast<int>(section["settle_ms"].value_or(int64_t{5}));
+        cfg.sweeps     = static_cast<uint32_t>(section["sweeps"].value_or(int64_t{0}));
+        cfg.layer1_only = section["layer1_only"].value_or(false);
+
+        // BWs
+        cfg.bws.clear();
+        if (auto* bw_arr = section["bws"].as_array()) {
+            for (auto& elem : *bw_arr) {
+                if (auto v = elem.value<int64_t>()) {
+                    cfg.bws.push_back(static_cast<uint32_t>(*v));
+                }
+            }
+        }
+        if (cfg.bws.empty()) {
+            cfg.bws = {62500, 125000, 250000};  // default EU868
+        }
+        std::ranges::sort(cfg.bws);
+
+        // Validate decimation factors
+        for (uint32_t bw : cfg.bws) {
+            const double targetRate = static_cast<double>(bw) * static_cast<double>(cfg.os_factor);
+            const double factor     = cfg.l1_rate / targetRate;
+            const double rounded    = std::round(factor);
+            if (std::abs(factor - rounded) > 0.01 || rounded < 1.0) {
+                gr::lora::log_ts("error", "config",
+                    "[%s] l1_rate %.0f / (BW %u x os %u) = %.3f -- must be integer",
+                    skey.c_str(), cfg.l1_rate, bw, cfg.os_factor, factor);
+                return {};
+            }
+        }
+
+        {
+            std::string bw_list;
+            for (std::size_t i = 0; i < cfg.bws.size(); i++) {
+                if (i > 0) bw_list += ",";
+                if (cfg.bws[i] >= 1000) bw_list += std::to_string(cfg.bws[i] / 1000) + "k";
+                else bw_list += std::to_string(cfg.bws[i]);
+            }
+            gr::lora::log_ts("info ", "config",
+                "scan set '%s': %.3f-%.3f MHz  BW=[%s]  os=%u  L1=%.1f MS/s",
+                skey.c_str(),
+                cfg.freq_start / 1e6, cfg.freq_stop / 1e6,
+                bw_list.c_str(), cfg.os_factor, cfg.l1_rate / 1e6);
+        }
+
+        configs.push_back(std::move(cfg));
+    }
+
+    if (configs.empty()) {
+        gr::lora::log_ts("error", "config",
+            "no scan [set_*] sections found (must have freq_start, no codec)");
         return {};
     }
 

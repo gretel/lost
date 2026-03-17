@@ -148,3 +148,20 @@ min_snr_db = -19.0
 # label      = "meshcore"
 # sync_word  = 0x12
 # min_snr_db = -15.0
+
+# --- Scan configuration (used by lora_scan) ---
+# Scan sets reuse [device] and [radio_*] sections above.
+# Scan sets must NOT have a 'codec' key (that's how they're distinguished from TRX sets).
+# Device-level scan defaults: l1_rate, master_clock can go in [device] or per-set.
+
+[set_scan_eu868]
+name       = "EU868 scan"
+radio      = "radio_868"
+freq_start = 863000000
+freq_stop  = 870000000
+bws        = [62500, 125000, 250000]
+os_factor  = 4
+min_ratio  = 8.0
+settle_ms  = 5
+# sweeps     = 0          # 0 = infinite (default)
+# layer1_only = false     # set true for energy-only mode
