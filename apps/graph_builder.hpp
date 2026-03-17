@@ -268,6 +268,20 @@ inline std::shared_ptr<gr::BlockModel> find_soapy_source(
     return nullptr;
 }
 
+/// Set `_device_serial` on all FrameSink blocks in the scheduler.
+inline void set_device_serial(std::span<std::shared_ptr<gr::BlockModel>> blocks,
+                              const std::string& serial) {
+    if (serial.empty()) return;
+    for (auto& blk : blocks) {
+        if (blk->typeName().find("FrameSink") != std::string_view::npos) {
+            auto* wrapper = dynamic_cast<gr::BlockWrapper<gr::lora::FrameSink>*>(blk.get());
+            if (wrapper) {
+                wrapper->blockRef()._device_serial = serial;
+            }
+        }
+    }
+}
+
 // ─── Scan graph (lora_scan) ──────────────────────────────────────────────────
 
 /// Shared state handles returned by build_scan_graph().

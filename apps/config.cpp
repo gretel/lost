@@ -561,7 +561,8 @@ static uint32_t count_meshcore_fields(const RawConfig::MeshCore& mc) {
     return n;
 }
 
-std::vector<uint8_t> build_config_cbor(const TrxConfig& cfg) {
+std::vector<uint8_t> build_config_cbor(const TrxConfig& cfg,
+                                       const std::string& device_serial) {
     namespace cbor = gr::lora::cbor;
     std::vector<uint8_t> buf;
     buf.reserve(512);
@@ -581,10 +582,15 @@ std::vector<uint8_t> build_config_cbor(const TrxConfig& cfg) {
     cbor::kv_float64(buf, "tx_gain", cfg.gain_tx);
 
     cbor::encode_text(buf, "server");
-    cbor::encode_map_begin(buf, 3);
+    uint32_t server_fields = 3;
+    if (!device_serial.empty()) server_fields++;
+    cbor::encode_map_begin(buf, server_fields);
     cbor::kv_text(buf, "device", cfg.device);
     cbor::kv_uint(buf, "status_interval", cfg.status_interval);
     cbor::kv_float64(buf, "sample_rate", static_cast<double>(cfg.rate));
+    if (!device_serial.empty()) {
+        cbor::kv_text(buf, "device_serial", device_serial);
+    }
 
     // Decode chain summary
     cbor::encode_text(buf, "decode_chains");

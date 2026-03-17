@@ -40,13 +40,14 @@ inline void apply_fpga_workaround(const std::string& device, std::string& device
     }
 }
 
-inline void log_hardware_info(const char* app_name,
-                              const std::string& device,
-                              const std::string& device_param) {
+/// Query hardware info and log it. Returns the device serial (empty if unavailable).
+inline std::string log_hardware_info(const char* app_name,
+                                     const std::string& device,
+                                     const std::string& device_param) {
     auto args = gr::blocks::soapy::detail::buildDeviceArgs(device, device_param);
     gr::blocks::soapy::Device dev(args);
     if (dev.get() == nullptr) {
-        return;
+        return {};
     }
     auto info = dev.getHardwareInfo();
     std::string fpga_ver, serial;
@@ -62,6 +63,7 @@ inline void log_hardware_info(const char* app_name,
             fpga_ver.empty() ? "?" : fpga_ver.c_str(),
             serial.empty() ? "?" : serial.c_str());
     }
+    return serial;
 }
 
 // --- SoapyBlock reliability defaults (shared by lora_trx and lora_scan) ---

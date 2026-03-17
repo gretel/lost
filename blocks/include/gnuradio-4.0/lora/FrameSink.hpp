@@ -67,6 +67,8 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     // Per-frame unique ID generation (UUID v4, seeded in start())
     std::mt19937_64      _rng{};
 
+    std::string  _device_serial{};  ///< SDR device serial (set by app after graph init)
+
     std::function<void(const std::vector<uint8_t>&, bool crc_valid)> _frame_callback{};
 
     int                              _udp_fd{-1};
@@ -264,12 +266,13 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
             effectiveSf(), bw_str, _pay_len, 4u + _cr,
             _crc_valid ? "OK" : "FAIL",
             sync_word, _snr_db);
-        if (_noise_floor_db > -999.0) std::fprintf(stderr, " nf=%.1fdBFS", _noise_floor_db);
-        if (_peak_db > -999.0)        std::fprintf(stderr, " peak=%.1fdBFS", _peak_db);
-        if (_snr_db_td > -999.0)      std::fprintf(stderr, " snr_td=%.1fdB", _snr_db_td);
-        if (_rx_channel >= 0)         std::fprintf(stderr, " ch=%d", static_cast<int>(_rx_channel));
-        if (!label.empty())           std::fprintf(stderr, " proto=%s", label.c_str());
-        if (_is_downchirp)            std::fprintf(stderr, " downchirp");
+        if (_noise_floor_db > -999.0)   std::fprintf(stderr, " nf=%.1fdBFS", _noise_floor_db);
+        if (_peak_db > -999.0)          std::fprintf(stderr, " peak=%.1fdBFS", _peak_db);
+        if (_snr_db_td > -999.0)        std::fprintf(stderr, " snr_td=%.1fdB", _snr_db_td);
+        if (_rx_channel >= 0)           std::fprintf(stderr, " ch=%d", static_cast<int>(_rx_channel));
+        if (!label.empty())             std::fprintf(stderr, " proto=%s", label.c_str());
+        if (!_device_serial.empty())    std::fprintf(stderr, " dev=%s", _device_serial.c_str());
+        if (_is_downchirp)              std::fprintf(stderr, " downchirp");
         std::fprintf(stderr, "  %s%s\n", hex.c_str(), truncated ? "..." : "");
     }
 
@@ -288,6 +291,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                                    // crc_valid, cr, is_downchirp, id, payload_hash
         if (_rx_channel >= 0) top_fields++;
         if (!label.empty()) top_fields++;
+        if (!_device_serial.empty()) top_fields++;
 
         cbor::encode_map_begin(buf, top_fields);
         cbor::kv_text(buf, "type", "lora_frame");
@@ -335,6 +339,11 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
         // Payload hash for aggregation grouping (FNV-1a 64-bit)
         cbor::kv_uint(buf, "payload_hash", phash);
+
+        // SDR device serial (for multi-device disambiguation)
+        if (!_device_serial.empty()) {
+            cbor::kv_text(buf, "device", _device_serial);
+        }
 
         return buf;
     }

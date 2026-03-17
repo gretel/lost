@@ -224,7 +224,9 @@ static constexpr std::array kDemodDecoderOverrides = {
 
 /// Build a CBOR "config" message — sent once on subscribe.
 /// Includes PHY, server, decode_chains, and raw passthrough sections.
-std::vector<uint8_t> build_config_cbor(const TrxConfig& cfg);
+/// `device_serial` is the SDR serial number (empty if unavailable).
+std::vector<uint8_t> build_config_cbor(const TrxConfig& cfg,
+                                       const std::string& device_serial = "");
 
 /// Build a CBOR "status" heartbeat — sent periodically.
 std::vector<uint8_t> build_status_cbor(const TrxConfig& cfg, SharedStatus& status);

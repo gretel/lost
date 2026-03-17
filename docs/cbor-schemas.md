@@ -61,14 +61,16 @@ event, delivered to clients via `lora_trx` UDP broadcast.
   "rx_channel":   0,                  // uint, optional, RX channel index
   "decode_label": "SF8-sync12",       // text, optional, decode chain label
   "id":           "550e8400-...",      // text, UUIDv4, unique per decode event
-  "payload_hash": 12345678901234      // uint, FNV-1a 64-bit hash
+  "payload_hash": 12345678901234,     // uint, FNV-1a 64-bit hash
+  "device":       "31DE7F5"           // text, optional, SDR device serial
 }
 ```
 
 **Optional fields:** `noise_floor_db`, `peak_db`, `snr_db_td` are only
 present when their EMA values have been initialised (value > -999). `rx_channel`
 is only present in multi-channel configurations. `decode_label` is only present
-when the decode chain has a non-empty label (configured via TOML).
+when the decode chain has a non-empty label (configured via TOML). `device` is
+only present when the SDR reports a serial number (UHD devices always do).
 
 **SNR fields:** `snr_db` is an FFT-domain estimate (peak-vs-rest energy ratio
 averaged over preamble symbols) and includes ~SF×3 dB of FFT processing gain.
@@ -191,10 +193,11 @@ server metadata, and passthrough config for Python scripts.
     "rx_gain":    40.0,               // float64, RX gain (dB)
     "tx_gain":    74.0                // float64, TX gain (dB)
   },
-  "server": {                         // map, 3 keys
+  "server": {                         // map, 3-4 keys
     "device":          "uhd",         // text, SDR backend
     "status_interval": 10,            // uint, seconds between status heartbeats (0 = off)
-    "sample_rate":     250000.0       // float64, sample rate (S/s)
+    "sample_rate":     250000.0,      // float64, sample rate (S/s)
+    "device_serial":   "31DE7F5"      // text, optional, SDR device serial (EEPROM)
   },
   "decode_chains": [                  // array of maps, one per decode chain
     {

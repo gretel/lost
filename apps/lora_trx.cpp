@@ -283,10 +283,12 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
     auto hex_len = std::min(payload.size(), kMaxHexBytes);
     auto hex = gr::lora::FrameSink::to_hex(
         std::span<const uint8_t>(payload.data(), hex_len));
+    char repeat_str[24] = "";
+    if (repeat > 1) std::snprintf(repeat_str, sizeof(repeat_str), " repeat=%d", repeat);
     gr::lora::log_ts("info ", "lora_trx",
-        "TX bytes=%zu sf=%u cr=4/%u sync=0x%02X repeat=%d airtime=%.1fms%s  %s%s",
-        payload.size(), cfg.sf, 4u + cr, sync, repeat,
-        airtime * 1000.0, dry_run ? " dry" : "",
+        "TX bytes=%zu sf=%u cr=4/%u sync=0x%02X airtime=%.1fms%s%s  %s%s",
+        payload.size(), cfg.sf, 4u + cr, sync,
+        airtime * 1000.0, repeat_str, dry_run ? " dry" : "",
         hex.c_str(), payload.size() > kMaxHexBytes ? "..." : "");
 
     // Push TX IQ to spectrum tap (if connected) for waterfall display
@@ -348,7 +350,8 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
                         TrxConfig& cfg,
                         const RxBlocks& rx_blocks,
                         UdpState& udp,
-                        const struct sockaddr_storage& sender) {
+                        const struct sockaddr_storage& sender,
+                        const std::string& device_serial) {
     namespace cbor = gr::lora::cbor;
 
     bool valid = true;
@@ -430,7 +433,7 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
     udp.sendTo(ack, sender);
 
     // Re-broadcast updated config to all clients
-    auto config_cbor = build_config_cbor(cfg);
+    auto config_cbor = build_config_cbor(cfg, device_serial);
     udp.broadcast_all(config_cbor);
 
     return ok;
@@ -503,7 +506,7 @@ int main(int argc, char* argv[]) {
         cfg.device.c_str(),
         cfg.device_param.empty() ? "(none)" : cfg.device_param.c_str());
 
-    lora_apps::log_hardware_info("lora_trx", cfg.device, cfg.device_param);
+    auto device_serial = lora_apps::log_hardware_info("lora_trx", cfg.device, cfg.device_param);
 
     // Build RX channel string
     {
@@ -634,6 +637,7 @@ int main(int argc, char* argv[]) {
     // After exchange(), the original emplaceBlock references are dangling —
     // we find them by scanning typeName().
     auto rx_blocks = find_rx_blocks(rx_sched.blocks());
+    set_device_serial(rx_sched.blocks(), device_serial);
     gr::lora::log_ts("info ", "lora_trx",
         "RX blocks: %zu MultiSfDecoder (SF7-12)  soapy=%s",
         rx_blocks.multisf_decoders.size(),
@@ -686,7 +690,7 @@ int main(int argc, char* argv[]) {
         cfg.rx_channels.size() > 1 ? "s" : "");
 
     // --- Pre-build config CBOR (sent once on subscribe) ---
-    auto config_cbor = build_config_cbor(cfg);
+    auto config_cbor = build_config_cbor(cfg, device_serial);
 
     // --- TX request queue + worker thread (replaces tx_busy + io pool dispatch) ---
     TxRequestQueue tx_queue(cfg.tx_queue_depth);
@@ -798,9 +802,9 @@ int main(int argc, char* argv[]) {
                 }
             } else if (type == "lora_config") {
                 udp.subscribe(sender);
-                handle_lora_config(msg, cfg, rx_blocks, udp, sender);
+                handle_lora_config(msg, cfg, rx_blocks, udp, sender, device_serial);
                 // Rebuild config_cbor so new subscribers get the updated config
-                config_cbor = build_config_cbor(cfg);
+                config_cbor = build_config_cbor(cfg, device_serial);
             } else if (type == "subscribe") {
                 // Optional sync_word filter — array of uint16 or single uint
                 std::vector<uint16_t> filter;
