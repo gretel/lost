@@ -232,30 +232,34 @@ const boost::ut::suite<"FrameSink text output"> text_tests = [] {
             runFrameSink(payload, frame_tag);
         });
 
-        // Should contain key format elements
-        expect(output.find("SF") != std::string::npos)
-            << "output should contain 'SF': " << output;
-        expect(output.find("bytes") != std::string::npos)
-            << "output should contain 'bytes': " << output;
-        expect(output.find("CR=4/") != std::string::npos)
-            << "output should contain 'CR=4/': " << output;
-        expect(output.find("CRC_OK") != std::string::npos)
-            << "output should contain 'CRC_OK': " << output;
+        // Should contain key=value format elements
+        expect(output.find("sf=") != std::string::npos)
+            << "output should contain 'sf=': " << output;
+        expect(output.find("bw=") != std::string::npos)
+            << "output should contain 'bw=': " << output;
+        expect(output.find("bytes=") != std::string::npos)
+            << "output should contain 'bytes=': " << output;
+        expect(output.find("cr=4/") != std::string::npos)
+            << "output should contain 'cr=4/': " << output;
+        expect(output.find("crc=OK") != std::string::npos)
+            << "output should contain 'crc=OK': " << output;
         expect(output.find("sync=0x") != std::string::npos)
             << "output should contain 'sync=0x': " << output;
-        expect(output.find("SNR=") != std::string::npos)
-            << "output should contain 'SNR=': " << output;
+        expect(output.find("snr=") != std::string::npos)
+            << "output should contain 'snr=': " << output;
+        expect(output.find("seq=#") != std::string::npos)
+            << "output should contain 'seq=#': " << output;
 
         // Exactly one frame = exactly one newline in the frame output line.
-        // Filter to lines containing "SF" to avoid scheduler noise.
+        // Filter to lines containing "sf=" to avoid scheduler noise.
         std::size_t frame_lines = 0;
         std::size_t pos = 0;
         while (pos < output.size()) {
             auto nl = output.find('\n', pos);
             if (nl == std::string::npos) nl = output.size();
             auto line = output.substr(pos, nl - pos);
-            if (line.find("SF") != std::string::npos
-                && line.find("bytes") != std::string::npos) {
+            if (line.find("sf=") != std::string::npos
+                && line.find("bytes=") != std::string::npos) {
                 frame_lines++;
             }
             pos = nl + 1;
@@ -304,14 +308,14 @@ const boost::ut::suite<"FrameSink text output"> text_tests = [] {
             runFrameSink(payload, frame_tag);
         });
 
-        // Find the frame line (contains "bytes")
+        // Find the frame line (contains "bytes=")
         std::string frame_line;
         std::size_t pos = 0;
         while (pos < output.size()) {
             auto nl = output.find('\n', pos);
             if (nl == std::string::npos) nl = output.size();
             auto line = output.substr(pos, nl - pos);
-            if (line.find("bytes") != std::string::npos) {
+            if (line.find("bytes=") != std::string::npos) {
                 frame_line = line;
                 break;
             }
@@ -319,7 +323,7 @@ const boost::ut::suite<"FrameSink text output"> text_tests = [] {
         }
 
         expect(!frame_line.empty()) << "should have a frame line";
-        // >64 bytes payload → hex is truncated with "..."
+        // >32 bytes payload → hex is truncated with "..."
         expect(frame_line.find("...") != std::string::npos)
             << "long payload should be truncated with '...': " << frame_line;
     };

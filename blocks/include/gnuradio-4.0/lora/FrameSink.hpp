@@ -242,23 +242,34 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     [[nodiscard]] uint8_t effectiveSf() const { return _frame_sf > 0 ? _frame_sf : phy_sf; }
 
     void printFrameText(const std::string& ts) {
-        constexpr std::size_t kMaxHexBytes = 64;
+        constexpr std::size_t kMaxHexBytes = 32;
         auto pay_actual = std::min(static_cast<std::size_t>(_pay_len), _frame.size());
         auto hex_len = std::min(pay_actual, kMaxHexBytes);
         auto hex = to_hex(std::span<const uint8_t>(_frame.data(), hex_len));
         bool truncated = pay_actual > kMaxHexBytes;
 
-        std::fprintf(stderr, "[%s] #%u  SF%u  %u bytes  CR=4/%u  %s  sync=0x%02X  SNR=%.1f dB",
-                    ts.c_str(), _frame_count,
-                    effectiveSf(), _pay_len, 4u + _cr,
-                    _crc_valid ? "CRC_OK" : "CRC_FAIL",
-                    sync_word, _snr_db);
-        if (_noise_floor_db > -999.0) std::fprintf(stderr, "  NF=%.1f dBFS", _noise_floor_db);
-        if (_peak_db > -999.0)        std::fprintf(stderr, "  peak=%.1f dBFS", _peak_db);
-        if (_snr_db_td > -999.0)      std::fprintf(stderr, "  SNR_td=%.1f dB", _snr_db_td);
-        if (_rx_channel >= 0)         std::fprintf(stderr, "  ch=%d", static_cast<int>(_rx_channel));
-        if (!label.empty())           std::fprintf(stderr, "  [%s]", label.c_str());
-        if (_is_downchirp)            std::fprintf(stderr, "  (downchirp)");
+        // Format BW as human-readable (e.g. "62.5k", "125k", "250k")
+        char bw_str[16];
+        if (phy_bw >= 1000 && (phy_bw % 1000) != 0) {
+            std::snprintf(bw_str, sizeof(bw_str), "%.1fk", static_cast<double>(phy_bw) / 1000.0);
+        } else if (phy_bw >= 1000) {
+            std::snprintf(bw_str, sizeof(bw_str), "%uk", phy_bw / 1000);
+        } else {
+            std::snprintf(bw_str, sizeof(bw_str), "%u", phy_bw);
+        }
+
+        std::fprintf(stderr,
+            "[%s] seq=#%u sf=%u bw=%s bytes=%u cr=4/%u crc=%s sync=0x%02X snr=%.1fdB",
+            ts.c_str(), _frame_count,
+            effectiveSf(), bw_str, _pay_len, 4u + _cr,
+            _crc_valid ? "OK" : "FAIL",
+            sync_word, _snr_db);
+        if (_noise_floor_db > -999.0) std::fprintf(stderr, " nf=%.1fdBFS", _noise_floor_db);
+        if (_peak_db > -999.0)        std::fprintf(stderr, " peak=%.1fdBFS", _peak_db);
+        if (_snr_db_td > -999.0)      std::fprintf(stderr, " snr_td=%.1fdB", _snr_db_td);
+        if (_rx_channel >= 0)         std::fprintf(stderr, " ch=%d", static_cast<int>(_rx_channel));
+        if (!label.empty())           std::fprintf(stderr, " proto=%s", label.c_str());
+        if (_is_downchirp)            std::fprintf(stderr, " downchirp");
         std::fprintf(stderr, "  %s%s\n", hex.c_str(), truncated ? "..." : "");
     }
 

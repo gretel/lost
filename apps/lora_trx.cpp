@@ -279,14 +279,14 @@ void handle_tx_request(const gr::lora::cbor::Map& msg, const TrxConfig& cfg,
     }
 
     double airtime = static_cast<double>(iq.size()) / static_cast<double>(cfg.rate);
-    constexpr std::size_t kMaxHexBytes = 64;
+    constexpr std::size_t kMaxHexBytes = 32;
     auto hex_len = std::min(payload.size(), kMaxHexBytes);
     auto hex = gr::lora::FrameSink::to_hex(
         std::span<const uint8_t>(payload.data(), hex_len));
     gr::lora::log_ts("info ", "lora_trx",
-        "TX %zu bytes SF%u CR4/%u sync=0x%02X repeat=%d %.1f ms%s  %s%s",
+        "TX bytes=%zu sf=%u cr=4/%u sync=0x%02X repeat=%d airtime=%.1fms%s  %s%s",
         payload.size(), cfg.sf, 4u + cr, sync, repeat,
-        airtime * 1000.0, dry_run ? " (dry)" : "",
+        airtime * 1000.0, dry_run ? " dry" : "",
         hex.c_str(), payload.size() > kMaxHexBytes ? "..." : "");
 
     // Push TX IQ to spectrum tap (if connected) for waterfall display
