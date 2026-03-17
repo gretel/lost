@@ -131,8 +131,8 @@ struct TrxConfig {
     RawConfig                 raw{};             ///< passthrough sections for Python scripts
 };
 
-/// Scan-specific configuration (parsed from [set_*] sections).
-/// Shares device/radio fields with TrxConfig; adds scan parameters.
+/// Scan-specific configuration (parsed from [scan] section).
+/// Shares [device] and [radio_*] with TrxConfig; adds scan parameters.
 struct ScanSetConfig {
     // From [device]
     std::string  device{"uhd"};

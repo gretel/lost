@@ -1,136 +1,45 @@
-# lora_trx configuration
+# gr4-lora configuration
 #
-# [device]      SDR hardware: driver, parameters, sample rate, clock
-# [network]     UDP I/O: listen address, port, status, TX queue, LBT
-# [aggregator]  lora_agg.py: upstream/listen addresses, combining window
-# [codec_*]     LoRa PHY parameters: bw, cr, sync_word, preamble_len
-# [radio_*]     RF frontend: frequency, channels, gains
-# [set_*]       binds a codec to a radio; REQUIRES [[set_*.decode]] entries
-# [meshcore]    MeshCore protocol settings (Python scripts only)
-# [logging]     Python script log configuration
+# Shared by lora_trx and lora_scan.  Each binary reads only its own
+# mode section ([trx] or [scan]) plus the shared [device], [radio_*],
+# [codec_*], and [logging] sections.
 #
-# The first [set_*] (by file order) is used at runtime.
+# ── Section overview ──
 #
-# RX decode capabilities (automatic, no per-parameter config needed):
-#   SF:  7-12  (simultaneous, per MultiSfDecoder lane)
-#   CR:  4/5 through 4/8  (auto-detected from explicit header)
-#   BW:  per decode_bws list (one MultiSfDecoder per BW via Splitter)
-#   LDRO: automatic (from symbol duration vs 16ms threshold)
-#
-# TX uses the codec's sf/cr/bw for transmission.
+# [device]        SDR hardware: driver, parameters, clock source
+# [logging]       Log level
+# [radio_*]       RF frontend: frequency, channels, gains
+# [codec_*]       LoRa PHY / TX parameters: sf, bw, cr, sync_word, preamble
+# [trx]           Transceiver mode (lora_trx)
+# [trx.network]   UDP I/O: listen, port, LBT, TX queue
+# [[trx.decode]]  RX decode chains: sync_word, label, block overrides
+# [scan]          Scanner mode (lora_scan)
+# [meshcore]      MeshCore protocol (Python scripts only)
+# [aggregator]    lora_agg.py diversity combiner
 #
 # B210/B220 channel mapping:
 #   0 = TRX_A  (TX/RX)    1 = RX_A  (RX only)
 #   2 = RX_B   (RX only)  3 = TRX_B (TX/RX)
 # TX only on channels 0 and 3.  Both chains share one PLL per direction.
 
+# ── Hardware ─────────────────────────────────────────────────────────────────
+
 [device]
 driver = "uhd"
 param  = "type=b200"
-rate   = 250000
-# internal, external, gpsdo
-clock  = "external"
-
-[network]
-udp_listen      = "127.0.0.1"
-udp_port        = 5556          # lora_trx raw port; lora_agg subscribes here
-status_interval = 10
-
-# Listen-before-talk: defer TX until MultiSfDecoder detects no channel activity
-lbt            = true
-lbt_timeout_ms = 2000           # max wait for channel clear before rejecting TX
-tx_queue_depth = 8              # max queued TX requests (rejects when full)
-
-[aggregator]
-upstream  = "127.0.0.1:5556"   # lora_trx raw port (lora_agg subscribes here)
-listen    = "127.0.0.1:5555"   # consumer-facing port served by lora_agg
-window_ms = 200                 # diversity combining window (ms)
-
-[meshcore]
-# port              = 7834                         # TCP listen port (avoid 5000 on macOS)
-name          = "DO2THX \U0001f4e1"                    # node display name (SET_ADVERT_NAME)
-# model             = "lora_trx"                   # device model string in DEVICE_INFO
-# identity_file     = "scripts/data/meshcore/identity.bin"
-# keys_dir          = "scripts/data/meshcore/keys"
-# channels_dir      = "scripts/data/meshcore/channels"
-# contacts_dir      = "scripts/data/meshcore/contacts"
-lat               = 53.54513                        # latitude  (decimal degrees)
-lon               = 9.94896                         # longitude (decimal degrees)
-# client_repeat     = 0                            # 0=off, 1=on (only valid at 433/869/918 MHz)
-# path_hash_mode    = 0                            # 0-2 (path hash mode for flood TX)
-# autoadd_config    = 0                            # bitmask: 0x01=overwrite oldest, 0x02=chat,
-#                                                  #   0x04=repeater, 0x08=room, 0x10=sensor
-# autoadd_max_hops  = 0                            # 0-64 (max hops for auto-add contacts)
-flood_scope       = "de-hh"                        # flood scope (SET_FLOOD_SCOPE)
+clock  = "external"           # internal, external, gpsdo
 
 [logging]
 level = "INFO"
 
-# --- PHY codecs ---
-# Codec defines TX parameters (sf, bw, cr) and shared RX defaults (sync_word, preamble).
-# RX is multi-SF (7-12) and multi-CR (auto) — only BW and sync_word matter for RX matching.
-
-[codec_meshcore_868]
-sf           = 8               # TX spreading factor (RX decodes SF7-12 automatically)
-bw           = 62500           # TX bandwidth (RX BWs configured via decode_bws)
-cr           = 8               # TX coding rate 4/N (RX auto-detects CR from header)
-sync_word    = 0x12
-preamble_len = 8
-
-# --- Radio frontends ---
+# ── Radio frontends ──────────────────────────────────────────────────────────
 
 [radio_868]
 freq       = 869618000
 rx_channel = [1, 2]
 tx_channel = 0
-rx_gain    = 40
-tx_gain    = 75
-
-# --- Active network sets ---
-# The first [set_*] (by file order) is used at runtime.
-#
-# [[set_*.decode]] entries: one per sync_word you want to receive.
-# Each entry creates one MultiSfDecoder (SF7-12, all CRs) per BW per radio channel.
-#
-# decode_bws: list of bandwidths to decode simultaneously.
-# Each BW gets its own MultiSfDecoder via Splitter. os = sample_rate / bw.
-# Omit for single-BW decode (uses codec bw only).
-# All BWs must divide sample_rate evenly.
-
-[set_meshcore_868]
-name  = "MeshCore 868 MHz"
-codec = "codec_meshcore_868"
-radio = "radio_868"
-decode_bws = [62500, 125000, 250000]   # decode all three EU868 LoRa BWs
-
-[[set_meshcore_868.decode]]
-label      = "meshcore"
-sync_word  = 0x12                       # MeshCore sync word
-min_snr_db = -19.0
-# energy_thresh = 1e-6
-# max_symbols   = 600
-
-# Example: also decode Meshtastic (different sync word) on the same radio
-# [[set_meshcore_868.decode]]
-# label      = "meshtastic"
-# sync_word  = 0x2B
-# min_snr_db = -15.0
-
-# --- Inactive networks (examples) ---
-
-# [codec_meshcore_433]
-# sf           = 11
-# bw           = 250000
-# cr           = 5
-# sync_word    = 0x12
-# preamble_len = 8
-
-# [codec_reticulum_868]
-# sf           = 8
-# bw           = 125000
-# cr           = 5
-# sync_word    = 0x12
-# preamble_len = 8
+rx_gain    = 36
+tx_gain    = 80
 
 # [radio_433]
 # freq       = 433650000
@@ -139,29 +48,93 @@ min_snr_db = -19.0
 # rx_gain    = 34
 # tx_gain    = 50
 
-# [set_meshcore_433]
-# name  = "MeshCore 433 MHz"
-# codec = "codec_meshcore_433"
-# radio = "radio_433"
-# decode_bws = [125000, 250000]
-# [[set_meshcore_433.decode]]
-# label      = "meshcore"
-# sync_word  = 0x12
+# ── PHY codecs (TX parameters) ──────────────────────────────────────────────
+# Codec defines TX parameters.  RX is multi-SF (7-12) and multi-CR (auto) —
+# only BW and sync_word matter for RX matching.
+
+[codec_meshcore_868]
+sf           = 8               # TX spreading factor
+bw           = 62500           # TX bandwidth
+cr           = 8               # TX coding rate 4/N
+sync_word    = 0x12
+preamble_len = 8
+
+# [codec_meshcore_433]
+# sf           = 11
+# bw           = 250000
+# cr           = 5
+# sync_word    = 0x12
+# preamble_len = 8
+
+# ── Transceiver mode (lora_trx) ─────────────────────────────────────────────
+#
+# RX decode capabilities (automatic):
+#   SF:   7-12  (simultaneous, per MultiSfDecoder lane)
+#   CR:   4/5 through 4/8  (auto-detected from explicit header)
+#   BW:   per decode_bws list (one MultiSfDecoder per BW via Splitter)
+#   LDRO: automatic (from symbol duration vs 16ms threshold)
+#
+# TX uses the codec's sf/cr/bw for transmission.
+
+[trx]
+name       = "MeshCore 868 MHz"
+radio      = "radio_868"
+codec      = "codec_meshcore_868"
+rate       = 250000                     # RX/TX sample rate (Hz)
+decode_bws = [62500, 125000, 250000]    # RX BWs (one MultiSfDecoder per BW)
+
+[trx.network]
+udp_listen      = "127.0.0.1"
+udp_port        = 5556
+status_interval = 10
+lbt             = true                  # listen-before-talk
+lbt_timeout_ms  = 2000
+tx_queue_depth  = 8
+
+# Each [[trx.decode]] entry creates one decode chain (SF7-12, all CRs) per BW.
+# Required keys: label, sync_word.  Optional: min_snr_db, energy_thresh, max_symbols.
+
+[[trx.decode]]
+label      = "meshcore"
+sync_word  = 0x12
+min_snr_db = -19.0
+
+# Example: also decode Meshtastic (different sync word) on the same radio
+# [[trx.decode]]
+# label      = "meshtastic"
+# sync_word  = 0x2B
 # min_snr_db = -15.0
 
-# --- Scan configuration (used by lora_scan) ---
-# Scan sets reuse [device] and [radio_*] sections above.
-# Scan sets must NOT have a 'codec' key (that's how they're distinguished from TRX sets).
-# Device-level scan defaults: l1_rate, master_clock can go in [device] or per-set.
+# ── MeshCore protocol (Python scripts) ──────────────────────────────────────
 
-[set_scan_eu868]
-name       = "EU868 scan"
-radio      = "radio_868"
-freq_start = 863000000
-freq_stop  = 870000000
-bws        = [62500, 125000, 250000]
-os_factor  = 4
-min_ratio  = 8.0
-settle_ms  = 5
-# sweeps     = 0          # 0 = infinite (default)
-# layer1_only = false     # set true for energy-only mode
+[meshcore]
+name        = "DO2THX 📡"
+lat         = 53.54513
+lon         = 9.94896
+flood_scope = "de-hh"
+
+# ── Aggregator (lora_agg.py) ────────────────────────────────────────────────
+
+[aggregator]
+upstream  = "127.0.0.1:5556"
+listen    = "127.0.0.1:5555"
+window_ms = 200
+
+# ── Scanner mode (lora_scan) ────────────────────────────────────────────────
+#
+# Layer 1: wideband FFT energy scan → candidate channels
+# Layer 2: per-channel CAD dwell with multi-SF detection
+
+[scan]
+name         = "EU868 scan"
+radio        = "radio_868"
+freq_start   = 863000000
+freq_stop    = 870000000
+bws          = [62500, 125000, 250000]  # channel BWs to probe
+l1_rate      = 16000000                 # L1 wideband sample rate
+master_clock = 32000000                 # FPGA master clock rate
+os_factor    = 4                        # oversampling factor
+min_ratio    = 8.0                      # CAD detection threshold
+settle_ms    = 5                        # PLL settle delay (ms)
+# sweeps     = 0                        # 0 = infinite (default)
+# layer1_only = false                   # set true for energy-only mode
