@@ -189,7 +189,9 @@ inline int create_udp_socket(const std::string& listen_addr, uint16_t port) {
     }
 
     int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags >= 0) {
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
 
     gr::lora::log_ts("info ", "udp", "bound %s:%u%s",
         listen_addr.c_str(), port, use_v6 ? " (IPv6 dual-stack)" : "");

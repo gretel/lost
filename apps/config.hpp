@@ -146,7 +146,7 @@ struct ScanSetConfig {
     double       freq_stop{870.0e6};        ///< scan band stop
     double       gain{40.0};
 
-    // From [set_*] scan keys
+    // From [scan]
     std::vector<uint32_t> bws{62500, 125000, 250000};  ///< BWs to probe
     uint32_t     os_factor{4};              ///< oversampling factor
     float        min_ratio{8.0F};           ///< CAD detection threshold
@@ -160,7 +160,8 @@ struct ScanSetConfig {
     uint16_t     udp_port{5557};            ///< separate from lora_trx (5556)
 
     [[nodiscard]] double min_bw() const {
-        return static_cast<double>(*std::ranges::min_element(bws));
+        return bws.empty() ? 62500.0
+                           : static_cast<double>(*std::ranges::min_element(bws));
     }
 };
 

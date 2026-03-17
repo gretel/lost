@@ -885,6 +885,7 @@ int main(int argc, char** argv) {
         }
         sched.requestStop();
         sched_thread.join();
+        if (udp.fd >= 0) ::close(udp.fd);
         std::quick_exit(0);
     }
 
@@ -904,7 +905,7 @@ int main(int argc, char** argv) {
     if (scanRange > usableBw) {
         gr::lora::log_ts("error", "lora_scan",
             "scan range %.1f MHz exceeds usable BW %.1f MHz at L1 rate %.1f MS/s "
-            "-- increase --l1-rate or narrow --freq-start/--freq-stop",
+            "-- increase [scan] l1_rate or narrow freq_start/freq_stop in config.toml",
             scanRange / 1.0e6, usableBw / 1.0e6, cfg.l1_rate / 1.0e6);
         sched.requestStop();
         sched_thread.join();
@@ -1067,6 +1068,7 @@ int main(int argc, char** argv) {
 
     sched.requestStop();
     sched_thread.join();
+    if (udp.fd >= 0) ::close(udp.fd);
     std::quick_exit(0);
     } catch (const std::exception& e) {
         if (savedStdout >= 0) {

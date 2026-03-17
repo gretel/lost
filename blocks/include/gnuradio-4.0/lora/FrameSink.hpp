@@ -318,6 +318,8 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
 
         cbor::kv_bytes(buf, "payload", _frame.data(), pay_len_actual);
         cbor::kv_uint(buf, "payload_len", _pay_len);
+        // NOTE: crc_valid and cr are intentional top-level duplicates of phy.*
+        // for backward compatibility with Python consumers (see cbor-schemas.md).
         cbor::kv_bool(buf, "crc_valid", _crc_valid);
         cbor::kv_uint(buf, "cr", _cr);
         cbor::kv_bool(buf, "is_downchirp", _is_downchirp);
