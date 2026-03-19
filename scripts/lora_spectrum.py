@@ -581,7 +581,10 @@ def main() -> None:
     try:
         while True:
             data, _ = sock.recvfrom(65536)
-            msg = cbor2.loads(data)
+            try:
+                msg = cbor2.loads(data)
+            except Exception:
+                continue  # skip malformed CBOR
             if not isinstance(msg, dict):
                 continue
 

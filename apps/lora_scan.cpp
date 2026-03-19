@@ -794,15 +794,12 @@ static void emitDataSetCbor(const gr::DataSet<float>& ds) {
         cb::kv_bytes(buf, "channels", floatBuf.data(), floatBuf.size());
         cb::kv_uint(buf, "n_channels", nCh);
 
-        // hot channels (indices where energy > median*6 — approximated as n_hot count)
+        // hot and detections: empty arrays (detections emitted as separate events)
         cb::encode_text(buf, "hot");
-        const auto nHot = static_cast<std::size_t>(getInt("n_hot"));
-        cb::encode_array_begin(buf, nHot);
-        // We don't have the exact indices; emit empty for now
-        // (lora_spectrum.py uses hot array for highlighting only)
+        cb::encode_array_begin(buf, 0);
 
         cb::encode_text(buf, "detections");
-        cb::encode_array_begin(buf, 0);  // detections emitted separately
+        cb::encode_array_begin(buf, 0);
 
     } else if (typeStr == "scan_detect") {
         auto getInt = [&](const std::string& key) -> int64_t {
