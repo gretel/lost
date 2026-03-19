@@ -194,7 +194,6 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         }
 
         // 4. State machine
-        std::size_t detectPublished   = 0;
         std::size_t spectrumPublished = 0;
 
         switch (_state) {
@@ -223,7 +222,6 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         }
 
         case ScanState::Report:
-            detectPublished   = emitDetections(detectOutPort);
             spectrumPublished = emitSpectrum(spectrumOutPort);
             _sweepCount++;
             resetAccumulation();
@@ -231,7 +229,6 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             break;
         }
 
-        detectOutPort.publish(detectPublished);
         spectrumOutPort.publish(spectrumPublished);
         return gr::work::Status::OK;
     }
@@ -353,40 +350,6 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
 
     // --- output ---
 
-    [[nodiscard]] std::size_t emitDetections(gr::OutputSpanLike auto& outPort) noexcept {
-        std::size_t published = 0;
-        auto outSpan = std::span(outPort);
-
-        for (const auto& result : _probeResults) {
-            if (published >= outSpan.size()) break;
-
-            gr::DataSet<float> ds;
-            ds.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-
-            ds.signal_names.emplace_back("detection");
-            ds.signal_units.emplace_back("ratio");
-            ds.signal_values = {result.ratio};
-            ds.extents       = {1};
-
-            ds.axis_names.emplace_back("frequency");
-            ds.axis_units.emplace_back("Hz");
-            ds.axis_values.push_back({static_cast<float>(result.freq)});
-
-            ds.meta_information.resize(1);
-            ds.meta_information[0]["type"]    = std::string("scan_detect");
-            ds.meta_information[0]["sf"]      = static_cast<int64_t>(result.sf);
-            ds.meta_information[0]["bw"]      = static_cast<float>(result.bw);
-            ds.meta_information[0]["ratio"]   = static_cast<float>(result.ratio);
-            ds.meta_information[0]["freq"]    = result.freq;
-            ds.meta_information[0]["sweep"]   = static_cast<int64_t>(_sweepCount);
-
-            outSpan[published] = std::move(ds);
-            ++published;
-        }
-        return published;
-    }
-
     [[nodiscard]] std::size_t emitSpectrum(gr::OutputSpanLike auto& outPort) noexcept {
         auto outSpan = std::span(outPort);
         if (outSpan.empty() || _nChannels == 0) return 0;
@@ -416,10 +379,32 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         }
 
         ds.meta_information.resize(1);
-        ds.meta_information[0]["type"]       = std::string("scan_spectrum");
-        ds.meta_information[0]["sweep"]      = static_cast<int64_t>(_sweepCount);
-        ds.meta_information[0]["n_hot"]      = static_cast<int64_t>(_hotChannels.size());
+        ds.meta_information[0]["type"]        = std::string("scan_spectrum");
+        ds.meta_information[0]["sweep"]       = static_cast<int64_t>(_sweepCount);
+        ds.meta_information[0]["n_hot"]       = static_cast<int64_t>(_hotChannels.size());
         ds.meta_information[0]["n_snapshots"] = static_cast<int64_t>(_snapshotCount);
+        ds.meta_information[0]["n_det"]       = static_cast<int64_t>(_probeResults.size());
+
+        // Embed hot channel indices as comma-separated string
+        // (pmt::Value doesn't support vector<int64_t>, so we serialize)
+        {
+            std::string hotStr;
+            for (std::size_t i = 0; i < _hotChannels.size(); ++i) {
+                if (i > 0) hotStr += ',';
+                hotStr += std::to_string(_hotChannels[i]);
+            }
+            ds.meta_information[0]["hot_indices"] = std::move(hotStr);
+        }
+
+        // Embed detection results as indexed metadata fields
+        for (std::size_t i = 0; i < _probeResults.size(); ++i) {
+            const auto& r = _probeResults[i];
+            const auto idx = std::to_string(i);
+            ds.meta_information[0][std::pmr::string("det" + idx + "_freq")]  = r.freq;
+            ds.meta_information[0][std::pmr::string("det" + idx + "_sf")]    = static_cast<int64_t>(r.sf);
+            ds.meta_information[0][std::pmr::string("det" + idx + "_bw")]    = static_cast<float>(r.bw);
+            ds.meta_information[0][std::pmr::string("det" + idx + "_ratio")] = static_cast<float>(r.ratio);
+        }
 
         outSpan[0] = std::move(ds);
         return 1;
@@ -433,9 +418,9 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     }
 
     [[nodiscard]] double channelCenterFreq(uint32_t ch) const noexcept {
-        const float usableBw  = sample_rate * 0.8f;
-        const float bandStart = center_freq - usableBw / 2.f;
-        return static_cast<double>(bandStart + (static_cast<float>(ch) + 0.5f) * channel_bw);
+        const double usableBw  = static_cast<double>(sample_rate) * 0.8;
+        const double bandStart = static_cast<double>(center_freq) - usableBw / 2.0;
+        return bandStart + (static_cast<double>(ch) + 0.5) * static_cast<double>(channel_bw);
     }
 };
 

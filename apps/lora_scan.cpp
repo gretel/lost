@@ -762,20 +762,61 @@ static void emitDataSetCbor(const gr::DataSet<float>& ds) {
     auto typeIt = meta.find("type");
     if (typeIt == meta.end()) return;
     const auto typeStr = typeIt->second.value_or(std::string{""});
+    if (typeStr != "scan_spectrum") return;
+
+    const auto nCh = static_cast<uint32_t>(ds.signal_values.size());
+    if (nCh == 0) return;
+
+    auto getInt = [&](const std::string& key) -> int64_t {
+        auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<int64_t>(0) : 0;
+    };
+    auto getMetaFloat = [&](const std::string& key) -> float {
+        auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<float>(0.f) : 0.f;
+    };
+    auto getMetaDouble = [&](const std::string& key) -> double {
+        auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<double>(0.0) : 0.0;
+    };
 
     namespace cb = gr::lora::cbor;
-    std::vector<uint8_t> buf;
-    buf.reserve(512);
 
-    if (typeStr == "scan_spectrum") {
-        const auto nCh = static_cast<uint32_t>(ds.signal_values.size());
-        if (nCh == 0) return;
+    // --- Parse hot channel indices from comma-separated string ---
+    std::vector<uint64_t> hotIndices;
+    {
+        auto hotIt = meta.find("hot_indices");
+        if (hotIt != meta.end()) {
+            const auto hotStr = hotIt->second.value_or(std::string{""});
+            std::size_t pos = 0;
+            while (pos < hotStr.size()) {
+                auto end = hotStr.find(',', pos);
+                if (end == std::string::npos) end = hotStr.size();
+                if (end > pos) {
+                    hotIndices.push_back(
+                        static_cast<uint64_t>(std::stoul(hotStr.substr(pos, end - pos))));
+                }
+                pos = end + 1;
+            }
+        }
+    }
 
-        auto getInt = [&](const std::string& key) -> int64_t {
-            auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<int64_t>(0) : 0;
-        };
+    // --- Parse detections from indexed metadata fields ---
+    const auto nDet = static_cast<std::size_t>(getInt("n_det"));
+    struct Det { uint64_t freq; uint64_t sf; uint64_t bw; double ratio; };
+    std::vector<Det> detections;
+    for (std::size_t i = 0; i < nDet; ++i) {
+        const auto prefix = std::string("det") + std::to_string(i) + "_";
+        Det d;
+        d.freq  = static_cast<uint64_t>(getMetaDouble(prefix + "freq"));
+        d.sf    = static_cast<uint64_t>(getInt(prefix + "sf"));
+        d.bw    = static_cast<uint64_t>(getMetaFloat(prefix + "bw"));
+        d.ratio = static_cast<double>(getMetaFloat(prefix + "ratio"));
+        detections.push_back(d);
+    }
 
-        // freq_min and freq_step from axis values
+    // --- Emit scan_spectrum CBOR (matches legacy format) ---
+    {
+        std::vector<uint8_t> buf;
+        buf.reserve(512);
+
         float freqMin  = (!ds.axis_values.empty() && !ds.axis_values[0].empty())
                          ? ds.axis_values[0][0] : 0.f;
         float freqStep = (!ds.axis_values.empty() && ds.axis_values[0].size() > 1)
@@ -788,43 +829,44 @@ static void emitDataSetCbor(const gr::DataSet<float>& ds) {
         cb::kv_uint(buf, "freq_min", static_cast<uint64_t>(freqMin));
         cb::kv_uint(buf, "freq_step", static_cast<uint64_t>(freqStep));
 
-        // channels as raw float bytes
         std::vector<uint8_t> floatBuf(nCh * sizeof(float));
         std::memcpy(floatBuf.data(), ds.signal_values.data(), nCh * sizeof(float));
         cb::kv_bytes(buf, "channels", floatBuf.data(), floatBuf.size());
         cb::kv_uint(buf, "n_channels", nCh);
 
-        // hot and detections: empty arrays (detections emitted as separate events)
         cb::encode_text(buf, "hot");
-        cb::encode_array_begin(buf, 0);
+        cb::encode_array_begin(buf, hotIndices.size());
+        for (auto idx : hotIndices) {
+            cb::encode_uint(buf, idx);
+        }
 
         cb::encode_text(buf, "detections");
-        cb::encode_array_begin(buf, 0);
+        cb::encode_array_begin(buf, detections.size());
+        for (const auto& d : detections) {
+            cb::encode_map_begin(buf, 4);
+            cb::kv_uint(buf, "freq", d.freq);
+            cb::kv_uint(buf, "sf", d.sf);
+            cb::kv_uint(buf, "bw", d.bw);
+            cb::kv_float64(buf, "ratio", d.ratio);
+        }
 
-    } else if (typeStr == "scan_detect") {
-        auto getInt = [&](const std::string& key) -> int64_t {
-            auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<int64_t>(0) : 0;
-        };
-        auto getFloat = [&](const std::string& key) -> float {
-            auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<float>(0.f) : 0.f;
-        };
-        auto getDouble = [&](const std::string& key) -> double {
-            auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<double>(0.0) : 0.0;
-        };
-
-        cb::encode_map_begin(buf, 7);
-        cb::kv_text(buf, "type", "scan_detection");
-        cb::kv_text(buf, "ts", gr::lora::ts_now());
-        cb::kv_uint(buf, "sweep", static_cast<uint64_t>(getInt("sweep")));
-        cb::kv_uint(buf, "freq", static_cast<uint64_t>(getDouble("freq")));
-        cb::kv_uint(buf, "sf", static_cast<uint64_t>(getInt("sf")));
-        cb::kv_uint(buf, "bw", static_cast<uint64_t>(getFloat("bw")));
-        cb::kv_float64(buf, "ratio", static_cast<double>(getFloat("ratio")));
-    } else {
-        return;
+        sendCbor(buf);
     }
 
-    sendCbor(buf);
+    // --- Emit scan_sweep_end CBOR (updates header in lora_spectrum.py) ---
+    {
+        std::vector<uint8_t> buf;
+        buf.reserve(128);
+
+        cb::encode_map_begin(buf, 5);
+        cb::kv_text(buf, "type", "scan_sweep_end");
+        cb::kv_text(buf, "ts", gr::lora::ts_now());
+        cb::kv_uint(buf, "sweep", static_cast<uint64_t>(getInt("sweep")));
+        cb::kv_uint(buf, "det", static_cast<uint64_t>(nDet));
+        cb::kv_uint(buf, "hot", static_cast<uint64_t>(hotIndices.size()));
+
+        sendCbor(buf);
+    }
 }
 
 static int streaming_main(ScanSetConfig& cfg) {

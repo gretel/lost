@@ -406,12 +406,9 @@ inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const Sc
         gr::lora::log_ts("error", "graph", "connect source -> controller failed");
     }
 
-    // ScanSink: receives detections and spectrum from ScanController
+    // ScanSink: receives spectrum (with embedded detections) from ScanController
     auto& sink = graph.emplaceBlock<gr::lora::ScanSink>({});
 
-    if (!ok(graph.connect<"detect_out", "detections">(controller, sink))) {
-        gr::lora::log_ts("error", "graph", "connect controller.detect_out -> sink.detections failed");
-    }
     if (!ok(graph.connect<"spectrum_out", "spectrum">(controller, sink))) {
         gr::lora::log_ts("error", "graph", "connect controller.spectrum_out -> sink.spectrum failed");
     }
