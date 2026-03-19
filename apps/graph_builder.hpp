@@ -367,7 +367,8 @@ inline ScanGraph build_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg,
 /// Build the streaming scan graph: SoapySource → ScanController → ScanSink
 /// No hardware retune — L2 uses digital channelization from the wideband stream.
 /// ScanController handles both L1 energy (internal FFT) and L2 CAD.
-inline void build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg) {
+/// Returns reference to ScanSink for callback setup (must be set before exchange()).
+inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg) {
     auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
 
     const double centerFreq = cfg.center_freq();
@@ -414,6 +415,8 @@ inline void build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cf
     if (!ok(graph.connect<"spectrum_out", "spectrum">(controller, sink))) {
         gr::lora::log_ts("error", "graph", "connect controller.spectrum_out -> sink.spectrum failed");
     }
+
+    return sink;
 }
 
 }  // namespace lora_graph

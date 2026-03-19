@@ -2,9 +2,8 @@
 #ifndef GNURADIO_LORA_SCAN_SINK_HPP
 #define GNURADIO_LORA_SCAN_SINK_HPP
 
-#include <chrono>
-#include <complex>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -16,13 +15,16 @@
 namespace gr::lora {
 
 struct ScanSink : gr::Block<ScanSink> {
-    using Description = Doc<"Sink for scan detection results and spectrum data. Logs detections to stderr.">;
+    using Description = Doc<"Sink for scan results. Logs detections and forwards DataSets via callback.">;
 
     gr::PortIn<gr::DataSet<float>, gr::Async> detections;
     gr::PortIn<gr::DataSet<float>, gr::Async> spectrum;
 
     uint32_t _detectionCount{0};
     uint32_t _sweepCount{0};
+
+    // Callback for each received DataSet (set before graph start, called from scheduler thread)
+    std::function<void(const gr::DataSet<float>&)> _onDataSet;
 
     GR_MAKE_REFLECTABLE(ScanSink, detections, spectrum);
 
@@ -76,6 +78,8 @@ struct ScanSink : gr::Block<ScanSink> {
             getDouble("freq") / 1e6,
             static_cast<double>(getFloat("ratio")),
             static_cast<long long>(getInt("sweep")));
+
+        if (_onDataSet) _onDataSet(ds);
     }
 
     void processSpectrum(const gr::DataSet<float>& ds) noexcept {
@@ -86,6 +90,8 @@ struct ScanSink : gr::Block<ScanSink> {
         if (it != meta.end()) {
             _sweepCount = static_cast<uint32_t>(it->second.value_or<int64_t>(0));
         }
+
+        if (_onDataSet) _onDataSet(ds);
     }
 };
 

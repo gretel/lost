@@ -754,8 +754,91 @@ static std::string ts_short() {
 
 // ─── streaming scan mode ──────────────────────────────────────────────────────
 
+// Convert a DataSet from the streaming pipeline to legacy CBOR and send via UDP/stdout.
+static void emitDataSetCbor(const gr::DataSet<float>& ds) {
+    if (ds.meta_information.empty()) return;
+    const auto& meta = ds.meta_information[0];
+
+    auto typeIt = meta.find("type");
+    if (typeIt == meta.end()) return;
+    const auto typeStr = typeIt->second.value_or(std::string{""});
+
+    namespace cb = gr::lora::cbor;
+    std::vector<uint8_t> buf;
+    buf.reserve(512);
+
+    if (typeStr == "scan_spectrum") {
+        const auto nCh = static_cast<uint32_t>(ds.signal_values.size());
+        if (nCh == 0) return;
+
+        auto getInt = [&](const std::string& key) -> int64_t {
+            auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<int64_t>(0) : 0;
+        };
+
+        // freq_min and freq_step from axis values
+        float freqMin  = (!ds.axis_values.empty() && !ds.axis_values[0].empty())
+                         ? ds.axis_values[0][0] : 0.f;
+        float freqStep = (!ds.axis_values.empty() && ds.axis_values[0].size() > 1)
+                         ? ds.axis_values[0][1] - ds.axis_values[0][0] : 62500.f;
+
+        cb::encode_map_begin(buf, 9);
+        cb::kv_text(buf, "type", "scan_spectrum");
+        cb::kv_text(buf, "ts", gr::lora::ts_now());
+        cb::kv_uint(buf, "sweep", static_cast<uint64_t>(getInt("sweep")));
+        cb::kv_uint(buf, "freq_min", static_cast<uint64_t>(freqMin));
+        cb::kv_uint(buf, "freq_step", static_cast<uint64_t>(freqStep));
+
+        // channels as raw float bytes
+        std::vector<uint8_t> floatBuf(nCh * sizeof(float));
+        std::memcpy(floatBuf.data(), ds.signal_values.data(), nCh * sizeof(float));
+        cb::kv_bytes(buf, "channels", floatBuf.data(), floatBuf.size());
+        cb::kv_uint(buf, "n_channels", nCh);
+
+        // hot channels (indices where energy > median*6 — approximated as n_hot count)
+        cb::encode_text(buf, "hot");
+        const auto nHot = static_cast<std::size_t>(getInt("n_hot"));
+        cb::encode_array_begin(buf, nHot);
+        // We don't have the exact indices; emit empty for now
+        // (lora_spectrum.py uses hot array for highlighting only)
+
+        cb::encode_text(buf, "detections");
+        cb::encode_array_begin(buf, 0);  // detections emitted separately
+
+    } else if (typeStr == "scan_detect") {
+        auto getInt = [&](const std::string& key) -> int64_t {
+            auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<int64_t>(0) : 0;
+        };
+        auto getFloat = [&](const std::string& key) -> float {
+            auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<float>(0.f) : 0.f;
+        };
+        auto getDouble = [&](const std::string& key) -> double {
+            auto it = meta.find(key); return (it != meta.end()) ? it->second.value_or<double>(0.0) : 0.0;
+        };
+
+        cb::encode_map_begin(buf, 7);
+        cb::kv_text(buf, "type", "scan_detection");
+        cb::kv_text(buf, "ts", gr::lora::ts_now());
+        cb::kv_uint(buf, "sweep", static_cast<uint64_t>(getInt("sweep")));
+        cb::kv_uint(buf, "freq", static_cast<uint64_t>(getDouble("freq")));
+        cb::kv_uint(buf, "sf", static_cast<uint64_t>(getInt("sf")));
+        cb::kv_uint(buf, "bw", static_cast<uint64_t>(getFloat("bw")));
+        cb::kv_float64(buf, "ratio", static_cast<double>(getFloat("ratio")));
+    } else {
+        return;
+    }
+
+    sendCbor(buf);
+}
+
 static int streaming_main(ScanSetConfig& cfg) {
     auto& g_stop = lora_apps::install_signal_handler();
+
+    // UDP socket for CBOR broadcast
+    UdpState udp;
+    udp.fd = lora_apps::create_udp_socket(cfg.udp_listen, cfg.udp_port);
+    if (udp.fd < 0) return 1;
+    g_udp = &udp;
+    g_cbor_stdout = cfg.cbor_out;
 
     lora_apps::log_version_banner("lora_scan", GIT_REV);
     gr::lora::log_ts("info ", "lora_scan",
@@ -778,7 +861,12 @@ static int streaming_main(ScanSetConfig& cfg) {
 
     // Build streaming scan graph
     gr::Graph graph;
-    lora_graph::build_streaming_scan_graph(graph, cfg);
+    auto& scanSink = lora_graph::build_streaming_scan_graph(graph, cfg);
+
+    // Wire CBOR output callback (called from scheduler thread)
+    scanSink._onDataSet = [](const gr::DataSet<float>& ds) {
+        emitDataSetCbor(ds);
+    };
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> sched;
     sched.timeout_inactivity_count = 1U;
@@ -810,13 +898,26 @@ static int streaming_main(ScanSetConfig& cfg) {
         sched_done.store(true, std::memory_order_relaxed);
     });
 
-    gr::lora::log_ts("info ", "lora_scan", "streaming — Ctrl+C to stop");
+    gr::lora::log_ts("info ", "lora_scan", "streaming — Ctrl+C to stop (UDP %s:%u)",
+        cfg.udp_listen.c_str(), cfg.udp_port);
 
-    // Main thread: just wait for stop signal, poll overflow counter
+    // Main thread: accept UDP subscriptions, poll overflow counter
     uint64_t lastOvf = 0;
     while (!g_stop.load(std::memory_order_relaxed)
            && !sched_done.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        // Accept UDP subscriptions (non-blocking)
+        {
+            struct sockaddr_storage sender{};
+            socklen_t sender_len = sizeof(sender);
+            char tmp[256];
+            auto n = ::recvfrom(udp.fd, tmp, sizeof(tmp), 0,
+                                reinterpret_cast<struct sockaddr*>(&sender), &sender_len);
+            if (n >= 0) {
+                udp.subscribe(sender);
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         if (soapy_source) {
             using SoapyType = gr::blocks::soapy::SoapyBlock<cf32, 1UL>;
@@ -835,6 +936,7 @@ static int streaming_main(ScanSetConfig& cfg) {
     gr::lora::log_ts("info ", "lora_scan", "stopping...");
     sched.requestStop();
     sched_thread.join();
+    if (udp.fd >= 0) ::close(udp.fd);
     std::quick_exit(0);
 }
 
