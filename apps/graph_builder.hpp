@@ -364,11 +364,11 @@ inline ScanGraph build_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg,
     return sg;
 }
 
-/// Build the streaming scan graph: SoapySource → Splitter → SpectrumTap + ScanController → ScanSink
+/// Build the streaming scan graph: SoapySource → ScanController → ScanSink
 /// No hardware retune — L2 uses digital channelization from the wideband stream.
+/// ScanController handles both L1 energy (internal FFT) and L2 CAD.
 inline void build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg) {
     auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
-    using std::string_literals::operator""s;
 
     const double centerFreq = cfg.center_freq();
 
@@ -389,47 +389,20 @@ inline void build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cf
     auto& source = graph.emplaceBlock<
         gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
 
-    // Splitter → 2 outputs: SpectrumTap + ScanController
-    auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
-        {"n_outputs", gr::Size_t{2}},
-    });
-    if (!ok(graph.connect<"out", "in">(source, splitter))) {
-        gr::lora::log_ts("error", "graph", "connect source -> splitter failed");
-    }
-
-    // Path 0: SpectrumTap → NullSink (sync passthrough discarded)
-    auto& tap = graph.emplaceBlock<gr::lora::SpectrumTap>({
-        {"sample_rate",    static_cast<float>(cfg.l1_rate)},
-        {"channel_bw",     cfg.channel_bw},
-        {"fft_size",       cfg.l1_fft_size},
-        {"fft_accumulate", cfg.l1_accumulate},
-    });
-    auto& null_sink = graph.emplaceBlock<gr::testing::NullSink<cf32>>({});
-
-    if (!ok(graph.connect(splitter, "out#0"s, tap, "in"s))) {
-        gr::lora::log_ts("error", "graph", "connect splitter -> tap failed");
-    }
-    if (!ok(graph.connect<"out", "in">(tap, null_sink))) {
-        gr::lora::log_ts("error", "graph", "connect tap -> null_sink failed");
-    }
-
-    // Path 1: ScanController (IQ sink with ring buffer + L2 digital channelization)
+    // ScanController: sole downstream block (IQ sink with ring buffer + L1/L2)
     auto& controller = graph.emplaceBlock<gr::lora::ScanController>({
-        {"sample_rate",  static_cast<float>(cfg.l1_rate)},
-        {"center_freq",  static_cast<float>(centerFreq)},
-        {"min_ratio",    cfg.min_ratio},
-        {"buffer_ms",    cfg.buffer_ms},
-        {"channel_bw",   cfg.channel_bw},
-        {"l1_reports",   cfg.l1_reports},
+        {"sample_rate",   static_cast<float>(cfg.l1_rate)},
+        {"center_freq",   static_cast<float>(centerFreq)},
+        {"min_ratio",     cfg.min_ratio},
+        {"buffer_ms",     cfg.buffer_ms},
+        {"channel_bw",    cfg.channel_bw},
+        {"l1_interval",   cfg.l1_reports},     // reuse config field
+        {"l1_snapshots",  uint32_t{16}},
+        {"l1_fft_size",   cfg.l1_fft_size},
     });
 
-    if (!ok(graph.connect(splitter, "out#1"s, controller, "in"s))) {
-        gr::lora::log_ts("error", "graph", "connect splitter -> controller failed");
-    }
-
-    // Connect SpectrumTap async output → ScanController async input
-    if (!ok(graph.connect<"spectrum", "energy_in">(tap, controller))) {
-        gr::lora::log_ts("error", "graph", "connect tap.spectrum -> controller.energy_in failed");
+    if (!ok(graph.connect<"out", "in">(source, controller))) {
+        gr::lora::log_ts("error", "graph", "connect source -> controller failed");
     }
 
     // ScanSink: receives detections and spectrum from ScanController

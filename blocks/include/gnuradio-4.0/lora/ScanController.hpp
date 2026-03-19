@@ -6,6 +6,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <numbers>
 #include <numeric>
 #include <ranges>
 #include <span>
@@ -13,44 +14,39 @@
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/DataSet.hpp>
+#include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
 #include <gnuradio-4.0/lora/algorithm/Channelize.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
 namespace gr::lora {
 
-/// Wideband IQ sink with L1 energy analysis and L2 digital channelization for LoRa channel scanning.
-///
-/// Receives wideband IQ on a sync input, maintains an IQ ring buffer, reads
-/// spectrum energy reports from an async input (SpectrumTap), and runs a
-/// two-phase scan state machine: L1 energy accumulation followed by L2 CAD
-/// probing of hot channels via digital channelization.  Detection results
-/// and averaged spectrum data are emitted on async output ports.
 struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
-    using Description = Doc<"Wideband IQ sink with L1 energy analysis and L2 digital channelization for LoRa channel scanning.">;
+    using Description = Doc<"Wideband IQ sink with integrated L1 energy and L2 digital channelization.">;
     using cf32 = std::complex<float>;
 
     // --- ports ---
-    gr::PortIn<cf32>                             in;           // sync: wideband IQ (sink — no sync output)
-    gr::PortIn<gr::DataSet<float>, gr::Async>    energy_in;    // async: spectrum energy from SpectrumTap
-    gr::PortOut<gr::DataSet<float>, gr::Async>   detect_out;   // async: detection results
-    gr::PortOut<gr::DataSet<float>, gr::Async>   spectrum_out;  // async: spectrum for display
+    gr::PortIn<cf32>                             in;
+    gr::PortOut<gr::DataSet<float>, gr::Async>   detect_out;
+    gr::PortOut<gr::DataSet<float>, gr::Async>   spectrum_out;
 
-    // --- settings (snake_case, reflected) ---
+    // --- settings ---
     float    sample_rate{16000000.f};
     float    center_freq{866500000.f};
     float    min_ratio{8.0f};
     float    buffer_ms{512.f};
     float    channel_bw{62500.f};
-    uint32_t l1_reports{64};
+    uint32_t l1_interval{64};       // processBulk calls between L1 energy snapshots
+    uint32_t l1_snapshots{16};      // snapshots to accumulate before probing
+    uint32_t l1_fft_size{4096};
 
-    GR_MAKE_REFLECTABLE(ScanController, in, energy_in, detect_out, spectrum_out,
+    GR_MAKE_REFLECTABLE(ScanController, in, detect_out, spectrum_out,
                         sample_rate, center_freq, min_ratio, buffer_ms,
-                        channel_bw, l1_reports);
+                        channel_bw, l1_interval, l1_snapshots, l1_fft_size);
 
     // --- internal types ---
 
-    enum class ScanState : uint8_t { Idle, Accumulate, Probe, Report };
+    enum class ScanState : uint8_t { Accumulate, Probe, Report };
 
     struct RingBuffer {
         std::vector<cf32> data;
@@ -66,9 +62,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         void push(std::span<const cf32> samples) noexcept {
             const auto cap = data.size();
             const auto n   = samples.size();
-            if (n == 0) return;
-
-            // bulk copy in at most two segments (avoiding per-sample modulo)
+            if (n == 0 || cap == 0) return;
             const auto firstChunk = std::min(n, cap - writeIdx);
             std::copy_n(samples.data(), firstChunk, data.data() + writeIdx);
             if (firstChunk < n) {
@@ -94,7 +88,6 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         void reset() noexcept {
             writeIdx = 0;
             count    = 0;
-            std::ranges::fill(data, cf32{0.f, 0.f});
         }
     };
 
@@ -105,20 +98,25 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         float    ratio{0.f};
     };
 
-    // --- internal state (public, prefixed _) ---
+    // --- internal state ---
 
     RingBuffer               _ring;
-    ScanState                _state{ScanState::Idle};
-    uint32_t                 _energyReportCount{0};
+    ScanState                _state{ScanState::Accumulate};
+    uint32_t                 _callCount{0};
+    uint32_t                 _snapshotCount{0};
     std::vector<float>       _channelEnergy;
     std::vector<uint32_t>    _hotChannels;
     std::size_t              _probeIndex{0};
-    std::size_t              _probeBwIndex{0};  // current BW within a hot channel probe
+    std::size_t              _probeBwIndex{0};
     uint32_t                 _sweepCount{0};
     uint32_t                 _nChannels{0};
     std::vector<ProbeResult> _probeResults;
-    ProbeResult              _currentBest;      // best result across BWs for current channel
+    ProbeResult              _currentBest;
     std::vector<float>       _bws;
+
+    // L1 FFT state
+    gr::algorithm::FFT<cf32> _fft;
+    std::vector<float>       _window;
 
     std::vector<ChannelActivityDetector> _cadPerBw;
 
@@ -143,69 +141,70 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             _cadPerBw.push_back(std::move(cad));
         }
 
-        _state             = ScanState::Idle;
-        _energyReportCount = 0;
-        _sweepCount        = 0;
+        // L1 FFT window (Hann)
+        _window.resize(l1_fft_size);
+        for (uint32_t i = 0; i < l1_fft_size; ++i) {
+            _window[i] = 0.5f * (1.f - std::cos(2.f * std::numbers::pi_v<float>
+                                                  * static_cast<float>(i)
+                                                  / static_cast<float>(l1_fft_size)));
+        }
+        _fft = gr::algorithm::FFT<cf32>{};
+
+        _state         = ScanState::Accumulate;
+        _callCount     = 0;
+        _snapshotCount = 0;
+        _sweepCount    = 0;
 
         gr::lora::log_ts("info ", "scanctrl",
-            "started: %.1f MS/s, %.3f MHz center, %u channels (%.1f kHz), buffer %u ms",
+            "started: %.1f MS/s, %.3f MHz center, %u ch (%.1f kHz), buffer %u ms, L1 every %u calls",
             static_cast<double>(sample_rate) / 1e6,
             static_cast<double>(center_freq) / 1e6, _nChannels,
             static_cast<double>(channel_bw) / 1e3,
-            static_cast<unsigned>(buffer_ms));
+            static_cast<unsigned>(buffer_ms), l1_interval);
     }
 
     // --- processBulk ---
 
     gr::work::Status processBulk(
-        gr::InputSpanLike auto&    inPort,
-        gr::InputSpanLike auto&    energyInPort,
+        gr::InputSpanLike auto&   inPort,
         gr::OutputSpanLike auto&  detectOutPort,
         gr::OutputSpanLike auto&  spectrumOutPort) noexcept
     {
-        // 1. Check overflow tags — reset state on sample discontinuity
+        // 1. Check overflow tags
         if (this->inputTagsPresent()) {
             const auto& tag = this->mergedInputTag();
             if (tag.map.contains("overflow")) {
-                gr::lora::log_ts("warn ", "scanctrl", "overflow detected — resetting state");
                 _ring.reset();
-                _state = ScanState::Idle;
-                _energyReportCount = 0;
+                _state         = ScanState::Accumulate;
+                _snapshotCount = 0;
                 _channelEnergy.assign(_nChannels, 0.f);
             }
         }
 
-        // 2. Push all input IQ into ring buffer (always consume all — keeps scheduler fast)
+        // 2. Push all input into ring buffer
         auto inSpan = std::span(inPort);
         _ring.push(inSpan);
         std::ignore = inPort.consume(inSpan.size());
 
-        // 3. Read async energy reports (if available)
-        auto energySpan = std::span(energyInPort);
-        if (!energySpan.empty()) {
-            for (std::size_t i = 0; i < energySpan.size(); ++i) {
-                processEnergyReport(energySpan[i]);
-            }
-            std::ignore = energyInPort.consume(energySpan.size());
+        // 3. Periodic L1 energy snapshot (cheap: one FFT per interval)
+        ++_callCount;
+        if (_state == ScanState::Accumulate && _callCount >= l1_interval) {
+            _callCount = 0;
+            computeEnergySnapshot();
         }
 
-        // 4. Run state machine
+        // 4. State machine
         std::size_t detectPublished   = 0;
         std::size_t spectrumPublished = 0;
 
         switch (_state) {
-        case ScanState::Idle:
-            _state = ScanState::Accumulate;
-            resetAccumulation();
-            break;
-
         case ScanState::Accumulate:
-            if (_energyReportCount >= l1_reports) {
+            if (_snapshotCount >= l1_snapshots) {
                 findHotChannels();
                 if (_hotChannels.empty()) {
                     spectrumPublished = emitSpectrum(spectrumOutPort);
                     _sweepCount++;
-                    _state = ScanState::Idle;
+                    resetAccumulation();
                 } else {
                     _probeIndex   = 0;
                     _probeBwIndex = 0;
@@ -227,7 +226,8 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             detectPublished   = emitDetections(detectOutPort);
             spectrumPublished = emitSpectrum(spectrumOutPort);
             _sweepCount++;
-            _state = ScanState::Idle;
+            resetAccumulation();
+            _state = ScanState::Accumulate;
             break;
         }
 
@@ -236,29 +236,57 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         return gr::work::Status::OK;
     }
 
-    // --- helper methods ---
+    // --- L1 energy ---
 
-    void processEnergyReport(const gr::DataSet<float>& ds) noexcept {
-        if (ds.signal_values.empty()) return;
+    void computeEnergySnapshot() noexcept {
+        // Need at least fft_size recent samples
+        if (_ring.count < l1_fft_size) return;
 
-        const auto nValues = std::min(ds.signal_values.size(), static_cast<std::size_t>(_nChannels));
-        for (std::size_t i = 0; i < nValues; ++i) {
-            _channelEnergy[i] += ds.signal_values[i];
+        auto samples = _ring.recent(l1_fft_size);
+        if (samples.empty()) return;
+
+        // Apply window
+        for (uint32_t i = 0; i < l1_fft_size; ++i) {
+            samples[i] *= _window[i];
         }
-        ++_energyReportCount;
+
+        auto fftOut = _fft.compute(
+            std::span<const cf32>(samples.data(), l1_fft_size));
+
+        // Accumulate |FFT|² into channel bins (DC-centered via fftshift)
+        const auto half    = l1_fft_size / 2;
+        const float binBw  = sample_rate / static_cast<float>(l1_fft_size);
+        const auto binsPerCh = static_cast<uint32_t>(channel_bw / binBw);
+
+        // Usable band starts at bin offset corresponding to -usableBw/2
+        const float usableBw  = sample_rate * 0.8f;
+        const auto  startBin  = static_cast<uint32_t>(
+            (static_cast<float>(l1_fft_size) - usableBw / binBw) / 2.f);
+
+        for (uint32_t ch = 0; ch < _nChannels && ch * binsPerCh + startBin + binsPerCh <= l1_fft_size; ++ch) {
+            float energy = 0.f;
+            for (uint32_t b = 0; b < binsPerCh; ++b) {
+                const auto fftIdx = (startBin + ch * binsPerCh + b + half) % l1_fft_size;
+                const auto& s = fftOut[fftIdx];
+                energy += s.real() * s.real() + s.imag() * s.imag();
+            }
+            _channelEnergy[ch] += energy;
+        }
+
+        ++_snapshotCount;
     }
+
+    // --- hot channel detection ---
 
     void findHotChannels() noexcept {
         _hotChannels.clear();
-        if (_nChannels == 0 || _energyReportCount == 0) return;
+        if (_nChannels == 0 || _snapshotCount == 0) return;
 
-        // Compute median energy for threshold
         std::vector<float> sorted(_channelEnergy.begin(),
                                   _channelEnergy.begin() + static_cast<std::ptrdiff_t>(_nChannels));
         std::ranges::sort(sorted);
         const float median = sorted[sorted.size() / 2];
 
-        // Hot = energy > 6× median (well above noise floor)
         constexpr float kHotMultiplier = 6.0f;
         const float threshold = median * kHotMultiplier;
 
@@ -269,15 +297,14 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         }
     }
 
-    // Probe one BW of one hot channel per processBulk call.
-    // Returns true when the current hot channel is fully probed (all BWs done).
+    // --- L2 probe (one BW per call) ---
+
     bool probeStep() noexcept {
         if (_probeIndex >= _hotChannels.size()) return true;
 
         const uint32_t ch = _hotChannels[_probeIndex];
         const double channelFreq = channelCenterFreq(ch);
 
-        // Initialize best result for this channel on first BW
         if (_probeBwIndex == 0) {
             _currentBest = ProbeResult{};
             _currentBest.freq = channelFreq;
@@ -313,7 +340,6 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             ++_probeBwIndex;
         }
 
-        // All BWs for this channel done?
         if (_probeBwIndex >= _bws.size()) {
             if (_currentBest.ratio >= min_ratio) {
                 _probeResults.push_back(_currentBest);
@@ -324,6 +350,8 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
 
         return _probeIndex >= _hotChannels.size();
     }
+
+    // --- output ---
 
     [[nodiscard]] std::size_t emitDetections(gr::OutputSpanLike auto& outPort) noexcept {
         std::size_t published = 0;
@@ -371,16 +399,14 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         ds.signal_units.emplace_back("linear");
         ds.extents = {static_cast<int32_t>(_nChannels)};
 
-        // Average the accumulated energy over the report count
-        const float scale = (_energyReportCount > 0)
-            ? 1.0f / static_cast<float>(_energyReportCount)
+        const float scale = (_snapshotCount > 0)
+            ? 1.0f / static_cast<float>(_snapshotCount)
             : 1.0f;
         ds.signal_values.resize(_nChannels);
         for (uint32_t i = 0; i < _nChannels; ++i) {
             ds.signal_values[i] = _channelEnergy[i] * scale;
         }
 
-        // Build frequency axis
         ds.axis_names.emplace_back("frequency");
         ds.axis_units.emplace_back("Hz");
         ds.axis_values.resize(1);
@@ -393,7 +419,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         ds.meta_information[0]["type"]       = std::string("scan_spectrum");
         ds.meta_information[0]["sweep"]      = static_cast<int64_t>(_sweepCount);
         ds.meta_information[0]["n_hot"]      = static_cast<int64_t>(_hotChannels.size());
-        ds.meta_information[0]["n_reports"]  = static_cast<int64_t>(_energyReportCount);
+        ds.meta_information[0]["n_snapshots"] = static_cast<int64_t>(_snapshotCount);
 
         outSpan[0] = std::move(ds);
         return 1;
@@ -401,15 +427,14 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
 
     void resetAccumulation() noexcept {
         _channelEnergy.assign(_nChannels, 0.f);
-        _energyReportCount = 0;
+        _snapshotCount = 0;
+        _callCount     = 0;
         _hotChannels.clear();
     }
 
     [[nodiscard]] double channelCenterFreq(uint32_t ch) const noexcept {
-        // Channels are spaced by channel_bw, centered around center_freq.
-        // Channel 0 is at the lowest frequency of the usable band.
-        const float usableBw    = sample_rate * 0.8f;
-        const float bandStart   = center_freq - usableBw / 2.f;
+        const float usableBw  = sample_rate * 0.8f;
+        const float bandStart = center_freq - usableBw / 2.f;
         return static_cast<double>(bandStart + (static_cast<float>(ch) + 0.5f) * channel_bw);
     }
 };
