@@ -752,6 +752,92 @@ static std::string ts_short() {
     return buf;
 }
 
+// ─── streaming scan mode ──────────────────────────────────────────────────────
+
+static int streaming_main(ScanSetConfig& cfg) {
+    auto& g_stop = lora_apps::install_signal_handler();
+
+    lora_apps::log_version_banner("lora_scan", GIT_REV);
+    gr::lora::log_ts("info ", "lora_scan",
+        "streaming mode: %.1f MS/s, center %.3f MHz, buffer %u ms",
+        cfg.l1_rate / 1e6, cfg.center_freq() / 1e6,
+        static_cast<unsigned>(cfg.buffer_ms));
+
+    lora_apps::apply_fpga_workaround(cfg.device, cfg.device_param);
+
+    int savedStdout = -1;
+    if (cfg.cbor_out) {
+        std::fflush(stdout);
+        savedStdout = dup(STDOUT_FILENO);
+        dup2(STDERR_FILENO, STDOUT_FILENO);
+    }
+
+    lora_apps::log_hardware_info("lora_scan", cfg.device, cfg.device_param);
+
+    gr::thread_pool::Manager::defaultCpuPool()->setThreadBounds(1, 1);
+
+    // Build streaming scan graph
+    gr::Graph graph;
+    lora_graph::build_streaming_scan_graph(graph, cfg);
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> sched;
+    sched.timeout_inactivity_count = 1U;
+    sched.watchdog_min_stall_count = 10U;
+    sched.watchdog_max_warnings    = 30U;
+
+    if (auto ret = sched.exchange(std::move(graph)); !ret) {
+        gr::lora::log_ts("error", "lora_scan", "scheduler init failed");
+        return 1;
+    }
+
+    // Find SoapySource for overflow counter
+    auto soapy_source = lora_graph::find_soapy_source(sched.blocks());
+
+    if (savedStdout >= 0) {
+        dup2(savedStdout, STDOUT_FILENO);
+        close(savedStdout);
+        savedStdout = -1;
+    }
+
+    // Start scheduler in background thread
+    std::atomic<bool> sched_done{false};
+    std::thread sched_thread([&sched, &sched_done]() {
+        auto ret = sched.runAndWait();
+        if (!ret.has_value()) {
+            gr::lora::log_ts("warn ", "lora_scan",
+                "scheduler stopped: %s", std::format("{}", ret.error()).c_str());
+        }
+        sched_done.store(true, std::memory_order_relaxed);
+    });
+
+    gr::lora::log_ts("info ", "lora_scan", "streaming — Ctrl+C to stop");
+
+    // Main thread: just wait for stop signal, poll overflow counter
+    uint64_t lastOvf = 0;
+    while (!g_stop.load(std::memory_order_relaxed)
+           && !sched_done.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        if (soapy_source) {
+            using SoapyType = gr::blocks::soapy::SoapyBlock<cf32, 1UL>;
+            auto* wrapper = dynamic_cast<gr::BlockWrapper<SoapyType>*>(soapy_source.get());
+            if (wrapper) {
+                uint64_t ovf = wrapper->blockRef().totalOverflowCount();
+                if (ovf != lastOvf) {
+                    gr::lora::log_ts("warn ", "lora_scan",
+                        "overflow count: %llu", static_cast<unsigned long long>(ovf));
+                    lastOvf = ovf;
+                }
+            }
+        }
+    }
+
+    gr::lora::log_ts("info ", "lora_scan", "stopping...");
+    sched.requestStop();
+    sched_thread.join();
+    std::quick_exit(0);
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -769,6 +855,12 @@ int main(int argc, char** argv) {
     auto cfg = std::move(configs[0]);
     cfg.cbor_out = cbor_out;
 
+    // Streaming mode: no retune, digital channelization
+    if (cfg.streaming) {
+        return streaming_main(cfg);
+    }
+
+    // Legacy mode: imperative scan loop with hardware retune
     auto& g_stop = lora_apps::install_signal_handler();
 
     // --- UDP socket for CBOR event broadcast ---

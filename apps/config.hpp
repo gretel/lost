@@ -154,6 +154,14 @@ struct ScanSetConfig {
     uint32_t     sweeps{0};                 ///< 0 = infinite
     bool         layer1_only{false};
     bool         cbor_out{false};           ///< CBOR on stdout
+    bool         streaming{true};           ///< streaming pipeline (no retune)
+
+    // Streaming-mode parameters
+    float        buffer_ms{512.f};          ///< IQ ring buffer duration (ms)
+    uint32_t     l1_fft_size{1024};         ///< FFT bins for L1 energy
+    uint32_t     l1_accumulate{64};         ///< FFTs to average per energy report
+    uint32_t     l1_reports{64};            ///< energy reports before probing
+    float        channel_bw{62500.f};       ///< L1 channel grid spacing (Hz)
 
     // From [scan.network]
     std::string  udp_listen{"127.0.0.1"};
@@ -162,6 +170,10 @@ struct ScanSetConfig {
     [[nodiscard]] double min_bw() const {
         return bws.empty() ? 62500.0
                            : static_cast<double>(*std::ranges::min_element(bws));
+    }
+
+    [[nodiscard]] double center_freq() const {
+        return (freq_start + freq_stop) / 2.0;
     }
 };
 

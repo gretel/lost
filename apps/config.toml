@@ -136,8 +136,16 @@ master_clock = 32000000                 # FPGA master clock rate
 os_factor    = 4                        # oversampling factor
 min_ratio    = 8.0                      # CAD detection threshold
 settle_ms    = 5                        # PLL settle delay (ms)
+streaming    = true                     # streaming pipeline (no retune)
 # sweeps     = 0                        # 0 = infinite (default)
 # layer1_only = false                   # set true for energy-only mode
+
+# Streaming-mode parameters (ignored when streaming = false)
+buffer_ms     = 512                     # IQ ring buffer duration (ms)
+l1_fft_size   = 1024                    # FFT bins for L1 energy
+l1_accumulate = 64                      # FFTs to average per energy report
+l1_reports    = 64                      # energy reports before probing
+channel_bw    = 62500                   # L1 channel grid spacing (Hz)
 
 [scan.network]
 udp_listen = "127.0.0.1"

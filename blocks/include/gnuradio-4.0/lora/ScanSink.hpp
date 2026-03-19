@@ -56,17 +56,17 @@ struct ScanSink : gr::Block<ScanSink> {
         auto getInt = [&](const std::string& key) -> int64_t {
             auto it = meta.find(key);
             if (it == meta.end()) return 0;
-            return std::get<int64_t>(it->second);
+            return it->second.value_or<int64_t>(0);
         };
         auto getFloat = [&](const std::string& key) -> float {
             auto it = meta.find(key);
             if (it == meta.end()) return 0.f;
-            return std::get<float>(it->second);
+            return it->second.value_or<float>(0.f);
         };
         auto getDouble = [&](const std::string& key) -> double {
             auto it = meta.find(key);
             if (it == meta.end()) return 0.0;
-            return std::get<double>(it->second);
+            return it->second.value_or<double>(0.0);
         };
 
         gr::lora::log_ts("det  ", "scan",
@@ -84,7 +84,7 @@ struct ScanSink : gr::Block<ScanSink> {
 
         auto it = meta.find("sweep");
         if (it != meta.end()) {
-            _sweepCount = static_cast<uint32_t>(std::get<int64_t>(it->second));
+            _sweepCount = static_cast<uint32_t>(it->second.value_or<int64_t>(0));
         }
     }
 };

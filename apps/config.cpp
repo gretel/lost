@@ -489,6 +489,14 @@ std::vector<ScanSetConfig> load_scan_config(const std::string& path,
     cfg.settle_ms   = static_cast<int>(scan_tbl->at_path("settle_ms").value_or(int64_t{5}));
     cfg.sweeps      = static_cast<uint32_t>(scan_tbl->at_path("sweeps").value_or(int64_t{0}));
     cfg.layer1_only = scan_tbl->at_path("layer1_only").value_or(false);
+    cfg.streaming   = scan_tbl->at_path("streaming").value_or(true);
+
+    // Streaming-mode parameters
+    cfg.buffer_ms     = static_cast<float>(scan_tbl->at_path("buffer_ms").value_or(512.0));
+    cfg.l1_fft_size   = static_cast<uint32_t>(scan_tbl->at_path("l1_fft_size").value_or(int64_t{1024}));
+    cfg.l1_accumulate = static_cast<uint32_t>(scan_tbl->at_path("l1_accumulate").value_or(int64_t{64}));
+    cfg.l1_reports    = static_cast<uint32_t>(scan_tbl->at_path("l1_reports").value_or(int64_t{64}));
+    cfg.channel_bw    = static_cast<float>(scan_tbl->at_path("channel_bw").value_or(62500.0));
 
     // [scan.network]
     if (auto* net_tbl = scan_tbl->at_path("network").as_table()) {
