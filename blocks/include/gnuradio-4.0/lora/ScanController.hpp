@@ -65,11 +65,17 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
 
         void push(std::span<const cf32> samples) noexcept {
             const auto cap = data.size();
-            for (const auto& s : samples) {
-                data[writeIdx] = s;
-                writeIdx = (writeIdx + 1) % cap;
+            const auto n   = samples.size();
+            if (n == 0) return;
+
+            // bulk copy in at most two segments (avoiding per-sample modulo)
+            const auto firstChunk = std::min(n, cap - writeIdx);
+            std::copy_n(samples.data(), firstChunk, data.data() + writeIdx);
+            if (firstChunk < n) {
+                std::copy_n(samples.data() + firstChunk, n - firstChunk, data.data());
             }
-            count += samples.size();
+            writeIdx = (writeIdx + n) % cap;
+            count += n;
         }
 
         [[nodiscard]] std::vector<cf32> recent(std::size_t n) const {
@@ -77,8 +83,10 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             std::vector<cf32> out(n);
             const auto        cap   = data.size();
             const std::size_t start = (writeIdx + cap - n) % cap;
-            for (std::size_t i = 0; i < n; ++i) {
-                out[i] = data[(start + i) % cap];
+            const auto firstChunk = std::min(n, cap - start);
+            std::copy_n(data.data() + start, firstChunk, out.data());
+            if (firstChunk < n) {
+                std::copy_n(data.data(), n - firstChunk, out.data() + firstChunk);
             }
             return out;
         }
@@ -105,9 +113,11 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     std::vector<float>       _channelEnergy;
     std::vector<uint32_t>    _hotChannels;
     std::size_t              _probeIndex{0};
+    std::size_t              _probeBwIndex{0};  // current BW within a hot channel probe
     uint32_t                 _sweepCount{0};
     uint32_t                 _nChannels{0};
     std::vector<ProbeResult> _probeResults;
+    ProbeResult              _currentBest;      // best result across BWs for current channel
     std::vector<float>       _bws;
 
     std::vector<ChannelActivityDetector> _cadPerBw;
@@ -197,19 +207,21 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
                     _sweepCount++;
                     _state = ScanState::Idle;
                 } else {
-                    _probeIndex = 0;
+                    _probeIndex   = 0;
+                    _probeBwIndex = 0;
                     _probeResults.clear();
                     _state = ScanState::Probe;
                 }
             }
             break;
 
-        case ScanState::Probe:
-            probeNextChannel();
-            if (_probeIndex >= _hotChannels.size()) {
+        case ScanState::Probe: {
+            bool done = probeStep();
+            if (done) {
                 _state = ScanState::Report;
             }
             break;
+        }
 
         case ScanState::Report:
             detectPublished   = emitDetections(detectOutPort);
@@ -257,52 +269,60 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         }
     }
 
-    void probeNextChannel() noexcept {
-        if (_probeIndex >= _hotChannels.size()) return;
+    // Probe one BW of one hot channel per processBulk call.
+    // Returns true when the current hot channel is fully probed (all BWs done).
+    bool probeStep() noexcept {
+        if (_probeIndex >= _hotChannels.size()) return true;
 
         const uint32_t ch = _hotChannels[_probeIndex];
         const double channelFreq = channelCenterFreq(ch);
 
-        ProbeResult bestResult;
-        bestResult.freq = channelFreq;
+        // Initialize best result for this channel on first BW
+        if (_probeBwIndex == 0) {
+            _currentBest = ProbeResult{};
+            _currentBest.freq = channelFreq;
+        }
 
-        for (std::size_t bwIdx = 0; bwIdx < _bws.size(); ++bwIdx) {
-            const float probeBw = _bws[bwIdx];
-            auto& cad = _cadPerBw[bwIdx];
+        if (_probeBwIndex < _bws.size()) {
+            const float probeBw = _bws[_probeBwIndex];
+            auto& cad = _cadPerBw[_probeBwIndex];
 
-            // Determine how many narrowband samples we need for 2-symbol CAD at SF12
-            // SF12 at 1x: 2 * 4096 = 8192 samples per 2-symbol window
-            constexpr uint32_t kMaxSf       = 12;
-            const uint32_t     fftSize      = 1U << kMaxSf;
-            const uint32_t     cadSamples   = fftSize * 2;
-            const auto         osFactor     = static_cast<uint32_t>(sample_rate / probeBw);
-            const uint32_t     wbSamples    = cadSamples * osFactor;
+            constexpr uint32_t kMaxSf     = 12;
+            const uint32_t     fftSize    = 1U << kMaxSf;
+            const uint32_t     cadSamples = fftSize * 2;
+            const auto         osFactor   = static_cast<uint32_t>(sample_rate / probeBw);
+            const uint32_t     wbSamples  = cadSamples * osFactor;
 
             auto wbIq = _ring.recent(wbSamples);
-            if (wbIq.empty()) continue;
+            if (!wbIq.empty()) {
+                auto nbIq = channelize(wbIq.data(), static_cast<uint32_t>(wbIq.size()),
+                                       channelFreq, static_cast<double>(center_freq),
+                                       static_cast<double>(sample_rate),
+                                       static_cast<double>(probeBw));
 
-            // Channelize: freq-shift + decimate to narrowband
-            auto nbIq = channelize(wbIq.data(), static_cast<uint32_t>(wbIq.size()),
-                                   channelFreq, static_cast<double>(center_freq),
-                                   static_cast<double>(sample_rate),
-                                   static_cast<double>(probeBw));
-
-            if (nbIq.size() < cadSamples) continue;
-
-            // Run multi-SF CAD on narrowband IQ
-            auto det = cad.detectMultiSf(nbIq.data());
-            if (det.detected && det.best_ratio > bestResult.ratio) {
-                bestResult.sf    = det.sf;
-                bestResult.bw    = probeBw;
-                bestResult.ratio = det.best_ratio;
+                if (nbIq.size() >= cadSamples) {
+                    auto det = cad.detectMultiSf(nbIq.data());
+                    if (det.detected && det.best_ratio > _currentBest.ratio) {
+                        _currentBest.sf    = det.sf;
+                        _currentBest.bw    = probeBw;
+                        _currentBest.ratio = det.best_ratio;
+                    }
+                }
             }
+
+            ++_probeBwIndex;
         }
 
-        if (bestResult.ratio >= min_ratio) {
-            _probeResults.push_back(bestResult);
+        // All BWs for this channel done?
+        if (_probeBwIndex >= _bws.size()) {
+            if (_currentBest.ratio >= min_ratio) {
+                _probeResults.push_back(_currentBest);
+            }
+            ++_probeIndex;
+            _probeBwIndex = 0;
         }
 
-        ++_probeIndex;
+        return _probeIndex >= _hotChannels.size();
     }
 
     [[nodiscard]] std::size_t emitDetections(gr::OutputSpanLike auto& outPort) noexcept {
