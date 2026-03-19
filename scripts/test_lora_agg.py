@@ -11,8 +11,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 from lora_agg import (
     Candidate,
     PendingGroup,
+    TX_ECHO_WINDOW,
     build_aggregated,
     extract_candidate,
+    fnv1a64,
     is_better,
 )
 
@@ -193,6 +195,87 @@ class TestCrcMask(unittest.TestCase):
             payload_hash=0, created_at=0.0, candidates=[c0, c1, c2], best_idx=1
         )
         self.assertEqual(build_aggregated(group)["diversity"]["crc_mask"], 0b010)
+
+
+class TestFnv1a64(unittest.TestCase):
+    def test_empty_returns_offset_basis(self):
+        self.assertEqual(fnv1a64(b""), 14695981039346656037)
+
+    def test_known_vector(self):
+        # Manually computed: h ^= 0x08, h *= prime, h ^= 0x4D, h *= prime, h ^= 0xAA, h *= prime
+        self.assertEqual(fnv1a64(b"\x08\x4d\xaa"), 2146301778539204652)
+
+    def test_bytearray_accepted(self):
+        expected = fnv1a64(b"\x01\x02\x03")
+        self.assertEqual(fnv1a64(bytearray(b"\x01\x02\x03")), expected)
+
+
+class TestTxEchoSuppression(unittest.TestCase):
+    """Test the TX echo filter logic at the data-structure level.
+
+    These tests exercise the hash-matching and TTL logic without
+    needing sockets or the full aggregation loop.
+    """
+
+    def test_matching_hash_is_suppressed(self):
+        """A frame whose payload_hash matches a recent TX should be suppressed."""
+        import time
+
+        payload = b"\x01\x02\x03"
+        tx_hash = fnv1a64(payload)
+        tx_echo_hashes: dict[int, float] = {tx_hash: time.monotonic()}
+
+        # Simulate what handle_upstream_frame does
+        h = tx_hash
+        suppressed = h in tx_echo_hashes
+        self.assertTrue(suppressed)
+
+        # One-shot delete
+        del tx_echo_hashes[h]
+        self.assertNotIn(h, tx_echo_hashes)
+
+    def test_non_matching_hash_is_not_suppressed(self):
+        """A frame with a different payload_hash should not be suppressed."""
+        import time
+
+        tx_hash = fnv1a64(b"\x01\x02\x03")
+        rx_hash = fnv1a64(b"\x04\x05\x06")
+        tx_echo_hashes: dict[int, float] = {tx_hash: time.monotonic()}
+
+        suppressed = rx_hash in tx_echo_hashes
+        self.assertFalse(suppressed)
+
+    def test_ttl_expiry_clears_stale_entries(self):
+        """TX echo entries older than TX_ECHO_WINDOW should be purged."""
+        import time
+
+        now = time.monotonic()
+        tx_echo_hashes: dict[int, float] = {
+            0xAAAA: now - TX_ECHO_WINDOW - 1.0,  # stale
+            0xBBBB: now - 1.0,  # fresh
+        }
+
+        # Simulate drain_expired TTL logic
+        tx_stale = [h for h, t in tx_echo_hashes.items() if (now - t) >= TX_ECHO_WINDOW]
+        for h in tx_stale:
+            del tx_echo_hashes[h]
+
+        self.assertNotIn(0xAAAA, tx_echo_hashes)
+        self.assertIn(0xBBBB, tx_echo_hashes)
+
+    def test_one_shot_allows_subsequent_same_hash(self):
+        """After suppressing once, a second frame with the same hash should pass."""
+        import time
+
+        tx_hash = fnv1a64(b"\x01\x02\x03")
+        tx_echo_hashes: dict[int, float] = {tx_hash: time.monotonic()}
+
+        # First frame: suppressed + deleted
+        self.assertIn(tx_hash, tx_echo_hashes)
+        del tx_echo_hashes[tx_hash]
+
+        # Second frame with same hash: not suppressed
+        self.assertNotIn(tx_hash, tx_echo_hashes)
 
 
 if __name__ == "__main__":

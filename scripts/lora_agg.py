@@ -36,8 +36,18 @@ CLIENT_EXPIRY = 60.0  # evict consumers with no keepalive after this
 UPSTREAM_SILENCE_WARN = 15.0  # warn if no upstream data for this long
 UDP_RCVBUF = 512 * 1024  # 512 KB receive buffer for burst resilience
 DEDUP_COOLDOWN = 5.0  # suppress duplicate hashes for this long after emit
+TX_ECHO_WINDOW = 10.0  # suppress RX frames matching recent TX for this long
 
 log = logging.getLogger("gr4.agg")
+
+
+def fnv1a64(data: bytes | bytearray) -> int:
+    """FNV-1a 64-bit hash — matches FrameSink::fnv1a64 in C++."""
+    h = 14695981039346656037
+    for b in data:
+        h ^= b
+        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +326,8 @@ def run(args: argparse.Namespace) -> None:
     # Aggregation state
     pending: dict[int, PendingGroup] = {}
     recently_emitted: dict[int, float] = {}  # hash -> emit timestamp (cooldown)
+    tx_echo_hashes: dict[int, float] = {}  # fnv1a64 -> transmit timestamp
+    tx_echoes_suppressed = 0
     _last_window_ms: int = -1  # sentinel: log config only on change
     last_keepalive = time.monotonic()
     last_evict = last_keepalive
@@ -370,9 +382,13 @@ def run(args: argparse.Namespace) -> None:
         stale = [h for h, t in recently_emitted.items() if (now - t) >= DEDUP_COOLDOWN]
         for h in stale:
             del recently_emitted[h]
+        # Purge stale TX echo entries
+        tx_stale = [h for h, t in tx_echo_hashes.items() if (now - t) >= TX_ECHO_WINDOW]
+        for h in tx_stale:
+            del tx_echo_hashes[h]
 
     def handle_upstream_frame(msg: dict[str, Any]) -> None:
-        nonlocal window_s, _last_window_ms
+        nonlocal window_s, _last_window_ms, tx_echoes_suppressed
         if msg.get("type") == "config":
             raw = apply_config(msg)
             new_window_ms = config_agg_window_ms(raw)
@@ -396,6 +412,17 @@ def run(args: argparse.Namespace) -> None:
             server.broadcast(data)
             return
         h = cand.msg["payload_hash"]
+
+        # TX echo suppression: drop frames matching recent transmissions
+        if h in tx_echo_hashes:
+            tx_age = now - tx_echo_hashes[h]
+            log.info(
+                "TX echo suppressed: hash=%016x (%.0fms after TX)", h, tx_age * 1000
+            )
+            del tx_echo_hashes[h]  # one-shot: suppress once, then clear
+            tx_echoes_suppressed += 1
+            return
+
         if h in recently_emitted:
             log.debug(
                 "dedup hash=%016x (%.0fms late)", h, (now - recently_emitted[h]) * 1000
@@ -442,11 +469,13 @@ def run(args: argparse.Namespace) -> None:
             # Periodic status log (every 5 min)
             if now - last_status_log >= 300.0:
                 log.info(
-                    "status: %d frames total, %d in last 5min, %d consumers, %d pending",
+                    "status: %d frames total, %d in last 5min, %d consumers, "
+                    "%d pending, %d TX echoes suppressed",
                     frames_total,
                     frames_since_log,
                     server.client_count,
                     len(pending),
+                    tx_echoes_suppressed,
                 )
                 frames_since_log = 0
                 last_status_log = now
@@ -469,6 +498,16 @@ def run(args: argparse.Namespace) -> None:
                         continue
                     tx_msg = server.handle_datagram(data, addr)
                     if tx_msg is not None and up_addrs:
+                        # Record TX payload hash for echo suppression
+                        tx_payload = tx_msg.get("payload", b"")
+                        if isinstance(tx_payload, (bytes, bytearray)) and tx_payload:
+                            tx_h = fnv1a64(tx_payload)
+                            tx_echo_hashes[tx_h] = time.monotonic()
+                            log.debug(
+                                "TX echo: recorded hash=%016x (%d bytes)",
+                                tx_h,
+                                len(tx_payload),
+                            )
                         fwd = cbor2.dumps(tx_msg)
                         try:
                             up_socks[0].sendto(fwd, up_addrs[0])

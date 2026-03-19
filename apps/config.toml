@@ -38,8 +38,8 @@ level = "INFO"
 freq       = 869618000
 rx_channel = [1, 2]
 tx_channel = 0
-rx_gain    = 36
-tx_gain    = 80
+rx_gain    = 32
+tx_gain    = 75
 
 # [radio_433]
 # freq       = 433650000
