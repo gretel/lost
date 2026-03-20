@@ -354,7 +354,10 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             _currentBest.freq = channelFreq;
         }
 
-        if (_probeBwIndex < _bws.size()) {
+        if (_probeBwIndex < _bws.size() && _currentBest.ratio < min_ratio) {
+            // Probe narrowest BW first; stop as soon as one detects above threshold.
+            // Narrowest BW gives correct SF identification (wider BWs detect
+            // chirp-slope equivalents at different SFs due to k = BW²/2^SF).
             const float probeBw = _bws[_probeBwIndex];
             auto& cad = _cadPerBw[_probeBwIndex];
 
@@ -384,7 +387,8 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             ++_probeBwIndex;
         }
 
-        if (_probeBwIndex >= _bws.size()) {
+        // Done if: all BWs tried, or narrowest BW already detected above threshold
+        if (_probeBwIndex >= _bws.size() || _currentBest.ratio >= min_ratio) {
             if (_currentBest.ratio >= min_ratio) {
                 _probeResults.push_back(_currentBest);
             }

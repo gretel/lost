@@ -59,6 +59,8 @@ FULL_CONFIGS = [
     TestConfig("SF10/BW62k high-edge", sf=10, bw_hz=62500, freq_mhz=870.000),
     TestConfig("SF12/BW62k low-edge", sf=12, bw_hz=62500, freq_mhz=863.500),
     TestConfig("SF7/BW125k LoRaWAN", sf=7, bw_hz=125000, freq_mhz=868.100),
+    TestConfig("SF8/BW125k mid-band", sf=8, bw_hz=125000, freq_mhz=867.500),
+    TestConfig("SF8/BW250k center", sf=8, bw_hz=250000, freq_mhz=866.500),
 ]
 
 
@@ -177,14 +179,27 @@ def run_config(
 
     result.sweeps = len(sweep_durs)
     result.avg_sweep_ms = int(sum(sweep_durs) / len(sweep_durs)) if sweep_durs else 0
-    result.detections = all_dets
-    result.det_count = len(all_dets)
 
-    if all_dets:
-        best = max(all_dets, key=lambda d: d.get("ratio", 0))
+    # Filter detections to within ±200 kHz of expected TX frequency
+    tx_freq_hz = cfg.freq_mhz * 1e6
+    freq_tol = 200e3
+    near_dets = [d for d in all_dets if abs(d.get("freq", 0) - tx_freq_hz) < freq_tol]
+    result.detections = near_dets
+    result.det_count = len(near_dets)
+
+    if near_dets:
+        best = max(near_dets, key=lambda d: d.get("ratio", 0))
         result.best_ratio = best.get("ratio", 0.0)
-        result.best_sf = best.get("sf", 0)
         result.detected = result.best_ratio >= min_ratio
+        # Report the most common SF (mode), not the highest-ratio SF.
+        # Cross-BW equivalences can produce occasional high-ratio detections
+        # at the wrong SF; the mode reflects the true signal.
+        sf_counts: dict[int, int] = {}
+        for d in near_dets:
+            sf = d.get("sf", 0)
+            if sf > 0:
+                sf_counts[sf] = sf_counts.get(sf, 0) + 1
+        result.best_sf = max(sf_counts, key=lambda s: sf_counts[s]) if sf_counts else 0
 
     return result
 
