@@ -23,39 +23,13 @@
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
+#include <gnuradio-4.0/lora/algorithm/SfLaneDetail.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
 namespace gr::lora {
 
-// Detection thresholds shared with FrameSync (duplicated to avoid include dependency
-// on FrameSync.hpp which carries its own GR_REGISTER_BLOCK).
-namespace multisf_detail {
-static constexpr int kPreambleBinTolerance = 1;
-static constexpr int kSyncWordBinTolerance = 2;
-static constexpr uint8_t kMaxAdditionalUpchirps = 3;
-static constexpr uint8_t kMaxPreambleRotations  = 4;
-static constexpr float   kMinPreamblePMR        = 4.0f;
-
-[[nodiscard]] inline int most_frequent(const std::vector<int>& arr) {
-    std::unordered_map<int, int> freq;
-    for (int v : arr) freq[v]++;
-    int max_count = 0, result = -1;
-    for (auto& [val, cnt] : freq) {
-        if (cnt > max_count) { max_count = cnt; result = val; }
-    }
-    return result;
-}
-
-[[nodiscard]] inline int my_roundf(float x) noexcept {
-    return x > 0 ? static_cast<int>(x + 0.5f)
-                 : static_cast<int>(std::ceil(x - 0.5f));
-}
-
-inline void complex_multiply(std::complex<float>* out, const std::complex<float>* a,
-                             const std::complex<float>* b, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) out[i] = a[i] * b[i];
-}
-}  // namespace multisf_detail
+// Alias for backward compatibility with call sites using multisf_detail::
+namespace multisf_detail = sflane_detail;
 
 /// Per-SF processing lane — holds the complete fused FrameSync + DemodDecoder
 /// state machine for one spreading factor.

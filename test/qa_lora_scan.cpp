@@ -21,6 +21,7 @@
 #include <gnuradio-4.0/lora/SpectrumTap.hpp>
 #include <gnuradio-4.0/lora/ScanController.hpp>
 #include <gnuradio-4.0/lora/algorithm/Channelize.hpp>
+#include <gnuradio-4.0/lora/algorithm/RingBuffer.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
 
 using namespace std::string_literals;
@@ -141,7 +142,7 @@ const boost::ut::suite<"RingBuffer"> ringBufferTests = [] {
     using namespace boost::ut;
 
     "push and recent basic"_test = [] {
-        gr::lora::ScanController::RingBuffer ring;
+        gr::lora::RingBuffer ring;
         ring.resize(100);
 
         std::vector<cf32> data(50, cf32(1.0f, 0.0f));
@@ -153,7 +154,7 @@ const boost::ut::suite<"RingBuffer"> ringBufferTests = [] {
     };
 
     "recent wraps around correctly"_test = [] {
-        gr::lora::ScanController::RingBuffer ring;
+        gr::lora::RingBuffer ring;
         ring.resize(10);
 
         // Write 15 samples (wraps around a 10-element buffer)
@@ -172,7 +173,7 @@ const boost::ut::suite<"RingBuffer"> ringBufferTests = [] {
     };
 
     "recent returns empty if not enough data"_test = [] {
-        gr::lora::ScanController::RingBuffer ring;
+        gr::lora::RingBuffer ring;
         ring.resize(100);
 
         cf32 val(1.0f, 0.0f);
@@ -183,7 +184,7 @@ const boost::ut::suite<"RingBuffer"> ringBufferTests = [] {
     };
 
     "reset clears buffer"_test = [] {
-        gr::lora::ScanController::RingBuffer ring;
+        gr::lora::RingBuffer ring;
         ring.resize(10);
 
         std::vector<cf32> data(10, cf32(1.0f, 0.0f));

@@ -17,6 +17,7 @@
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
 #include <gnuradio-4.0/lora/algorithm/Channelize.hpp>
+#include <gnuradio-4.0/lora/algorithm/RingBuffer.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
 namespace gr::lora {
@@ -49,49 +50,6 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     // --- internal types ---
 
     enum class ScanState : uint8_t { Accumulate, Probe, Report };
-
-    struct RingBuffer {
-        std::vector<cf32> data;
-        std::size_t       writeIdx{0};
-        std::size_t       count{0};
-
-        void resize(std::size_t capacity) {
-            data.assign(capacity, {0.f, 0.f});
-            writeIdx = 0;
-            count    = 0;
-        }
-
-        void push(std::span<const cf32> samples) noexcept {
-            const auto cap = data.size();
-            const auto n   = samples.size();
-            if (n == 0 || cap == 0) return;
-            const auto firstChunk = std::min(n, cap - writeIdx);
-            std::copy_n(samples.data(), firstChunk, data.data() + writeIdx);
-            if (firstChunk < n) {
-                std::copy_n(samples.data() + firstChunk, n - firstChunk, data.data());
-            }
-            writeIdx = (writeIdx + n) % cap;
-            count += n;
-        }
-
-        [[nodiscard]] std::vector<cf32> recent(std::size_t n) const {
-            if (count < n || n > data.size()) return {};
-            std::vector<cf32> out(n);
-            const auto        cap   = data.size();
-            const std::size_t start = (writeIdx + cap - n) % cap;
-            const auto firstChunk = std::min(n, cap - start);
-            std::copy_n(data.data() + start, firstChunk, out.data());
-            if (firstChunk < n) {
-                std::copy_n(data.data(), n - firstChunk, out.data() + firstChunk);
-            }
-            return out;
-        }
-
-        void reset() noexcept {
-            writeIdx = 0;
-            count    = 0;
-        }
-    };
 
     struct ProbeResult {
         double   freq{0.0};
