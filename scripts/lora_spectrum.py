@@ -184,6 +184,11 @@ class State:
 
     def on_sweep_end(self, msg: dict[str, Any]) -> None:
         self.last_sweep_ms = msg.get("duration_ms", 0)
+        self.sweeps = msg.get("sweep", self.sweeps)
+        self.total_det += msg.get("detections", 0)
+        ovf = msg.get("overflows", 0)
+        if ovf > 0:
+            self.overflows = ovf
 
     def on_l2_probe(self, _msg: dict[str, Any]) -> None:
         pass
@@ -338,27 +343,29 @@ def _render_footer(s: State, term_w: int) -> str:
         bw_str = _bw_short(det["bw"])
         ratio_up = det.get("ratio_up", 0.0)
         ratio_dn = det.get("ratio_dn", 0.0)
-        if ratio_up == 0 and ratio_dn == 0:
-            ratio_up = ratio_dn = det.get("ratio", 0.0)
+        ratio = det.get("ratio", 0.0)
         chirp = det.get("chirp", "")
-        best_ratio = max(ratio_up, ratio_dn)
+        # Streaming pipeline provides only "ratio"; legacy provides ratio_up/dn
+        if ratio_up == 0 and ratio_dn == 0:
+            best_ratio = ratio
+        else:
+            best_ratio = max(ratio_up, ratio_dn)
         rc = _ratio_color(best_ratio)
 
         ts = _ts_hires(wall)
-        chirp_label = {
-            "both": "detected bothchirps",
-            "up": "detected upchirp",
-            "dn": "detected downchirp",
-        }.get(chirp, chirp)
         line = (
             f"{C_GRAY}{ts}{C_RST}"
             f"  {C_BLUE}#{sweep:<5}{C_RST}"
             f"  {C_CYAN}{freq_mhz:>7.3f} MHz{C_RST}"
             f"  {C_WHITE}SF{det['sf']}{C_RST} / {C_CYAN}{bw_str}{C_RST}"
-            f"  {rc}up {ratio_up:>5.1f}{C_RST}"
-            f"  {rc}dn {ratio_dn:>5.1f}{C_RST}"
+            f"  {rc}ratio {best_ratio:>5.1f}{C_RST}"
         )
-        if chirp_label:
+        if chirp:
+            chirp_label = {
+                "both": "bothchirps",
+                "up": "upchirp",
+                "dn": "downchirp",
+            }.get(chirp, chirp)
             chirp_c = C_GREEN if chirp == "both" else C_YELLOW
             line += f"  {chirp_c}{chirp_label}{C_RST}"
         line += "\033[K"

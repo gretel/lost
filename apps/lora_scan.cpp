@@ -853,17 +853,20 @@ static void emitDataSetCbor(const gr::DataSet<float>& ds) {
         sendCbor(buf);
     }
 
-    // --- Emit scan_sweep_end CBOR (updates header in lora_spectrum.py) ---
+    // --- Emit scan_sweep_end CBOR (updates header in lora_spectrum.py + lora_perf.py) ---
     {
         std::vector<uint8_t> buf;
         buf.reserve(128);
 
-        cb::encode_map_begin(buf, 5);
+        cb::encode_map_begin(buf, 8);
         cb::kv_text(buf, "type", "scan_sweep_end");
         cb::kv_text(buf, "ts", gr::lora::ts_now());
         cb::kv_uint(buf, "sweep", static_cast<uint64_t>(getInt("sweep")));
-        cb::kv_uint(buf, "det", static_cast<uint64_t>(nDet));
-        cb::kv_uint(buf, "hot", static_cast<uint64_t>(hotIndices.size()));
+        cb::kv_uint(buf, "duration_ms", static_cast<uint64_t>(getInt("duration_ms")));
+        cb::kv_uint(buf, "detections", static_cast<uint64_t>(nDet));
+        cb::kv_uint(buf, "hot_count", static_cast<uint64_t>(hotIndices.size()));
+        cb::kv_uint(buf, "l1_snapshots", static_cast<uint64_t>(getInt("n_snapshots")));
+        cb::kv_uint(buf, "overflows", static_cast<uint64_t>(0));  // TODO: wire overflow count
 
         sendCbor(buf);
     }

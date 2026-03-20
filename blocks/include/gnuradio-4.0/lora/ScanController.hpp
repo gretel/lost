@@ -113,6 +113,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     std::vector<ProbeResult> _probeResults;
     ProbeResult              _currentBest;
     std::vector<float>       _bws;
+    std::chrono::steady_clock::time_point _sweepStart{std::chrono::steady_clock::now()};
 
     // L1 FFT state
     gr::algorithm::FFT<cf32> _fft;
@@ -379,11 +380,15 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         }
 
         ds.meta_information.resize(1);
+        const auto sweepDur = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - _sweepStart).count();
+
         ds.meta_information[0]["type"]        = std::string("scan_spectrum");
         ds.meta_information[0]["sweep"]       = static_cast<int64_t>(_sweepCount);
         ds.meta_information[0]["n_hot"]       = static_cast<int64_t>(_hotChannels.size());
         ds.meta_information[0]["n_snapshots"] = static_cast<int64_t>(_snapshotCount);
         ds.meta_information[0]["n_det"]       = static_cast<int64_t>(_probeResults.size());
+        ds.meta_information[0]["duration_ms"] = static_cast<int64_t>(sweepDur);
 
         // Embed hot channel indices as comma-separated string
         // (pmt::Value doesn't support vector<int64_t>, so we serialize)
@@ -415,6 +420,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         _snapshotCount = 0;
         _callCount     = 0;
         _hotChannels.clear();
+        _sweepStart = std::chrono::steady_clock::now();
     }
 
     [[nodiscard]] double channelCenterFreq(uint32_t ch) const noexcept {
