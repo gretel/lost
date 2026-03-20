@@ -19,7 +19,9 @@ import argparse
 import logging
 import os
 import socket
+import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 from typing import IO, Any, Callable
@@ -792,3 +794,69 @@ def build_bizcard_uri(advert_packet: bytes) -> str:
     into importContact() which deserializes it as a Packet.
     """
     return "meshcore://" + advert_packet.hex()
+
+
+# ---- Companion device driver ----
+
+
+class CompanionDriver:
+    """Wraps meshcore-cli for companion device control.
+
+    Two modes:
+    - TCP bridge (default): connects to serial_bridge.py. No DTR reboot. ~0.3s.
+    - Direct serial: 14s reboot per command (fallback).
+    """
+
+    def __init__(
+        self,
+        *,
+        bridge_host: str = "127.0.0.1",
+        bridge_port: int = 7835,
+        serial: str | None = None,
+        reboot_wait: float = 14.0,
+    ):
+        self.bridge_host = bridge_host
+        self.bridge_port = bridge_port
+        self.serial = serial
+        self.reboot_wait = reboot_wait
+        self._last_sf: int | None = None
+        self._last_bw: float | None = None
+
+    def _cli_args(self) -> list[str]:
+        if self.serial:
+            return ["-q", "-s", self.serial]
+        return ["-q", "-t", self.bridge_host, "-p", str(self.bridge_port)]
+
+    def _run(self, *args: str, timeout: float = 20.0) -> tuple[bool, str]:
+        cmd = ["uvx", "meshcore-cli", *self._cli_args(), *args]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return r.returncode == 0, r.stdout.strip()
+        except subprocess.TimeoutExpired:
+            return False, "timeout"
+        except FileNotFoundError:
+            return False, "uvx not found"
+
+    def set_radio(self, freq_mhz: float, bw_khz: float, sf: int, cr: int = 8) -> bool:
+        if self._last_sf == sf and self._last_bw == bw_khz:
+            return True
+        ok, _ = self._run("set", "radio", f"{freq_mhz},{bw_khz},{sf},{cr}")
+        if ok and self.serial:
+            time.sleep(self.reboot_wait)
+        self._last_sf = sf
+        self._last_bw = bw_khz
+        return ok
+
+    def set_tx_power(self, dbm: int) -> bool:
+        ok, _ = self._run("set", "tx", str(dbm))
+        if ok and self.serial:
+            time.sleep(self.reboot_wait)
+        return ok
+
+    def send_advert(self) -> bool:
+        ok, _ = self._run("advert")
+        return ok
+
+    def get_radio(self) -> str:
+        ok, out = self._run("get", "radio")
+        return out if ok else ""
