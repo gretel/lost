@@ -31,18 +31,20 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     gr::PortOut<gr::DataSet<float>, gr::Async>   spectrum_out;
 
     // --- settings ---
-    float    sample_rate{16000000.f};
-    float    center_freq{866500000.f};
-    float    min_ratio{8.0f};
-    float    buffer_ms{512.f};
-    float    channel_bw{62500.f};
-    uint32_t l1_interval{64};       // processBulk calls between L1 energy snapshots
-    uint32_t l1_snapshots{16};      // snapshots to accumulate before probing
-    uint32_t l1_fft_size{4096};
+    float       sample_rate{16000000.f};
+    float       center_freq{866500000.f};
+    float       min_ratio{8.0f};
+    float       buffer_ms{512.f};
+    float       channel_bw{62500.f};
+    uint32_t    l1_interval{64};       // processBulk calls between L1 energy snapshots
+    uint32_t    l1_snapshots{16};      // snapshots to accumulate before probing
+    uint32_t    l1_fft_size{4096};
+    std::string probe_bws{"62500"};    // comma-separated BWs to probe (Hz)
 
     GR_MAKE_REFLECTABLE(ScanController, in, detect_out, spectrum_out,
                         sample_rate, center_freq, min_ratio, buffer_ms,
-                        channel_bw, l1_interval, l1_snapshots, l1_fft_size);
+                        channel_bw, l1_interval, l1_snapshots, l1_fft_size,
+                        probe_bws);
 
     // --- internal types ---
 
@@ -113,6 +115,8 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     std::vector<ProbeResult> _probeResults;
     ProbeResult              _currentBest;
     std::vector<float>       _bws;
+    std::vector<uint32_t>    _channelPeakBin;  // DC-centered FFT bin with max |Y|² per channel
+    std::vector<float>       _channelPeakMag;  // max |Y|² per channel
     std::chrono::steady_clock::time_point _sweepStart{std::chrono::steady_clock::now()};
 
     // L1 FFT state
@@ -130,8 +134,24 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         const float usableBw = sample_rate * 0.8f;
         _nChannels = static_cast<uint32_t>(usableBw / channel_bw);
         _channelEnergy.assign(_nChannels, 0.f);
+        _channelPeakBin.assign(_nChannels, 0);
+        _channelPeakMag.assign(_nChannels, 0.f);
 
-        _bws = {62500.f, 125000.f, 250000.f};
+        // Parse configurable BWs from comma-separated string
+        _bws.clear();
+        {
+            std::string s = probe_bws;
+            std::size_t pos = 0;
+            while (pos < s.size()) {
+                auto end = s.find(',', pos);
+                if (end == std::string::npos) end = s.size();
+                if (end > pos) {
+                    _bws.push_back(std::stof(s.substr(pos, end - pos)));
+                }
+                pos = end + 1;
+            }
+        }
+        if (_bws.empty()) _bws = {62500.f};
         _cadPerBw.clear();
         _cadPerBw.reserve(_bws.size());
         for (float bw : _bws) {
@@ -266,7 +286,13 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             for (uint32_t b = 0; b < binsPerCh; ++b) {
                 const auto fftIdx = (startBin + ch * binsPerCh + b + half) % l1_fft_size;
                 const auto& s = fftOut[fftIdx];
-                energy += s.real() * s.real() + s.imag() * s.imag();
+                const float mag = s.real() * s.real() + s.imag() * s.imag();
+                energy += mag;
+                // Track peak bin within this channel for frequency refinement
+                if (mag > _channelPeakMag[ch]) {
+                    _channelPeakMag[ch] = mag;
+                    _channelPeakBin[ch] = startBin + ch * binsPerCh + b;
+                }
             }
             _channelEnergy[ch] += energy;
         }
@@ -280,6 +306,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         _hotChannels.clear();
         if (_nChannels == 0 || _snapshotCount == 0) return;
 
+        // Threshold: channels with energy > 6× median
         std::vector<float> sorted(_channelEnergy.begin(),
                                   _channelEnergy.begin() + static_cast<std::ptrdiff_t>(_nChannels));
         std::ranges::sort(sorted);
@@ -288,10 +315,28 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         constexpr float kHotMultiplier = 6.0f;
         const float threshold = median * kHotMultiplier;
 
+        std::vector<uint32_t> raw;
         for (uint32_t ch = 0; ch < _nChannels; ++ch) {
             if (_channelEnergy[ch] > threshold) {
-                _hotChannels.push_back(ch);
+                raw.push_back(ch);
             }
+        }
+
+        // Cluster dedup: merge adjacent hot channels, keep peak-energy channel per cluster
+        std::size_t i = 0;
+        while (i < raw.size()) {
+            uint32_t bestCh = raw[i];
+            float    bestE  = _channelEnergy[bestCh];
+            std::size_t j = i + 1;
+            while (j < raw.size() && raw[j] == raw[j - 1] + 1) {
+                if (_channelEnergy[raw[j]] > bestE) {
+                    bestCh = raw[j];
+                    bestE  = _channelEnergy[raw[j]];
+                }
+                ++j;
+            }
+            _hotChannels.push_back(bestCh);
+            i = j;
         }
     }
 
@@ -301,8 +346,9 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         if (_probeIndex >= _hotChannels.size()) return true;
 
         const uint32_t ch = _hotChannels[_probeIndex];
-        const double channelFreq = channelCenterFreq(ch);
+        const double channelFreq = refinedFreq(ch);
 
+        // Initialize best result for this channel on first BW
         if (_probeBwIndex == 0) {
             _currentBest = ProbeResult{};
             _currentBest.freq = channelFreq;
@@ -417,10 +463,23 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
 
     void resetAccumulation() noexcept {
         _channelEnergy.assign(_nChannels, 0.f);
+        _channelPeakBin.assign(_nChannels, 0);
+        _channelPeakMag.assign(_nChannels, 0.f);
         _snapshotCount = 0;
         _callCount     = 0;
         _hotChannels.clear();
         _sweepStart = std::chrono::steady_clock::now();
+    }
+
+    /// Refined frequency from L1 FFT peak bin (Fix B: ~3.9 kHz resolution vs 62.5 kHz channel center).
+    [[nodiscard]] double refinedFreq(uint32_t ch) const noexcept {
+        if (ch < _nChannels && _channelPeakMag[ch] > 0.f) {
+            const double binBw = static_cast<double>(sample_rate) / static_cast<double>(l1_fft_size);
+            const double usableBw = static_cast<double>(sample_rate) * 0.8;
+            const double bandStart = static_cast<double>(center_freq) - usableBw / 2.0;
+            return bandStart + static_cast<double>(_channelPeakBin[ch]) * binBw + binBw * 0.5;
+        }
+        return channelCenterFreq(ch);
     }
 
     [[nodiscard]] double channelCenterFreq(uint32_t ch) const noexcept {

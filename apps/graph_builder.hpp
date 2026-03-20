@@ -391,15 +391,24 @@ inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const Sc
         gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
 
     // ScanController: sole downstream block (IQ sink with ring buffer + L1/L2)
+    // Build probe_bws string from config bws vector
+    std::string probeBwsStr;
+    for (std::size_t i = 0; i < cfg.bws.size(); ++i) {
+        if (i > 0) probeBwsStr += ',';
+        probeBwsStr += std::to_string(cfg.bws[i]);
+    }
+    if (probeBwsStr.empty()) probeBwsStr = "62500";
+
     auto& controller = graph.emplaceBlock<gr::lora::ScanController>({
         {"sample_rate",   static_cast<float>(cfg.l1_rate)},
         {"center_freq",   static_cast<float>(centerFreq)},
         {"min_ratio",     cfg.min_ratio},
         {"buffer_ms",     cfg.buffer_ms},
         {"channel_bw",    cfg.channel_bw},
-        {"l1_interval",   cfg.l1_reports},     // reuse config field
+        {"l1_interval",   cfg.l1_reports},
         {"l1_snapshots",  uint32_t{16}},
         {"l1_fft_size",   cfg.l1_fft_size},
+        {"probe_bws",     probeBwsStr},
     });
 
     if (!ok(graph.connect<"out", "in">(source, controller))) {

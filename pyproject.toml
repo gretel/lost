@@ -12,4 +12,5 @@ dependencies = [
     "paho-mqtt",
     "sounddevice",
     "numpy>=2.4.2",
+    "pyserial>=3.5",
 ]
