@@ -346,7 +346,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         if (_probeIndex >= _hotChannels.size()) return true;
 
         const uint32_t ch = _hotChannels[_probeIndex];
-        const double channelFreq = refinedFreq(ch);
+        const double channelFreq = channelCenterFreq(ch);
 
         // Initialize best result for this channel on first BW
         if (_probeBwIndex == 0) {
