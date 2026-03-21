@@ -72,18 +72,12 @@ target_compile_definitions(qa_lora_scan PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
 set_tests_properties(qa_lora_scan PROPERTIES TIMEOUT 60)
 
+add_ut_test(qa_lora_wideband)
+target_compile_definitions(qa_lora_wideband PRIVATE
+    TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
+set_tests_properties(qa_lora_wideband PROPERTIES TIMEOUT 120)
+
 # Test vector generator (not a test — run manually to regenerate vectors)
 add_executable(generate_vectors generate_vectors.cpp)
 target_link_libraries(generate_vectors PRIVATE gr-lora)
 
-# --- Hardware tests (require SoapySDR + B210/B220) ---
-if(TARGET gr-soapy)
-    add_executable(qa_SoapySink qa_SoapySink.cpp)
-    target_link_libraries(qa_SoapySink PRIVATE
-        gnuradio-options gnuradio-core-group gr-lora gr-soapy gr-testing ut)
-    add_test(NAME qa_SoapySink
-             COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/qa_SoapySink)
-    set_tests_properties(qa_SoapySink PROPERTIES
-        ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0"
-        TIMEOUT 30)
-endif()

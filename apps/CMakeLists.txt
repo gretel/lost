@@ -8,8 +8,6 @@ if(NOT TARGET gr-soapy)
     return()
 endif()
 
-# SoapySink.hpp lives in blocks/include/ — add it to the include path via gr-lora
-
 add_executable(lora_trx lora_trx.cpp config.cpp)
 target_link_libraries(lora_trx PRIVATE gnuradio-core-group gr-lora gr-soapy gr-testing tomlplusplus::tomlplusplus)
 
