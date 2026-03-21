@@ -60,9 +60,6 @@ struct ChannelSlot {
     CascadedDecimator decimator;
     uint32_t decodeBw{62500};
 
-    // Persistent mix buffer (avoids per-call heap allocation in pushWideband)
-    std::vector<cf32> mixBuf;
-
     // Narrowband output samples (accumulated between drain calls)
     std::vector<cf32> nbAccum;
 
@@ -96,7 +93,6 @@ struct ChannelSlot {
         for (uint32_t v = os_factor; v > 1; v >>= 1) ++nStages;
         decimator.init(nStages);
         decodeBw = bw;
-        mixBuf.reserve(8192);   // typical chunk size
         nbAccum.clear();
 
         // Initialize SfLanes for SF7-12 at os_factor=1
@@ -112,32 +108,19 @@ struct ChannelSlot {
     void deactivate() {
         state = State::Idle;
         decimator.reset();
-        mixBuf.clear();
-        mixBuf.shrink_to_fit();
         nbAccum.clear();
         nbAccum.shrink_to_fit();
         sfLanes.clear();
     }
 
     /// Mix wideband samples through the NCO and cascaded half-band FIR
-    /// decimator. Phase is continuous across calls. Output appended to nbAccum.
+    /// decimator in a single fused pass. Each wideband sample is read once
+    /// and never materialized as an intermediate mixed result, eliminating
+    /// 128 KB of memory traffic per call (8192 × 16 bytes).
     ///
-    /// Uses complex-multiply recurrence (4 muls + 2 adds per sample) instead
-    /// of per-sample cos/sin (~20 float-equivalent ops). Renormalizes every
-    /// 1024 samples to prevent amplitude drift from floating-point rounding.
+    /// Phase is continuous across calls. Output appended to nbAccum.
     void pushWideband(std::span<const cf32> wbSamples) {
-        mixBuf.resize(wbSamples.size());
-        for (std::size_t i = 0; i < wbSamples.size(); ++i) {
-            mixBuf[i] = wbSamples[i] * ncoRot;
-            ncoRot *= ncoStep;
-            // Renormalize every 1024 samples to prevent amplitude drift.
-            // Convention: fire AFTER sample index 1023, 2047, ... (0-indexed)
-            if ((i & 0x3FFU) == 0x3FFU) {
-                ncoRot /= std::abs(ncoRot);
-            }
-        }
-        // Cascaded half-band FIR decimation
-        decimator.process(std::span<const cf32>(mixBuf), nbAccum);
+        decimator.processWithNco(wbSamples, nbAccum, ncoRot, ncoStep);
     }
 };
 

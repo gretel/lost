@@ -107,6 +107,31 @@ struct HalfBandStage {
             ++sampleCount;
         }
     }
+
+    /// Process with per-sample mixing fused into the input.
+    /// mixFn(i) returns the mixed sample for index i.
+    template<typename MixFn>
+    void processWithMix(std::size_t count, MixFn&& mixFn, std::vector<cf32>& out) {
+        using namespace halfband_detail;
+        for (std::size_t i = 0; i < count; ++i) {
+            delay[writePos] = mixFn(i);
+            if ((sampleCount & 1U) == 1U) {
+                cf32 acc{0.f, 0.f};
+                for (std::size_t c = 0; c < kCoeffs.size(); ++c) {
+                    const std::size_t k = c * 2;
+                    const std::size_t kMirror = kFilterLen - 1 - k;
+                    const std::size_t idx1 = (writePos + k + 1) % kFilterLen;
+                    const std::size_t idx2 = (writePos + kMirror + 1) % kFilterLen;
+                    acc += kCoeffs[c] * (delay[idx1] + delay[idx2]);
+                }
+                const std::size_t centerIdx = (writePos + 11 + 1) % kFilterLen;
+                acc += kCenterTap * delay[centerIdx];
+                out.push_back(acc);
+            }
+            writePos = (writePos + 1) % kFilterLen;
+            ++sampleCount;
+        }
+    }
 };
 
 // ─── CascadedDecimator ──────────────────────────────────────────────────────
@@ -168,6 +193,47 @@ struct CascadedDecimator {
         std::vector<cf32> out;
         process(input, out);
         return out;
+    }
+
+    /// Process input with NCO mixing fused into the first half-band stage.
+    /// Eliminates the intermediate mixed buffer — each wideband sample is read
+    /// once from the input span and never materialized as a mixed result.
+    /// Updates rot in-place for phase continuity across calls.
+    void processWithNco(std::span<const cf32> input, std::vector<cf32>& out,
+                        cf32& rot, const cf32& step) {
+        if (stages.empty()) {
+            // No FIR stages — just mix directly to output
+            for (std::size_t i = 0; i < input.size(); ++i) {
+                out.push_back(input[i] * rot);
+                rot *= step;
+                if ((i & 0x3FFU) == 0x3FFU) rot /= std::abs(rot);
+            }
+            return;
+        }
+
+        // First stage: fused NCO + FIR via lambda
+        scratch0.clear();
+        std::size_t idx = 0;
+        stages[0].processWithMix(input.size(),
+            [&](std::size_t) -> cf32 {
+                cf32 s = input[idx] * rot;
+                rot *= step;
+                if ((idx & 0x3FFU) == 0x3FFU) rot /= std::abs(rot);
+                ++idx;
+                return s;
+            },
+            scratch0);
+
+        // Remaining stages: normal ping-pong processing
+        for (std::size_t i = 1; i < stages.size(); ++i) {
+            auto& src = (i & 1U) ? scratch0 : scratch1;
+            auto& dst = (i & 1U) ? scratch1 : scratch0;
+            dst.clear();
+            stages[i].process(std::span<const cf32>(src), dst);
+        }
+
+        auto& result = (stages.size() & 1U) ? scratch0 : scratch1;
+        out.insert(out.end(), result.begin(), result.end());
     }
 };
 

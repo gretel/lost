@@ -1202,4 +1202,83 @@ const boost::ut::suite<"HalfBandDecimator"> halfBandTests = [] {
     };
 };
 
+// ============================================================================
+// Fused NCO+FIR equivalence test
+// ============================================================================
+
+const boost::ut::suite<"Fused NCO+FIR equivalence"> fusedNcoFirTests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "processWithNco matches separate NCO+FIR"_test = [] {
+        // Generate random wideband input, process through:
+        //   (a) separate NCO mix → CascadedDecimator::process()
+        //   (b) CascadedDecimator::processWithNco() (fused)
+        // Assert outputs match within float precision.
+        constexpr std::size_t nSamples = 8192;
+        constexpr std::size_t nStages  = 8;  // BW62.5k at 16 MS/s: 2^8 = 256
+        constexpr double sampleRate    = 16e6;
+        constexpr double channelFreq   = 869.5e6;
+        constexpr double centerFreq    = 866.5e6;
+        constexpr double shiftHz       = -(channelFreq - centerFreq);  // -3 MHz
+
+        const double phaseInc = 2.0 * std::numbers::pi * shiftHz / sampleRate;
+        const cf32 ncoStep(static_cast<float>(std::cos(phaseInc)),
+                           static_cast<float>(std::sin(phaseInc)));
+
+        // Random wideband input
+        std::mt19937 rng(42);
+        std::normal_distribution<float> dist(0.f, 1.0f);
+        std::vector<cf32> wbInput(nSamples);
+        for (auto& s : wbInput) {
+            s = cf32(dist(rng), dist(rng));
+        }
+
+        // --- Path A: separate NCO mix + FIR ---
+        cf32 rotA(1.f, 0.f);
+        std::vector<cf32> mixBuf(nSamples);
+        for (std::size_t i = 0; i < nSamples; ++i) {
+            mixBuf[i] = wbInput[i] * rotA;
+            rotA *= ncoStep;
+            if ((i & 0x3FFU) == 0x3FFU) {
+                rotA /= std::abs(rotA);
+            }
+        }
+        CascadedDecimator decA;
+        decA.init(nStages, nSamples);
+        std::vector<cf32> outA;
+        decA.process(std::span<const cf32>(mixBuf), outA);
+
+        // --- Path B: fused NCO+FIR ---
+        cf32 rotB(1.f, 0.f);
+        CascadedDecimator decB;
+        decB.init(nStages, nSamples);
+        std::vector<cf32> outB;
+        decB.processWithNco(std::span<const cf32>(wbInput), outB, rotB, ncoStep);
+
+        // --- Assertions ---
+        expect(eq(outA.size(), outB.size()))
+            << "output sizes must match: A=" << outA.size() << " B=" << outB.size();
+
+        float maxErr = 0.f;
+        for (std::size_t i = 0; i < std::min(outA.size(), outB.size()); ++i) {
+            float err = std::abs(outA[i] - outB[i]);
+            maxErr = std::max(maxErr, err);
+        }
+
+        std::fprintf(stderr, "  fused NCO+FIR: %zu outputs, maxErr=%.9f\n",
+                     outB.size(), static_cast<double>(maxErr));
+
+        expect(maxErr < 1e-6f)
+            << "max error between separate and fused = " << maxErr
+            << ", expected < 1e-6";
+
+        // NCO rotation state should also match after processing
+        float rotDiff = std::abs(rotA - rotB);
+        expect(rotDiff < 1e-5f)
+            << "NCO rotation state divergence = " << rotDiff
+            << ", expected < 1e-5";
+    };
+};
+
 int main() { /* boost.ut auto-runs */ }
