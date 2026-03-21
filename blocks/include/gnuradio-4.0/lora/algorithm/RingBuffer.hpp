@@ -39,6 +39,29 @@ struct RingBuffer {
         count += n;
     }
 
+    /// Zero-copy view of the most recent N samples as 1 or 2 contiguous spans.
+    /// When the data wraps around the circular boundary, two spans are returned;
+    /// otherwise the second span is empty.  The spans point into the ring buffer
+    /// — callers must NOT modify the data through them.
+    [[nodiscard]] std::pair<std::span<const cf32>, std::span<const cf32>>
+    recentView(std::size_t n) const noexcept {
+        n = std::min(n, count);
+        if (n == 0 || data.empty()) return {{}, {}};
+
+        const auto cap = data.size();
+        const std::size_t start = (writeIdx + cap - n) % cap;
+        if (start + n <= cap) {
+            // No wrap — single contiguous span
+            return {std::span<const cf32>(data.data() + start, n), {}};
+        }
+        // Wraps around — two spans
+        const std::size_t firstLen = cap - start;
+        return {
+            std::span<const cf32>(data.data() + start, firstLen),
+            std::span<const cf32>(data.data(), n - firstLen)
+        };
+    }
+
     [[nodiscard]] std::vector<cf32> recent(std::size_t n) const {
         if (count < n || n > data.size()) return {};
         std::vector<cf32> out(n);

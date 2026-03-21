@@ -184,7 +184,8 @@ struct WidebandDecoder
     cf32                      _dc_prev_in{0.f, 0.f};
     cf32                      _dc_prev_out{0.f, 0.f};
     static constexpr float    _dc_alpha{0.999f};
-    std::vector<cf32>         _dcBuf;  // persistent buffer (avoids per-call heap alloc)
+    std::vector<cf32>         _dcBuf;   // persistent buffer (avoids per-call heap alloc)
+    std::vector<cf32>         _fftBuf;  // persistent L1 FFT buffer (avoids ~30/s heap allocs)
 
     // Noise floor tracking
     float                     _noise_floor_db{-999.f};
@@ -241,7 +242,8 @@ struct WidebandDecoder
         }
         _fft = gr::algorithm::FFT<cf32>{};
 
-        _dcBuf.reserve(8192);   // typical chunk size
+        _dcBuf.reserve(8192);           // typical chunk size
+        _fftBuf.reserve(l1_fft_size);   // persistent L1 FFT buffer
         _callCount     = 0;
         _snapshotCount = 0;
         _sweepCount    = 0;
@@ -406,16 +408,21 @@ struct WidebandDecoder
     void computeEnergySnapshot() noexcept {
         if (_ring.count < l1_fft_size) return;
 
-        auto samples = _ring.recent(l1_fft_size);
-        if (samples.empty()) return;
+        // Copy recent samples into persistent buffer (must copy — Hann windowing modifies in-place)
+        auto [v1, v2] = _ring.recentView(l1_fft_size);
+        if (v1.empty() && v2.empty()) return;
+        _fftBuf.resize(l1_fft_size);
+        std::copy(v1.begin(), v1.end(), _fftBuf.begin());
+        if (!v2.empty())
+            std::copy(v2.begin(), v2.end(), _fftBuf.begin() + static_cast<std::ptrdiff_t>(v1.size()));
 
         // Apply Hann window
         for (uint32_t i = 0; i < l1_fft_size; ++i) {
-            samples[i] *= _window[i];
+            _fftBuf[i] *= _window[i];
         }
 
         auto fftOut = _fft.compute(
-            std::span<const cf32>(samples.data(), l1_fft_size));
+            std::span<const cf32>(_fftBuf.data(), l1_fft_size));
 
         // Accumulate |FFT|^2 into channel bins (DC-centered via fftshift)
         const auto half    = l1_fft_size / 2;
