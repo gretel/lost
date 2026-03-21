@@ -937,6 +937,93 @@ const boost::ut::suite<"WidebandDecoder loopback"> wbLoopbackTests = [] {
 };
 
 // ============================================================================
+// NCO complex-multiply recurrence precision test
+// ============================================================================
+
+const boost::ut::suite<"NCO recurrence precision"> ncoRecurrenceTests = [] {
+    using namespace boost::ut;
+
+    "complex-multiply recurrence matches cos/sin reference"_test = [] {
+        // Validate that the complex-multiply NCO recurrence stays within
+        // acceptable phase and amplitude error over a realistic processing
+        // interval.  Uses a 3 MHz offset at 16 MS/s (typical mid-band shift).
+        constexpr double sampleRate = 16e6;
+        constexpr double shiftHz    = -3e6;  // typical -(channelFreq - centerFreq)
+        constexpr double phaseInc   = 2.0 * std::numbers::pi * shiftHz / sampleRate;
+        constexpr std::size_t N     = 65536;  // one large processBulk equivalent
+        constexpr std::size_t kRenorm = 1024;  // renormalize every 1024 samples
+
+        // --- Reference: per-sample cos/sin (current implementation) ---
+        std::vector<cf32> ref(N);
+        {
+            double phase = 0.0;
+            for (std::size_t i = 0; i < N; ++i) {
+                ref[i] = cf32(static_cast<float>(std::cos(phase)),
+                              static_cast<float>(std::sin(phase)));
+                phase += phaseInc;
+                if (((i + 1) & 0x3FFU) == 0) {
+                    phase = std::remainder(phase, 2.0 * std::numbers::pi);
+                }
+            }
+        }
+
+        // --- Recurrence: rot *= step, renormalize every kRenorm samples ---
+        std::vector<cf32> rec(N);
+        {
+            const cf32 step(static_cast<float>(std::cos(phaseInc)),
+                            static_cast<float>(std::sin(phaseInc)));
+            cf32 rot(1.f, 0.f);  // start at phase=0
+            for (std::size_t i = 0; i < N; ++i) {
+                rec[i] = rot;
+                rot *= step;
+                // Renormalize every kRenorm samples (fire AFTER index 1023, 2047, ...)
+                if ((i & 0x3FFU) == 0x3FFU) {
+                    rot /= std::abs(rot);
+                }
+            }
+        }
+
+        // --- Assertions ---
+        float maxPhaseErr = 0.f;
+        float maxAmpErr   = 0.f;
+        float worstAmpBeforeRenorm = 0.f;
+
+        for (std::size_t i = 0; i < N; ++i) {
+            // Phase error: angle between ref and rec phasors
+            // arg(rec[i] * conj(ref[i])) gives the phase difference
+            cf32 diff = rec[i] * std::conj(ref[i]);
+            float phaseErr = std::abs(std::arg(diff));
+            maxPhaseErr = std::max(maxPhaseErr, phaseErr);
+
+            // Amplitude deviation from unity
+            float ampErr = std::abs(std::abs(rec[i]) - 1.0f);
+            maxAmpErr = std::max(maxAmpErr, ampErr);
+
+            // Track worst amplitude just before renormalization
+            if ((i & 0x3FFU) == 0x3FEU) {  // sample 1022, 2046, ...
+                worstAmpBeforeRenorm = std::max(worstAmpBeforeRenorm, ampErr);
+            }
+        }
+
+        std::fprintf(stderr,
+            "  NCO recurrence (N=%zu, renorm=%zu): maxPhaseErr=%.6f rad, "
+            "maxAmpErr=%.6f, worstPreRenorm=%.6f\n",
+            N, kRenorm, static_cast<double>(maxPhaseErr),
+            static_cast<double>(maxAmpErr),
+            static_cast<double>(worstAmpBeforeRenorm));
+
+        // Phase error < 0.01 radian over entire interval
+        expect(maxPhaseErr < 0.01f)
+            << "max phase error = " << maxPhaseErr << " rad, expected < 0.01";
+
+        // Amplitude within 0.02% of unity after each renormalization cycle
+        // (checking at every sample; worst case is just before renormalization)
+        expect(maxAmpErr < 0.0002f)
+            << "max amplitude error = " << maxAmpErr << ", expected < 0.0002";
+    };
+};
+
+// ============================================================================
 // HalfBandDecimator unit tests
 // ============================================================================
 

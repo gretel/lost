@@ -48,9 +48,13 @@ struct ChannelSlot {
     uint32_t osFactor{1};        // decimation factor = sample_rate / bw
     uint32_t channelIdx{0};      // L1 channel index that activated this slot
 
-    // Phase-continuous NCO state (double precision to avoid drift at 16 MS/s)
-    double ncoPhase{0.0};
+    // Phase-continuous NCO state
+    // Double-precision phaseInc kept for computing the single-precision step phasor
+    // in activate(). Hot path uses complex-multiply recurrence (ncoRot *= ncoStep)
+    // with renormalization every 1024 samples.
     double ncoPhaseInc{0.0};     // radians per sample = 2*pi * shift_hz / sample_rate
+    cf32   ncoRot{1.f, 0.f};     // current NCO phasor (rotated each sample)
+    cf32   ncoStep{1.f, 0.f};    // per-sample rotation phasor (computed once in activate)
 
     // Cascaded half-band FIR decimator
     CascadedDecimator decimator;
@@ -76,7 +80,9 @@ struct ChannelSlot {
         // NCO shift: negate to bring channel down to baseband
         const double shift_hz = -(channel_freq - center_freq);
         ncoPhaseInc = 2.0 * std::numbers::pi * shift_hz / sample_rate;
-        ncoPhase    = 0.0;
+        ncoStep = cf32(static_cast<float>(std::cos(ncoPhaseInc)),
+                       static_cast<float>(std::sin(ncoPhaseInc)));
+        ncoRot  = cf32(1.f, 0.f);  // start at 0 phase
 
         // Cascaded half-band FIR: os_factor must be power of 2
         if ((os_factor & (os_factor - 1)) != 0) {
@@ -109,18 +115,19 @@ struct ChannelSlot {
 
     /// Mix wideband samples through the NCO and cascaded half-band FIR
     /// decimator. Phase is continuous across calls. Output appended to nbAccum.
+    ///
+    /// Uses complex-multiply recurrence (4 muls + 2 adds per sample) instead
+    /// of per-sample cos/sin (~20 float-equivalent ops). Renormalizes every
+    /// 1024 samples to prevent amplitude drift from floating-point rounding.
     void pushWideband(std::span<const cf32> wbSamples) {
-        // NCO mix: rotate each sample to baseband
         std::vector<cf32> mixed(wbSamples.size());
-        uint32_t sampleIdx = 0;
         for (std::size_t i = 0; i < wbSamples.size(); ++i) {
-            const auto rot = cf32(
-                static_cast<float>(std::cos(ncoPhase)),
-                static_cast<float>(std::sin(ncoPhase)));
-            mixed[i] = wbSamples[i] * rot;
-            ncoPhase += ncoPhaseInc;
-            if ((++sampleIdx & 0x3FFU) == 0) {
-                ncoPhase = std::remainder(ncoPhase, 2.0 * std::numbers::pi);
+            mixed[i] = wbSamples[i] * ncoRot;
+            ncoRot *= ncoStep;
+            // Renormalize every 1024 samples to prevent amplitude drift.
+            // Convention: fire AFTER sample index 1023, 2047, ... (0-indexed)
+            if ((i & 0x3FFU) == 0x3FFU) {
+                ncoRot /= std::abs(ncoRot);
             }
         }
         // Cascaded half-band FIR decimation
