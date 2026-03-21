@@ -107,6 +107,8 @@ Note the exact coefficient values. They will be hardcoded as `constexpr` in the 
 
 Add a new test suite to `test/qa_lora_wideband.cpp`, after the includes but before the existing suites. Add `#include <gnuradio-4.0/lora/algorithm/HalfBandDecimator.hpp>` to the includes.
 
+**Note:** The test helpers `makeTone()`, `peakBin()`, and `peakToMeanDb()` already exist in the anonymous namespace at lines 31-91 of `qa_lora_wideband.cpp`. They use Hz-based frequency parameters. The HalfBandDecimator tests call them with normalized units (e.g., `makeTone(N, 0.1, 1.0)` = 0.1 Hz at 1.0 Hz sample rate), which works because the implementation uses `2*pi*freq/rate`.
+
 ```cpp
 // In test/qa_lora_wideband.cpp, new test suite:
 
@@ -484,7 +486,12 @@ Expected: The new test FAILS (box-car only gives ~-13 dB rejection). Existing te
 
 - [ ] **Step 3: Replace the box-car in ChannelSlot**
 
-Modify `ChannelSlot` in `WidebandDecoder.hpp`:
+Modify `ChannelSlot` in `WidebandDecoder.hpp`.
+
+**Note:** The existing `activate()` already takes 8 parameters (line 72):
+`activate(channel_freq, center_freq, sample_rate, os_factor, ch_idx, bw, sync, preamble)`.
+The test examples below use 4 args (relying on defaults for the rest). This is fine —
+the signature does NOT change in this task. Task 4 will call all 8 args explicitly.
 
 **Add include** (after existing includes at top of file):
 ```cpp
@@ -693,11 +700,20 @@ In `WidebandDecoder.hpp`:
 
 **Add to GR_MAKE_REFLECTABLE** — add `decode_bw_str` to the macro parameter list.
 
-**Add internal state** (in internal state section):
+**Add internal state** (in internal state section). Replace the old `_activeChannelMap` declaration:
 ```cpp
     std::vector<uint32_t>                _decodeBws;
     std::vector<std::vector<uint32_t>>   _activeChannelMap;  // channelIdx → list of slotIdx
 ```
+
+**Audit all access sites for old `_activeChannelMap`:** The old type was `vector<uint32_t>`
+with `UINT32_MAX` sentinel. All existing reads (in `updateActiveChannels()` and overflow
+handling) must be updated to the vector-of-vectors type. Search for `_activeChannelMap`
+in `WidebandDecoder.hpp` and update each occurrence:
+- `_activeChannelMap[ch] != UINT32_MAX` → `!_activeChannelMap[ch].empty()`
+- `_activeChannelMap[ch] = UINT32_MAX` → `_activeChannelMap[ch].clear()`
+- `_activeChannelMap[ch] = slotIdx` → `_activeChannelMap[ch].push_back(slotIdx)`
+- Overflow reset: `_activeChannelMap.assign(_nChannels, UINT32_MAX)` → `for (auto& v : _activeChannelMap) v.clear();`
 
 **Modify `start()`** — add after the existing `_activeChannelMap` initialization. Replace the old `_activeChannelMap.assign(_nChannels, UINT32_MAX)` with the new vector-of-vectors:
 
