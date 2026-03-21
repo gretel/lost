@@ -60,6 +60,9 @@ struct ChannelSlot {
     CascadedDecimator decimator;
     uint32_t decodeBw{62500};
 
+    // Persistent mix buffer (avoids per-call heap allocation in pushWideband)
+    std::vector<cf32> mixBuf;
+
     // Narrowband output samples (accumulated between drain calls)
     std::vector<cf32> nbAccum;
 
@@ -93,6 +96,7 @@ struct ChannelSlot {
         for (uint32_t v = os_factor; v > 1; v >>= 1) ++nStages;
         decimator.init(nStages);
         decodeBw = bw;
+        mixBuf.reserve(8192);   // typical chunk size
         nbAccum.clear();
 
         // Initialize SfLanes for SF7-12 at os_factor=1
@@ -108,6 +112,8 @@ struct ChannelSlot {
     void deactivate() {
         state = State::Idle;
         decimator.reset();
+        mixBuf.clear();
+        mixBuf.shrink_to_fit();
         nbAccum.clear();
         nbAccum.shrink_to_fit();
         sfLanes.clear();
@@ -120,9 +126,9 @@ struct ChannelSlot {
     /// of per-sample cos/sin (~20 float-equivalent ops). Renormalizes every
     /// 1024 samples to prevent amplitude drift from floating-point rounding.
     void pushWideband(std::span<const cf32> wbSamples) {
-        std::vector<cf32> mixed(wbSamples.size());
+        mixBuf.resize(wbSamples.size());
         for (std::size_t i = 0; i < wbSamples.size(); ++i) {
-            mixed[i] = wbSamples[i] * ncoRot;
+            mixBuf[i] = wbSamples[i] * ncoRot;
             ncoRot *= ncoStep;
             // Renormalize every 1024 samples to prevent amplitude drift.
             // Convention: fire AFTER sample index 1023, 2047, ... (0-indexed)
@@ -131,7 +137,7 @@ struct ChannelSlot {
             }
         }
         // Cascaded half-band FIR decimation
-        decimator.process(std::span<const cf32>(mixed), nbAccum);
+        decimator.process(std::span<const cf32>(mixBuf), nbAccum);
     }
 };
 
@@ -195,6 +201,7 @@ struct WidebandDecoder
     cf32                      _dc_prev_in{0.f, 0.f};
     cf32                      _dc_prev_out{0.f, 0.f};
     static constexpr float    _dc_alpha{0.999f};
+    std::vector<cf32>         _dcBuf;  // persistent buffer (avoids per-call heap alloc)
 
     // Noise floor tracking
     float                     _noise_floor_db{-999.f};
@@ -251,6 +258,7 @@ struct WidebandDecoder
         }
         _fft = gr::algorithm::FFT<cf32>{};
 
+        _dcBuf.reserve(8192);   // typical chunk size
         _callCount     = 0;
         _snapshotCount = 0;
         _sweepCount    = 0;
@@ -294,14 +302,15 @@ struct WidebandDecoder
 
         // 2. DC removal (IIR high-pass) — removes B210 DC offset that
         //    corrupts the center channel's signal via the box-car decimator
-        std::vector<cf32> dc_removed(in_span.begin(), in_span.end());
-        for (auto& s : dc_removed) {
-            cf32 out = s - _dc_prev_in + cf32(_dc_alpha, 0.f) * _dc_prev_out;
+        _dcBuf.resize(in_span.size());
+        for (std::size_t i = 0; i < in_span.size(); ++i) {
+            cf32 s = in_span[i];
+            cf32 out_val = s - _dc_prev_in + cf32(_dc_alpha, 0.f) * _dc_prev_out;
             _dc_prev_in  = s;
-            _dc_prev_out = out;
-            s = out;
+            _dc_prev_out = out_val;
+            _dcBuf[i] = out_val;
         }
-        auto clean_span = std::span<const cf32>(dc_removed);
+        auto clean_span = std::span<const cf32>(_dcBuf);
 
         // 3. Push DC-removed input into ring buffer
         _ring.push(clean_span);
