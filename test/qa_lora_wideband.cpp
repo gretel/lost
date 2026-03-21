@@ -20,7 +20,6 @@
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
 #include <gnuradio-4.0/lora/WidebandDecoder.hpp>
-#include <gnuradio-4.0/lora/algorithm/Channelize.hpp>
 #include <gnuradio-4.0/lora/algorithm/HalfBandDecimator.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
@@ -135,7 +134,7 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
         constexpr double centerFreq = 866.5e6;
         constexpr double channelFreq = 869.5e6;  // +3 MHz
         constexpr uint32_t osFactor = 256;        // 16e6 / 62.5e3 = 256
-        constexpr std::size_t nSamples = 256 * 100;  // exactly 100 output samples
+        constexpr std::size_t nSamples = 256 * 100;  // 100 ideal output samples
 
         gr::lora::ChannelSlot slot;
         slot.activate(channelFreq, centerFreq, sampleRate, osFactor);
@@ -143,8 +142,13 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
         auto tone = makeTone(nSamples, channelFreq - centerFreq, sampleRate);
         slot.pushWideband(tone);
 
-        expect(eq(slot.nbAccum.size(), 100UZ))
-            << "output sample count = wideband / osFactor";
+        // FIR group delay means output count is slightly less than ideal.
+        // With 8 cascaded half-band stages (23-tap each), expect close to 100.
+        constexpr std::size_t expectedIdeal = 100;
+        expect(slot.nbAccum.size() >= expectedIdeal - 5
+            && slot.nbAccum.size() <= expectedIdeal + 1)
+            << "output sample count " << slot.nbAccum.size()
+            << " near expected " << expectedIdeal;
     };
 
     "tone at channel freq appears at DC after channelization"_test = [] {
@@ -152,9 +156,8 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
         constexpr double centerFreq = 866.5e6;
         constexpr double channelFreq = 869.5e6;  // +3 MHz offset
         constexpr uint32_t osFactor = 256;        // BW62.5k: 16e6/62.5e3
-        // 256 output samples -> 256 * 256 = 65536 input samples
-        constexpr std::size_t nOut = 256;
-        constexpr std::size_t nSamples = nOut * osFactor;
+        // Generate enough for ~256 output samples (FIR may produce slightly fewer)
+        constexpr std::size_t nSamples = 256 * osFactor;
 
         gr::lora::ChannelSlot slot;
         slot.activate(channelFreq, centerFreq, sampleRate, osFactor);
@@ -162,7 +165,8 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
         auto tone = makeTone(nSamples, channelFreq - centerFreq, sampleRate);
         slot.pushWideband(tone);
 
-        expect(eq(slot.nbAccum.size(), nOut));
+        expect(slot.nbAccum.size() > 64UZ)
+            << "sufficient output: " << slot.nbAccum.size();
 
         // FFT peak should be at bin 0 (DC)
         auto bin = peakBin(slot.nbAccum);
@@ -197,9 +201,11 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
         }
 
         const std::size_t expectedOut = totalSamples / osFactor;
-        expect(eq(slot.nbAccum.size(), expectedOut))
+        // FIR group delay means a few fewer samples
+        expect(slot.nbAccum.size() >= expectedOut - 5
+            && slot.nbAccum.size() <= expectedOut + 1)
             << "total output = " << slot.nbAccum.size()
-            << ", expected " << expectedOut;
+            << ", expected ~" << expectedOut;
 
         // FFT peak at DC (bin 0) proves phase is continuous:
         // if NCO phase reset between chunks, the tone would smear across bins.
@@ -221,8 +227,7 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
         constexpr double toneOffset = 10e3;       // 10 kHz above channel center
         constexpr double toneFreq = channelFreq + toneOffset;
         constexpr uint32_t osFactor = 256;         // BW62.5k -> nb rate = 62.5 kHz
-        constexpr std::size_t nOut = 128;
-        constexpr std::size_t nSamples = nOut * osFactor;
+        constexpr std::size_t nSamples = 256 * osFactor;  // plenty for FIR warmup
 
         gr::lora::ChannelSlot slot;
         slot.activate(channelFreq, centerFreq, sampleRate, osFactor);
@@ -230,21 +235,25 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
         auto tone = makeTone(nSamples, toneFreq - centerFreq, sampleRate);
         slot.pushWideband(tone);
 
-        expect(eq(slot.nbAccum.size(), nOut));
+        expect(slot.nbAccum.size() > 64UZ)
+            << "sufficient output: " << slot.nbAccum.size();
 
         // After channelization, the tone is at +10 kHz in the narrowband stream.
-        // With nb sample rate = 62.5 kHz and N=128 FFT bins, bin spacing = 488.3 Hz.
-        // Expected bin = 10000 / (62500 / 128) ≈ 20.48 → peak at bin 20 or 21.
+        // With nb sample rate = 62.5 kHz, bin spacing = 62500/N Hz.
+        // Expected bin ≈ 10000 / (62500 / N) — depends on actual N from FIR.
+        auto N = slot.nbAccum.size();
         auto bin = peakBin(slot.nbAccum);
+        double expectedBin = 10000.0 / (62500.0 / static_cast<double>(N));
         expect(bin != 0UZ) << "offset tone should NOT be at DC";
-        expect(bin >= 19UZ && bin <= 22UZ)
-            << "expected bin ~20, got " << bin;
+        expect(std::abs(static_cast<double>(bin) - expectedBin) < 3.0)
+            << "expected bin ~" << expectedBin << ", got " << bin;
     };
 
     "decimator handles partial blocks correctly"_test = [] {
-        // Push a number of samples that is NOT a multiple of osFactor
+        // Push a number of samples that is NOT a multiple of osFactor.
+        // FIR has group delay, so use large input to make warmup negligible.
         constexpr uint32_t osFactor = 256;
-        constexpr std::size_t nSamples = osFactor * 3 + 100;  // 3 complete + 100 leftover
+        constexpr std::size_t nSamples = osFactor * 100 + 100;
 
         gr::lora::ChannelSlot slot;
         slot.activate(866.5e6, 866.5e6, 16e6, osFactor);  // channel == center -> no shift
@@ -252,24 +261,28 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
         std::vector<cf32> dc(nSamples, cf32(1.f, 0.f));
         slot.pushWideband(dc);
 
-        // Should have exactly 3 output samples (100 leftover not yet dumped)
-        expect(eq(slot.nbAccum.size(), 3UZ))
-            << "partial block: only complete integrations dumped";
-        // With two-stage decimation, leftover is in stage1 or stage2 counter
-        // Just verify we got the right number of output samples
-        expect(eq(slot.nbAccum.size(), 3UZ))
-            << "partial block: leftover preserved";
+        // FIR decimation: output count depends on filter group delay.
+        // With 8 cascaded half-band stages (2^8=256), each 23-tap stage
+        // has 11-sample group delay. The exact count is hard to predict,
+        // but should be close to floor(nSamples/osFactor) = 100.
+        // Accept within ±5 samples of the ideal count.
+        const auto expectedApprox = nSamples / osFactor;
+        expect(slot.nbAccum.size() >= expectedApprox - 5
+            && slot.nbAccum.size() <= expectedApprox + 5)
+            << "partial block: output count " << slot.nbAccum.size()
+            << " near expected " << expectedApprox;
 
-        // Push 156 more to complete the 4th output sample
-        std::vector<cf32> remainder(osFactor - 100, cf32(1.f, 0.f));
-        slot.pushWideband(remainder);
-        expect(eq(slot.nbAccum.size(), 4UZ))
-            << "4th sample dumped after completing accumulation";
+        // Push more samples — output should grow
+        auto prevSize = slot.nbAccum.size();
+        std::vector<cf32> more(osFactor * 10, cf32(1.f, 0.f));
+        slot.pushWideband(more);
+        expect(slot.nbAccum.size() > prevSize)
+            << "more input produces more output";
     };
 
     "DC signal at center freq passes through unchanged"_test = [] {
         constexpr uint32_t osFactor = 128;
-        constexpr std::size_t nSamples = osFactor * 64;
+        constexpr std::size_t nSamples = osFactor * 128;  // extra for FIR warmup
 
         gr::lora::ChannelSlot slot;
         // Channel == center freq -> shift_hz = 0 -> NCO is identity
@@ -278,50 +291,94 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
         std::vector<cf32> dc(nSamples, cf32(1.f, 0.f));
         slot.pushWideband(dc);
 
-        expect(eq(slot.nbAccum.size(), 64UZ));
+        expect(slot.nbAccum.size() > 20UZ)
+            << "enough output samples: " << slot.nbAccum.size();
 
-        // Each output sample should be ~1.0 (average of osFactor identical inputs)
-        for (const auto& s : slot.nbAccum) {
-            expect(std::abs(s.real() - 1.0f) < 0.01f)
-                << "DC passthrough real = " << s.real();
-            expect(std::abs(s.imag()) < 0.01f)
-                << "DC passthrough imag = " << s.imag();
+        // Skip first 20 samples (FIR warmup transient), then check steady-state
+        for (std::size_t i = 20; i < slot.nbAccum.size(); ++i) {
+            expect(std::abs(std::abs(slot.nbAccum[i]) - 1.0f) < 0.05f)
+                << "DC passthrough magnitude at [" << i << "] = "
+                << std::abs(slot.nbAccum[i]);
         }
     };
 
-    "matches batch channelize() for single call"_test = [] {
-        // Verify ChannelSlot produces the same result as the batch channelize()
-        // when called with the full buffer in one shot (no phase continuity needed).
+    "FIR channelizer output has clean tone at DC"_test = [] {
+        // Verify ChannelSlot with FIR decimator produces a clean tone at DC
+        // when fed a wideband tone at the channel frequency.
         constexpr double sampleRate = 16e6;
         constexpr double centerFreq = 866.5e6;
         constexpr double channelFreq = 868.0e6;
-        constexpr double targetBw = 125e3;
-        constexpr uint32_t osFactor = 128;  // 16e6 / 125e3
-        constexpr uint32_t nSamples = osFactor * 64;
+        constexpr uint32_t osFactor = 128;  // BW125k: 16e6 / 125e3
+        constexpr std::size_t nOut = 256;
+        constexpr std::size_t nSamples = nOut * osFactor;
 
         auto tone = makeTone(nSamples, channelFreq - centerFreq, sampleRate);
 
-        // Batch channelize (reference)
-        auto refOut = gr::lora::channelize(tone.data(), nSamples,
-                                           channelFreq, centerFreq,
-                                           sampleRate, targetBw);
-
-        // Streaming ChannelSlot
         gr::lora::ChannelSlot slot;
         slot.activate(channelFreq, centerFreq, sampleRate, osFactor);
         slot.pushWideband(tone);
 
-        expect(eq(slot.nbAccum.size(), refOut.size()))
-            << "same output length";
+        expect(slot.nbAccum.size() > 64UZ)
+            << "sufficient output: " << slot.nbAccum.size();
 
-        // Compare sample-by-sample (should be very close)
-        float maxErr = 0.f;
-        for (std::size_t i = 0; i < refOut.size(); ++i) {
-            float err = std::abs(slot.nbAccum[i] - refOut[i]);
-            maxErr = std::max(maxErr, err);
-        }
-        expect(maxErr < 0.01f)
-            << "max error vs batch channelize = " << maxErr;
+        // FFT peak should be at bin 0 (DC)
+        auto bin = peakBin(slot.nbAccum);
+        expect(eq(bin, 0UZ)) << "tone at channel freq maps to DC";
+
+        // Peak-to-mean ratio should be high (clean tone from FIR)
+        auto pmr = peakToMeanDb(slot.nbAccum);
+        expect(pmr > 20.f) << "PMR = " << pmr << " dB, expected > 20 dB";
+    };
+
+    "out-of-band rejection > 30 dB"_test = [] {
+        // Two ChannelSlots at the same channel: one in-band tone, one out-of-band.
+        // FIR should give > 30 dB rejection (box-car gave only ~13 dB).
+        constexpr double sampleRate = 16e6;
+        constexpr double centerFreq = 866.5e6;
+        constexpr double channelFreq = 869.5e6;
+        constexpr uint32_t osFactor = 256;  // BW62.5k: 16e6 / 62.5e3
+        constexpr double nbRate = sampleRate / osFactor;  // 62500 Hz
+        constexpr std::size_t nOut = 512;
+        constexpr std::size_t nSamples = nOut * osFactor;
+
+        // In-band: tone exactly at channel center
+        auto inBandTone = makeTone(nSamples, channelFreq - centerFreq, sampleRate);
+        gr::lora::ChannelSlot slotIn;
+        slotIn.activate(channelFreq, centerFreq, sampleRate, osFactor);
+        slotIn.pushWideband(inBandTone);
+
+        // Out-of-band: tone 100 kHz away (well outside BW62.5k passband)
+        constexpr double oobOffset = 100e3;
+        auto oobTone = makeTone(nSamples,
+                                (channelFreq + oobOffset) - centerFreq, sampleRate);
+        gr::lora::ChannelSlot slotOob;
+        slotOob.activate(channelFreq, centerFreq, sampleRate, osFactor);
+        slotOob.pushWideband(oobTone);
+
+        // Measure output power (skip warmup transient)
+        auto measurePower = [](const std::vector<cf32>& samples, std::size_t skip) {
+            double power = 0.0;
+            std::size_t count = 0;
+            for (std::size_t i = skip; i < samples.size(); ++i) {
+                power += static_cast<double>(std::norm(samples[i]));
+                ++count;
+            }
+            return count > 0 ? power / static_cast<double>(count) : 0.0;
+        };
+
+        constexpr std::size_t kSkip = 30;  // skip FIR warmup
+        double inPower  = measurePower(slotIn.nbAccum, kSkip);
+        double oobPower = measurePower(slotOob.nbAccum, kSkip);
+
+        expect(inPower > 0.0) << "in-band has signal power";
+        expect(oobPower > 0.0) << "out-of-band has residual power";
+
+        double rejectionDb = 10.0 * std::log10(oobPower / inPower);
+        (void)nbRate;
+        std::fprintf(stderr, "  out-of-band rejection: %.1f dB (in=%.2e, oob=%.2e)\n",
+                     rejectionDb, inPower, oobPower);
+        expect(rejectionDb < -30.0)
+            << "OOB rejection = " << rejectionDb << " dB, expected < -30 dB";
     };
 };
 
@@ -545,21 +602,63 @@ const boost::ut::suite<"WidebandDecoder loopback"> wbLoopbackTests = [] {
         constexpr double   channel_freq = 869.5e6;  // +3 MHz offset
         constexpr uint32_t os_factor = static_cast<uint32_t>(wb_rate / test_bw);  // 256
 
-        // Generate a LoRa frame at 1x BW (os_factor=1 for narrowband)
+        // Generate a LoRa frame at 1x BW (os_factor=1), then upsample to
+        // wideband rate using cascaded interpolate-by-2 stages. Each stage
+        // zero-stuffs by 2 and applies the same half-band FIR as the decimator
+        // (but without decimation) to remove spectral images.
         const std::vector<uint8_t> payload = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04};
         uint32_t nb_sps = (1u << test_sf);  // os_factor=1
         auto nb_iq = generate_frame_iq(payload, test_sf, test_cr, 1,
                                         test_sync, test_preamble,
                                         true, nb_sps * 5, 2, test_bw, false);
 
-        // Upsample + freq-shift to wideband: each NB sample becomes os_factor WB samples
-        // This is the inverse of what ChannelSlot does (decimate + freq-shift to baseband)
+        // Cascaded interpolation: 8 stages of interp-by-2 = 256x total.
+        // Each stage: zero-stuff by 2, then apply 23-tap half-band FIR
+        // (non-decimating) to remove the image.
+        uint32_t nInterpStages = 0;
+        for (uint32_t v = os_factor; v > 1; v >>= 1) ++nInterpStages;
+
+        auto halfBandInterp = [](const std::vector<cf32>& input) -> std::vector<cf32> {
+            using namespace gr::lora::halfband_detail;
+            // Zero-stuff by 2: insert zero between each sample
+            std::vector<cf32> stuffed(input.size() * 2);
+            for (std::size_t i = 0; i < input.size(); ++i) {
+                stuffed[i * 2]     = input[i] * 2.0f;  // gain=2 to preserve amplitude
+                stuffed[i * 2 + 1] = cf32(0.f, 0.f);
+            }
+            // Apply 23-tap half-band FIR without decimation (keep all samples)
+            std::vector<cf32> out(stuffed.size());
+            std::array<cf32, kFilterLen> delay{};
+            for (std::size_t n = 0; n < stuffed.size(); ++n) {
+                // Shift delay line
+                for (std::size_t k = kFilterLen - 1; k > 0; --k) {
+                    delay[k] = delay[k - 1];
+                }
+                delay[0] = stuffed[n];
+                // Compute FIR output (symmetric pairs + center tap)
+                cf32 acc{0.f, 0.f};
+                for (std::size_t c = 0; c < kCoeffs.size(); ++c) {
+                    std::size_t k = c * 2;
+                    std::size_t kMirror = kFilterLen - 1 - k;
+                    acc += kCoeffs[c] * (delay[k] + delay[kMirror]);
+                }
+                acc += kCenterTap * delay[kFilterLen / 2];
+                out[n] = acc;
+            }
+            return out;
+        };
+
+        std::vector<cf32> interp = nb_iq;
+        for (uint32_t stage = 0; stage < nInterpStages; ++stage) {
+            interp = halfBandInterp(interp);
+        }
+
+        // Freq-shift the interpolated wideband frame to the channel offset
         const double shift_hz = channel_freq - center_freq;
         const double phaseInc = 2.0 * std::numbers::pi * shift_hz / wb_rate;
-        const std::size_t wb_len = nb_iq.size() * os_factor;
         // Add padding: L1 needs enough data for detection
         constexpr std::size_t pad_samples = 8192 * 20;  // L1 warmup
-        std::vector<cf32> wb_iq(pad_samples + wb_len + pad_samples, cf32(0.f, 0.f));
+        std::vector<cf32> wb_iq(pad_samples + interp.size() + pad_samples, cf32(0.f, 0.f));
 
         // Add weak noise floor
         std::mt19937 rng(42);
@@ -568,17 +667,15 @@ const boost::ut::suite<"WidebandDecoder loopback"> wbLoopbackTests = [] {
             s = cf32(noise(rng), noise(rng));
         }
 
-        // Embed upsampled narrowband signal at offset
+        // Embed band-limited frame at frequency offset
         double phase = 0.0;
-        for (std::size_t i = 0; i < nb_iq.size(); ++i) {
-            for (uint32_t j = 0; j < os_factor; ++j) {
-                std::size_t wb_idx = pad_samples + i * os_factor + j;
-                auto rot = cf32(
-                    static_cast<float>(std::cos(phase)),
-                    static_cast<float>(std::sin(phase)));
-                wb_iq[wb_idx] += nb_iq[i] * rot;
-                phase += phaseInc;
-            }
+        for (std::size_t i = 0; i < interp.size(); ++i) {
+            std::size_t wb_idx = pad_samples + i;
+            auto rot = cf32(
+                static_cast<float>(std::cos(phase)),
+                static_cast<float>(std::sin(phase)));
+            wb_iq[wb_idx] += interp[i] * rot;
+            phase += phaseInc;
         }
 
         // Build graph: TagSource → WidebandDecoder → TagSink

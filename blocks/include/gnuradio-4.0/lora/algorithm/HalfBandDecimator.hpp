@@ -137,11 +137,12 @@ struct CascadedDecimator {
         }
     }
 
-    /// Process input through all stages, returning decimated output.
+    /// Process input through all stages, appending decimated output to `out`.
     /// The input is decimated by 2^nStages total.
-    [[nodiscard]] std::vector<cf32> process(std::span<const cf32> input) {
+    void process(std::span<const cf32> input, std::vector<cf32>& out) {
         if (stages.empty()) {
-            return {input.begin(), input.end()};
+            out.insert(out.end(), input.begin(), input.end());
+            return;
         }
 
         // First stage reads from input
@@ -156,9 +157,17 @@ struct CascadedDecimator {
             stages[i].process(std::span<const cf32>(src), dst);
         }
 
-        // Return the final buffer
+        // Append final buffer to output
         auto& result = (stages.size() & 1U) ? scratch0 : scratch1;
-        return {result.begin(), result.end()};
+        out.insert(out.end(), result.begin(), result.end());
+    }
+
+    /// Process input through all stages, returning decimated output.
+    /// The input is decimated by 2^nStages total.
+    [[nodiscard]] std::vector<cf32> process(std::span<const cf32> input) {
+        std::vector<cf32> out;
+        process(input, out);
+        return out;
     }
 };
 
