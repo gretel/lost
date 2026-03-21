@@ -783,6 +783,157 @@ const boost::ut::suite<"WidebandDecoder loopback"> wbLoopbackTests = [] {
             expect(false) << "wideband loopback: no decode output";
         }
     };
+    "SF8 noisy loopback: FIR survives wideband noise"_test = [] {
+        constexpr uint8_t  test_sf  = 8;
+        constexpr uint8_t  test_cr  = 4;
+        constexpr uint32_t test_bw  = 62500;
+        constexpr uint16_t test_sync = 0x12;
+        constexpr uint16_t test_preamble = 8;
+        constexpr double   wb_rate  = 16e6;
+        constexpr double   center_freq = 866.5e6;
+        constexpr double   channel_freq = 869.5e6;  // +3 MHz offset
+        constexpr uint32_t os_factor = static_cast<uint32_t>(wb_rate / test_bw);  // 256
+
+        // Generate a LoRa frame at 1x BW, then upsample to wideband rate.
+        const std::vector<uint8_t> payload = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04};
+        uint32_t nb_sps = (1u << test_sf);  // os_factor=1
+        auto nb_iq = generate_frame_iq(payload, test_sf, test_cr, 1,
+                                        test_sync, test_preamble,
+                                        true, nb_sps * 5, 2, test_bw, false);
+
+        // Cascaded interpolation: 8 stages of interp-by-2 = 256x total.
+        uint32_t nInterpStages = 0;
+        for (uint32_t v = os_factor; v > 1; v >>= 1) ++nInterpStages;
+
+        auto halfBandInterp = [](const std::vector<cf32>& input) -> std::vector<cf32> {
+            using namespace gr::lora::halfband_detail;
+            std::vector<cf32> stuffed(input.size() * 2);
+            for (std::size_t i = 0; i < input.size(); ++i) {
+                stuffed[i * 2]     = input[i] * 2.0f;
+                stuffed[i * 2 + 1] = cf32(0.f, 0.f);
+            }
+            std::vector<cf32> out(stuffed.size());
+            std::array<cf32, kFilterLen> delay{};
+            for (std::size_t n = 0; n < stuffed.size(); ++n) {
+                for (std::size_t k = kFilterLen - 1; k > 0; --k) {
+                    delay[k] = delay[k - 1];
+                }
+                delay[0] = stuffed[n];
+                cf32 acc{0.f, 0.f};
+                for (std::size_t c = 0; c < kCoeffs.size(); ++c) {
+                    std::size_t k = c * 2;
+                    std::size_t kMirror = kFilterLen - 1 - k;
+                    acc += kCoeffs[c] * (delay[k] + delay[kMirror]);
+                }
+                acc += kCenterTap * delay[kFilterLen / 2];
+                out[n] = acc;
+            }
+            return out;
+        };
+
+        std::vector<cf32> interp = nb_iq;
+        for (uint32_t stage = 0; stage < nInterpStages; ++stage) {
+            interp = halfBandInterp(interp);
+        }
+
+        // Freq-shift to channel offset and embed in wideband stream with STRONG noise
+        const double shift_hz = channel_freq - center_freq;
+        const double phaseInc = 2.0 * std::numbers::pi * shift_hz / wb_rate;
+        constexpr std::size_t pad_samples = 8192 * 20;
+        std::vector<cf32> wb_iq(pad_samples + interp.size() + pad_samples, cf32(0.f, 0.f));
+
+        // Key difference: sigma=0.3 wideband noise (vs 0.001 in clean test).
+        // The box-car decimator (-13 dB stopband) couldn't reject this;
+        // the FIR channelizer (-45 dB stopband) can.
+        std::mt19937 rng(42);
+        std::normal_distribution<float> noise(0.f, 0.3f);
+        for (auto& s : wb_iq) {
+            s = cf32(noise(rng), noise(rng));
+        }
+
+        // Embed band-limited frame at frequency offset
+        double phase = 0.0;
+        for (std::size_t i = 0; i < interp.size(); ++i) {
+            std::size_t wb_idx = pad_samples + i;
+            auto rot = cf32(
+                static_cast<float>(std::cos(phase)),
+                static_cast<float>(std::sin(phase)));
+            wb_iq[wb_idx] += interp[i] * rot;
+            phase += phaseInc;
+        }
+
+        // Build graph: TagSource → WidebandDecoder → TagSink
+        gr::Graph graph;
+        auto& src = graph.emplaceBlock<gr::testing::TagSource<cf32,
+            gr::testing::ProcessFunction::USE_PROCESS_BULK>>({
+            {"n_samples_max", static_cast<gr::Size_t>(wb_iq.size())},
+            {"repeat_tags", false},
+            {"mark_tag", false},
+        });
+        src.values = wb_iq;
+
+        auto& decoder = graph.emplaceBlock<WidebandDecoder>({
+            {"sample_rate", static_cast<float>(wb_rate)},
+            {"center_freq", static_cast<float>(center_freq)},
+            {"channel_bw", 62500.f},
+            {"decode_bw", static_cast<float>(test_bw)},
+            {"max_channels", uint32_t{8}},
+            {"buffer_ms", 200.f},
+            {"l1_interval", uint32_t{1}},
+            {"l1_snapshots", uint32_t{2}},
+            {"l1_fft_size", uint32_t{4096}},
+            {"sync_word", test_sync},
+            {"preamble_len", test_preamble},
+            {"energy_thresh", 1e-8f},
+            {"min_snr_db", -20.0f},
+            {"debug", true},
+        });
+
+        auto& sink = graph.emplaceBlock<gr::testing::TagSink<uint8_t,
+            gr::testing::ProcessFunction::USE_PROCESS_BULK>>({
+            {"log_samples", true},
+            {"log_tags", true},
+        });
+
+        (void)graph.connect<"out", "in">(src, decoder);
+        (void)graph.connect<"out", "in">(decoder, sink);
+
+        gr::scheduler::Simple sched;
+        if (auto ret = sched.exchange(std::move(graph)); !ret) {
+            std::fprintf(stderr, "scheduler exchange failed\n");
+            expect(false) << "scheduler exchange failed";
+            return;
+        }
+        sched.runAndWait();
+
+        // Check output
+        std::vector<uint8_t> decoded;
+        decoded.assign(sink._samples.begin(), sink._samples.end());
+
+        if (decoded.size() >= payload.size()) {
+            bool match = std::equal(payload.begin(), payload.end(), decoded.begin());
+            expect(match) << "decoded payload matches TX payload (noisy)";
+
+            bool found_sf_tag = false;
+            for (const auto& tag : sink._tags) {
+                if (tag.map.contains("sf")) {
+                    auto sf_val = tag.map.at("sf").template value_or<int64_t>(0);
+                    expect(eq(sf_val, static_cast<int64_t>(test_sf)))
+                        << "decoded SF tag matches (noisy)";
+                    found_sf_tag = true;
+                }
+                if (tag.map.contains("crc_valid")) {
+                    auto crc_ok = tag.map.at("crc_valid").template value_or<bool>(false);
+                    expect(crc_ok) << "CRC valid (noisy)";
+                }
+            }
+            expect(found_sf_tag) << "SF tag present in output (noisy)";
+        } else {
+            std::fprintf(stderr, "noisy wideband loopback: decoded %zu bytes, expected %zu\n",
+                         decoded.size(), payload.size());
+            expect(false) << "noisy wideband loopback: no decode output";
+        }
+    };
 };
 
 // ============================================================================
