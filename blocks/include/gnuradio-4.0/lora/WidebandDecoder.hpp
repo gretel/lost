@@ -174,6 +174,7 @@ struct WidebandDecoder
     uint32_t                  _callCount{0};
     uint32_t                  _snapshotCount{0};
     uint32_t                  _sweepCount{0};
+    bool                      _overflowInSweep{false};
 
     // Hot channel tracking
     std::vector<uint32_t>     _hotChannels;
@@ -266,13 +267,13 @@ struct WidebandDecoder
     {
         auto in_span = std::span(input);
 
-        // 1. Handle overflow tags — reset everything
+        // 1. Handle overflow tags — reset everything and mark sweep tainted
         if (this->inputTagsPresent()) {
             const auto& tag = this->mergedInputTag();
             if (tag.map.contains("overflow")) {
-                _ring.reset();
                 _snapshotCount = 0;
                 _channelEnergy.assign(_nChannels, 0.f);
+                _overflowInSweep = true;  // discard this sweep's results
                 for (auto& slot : _slots) {
                     if (slot.state != ChannelSlot::State::Idle) {
                         slot.deactivate();
@@ -280,13 +281,13 @@ struct WidebandDecoder
                 }
                 for (auto& v : _activeChannelMap) v.clear();
                 if (debug) {
-                    log_ts("debug", "wideband", "overflow: reset ring + all slots");
+                    log_ts("debug", "wideband", "overflow: reset all slots");
                 }
             }
         }
 
-        // 2. DC removal (IIR high-pass) — removes B210 DC offset that
-        //    corrupts the center channel's signal via the box-car decimator
+        // 2. DC removal (IIR high-pass) — needed when signal is at/near center
+        //    frequency where B210 DC spur corrupts the channel.
         _dcBuf.resize(in_span.size());
         for (std::size_t i = 0; i < in_span.size(); ++i) {
             cf32 s = in_span[i];
@@ -297,30 +298,35 @@ struct WidebandDecoder
         }
         auto clean_span = std::span<const cf32>(_dcBuf);
 
-        // 3. Push DC-removed input into ring buffer
-        _ring.push(clean_span);
-
-        // 4. Push DC-removed input through all active ChannelSlots
+        // 3. Push DC-removed input through all active ChannelSlots
         for (auto& slot : _slots) {
             if (slot.state == ChannelSlot::State::Active) {
                 slot.pushWideband(clean_span);
             }
         }
 
-        // 4. Periodic L1 energy snapshot
+        // 4. Periodic L1 energy snapshot (from DC-removed span)
         ++_callCount;
         if (_callCount >= l1_interval) {
             _callCount = 0;
-            computeEnergySnapshot();
+            computeEnergySnapshotFromSpan(clean_span);
         }
 
         // 5. After accumulating enough snapshots, update active channels
         std::size_t out_idx = 0;
         if (_snapshotCount >= l1_snapshots) {
-            findHotChannels();
-            updateActiveChannels();
+            if (_overflowInSweep) {
+                // Discard this sweep — energy was accumulated during overflow
+                if (debug) {
+                    log_ts("debug", "wideband", "discarding tainted sweep (overflow during accumulation)");
+                }
+            } else {
+                findHotChannels();
+                updateActiveChannels();
+            }
             _channelEnergy.assign(_nChannels, 0.f);
             _snapshotCount = 0;
+            _overflowInSweep = false;
             _sweepCount++;
 
             // Periodic status (every 10 sweeps, ~5s)
@@ -330,12 +336,11 @@ struct WidebandDecoder
                     if (slot.state != ChannelSlot::State::Idle) ++nActive;
                 }
                 log_ts("info ", "wideband",
-                    "sweep %u  hot %zu  active %u/%u  ring %zu",
+                    "sweep %u  hot %zu  active %u/%u",
                     _sweepCount,
                     _hotChannels.size(),
                     nActive,
-                    static_cast<uint32_t>(max_channels),
-                    _ring.count);
+                    static_cast<uint32_t>(max_channels));
             }
         }
 
@@ -415,6 +420,47 @@ struct WidebandDecoder
         std::copy(v1.begin(), v1.end(), _fftBuf.begin());
         if (!v2.empty())
             std::copy(v2.begin(), v2.end(), _fftBuf.begin() + static_cast<std::ptrdiff_t>(v1.size()));
+
+        // Apply Hann window
+        for (uint32_t i = 0; i < l1_fft_size; ++i) {
+            _fftBuf[i] *= _window[i];
+        }
+
+        auto fftOut = _fft.compute(
+            std::span<const cf32>(_fftBuf.data(), l1_fft_size));
+
+        // Accumulate |FFT|^2 into channel bins (DC-centered via fftshift)
+        const auto half    = l1_fft_size / 2;
+        const float binBw  = sample_rate / static_cast<float>(l1_fft_size);
+        const auto binsPerCh = static_cast<uint32_t>(channel_bw / binBw);
+
+        const float usableBw = sample_rate * 0.8f;
+        const auto  startBin = static_cast<uint32_t>(
+            (static_cast<float>(l1_fft_size) - usableBw / binBw) / 2.f);
+
+        for (uint32_t ch = 0; ch < _nChannels
+             && ch * binsPerCh + startBin + binsPerCh <= l1_fft_size; ++ch) {
+            float energy = 0.f;
+            for (uint32_t b = 0; b < binsPerCh; ++b) {
+                const auto fftIdx = (startBin + ch * binsPerCh + b + half) % l1_fft_size;
+                const auto& s = fftOut[fftIdx];
+                energy += s.real() * s.real() + s.imag() * s.imag();
+            }
+            _channelEnergy[ch] += energy;
+        }
+
+        ++_snapshotCount;
+    }
+
+    /// Compute L1 energy snapshot directly from the input span (no ring buffer).
+    /// Uses the last l1_fft_size samples from the input span.
+    void computeEnergySnapshotFromSpan(std::span<const cf32> span) noexcept {
+        if (span.size() < l1_fft_size) return;
+
+        // Use the last l1_fft_size samples from the span
+        auto src = span.subspan(span.size() - l1_fft_size, l1_fft_size);
+        _fftBuf.resize(l1_fft_size);
+        std::copy(src.begin(), src.end(), _fftBuf.begin());
 
         // Apply Hann window
         for (uint32_t i = 0; i < l1_fft_size; ++i) {
@@ -534,11 +580,10 @@ struct WidebandDecoder
                     static_cast<double>(sample_rate), os, ch, bw, sync_word, preamble_len);
                 _activeChannelMap[ch].push_back(freeSlot);
 
-                const auto replayLen = std::min(_ring.count, _ring.data.size());
-                if (replayLen > 0) {
-                    auto hist = _ring.recent(replayLen);
-                    _slots[freeSlot].pushWideband(hist);
-                }
+                // No ring buffer replay — start decode from the live stream.
+                // The L1 sweep fires every ~500ms; a LoRa preamble lasts
+                // 8 symbols (~33ms at SF8/BW62.5k), so the next ADVERT will
+                // be caught from the start.
 
                 if (debug) {
                     log_ts("debug", "wideband", "activate slot %u -> ch %u BW %u (%.3f MHz, os=%u)",
