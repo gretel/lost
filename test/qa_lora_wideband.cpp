@@ -579,6 +579,38 @@ const boost::ut::suite<"WidebandDecoder block skeleton"> wbBlockTests = [] {
         decoder._slots[0].deactivate();
         expect(eq(decoder.activeSlotCount(), 1U)) << "one deactivated";
     };
+
+    "multi-BW: three slots activated per hot channel"_test = [] {
+        gr::lora::WidebandDecoder decoder;
+        decoder.sample_rate = 16e6f;
+        decoder.center_freq = 866.5e6f;
+        decoder.channel_bw  = 62500.f;
+        decoder.decode_bw_str = "62500,125000,250000";
+        decoder.max_channels = 24;
+        decoder.start();
+
+        // Simulate: force one hot channel
+        decoder._hotChannels = {100};
+
+        decoder.updateActiveChannels();
+
+        // Should have 3 active slots (one per BW)
+        expect(eq(decoder.activeSlotCount(), 3U))
+            << "3 slots for 3 BWs on 1 hot channel";
+
+        // Each slot should have a different decodeBw
+        std::vector<uint32_t> bws;
+        for (const auto& slot : decoder._slots) {
+            if (slot.state != gr::lora::ChannelSlot::State::Idle) {
+                bws.push_back(slot.decodeBw);
+            }
+        }
+        std::ranges::sort(bws);
+        expect(eq(bws.size(), 3UZ));
+        expect(eq(bws[0], 62500U));
+        expect(eq(bws[1], 125000U));
+        expect(eq(bws[2], 250000U));
+    };
 };
 
 // ============================================================================

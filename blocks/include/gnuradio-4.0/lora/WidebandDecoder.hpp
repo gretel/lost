@@ -19,6 +19,7 @@
 #include <numeric>
 #include <ranges>
 #include <span>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -145,9 +146,10 @@ struct WidebandDecoder
     float       center_freq{866500000.f};  // wideband center frequency (Hz)
     float       channel_bw{62500.f};       // L1 channel grid spacing (Hz)
     float       decode_bw{62500.f};        // decode bandwidth for channelization (Hz)
+    std::string decode_bw_str{"62500"};    // comma-separated BWs for multi-BW decode
     float       min_ratio{8.0f};           // min L2 CAD peak ratio (unused in M3)
     float       buffer_ms{512.f};          // ring buffer duration (ms)
-    uint32_t    max_channels{8};           // max simultaneous decode channels
+    uint32_t    max_channels{24};          // max simultaneous decode channels
     uint32_t    l1_interval{64};           // processBulk calls between L1 snapshots
     uint32_t    l1_snapshots{16};          // snapshots to accumulate before probing
     uint32_t    l1_fft_size{4096};         // L1 FFT size
@@ -159,7 +161,7 @@ struct WidebandDecoder
     bool        debug{false};              // verbose logging
 
     GR_MAKE_REFLECTABLE(WidebandDecoder, in, out, msg_out,
-        sample_rate, center_freq, channel_bw, decode_bw, min_ratio,
+        sample_rate, center_freq, channel_bw, decode_bw, decode_bw_str, min_ratio,
         buffer_ms, max_channels, l1_interval, l1_snapshots, l1_fft_size,
         sync_word, preamble_len, energy_thresh, min_snr_db, max_symbols, debug);
 
@@ -179,7 +181,8 @@ struct WidebandDecoder
 
     // Hot channel tracking
     std::vector<uint32_t>     _hotChannels;
-    std::vector<uint32_t>     _activeChannelMap;  // channelIdx -> slotIdx (or UINT32_MAX)
+    std::vector<uint32_t>                _decodeBws;
+    std::vector<std::vector<uint32_t>>   _activeChannelMap;  // channelIdx → list of slotIdx
 
     // DC removal (IIR high-pass: y[n] = x[n] - x[n-1] + alpha * y[n-1])
     cf32                      _dc_prev_in{0.f, 0.f};
@@ -201,7 +204,33 @@ struct WidebandDecoder
         const float usableBw = sample_rate * 0.8f;
         _nChannels = static_cast<uint32_t>(usableBw / channel_bw);
         _channelEnergy.assign(_nChannels, 0.f);
-        _activeChannelMap.assign(_nChannels, UINT32_MAX);
+
+        // Parse decode_bw_str into _decodeBws
+        _decodeBws.clear();
+        {
+            std::istringstream iss(decode_bw_str);
+            std::string token;
+            while (std::getline(iss, token, ',')) {
+                token.erase(0, token.find_first_not_of(" \t"));
+                token.erase(token.find_last_not_of(" \t") + 1);
+                if (token.empty()) continue;
+                auto bw = static_cast<uint32_t>(std::stoul(token));
+                uint32_t os = static_cast<uint32_t>(
+                    std::round(static_cast<double>(sample_rate) / static_cast<double>(bw)));
+                if (os == 0 || (os & (os - 1)) != 0) {
+                    log_ts("error", "wideband",
+                        "BW %u gives non-power-of-2 os=%u at %.0f MS/s, skipping",
+                        bw, os, static_cast<double>(sample_rate) / 1e6);
+                    continue;
+                }
+                _decodeBws.push_back(bw);
+            }
+        }
+        std::ranges::sort(_decodeBws);  // narrowest first
+        if (_decodeBws.empty()) {
+            _decodeBws.push_back(static_cast<uint32_t>(decode_bw));
+        }
+        _activeChannelMap.assign(_nChannels, {});
 
         // Channel slots
         _slots.resize(max_channels);
@@ -249,7 +278,7 @@ struct WidebandDecoder
                         slot.deactivate();
                     }
                 }
-                _activeChannelMap.assign(_nChannels, UINT32_MAX);
+                for (auto& v : _activeChannelMap) v.clear();
                 if (debug) {
                     log_ts("debug", "wideband", "overflow: reset ring + all slots");
                 }
@@ -456,83 +485,59 @@ struct WidebandDecoder
     // --- Channel pool management ---
 
     void updateActiveChannels() noexcept {
-        // Deactivate slots for channels no longer hot
-        for (uint32_t s = 0; s < static_cast<uint32_t>(_slots.size()); ++s) {
-            auto& slot = _slots[s];
-            if (slot.state == ChannelSlot::State::Idle) continue;
-
-            bool stillHot = std::ranges::find(_hotChannels, slot.channelIdx)
-                          != _hotChannels.end();
+        // 1. Deactivate slots for channels no longer hot
+        for (uint32_t ch = 0; ch < _nChannels; ++ch) {
+            if (_activeChannelMap[ch].empty()) continue;
+            bool stillHot = std::ranges::find(_hotChannels, ch) != _hotChannels.end();
             if (!stillHot) {
-                if (debug) {
-                    log_ts("debug", "wideband",
-                        "deactivate slot %u (ch %u, %.3f MHz)",
-                        s, slot.channelIdx,
-                        slot.channelFreq / 1e6);
+                for (uint32_t slotIdx : _activeChannelMap[ch]) {
+                    if (debug) {
+                        log_ts("debug", "wideband", "deactivate slot %u (ch %u, BW %u)",
+                            slotIdx, ch, _slots[slotIdx].decodeBw);
+                    }
+                    _slots[slotIdx].deactivate();
                 }
-                _activeChannelMap[slot.channelIdx] = UINT32_MAX;
-                slot.deactivate();
+                _activeChannelMap[ch].clear();
             }
         }
 
-        // Activate slots for new hot channels
+        // 2. Activate slots for new hot channels (one per BW per channel)
         for (uint32_t ch : _hotChannels) {
             if (ch >= _nChannels) continue;
-            if (_activeChannelMap[ch] != UINT32_MAX) continue;  // already active
+            for (uint32_t bw : _decodeBws) {
+                bool alreadyActive = false;
+                for (uint32_t slotIdx : _activeChannelMap[ch]) {
+                    if (_slots[slotIdx].decodeBw == bw) { alreadyActive = true; break; }
+                }
+                if (alreadyActive) continue;
 
-            // Find free slot
-            uint32_t freeSlot = UINT32_MAX;
-            for (uint32_t s = 0; s < static_cast<uint32_t>(_slots.size()); ++s) {
-                if (_slots[s].state == ChannelSlot::State::Idle) {
-                    freeSlot = s;
+                uint32_t freeSlot = UINT32_MAX;
+                for (uint32_t s = 0; s < static_cast<uint32_t>(_slots.size()); ++s) {
+                    if (_slots[s].state == ChannelSlot::State::Idle) { freeSlot = s; break; }
+                }
+                if (freeSlot == UINT32_MAX) {
+                    if (debug) log_ts("debug", "wideband", "no free slot for ch %u BW %u", ch, bw);
                     break;
                 }
-            }
-            if (freeSlot == UINT32_MAX) {
-                if (debug) {
-                    log_ts("debug", "wideband",
-                        "no free slot for ch %u", ch);
+
+                double freq = channelCenterFreq(ch);
+                uint32_t os = static_cast<uint32_t>(
+                    std::round(static_cast<double>(sample_rate) / static_cast<double>(bw)));
+
+                _slots[freeSlot].activate(freq, static_cast<double>(center_freq),
+                    static_cast<double>(sample_rate), os, ch, bw, sync_word, preamble_len);
+                _activeChannelMap[ch].push_back(freeSlot);
+
+                const auto replayLen = std::min(_ring.count, _ring.data.size());
+                if (replayLen > 0) {
+                    auto hist = _ring.recent(replayLen);
+                    _slots[freeSlot].pushWideband(hist);
                 }
-                continue;  // all slots busy
-            }
 
-            double freq = channelCenterFreq(ch);
-            uint32_t os = static_cast<uint32_t>(
-                std::round(static_cast<double>(sample_rate)
-                         / static_cast<double>(decode_bw)));
-
-            _slots[freeSlot].activate(freq,
-                                      static_cast<double>(center_freq),
-                                      static_cast<double>(sample_rate),
-                                      os, ch,
-                                      static_cast<uint32_t>(decode_bw),
-                                      sync_word, preamble_len);
-            _activeChannelMap[ch] = freeSlot;
-
-            // Replay historical samples from ring buffer so the slot sees
-            // the preamble that triggered L1 detection.  The L1 accumulation
-            // window is ~500ms, so replay the entire ring buffer contents.
-            const auto replayLen = std::min(_ring.count, _ring.data.size());
-            if (replayLen > 0) {
-                auto hist = _ring.recent(replayLen);
-                _slots[freeSlot].pushWideband(hist);
-            }
-
-            if (debug) {
-                // Dump NCO config + first narrowband samples for diagnostics
-                auto& sl = _slots[freeSlot];
-                float nb_mag0 = 0.f, nb_mag1 = 0.f, nb_mag2 = 0.f;
-                if (sl.nbAccum.size() > 0) nb_mag0 = std::abs(sl.nbAccum[0]);
-                if (sl.nbAccum.size() > 1) nb_mag1 = std::abs(sl.nbAccum[1]);
-                if (sl.nbAccum.size() > 2) nb_mag2 = std::abs(sl.nbAccum[2]);
-                log_ts("debug", "wideband",
-                    "activate slot %u -> ch %u (%.3f MHz, os=%u, replay %zu, "
-                    "nco_inc=%.6f, nb_len=%zu, mag=[%.4f %.4f %.4f])",
-                    freeSlot, ch, freq / 1e6, os, replayLen,
-                    sl.ncoPhaseInc, sl.nbAccum.size(),
-                    static_cast<double>(nb_mag0),
-                    static_cast<double>(nb_mag1),
-                    static_cast<double>(nb_mag2));
+                if (debug) {
+                    log_ts("debug", "wideband", "activate slot %u -> ch %u BW %u (%.3f MHz, os=%u)",
+                        freeSlot, ch, bw, freq / 1e6, os);
+                }
             }
         }
     }
@@ -1051,7 +1056,7 @@ struct WidebandDecoder
         out_tag["is_downchirp"]  = gr::pmt::Value(false);
         out_tag["snr_db"]        = gr::pmt::Value(static_cast<double>(lane.snr_db));
         out_tag["channel_freq"]  = gr::pmt::Value(slot.channelFreq);
-        out_tag["decode_bw"]     = gr::pmt::Value(static_cast<double>(decode_bw));
+        out_tag["decode_bw"]     = gr::pmt::Value(static_cast<double>(slot.decodeBw));
         out_tag["cfo_int"]       = gr::pmt::Value(static_cast<int64_t>(lane.cfo_int));
         out_tag["cfo_frac"]      = gr::pmt::Value(static_cast<double>(lane.cfo_frac));
         out_tag["sfo_hat"]       = gr::pmt::Value(static_cast<double>(lane.sfo_hat));
@@ -1073,11 +1078,30 @@ struct WidebandDecoder
 
         if (debug) {
             log_ts("info ", "wideband",
-                   "SF%u frame @ %.3f MHz: pay_len=%u cr=%u crc=%s snr=%.1f dB",
-                   lane.sf, slot.channelFreq / 1e6,
+                   "SF%u frame @ %.3f MHz BW%u: pay_len=%u cr=%u crc=%s snr=%.1f dB",
+                   lane.sf, slot.channelFreq / 1e6, slot.decodeBw,
                    frame.pay_len, frame.cr,
                    frame.crc_valid ? "OK" : "FAIL",
                    static_cast<double>(lane.snr_db));
+        }
+
+        // Narrowest-BW-first dedup: suppress wider-BW slots on same channel
+        if (frame.crc_valid) {
+            for (uint32_t peerSlotIdx : _activeChannelMap[slot.channelIdx]) {
+                auto& peer = _slots[peerSlotIdx];
+                if (peer.decodeBw > slot.decodeBw
+                    && peer.state == ChannelSlot::State::Active) {
+                    peer.state = ChannelSlot::State::Draining;
+                    for (auto& peerLane : peer.sfLanes) {
+                        peerLane.resetToDetect();
+                    }
+                    if (debug) {
+                        log_ts("debug", "wideband",
+                            "dedup: draining slot BW %u (ch %u) after BW %u decode",
+                            peer.decodeBw, slot.channelIdx, slot.decodeBw);
+                    }
+                }
+            }
         }
     }
 
