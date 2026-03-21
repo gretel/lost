@@ -279,30 +279,29 @@ namespace gr::lora {
 
 using cf32 = std::complex<float>;
 
-// 19-tap half-band FIR coefficients.
+// 23-tap half-band FIR coefficients.
 // Designed via Parks-McClellan for transition band [0.4, 0.6] * Fs.
-// Stopband rejection ≥ 40 dB, passband ripple < 0.1 dB.
-// h[n] = h[18-n] (symmetric), odd taps zero except center h[9] = 0.5.
-// Only 5 unique non-zero values: h[0], h[2], h[4], h[6], h[8].
-// INSERT ACTUAL COEFFICIENTS FROM TASK 1 HERE
+// Stopband rejection: -45.1 dB. Passband ripple: 0.048 dB.
+// h[n] = h[22-n] (symmetric), odd taps zero except center h[11] = 0.5.
+// 6 unique non-zero values: h[0], h[2], h[4], h[6], h[8], h[10].
 namespace halfband_detail {
-    // Placeholder — replace with actual scipy.signal.remez output from Task 1
-    constexpr std::array<float, 5> kCoeffs = {
-        0.0f,   // h[0] = h[18]
-        0.0f,   // h[2] = h[16]
-        0.0f,   // h[4] = h[14]
-        0.0f,   // h[6] = h[12]
-        0.0f,   // h[8] = h[10]
+    constexpr std::array<float, 6> kCoeffs = {
+        -7.193324475036694e-03f,  // h[0]  = h[22]
+         1.361692586579394e-02f,  // h[2]  = h[20]
+        -2.628066406628573e-02f,  // h[4]  = h[18]
+         4.860759433245809e-02f,  // h[6]  = h[16]
+        -9.646258355192097e-02f,  // h[8]  = h[14]
+         3.150052960795258e-01f,  // h[10] = h[12]
     };
-    constexpr float kCenterTap = 0.5f;  // h[9]
-    constexpr uint32_t kNumTaps = 19;
+    constexpr float kCenterTap = 0.5f;  // h[11]
+    constexpr uint32_t kNumTaps = 23;
 }  // namespace halfband_detail
 
 /// Single half-band FIR filter + decimate-by-2 stage.
 /// Delay line persists across process() calls for phase continuity.
 struct HalfBandStage {
-    static constexpr uint32_t kBufLen = 19;  // delay line = filter length
-    std::array<cf32, kBufLen> delay{};
+    static constexpr uint32_t kBufLen = halfband_detail::kNumTaps;  // 23
+    std::array<cf32, 23> delay{};  // sized to kNumTaps
     uint32_t writePos{0};   // next write position in circular buffer
     uint32_t sampleCount{0};  // counts input samples for decimate-by-2 phase
 
@@ -331,15 +330,16 @@ struct HalfBandStage {
                 //   = delay[(writePos + k + 1) % 19]
 
                 cf32 acc(0.f, 0.f);
-                // Symmetric pairs: h[0]*(x[0]+x[18]), h[2]*(x[2]+x[16]), etc.
-                for (uint32_t i = 0; i < 5; ++i) {
-                    uint32_t k = 2 * i;  // tap index: 0, 2, 4, 6, 8
+                // Symmetric pairs: h[0]*(x[0]+x[22]), h[2]*(x[2]+x[20]), etc.
+                constexpr uint32_t nPairs = halfband_detail::kCoeffs.size();  // 6
+                for (uint32_t i = 0; i < nPairs; ++i) {
+                    uint32_t k = 2 * i;  // tap index: 0, 2, 4, 6, 8, 10
                     uint32_t idx_lo = (writePos + k + 1) % kBufLen;
-                    uint32_t idx_hi = (writePos + (18 - k) + 1) % kBufLen;
+                    uint32_t idx_hi = (writePos + (kBufLen - 1 - k) + 1) % kBufLen;
                     acc += c[i] * (delay[idx_lo] + delay[idx_hi]);
                 }
-                // Center tap (tap index 9)
-                uint32_t idx_center = (writePos + 9 + 1) % kBufLen;
+                // Center tap (tap index 11 for 23-tap filter)
+                uint32_t idx_center = (writePos + kBufLen / 2 + 1) % kBufLen;
                 acc += halfband_detail::kCenterTap * delay[idx_center];
 
                 out.push_back(acc);
@@ -410,7 +410,7 @@ struct CascadedDecimator {
 #endif  // GNURADIO_LORA_ALGORITHM_HALFBAND_DECIMATOR_HPP
 ```
 
-**Important:** After Task 1 produces the actual coefficients, replace the placeholder values in `kCoeffs`.
+**Note:** Coefficients above are the final values from Task 1 (`scipy.signal.remez`, 23 taps, -45.1 dB stopband verified).
 
 - [ ] **Step 4: Build and run the tests**
 

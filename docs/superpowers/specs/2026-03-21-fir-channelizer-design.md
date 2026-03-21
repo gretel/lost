@@ -63,56 +63,50 @@ A half-band filter of length N has `(N-1)/4` unique non-zero coefficients
 (exploiting symmetry + zero-tap property), plus the fixed center tap of
 0.5. The number of taps determines achievable stopband rejection:
 
-| Taps | Non-zero unique | MAC/output | Achievable stopband |
-|------|-----------------|------------|---------------------|
-| 15   | 4               | 4          | ~-33 to -37 dB     |
-| 19   | 5               | 5          | ~-43 to -47 dB     |
-| 23   | 6               | 6          | ~-53 to -57 dB     |
+| Taps | Non-zero unique | MAC/output | Measured stopband |
+|------|-----------------|------------|-------------------|
+| 15   | 4               | 4          | ~-33 dB           |
+| 19   | 5               | 5          | -38.9 dB          |
+| 23   | 6               | 6          | **-45.1 dB**      |
 
-**Decision:** Use **19 taps** (5 unique non-zero coefficients) to
-reliably achieve the -40 dB target. The 25% compute increase over 15
-taps (5 vs 4 MAC/output) is negligible relative to the total budget.
+**Decision:** Use **23 taps** (6 unique non-zero coefficients). 19 taps
+only achieved -38.9 dB (short of -40 dB target). 23 taps gives -45.1 dB
+with 0.048 dB passband ripple. The 50% compute increase over 15 taps
+(6 vs 4 MAC/output) is still negligible relative to the total budget.
 
-The Parks-McClellan (Remez exchange) design for a 19-tap half-band with
-transition band [0.4, 0.6] × Fs yields symmetric coefficients
-(h[n] = h[18-n], odd taps zero except center):
+Coefficients computed via `scipy.signal.remez` with transition band
+[0.4, 0.6] × Fs, half-band constraints enforced (odd taps zero except
+center h[11] = 0.5):
 
 ```
-h[0] = h[18]   (unique coefficient 1)
-h[1] = 0
-h[2] = h[16]   (unique coefficient 2)
-h[3] = 0
-h[4] = h[14]   (unique coefficient 3)
-h[5] = 0
-h[6] = h[12]   (unique coefficient 4)
-h[7] = 0
-h[8] = h[10]   (unique coefficient 5)
-h[9] = 0.5     (center tap, fixed by half-band definition)
+h[0]  = h[22] = -7.193324475036694e-03
+h[2]  = h[20] =  1.361692586579394e-02
+h[4]  = h[18] = -2.628066406628573e-02
+h[6]  = h[16] =  4.860759433245809e-02
+h[8]  = h[14] = -9.646258355192097e-02
+h[10] = h[12] =  3.150052960795258e-01
+h[11]         =  0.5 (center tap)
 ```
-
-Exact values will be computed during M1 using `scipy.signal.remez` and
-verified to meet the -40 dB stopband requirement before being hardcoded
-as `constexpr` C++ constants.
 
 ### 2.4 Compute cost
 
-Per active channel (BW62.5k, 8 stages, 5 MAC/output with 19 taps):
-- Stage 1: 16M input/s → 8M output/s, 5 MAC per output = 40M MAC/s
-- Stage 2: 8M → 4M, 5 MAC per output = 20M MAC/s
+Per active channel (BW62.5k, 8 stages, 6 MAC/output with 23 taps):
+- Stage 1: 16M input/s → 8M output/s, 6 MAC per output = 48M MAC/s
+- Stage 2: 8M → 4M, 6 MAC per output = 24M MAC/s
 - Stage 3-8: geometric sum continues...
-- Total: ~79M MAC/s per channel (geometric series converges to 2× first)
+- Total: ~95M MAC/s per channel (geometric series converges to 2× first)
 
-For 8 active channels across 3 BWs (24 slots max): ~1.9G MAC/s — well
+For 8 active channels across 3 BWs (24 slots max): ~2.3G MAC/s — well
 within Apple M1's budget (~100 GFLOP/s single-core).
 
 **Per-processBulk latency** at 8192-sample chunks (1953 calls/s):
-24 slots × 8192 samples × 5 MAC ≈ 983K MACs per call ≈ 0.25 ms.
-Budget per chunk: 8192/16M = 0.51 ms → ~49% CPU at full occupancy.
+24 slots × 8192 samples × 6 MAC ≈ 1.2M MACs per call ≈ 0.30 ms.
+Budget per chunk: 8192/16M = 0.51 ms → ~59% CPU at full occupancy.
 Tight but feasible in Release builds. In practice, most sweeps have
 0-3 hot channels (6-9 active slots), using ~25% CPU.
 
 **Memory per slot:** ~2.5 MB dominated by SfLane buffers (SF12 preamble
-storage). FIR delay lines add 18 samples × 8 stages × 8 bytes = 1.1 KB
+storage). FIR delay lines add 22 samples × 8 stages × 8 bytes = 1.4 KB
 per slot (negligible). 24 slots total: ~60 MB for SfLane buffers.
 Acceptable for desktop/M1.
 
@@ -123,7 +117,7 @@ Acceptable for desktop/M1.
 ### 3.1 New file: `algorithm/HalfBandDecimator.hpp`
 
 **`HalfBandStage`** struct:
-- `std::array<cf32, 18> delay` — delay line (19-tap filter, 18 history samples)
+- `std::array<cf32, 23> delay` — delay line (23-tap filter, circular buffer)
 - `uint32_t phase` — polyphase phase counter (0 or 1, for decimate-by-2)
 - `void reset()`
 - `cf32 processSample(cf32 input)` — returns decimated output every 2nd input, or sentinel
