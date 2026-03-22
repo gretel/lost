@@ -191,10 +191,11 @@ def main() -> None:
             if tainted:
                 wb_stats.tainted_count += 1
 
+            ovf = msg.get("overflows", 0)
             tag = " TAINTED" if tainted else ""
             print(
                 f"WB_SWEEP sweep={sweep} dur={dur}ms "
-                f"hot={n_hot} active={n_active}/{max_slots}{tag}",
+                f"hot={n_hot} active={n_active}/{max_slots} ovf={ovf}{tag}",
                 flush=True,
             )
 

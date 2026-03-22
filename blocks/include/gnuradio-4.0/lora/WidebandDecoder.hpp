@@ -166,13 +166,15 @@ struct WidebandDecoder
     float       energy_thresh{1e-6f};      // per-symbol energy threshold
     float       min_snr_db{-10.0f};        // minimum SNR for decode
     uint32_t    max_symbols{600};          // max symbols per frame
+    uint32_t    overflow_max_per_sweep{5}; // overflows tolerated per sweep before tainting
     bool        debug{false};              // verbose logging
 
     GR_MAKE_REFLECTABLE(WidebandDecoder, in, out, msg_out,
         sample_rate, center_freq, channel_bw, decode_bw, decode_bw_str,
         decode_sfs_str, min_ratio,
         buffer_ms, max_channels, l1_interval, l1_snapshots, l1_fft_size,
-        sync_word, preamble_len, energy_thresh, min_snr_db, max_symbols, debug);
+        sync_word, preamble_len, energy_thresh, min_snr_db, max_symbols,
+        overflow_max_per_sweep, debug);
 
     // --- internal state ---
 
@@ -187,7 +189,7 @@ struct WidebandDecoder
     uint32_t                  _callCount{0};
     uint32_t                  _snapshotCount{0};
     uint32_t                  _sweepCount{0};
-    bool                      _overflowInSweep{false};
+    uint32_t                  _overflowsInSweep{0};
     uint32_t                  _overflowLogSuppress{0}; // suppress overflow log for N calls after first
 
     // Hot channel tracking
@@ -317,23 +319,15 @@ struct WidebandDecoder
     {
         auto in_span = std::span(input);
 
-        // 1. Handle overflow tags — deactivate slots but let sweep complete
-        //    (tainted sweep is discarded at step 5; resetting _snapshotCount
-        //    here would prevent the sweep from ever finishing when overflow
-        //    tags trickle in one-per-call from the startup burst).
+        // 1. Count overflow tags (informational — do NOT deactivate slots).
+        //    At 16 MS/s the B210 produces ~1 overflow per processBulk call.
+        //    Deactivating slots would destroy all in-progress decode.
+        //    L1 energy detection and SfLane decode are tolerant of occasional
+        //    sample discontinuities (missing samples look like noise bursts).
         if (this->inputTagsPresent()) {
             const auto& tag = this->mergedInputTag();
             if (tag.map.contains("overflow")) {
-                _overflowInSweep = true;  // discard this sweep's results
-                for (auto& slot : _slots) {
-                    if (slot.state != ChannelSlot::State::Idle) {
-                        slot.deactivate();
-                    }
-                }
-                for (auto& v : _activeChannelMap) v.clear();
-                if (debug) {
-                    log_ts("debug", "wideband", "overflow: reset all slots");
-                }
+                ++_overflowsInSweep;
             }
         }
 
@@ -366,19 +360,16 @@ struct WidebandDecoder
         // 5. After accumulating enough snapshots, update active channels
         std::size_t out_idx = 0;
         if (_snapshotCount >= l1_snapshots) {
-            if (_overflowInSweep) {
-                // Discard this sweep — energy was accumulated during overflow
-                if (debug) {
-                    log_ts("debug", "wideband", "discarding tainted sweep (overflow during accumulation)");
-                }
-            } else {
-                findHotChannels();
-                updateActiveChannels();
-            }
+            // Always run hot channel detection — L1 energy is statistical
+            // and tolerant of sample discontinuities from overflows.
+            // Overflow tags only affect active decode slots (reset in step 1).
+            findHotChannels();
+            updateActiveChannels();
             _channelEnergy.assign(_nChannels, 0.f);
             _snapshotCount = 0;
-            bool wasTainted = _overflowInSweep;
-            _overflowInSweep = false;
+            uint32_t sweepOverflows = _overflowsInSweep;
+            bool wasTainted = (sweepOverflows > overflow_max_per_sweep);
+            _overflowsInSweep = 0;
             _sweepCount++;
 
             // sweep timing
@@ -400,6 +391,7 @@ struct WidebandDecoder
                 evt["type"]        = std::pmr::string("wideband_sweep");
                 evt["sweep"]       = _sweepCount;
                 evt["tainted"]     = wasTainted;
+                evt["overflows"]   = sweepOverflows;
                 evt["duration_ms"] = durMs;
                 evt["n_snapshots"] = static_cast<uint32_t>(l1_snapshots);
                 evt["n_hot"]       = static_cast<uint32_t>(_hotChannels.size());
@@ -411,12 +403,13 @@ struct WidebandDecoder
             // periodic console status (every 10 sweeps)
             if (_sweepCount % 10 == 0) {
                 log_ts("info ", "wideband",
-                    "sweep %u  hot %zu  active %u/%u  dur %ums%s",
+                    "sweep %u  hot %zu  active %u/%u  dur %ums  ovf %u%s",
                     _sweepCount,
                     _hotChannels.size(),
                     nActive,
                     static_cast<uint32_t>(max_channels),
                     durMs,
+                    sweepOverflows,
                     wasTainted ? " TAINTED" : "");
             }
         }
