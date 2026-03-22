@@ -17,7 +17,12 @@
 # [meshcore]      MeshCore protocol (Python scripts only)
 # [aggregator]    lora_agg.py diversity combiner
 #
-# B210/B220 channel mapping:
+# Example uses a USRP B210 via UHD.  Adapt [device] for your hardware:
+#   LimeSDR:  driver = "lime"    param = ""
+#   HackRF:   driver = "hackrf"  param = ""
+#   Loopback: driver = "loopback" param = ""
+#
+# B210/B220 channel mapping (UHD-specific):
 #   0 = TRX_A  (TX/RX)    1 = RX_A  (RX only)
 #   2 = RX_B   (RX only)  3 = TRX_B (TX/RX)
 # TX only on channels 0 and 3.  Both chains share one PLL per direction.
@@ -25,8 +30,8 @@
 # ── Hardware ─────────────────────────────────────────────────────────────────
 
 [device]
-driver = "uhd"
-param  = "type=b200"
+driver = "uhd"                # SoapySDR driver name (required)
+param  = "type=b200"          # device filter (optional, driver-specific)
 clock  = "external"           # internal, external, gpsdo
 
 [logging]
@@ -82,6 +87,12 @@ radio      = "radio_868"
 codec      = "codec_meshcore_868"
 rate       = 250000                     # RX/TX sample rate (Hz)
 decode_bws = [62500, 125000, 250000]    # RX BWs (one MultiSfDecoder per BW)
+
+# Wideband mode: 16 MS/s capture, digital channelization, all SFs on all channels
+# When enabled, decode_bws and rate are ignored (uses wideband_rate instead)
+wideband             = false
+wideband_rate        = 16000000     # wideband sample rate (Hz)
+wideband_master_clock = 32000000    # FPGA master clock (Hz)
 
 [trx.network]
 udp_listen      = "127.0.0.1"

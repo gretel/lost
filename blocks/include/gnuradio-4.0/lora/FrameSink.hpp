@@ -60,6 +60,11 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
     double               _noise_floor_db{-999.0};
     double               _peak_db{-999.0};
     int64_t              _rx_channel{-1};
+    double               _channel_freq{0.0};
+    double               _decode_bw{0.0};
+    int64_t              _cfo_int{0};
+    double               _cfo_frac{0.0};
+    double               _sfo_hat{0.0};
     bool                 _collecting{false};
     std::vector<uint8_t> _frame;
     uint32_t             _frame_count{0};
@@ -270,6 +275,7 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         if (_peak_db > -999.0)          std::fprintf(stderr, " peak=%.1fdBFS", _peak_db);
         if (_snr_db_td > -999.0)        std::fprintf(stderr, " snr_td=%.1fdB", _snr_db_td);
         if (_rx_channel >= 0)           std::fprintf(stderr, " ch=%d", static_cast<int>(_rx_channel));
+        if (_channel_freq > 0.0)        std::fprintf(stderr, " freq=%.3fMHz", _channel_freq / 1e6);
         if (!label.empty())             std::fprintf(stderr, " proto=%s", label.c_str());
         if (!_device_serial.empty())    std::fprintf(stderr, " dev=%s", _device_serial.c_str());
         if (_is_downchirp)              std::fprintf(stderr, " downchirp");
@@ -303,6 +309,9 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         if (_noise_floor_db > -999.0) phy_fields++;
         if (_peak_db > -999.0) phy_fields++;
         if (_snr_db_td > -999.0) phy_fields++;
+        if (_channel_freq > 0.0) phy_fields++;
+        if (_decode_bw > 0.0) phy_fields++;
+        if (_channel_freq > 0.0) phy_fields += 3;  // cfo_int, cfo_frac, sfo_hat
         cbor::encode_map_begin(buf, phy_fields);
         cbor::kv_uint(buf, "sf", effectiveSf());
         cbor::kv_uint(buf, "bw", phy_bw);
@@ -318,6 +327,17 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         }
         if (_snr_db_td > -999.0) {
             cbor::kv_float64(buf, "snr_db_td", _snr_db_td);
+        }
+        if (_channel_freq > 0.0) {
+            cbor::kv_float64(buf, "channel_freq", _channel_freq);
+        }
+        if (_decode_bw > 0.0) {
+            cbor::kv_float64(buf, "decode_bw", _decode_bw);
+        }
+        if (_channel_freq > 0.0) {
+            cbor::kv_float64(buf, "cfo_int", static_cast<double>(_cfo_int));
+            cbor::kv_float64(buf, "cfo_frac", _cfo_frac);
+            cbor::kv_float64(buf, "sfo_hat", _sfo_hat);
         }
 
         cbor::kv_bytes(buf, "payload", _frame.data(), pay_len_actual);
@@ -442,6 +462,36 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
                     _rx_channel = it2->second.value_or<int64_t>(-1);
                 } else {
                     _rx_channel = -1;
+                }
+                if (auto it2 = tag.map.find("channel_freq");
+                    it2 != tag.map.end()) {
+                    _channel_freq = it2->second.value_or<double>(0.0);
+                } else {
+                    _channel_freq = 0.0;
+                }
+                if (auto it2 = tag.map.find("decode_bw");
+                    it2 != tag.map.end()) {
+                    _decode_bw = it2->second.value_or<double>(0.0);
+                } else {
+                    _decode_bw = 0.0;
+                }
+                if (auto it2 = tag.map.find("cfo_int");
+                    it2 != tag.map.end()) {
+                    _cfo_int = it2->second.value_or<int64_t>(0);
+                } else {
+                    _cfo_int = 0;
+                }
+                if (auto it2 = tag.map.find("cfo_frac");
+                    it2 != tag.map.end()) {
+                    _cfo_frac = it2->second.value_or<double>(0.0);
+                } else {
+                    _cfo_frac = 0.0;
+                }
+                if (auto it2 = tag.map.find("sfo_hat");
+                    it2 != tag.map.end()) {
+                    _sfo_hat = it2->second.value_or<double>(0.0);
+                } else {
+                    _sfo_hat = 0.0;
                 }
 
                 _frame.clear();

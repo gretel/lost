@@ -107,22 +107,26 @@ int parse_args(int argc, char* argv[], std::string& config_path,
 // --- Shared TOML helpers ---
 
 struct ParsedDevice {
-    std::string device{"uhd"};
-    std::string param{"type=b200"};
+    std::string device{};
+    std::string param{};
     std::string clock{};
 };
 
 static ParsedDevice parse_device(const toml::table& tbl) {
     ParsedDevice d;
     auto* dev_tbl = tbl["device"].as_table();
+    if (!dev_tbl) {
+        throw std::runtime_error("[device] section is required in config (set driver and param)");
+    }
     auto dev_or_s = [&](std::string_view key, std::string def) -> std::string {
-        if (dev_tbl) {
-            if (auto v = dev_tbl->at_path(key).value<std::string>()) return *v;
-        }
+        if (auto v = dev_tbl->at_path(key).value<std::string>()) return *v;
         return def;
     };
-    d.device = dev_or_s("driver", dev_or_s("device", "uhd"));
-    d.param  = dev_or_s("param", "type=b200");
+    d.device = dev_or_s("driver", dev_or_s("device", ""));
+    d.param  = dev_or_s("param", "");
+    if (d.device.empty()) {
+        throw std::runtime_error("[device].driver is required (e.g. \"uhd\", \"lime\", \"loopback\")");
+    }
     d.clock  = dev_or_s("clock", "");
     return d;
 }
@@ -221,7 +225,12 @@ std::vector<TrxConfig> load_config(const std::string& path,
     parse_logging(tbl, cli_log_level);
     auto codecs = parse_codecs(tbl);
     auto radios = parse_radios(tbl);
-    bool g_debug = (cli_log_level == "DEBUG");
+    std::string effective_level = cli_log_level;
+    if (effective_level.empty()) {
+        auto* log_tbl = tbl["logging"].as_table();
+        if (log_tbl) effective_level = log_tbl->at_path("level").value_or(std::string{"INFO"});
+    }
+    bool g_debug = (effective_level == "DEBUG");
 
     // --- [trx] section ---
     auto* trx_tbl = tbl["trx"].as_table();
@@ -393,6 +402,17 @@ std::vector<TrxConfig> load_config(const std::string& path,
     }
     if (cfg.decode_bws.empty()) {
         cfg.decode_bws.push_back(cfg.bw);
+    }
+
+    // wideband mode
+    if (auto v = trx_tbl->at_path("wideband").value<bool>()) {
+        cfg.wideband = *v;
+    }
+    if (auto v = trx_tbl->at_path("wideband_rate").value<double>()) {
+        cfg.wideband_rate = *v;
+    }
+    if (auto v = trx_tbl->at_path("wideband_master_clock").value<double>()) {
+        cfg.wideband_master_clock = *v;
     }
 
     // Validate

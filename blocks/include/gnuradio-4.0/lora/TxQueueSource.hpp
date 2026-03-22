@@ -10,7 +10,7 @@
 ///
 /// Two output ports (out0, out1) are produced in lockstep (same sample count
 /// per call), so SoapySinkBlock<cf32,2> stays in sync. out0 carries the IQ
-/// signal; out1 carries matching zeros for the dummy B210 balanced channel.
+/// signal; out1 carries matching zeros for the second TX channel (if present).
 
 #include <algorithm>
 #include <complex>
@@ -27,7 +27,7 @@ struct TxQueueSource : gr::Block<TxQueueSource> {
     using cf32 = std::complex<float>;
 
     gr::PortOut<cf32> out0;  ///< IQ signal channel
-    gr::PortOut<cf32> out1;  ///< zeros channel (B210 balanced dummy)
+    gr::PortOut<cf32> out1;  ///< zeros channel (second TX chain dummy)
 
     GR_MAKE_REFLECTABLE(TxQueueSource, out0, out1);
 

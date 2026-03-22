@@ -16,5 +16,6 @@ gr_add_block_library(
         include/gnuradio-4.0/lora/FrameSink.hpp
         include/gnuradio-4.0/lora/TxQueueSource.hpp
         include/gnuradio-4.0/lora/MultiSfDecoder.hpp
+        include/gnuradio-4.0/lora/WidebandDecoder.hpp
     LINK_LIBRARIES
         gr-lora)

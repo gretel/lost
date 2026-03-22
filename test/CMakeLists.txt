@@ -77,6 +77,27 @@ target_compile_definitions(qa_lora_wideband PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
 set_tests_properties(qa_lora_wideband PROPERTIES TIMEOUT 120)
 
+# --- SoapyLoopback: hardware-free SoapySDR loopback testing ---
+# Override with -DFETCHCONTENT_SOURCE_DIR_SOAPYLOOPBACK=<path> for local development
+FetchContent_Declare(
+    SoapyLoopback
+    GIT_REPOSITORY https://github.com/gretel/SoapyLoopback.git
+    GIT_TAG        bffb12274ac657802d5f14e46996a77f023a4077  # fix/tx-loopback-qa
+)
+FetchContent_MakeAvailable(SoapyLoopback)
+
+add_executable(qa_soapy_loopback qa_soapy_loopback.cpp)
+target_link_libraries(qa_soapy_loopback PRIVATE
+    gnuradio-options gnuradio-core-group gr-soapy gr-testing ut)
+target_compile_definitions(qa_soapy_loopback PRIVATE
+    SOAPY_LOOPBACK_MODULE_PATH="$<TARGET_FILE:soapyloopback>")
+add_test(NAME qa_soapy_loopback
+         COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/qa_soapy_loopback)
+set_tests_properties(qa_soapy_loopback PROPERTIES
+    TIMEOUT 60
+    ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+add_dependencies(qa_soapy_loopback soapyloopback)
+
 # Test vector generator (not a test — run manually to regenerate vectors)
 add_executable(generate_vectors generate_vectors.cpp)
 target_link_libraries(generate_vectors PRIVATE gr-lora)

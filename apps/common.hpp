@@ -34,8 +34,11 @@ inline std::atomic<bool>& install_signal_handler() {
 
 // Homebrew UHD patches B2XX_FPGA_FILE_NAME to absolute Cellar paths that
 // break after revision bumps — override with bare filenames.
+// Only applies to B200-family devices (B200, B200mini, B210, B220).
 inline void apply_fpga_workaround(const std::string& device, std::string& device_param) {
-    if (device == "uhd" && device_param.find("fpga=") == std::string::npos) {
+    if (device == "uhd"
+        && device_param.find("type=b2") != std::string::npos
+        && device_param.find("fpga=") == std::string::npos) {
         device_param += ",fpga=usrp_b210_fpga.bin";
     }
 }

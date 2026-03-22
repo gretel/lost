@@ -104,8 +104,8 @@ struct RawConfig {
 
 struct TrxConfig {
     std::string          name{};
-    std::string          device{"uhd"};
-    std::string          device_param{"type=b200"};
+    std::string          device{};
+    std::string          device_param{};
     double               freq{869'618'000.0};
     double               gain_rx{30.0};
     double               gain_tx{75.0};
@@ -129,14 +129,19 @@ struct TrxConfig {
     std::vector<DecodeConfig> decode_configs{};  ///< per-chain decode configs (at least one required)
     std::vector<uint32_t>     decode_bws{};      ///< BWs to decode (empty = {bw} only)
     RawConfig                 raw{};             ///< passthrough sections for Python scripts
+
+    // Wideband decode mode (16 MS/s, digital channelization, all SFs on all channels)
+    bool                 wideband{false};
+    double               wideband_rate{16.0e6};
+    double               wideband_master_clock{32.0e6};
 };
 
 /// Scan-specific configuration (parsed from [scan] section).
 /// Shares [device] and [radio_*] with TrxConfig; adds scan parameters.
 struct ScanSetConfig {
     // From [device]
-    std::string  device{"uhd"};
-    std::string  device_param{"type=b200"};
+    std::string  device{};
+    std::string  device_param{};
     double       l1_rate{16.0e6};           ///< L1 wideband sample rate
     double       master_clock{32.0e6};      ///< FPGA master clock rate
     std::string  clock{};

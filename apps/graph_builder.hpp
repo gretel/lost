@@ -15,6 +15,7 @@
 #include <gnuradio-4.0/Tensor.hpp>
 
 #include <gnuradio-4.0/lora/MultiSfDecoder.hpp>
+#include <gnuradio-4.0/lora/WidebandDecoder.hpp>
 #include <gnuradio-4.0/lora/Splitter.hpp>
 #include <gnuradio-4.0/lora/FrameSink.hpp>
 #include <gnuradio-4.0/lora/CaptureSink.hpp>
@@ -423,6 +424,73 @@ inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const Sc
     }
 
     return sink;
+}
+
+// ─── Wideband decode graph (lora_trx --wideband) ─────────────────────────────
+
+/// Build wideband decode graph:
+///   SoapySource (16 MS/s) → WidebandDecoder → FrameSink
+///
+/// WidebandDecoder handles L1 energy gating + digital channelization + multi-SF
+/// decode internally. No Splitter or per-BW chains needed.
+inline std::atomic<uint64_t>* build_wideband_graph(
+        gr::Graph& graph, const TrxConfig& cfg,
+        std::function<void(const std::vector<uint8_t>&, bool)> callback) {
+    auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
+
+    const auto& dc = cfg.decode_configs[0];
+
+    // SoapySource at wideband rate
+    auto source_props = lora_apps::soapy_reliability_defaults();
+    source_props.merge(gr::property_map{
+        {"device", cfg.device},
+        {"device_parameter", cfg.device_param},
+        {"sample_rate", static_cast<double>(cfg.wideband_rate)},
+        {"master_clock_rate", cfg.wideband_master_clock},
+        {"rx_center_frequency", gr::Tensor<double>{cfg.freq}},
+        {"rx_gains", gr::Tensor<double>{cfg.gain_rx}},
+        {"verbose_overflow", false},
+    });
+    if (!cfg.clock.empty()) {
+        source_props["clock_source"] = cfg.clock;
+    }
+    auto& source = graph.emplaceBlock<
+        gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
+
+    // WidebandDecoder
+    auto& decoder = graph.emplaceBlock<gr::lora::WidebandDecoder>({
+        {"sample_rate", static_cast<float>(cfg.wideband_rate)},
+        {"center_freq", static_cast<float>(cfg.freq)},
+        {"channel_bw", 62500.f},
+        {"decode_bw", static_cast<float>(cfg.bw)},
+        {"max_channels", uint32_t{8}},
+        {"buffer_ms", 512.f},
+        {"sync_word", dc.sync_word},
+        {"preamble_len", cfg.preamble},
+        {"debug", cfg.debug},
+    });
+
+    // FrameSink
+    auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
+        {"sync_word", dc.sync_word},
+        {"phy_sf", uint8_t{0}},  // SF varies per frame, reported in tag
+        {"phy_bw", cfg.bw},
+        {"label", dc.label},
+    });
+    sink._frame_callback = callback;
+
+    if (!ok(graph.connect<"out", "in">(source, decoder))) {
+        gr::lora::log_ts("error", "graph", "connect source -> WidebandDecoder failed");
+    }
+    if (!ok(graph.connect<"out", "in">(decoder, sink))) {
+        gr::lora::log_ts("error", "graph", "connect WidebandDecoder -> FrameSink failed");
+    }
+
+    gr::lora::log_ts("info ", "graph",
+        "wideband graph: %.1f MS/s, %.3f MHz center, BW%u, SF7-12",
+        cfg.wideband_rate / 1e6, cfg.freq / 1e6, cfg.bw);
+
+    return &source._totalOverFlowCount;
 }
 
 }  // namespace lora_graph

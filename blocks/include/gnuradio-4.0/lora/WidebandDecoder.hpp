@@ -175,6 +175,7 @@ struct WidebandDecoder
     uint32_t                  _snapshotCount{0};
     uint32_t                  _sweepCount{0};
     bool                      _overflowInSweep{false};
+    uint32_t                  _overflowLogSuppress{0}; // suppress overflow log for N calls after first
 
     // Hot channel tracking
     std::vector<uint32_t>     _hotChannels;

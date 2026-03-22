@@ -581,22 +581,32 @@ int main(int argc, char* argv[]) {
     // --- Build persistent TX graph (created before RX to avoid device handle races) ---
     // SoapySinkBlock<cf32,2> stays open for the process lifetime; TxQueueSource
     // receives bursts from the UDP loop thread via push() + notifyProgress().
+    //
+    // Wideband mode skips the TX graph: the B210 AD9361 limits master clock to
+    // 30.72 MHz with 2 TX channels, but 16 MS/s RX needs 32 MHz (32/16 = 2).
+    // TX support in wideband mode requires single-channel TX (future work).
     gr::lora::TxQueueSource* tx_source_ptr = nullptr;
-    auto tx_sched = build_tx_graph(tx_source_ptr, cfg);
-    if (!tx_sched || tx_source_ptr == nullptr) {
-        gr::lora::log_ts("error", "lora_trx", "failed to build TX graph");
-        ::close(udp.fd);
-        return 1;
-    }
-    gr::lora::TxQueueSource& tx_source = *tx_source_ptr;
-    std::thread tx_thread([&tx_sched]() {
-        auto ret = tx_sched->runAndWait();
-        if (!ret.has_value()) {
-            gr::lora::log_ts("warn ", "lora_trx",
-                "TX scheduler stopped: %s",
-                std::format("{}", ret.error()).c_str());
+    std::unique_ptr<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>> tx_sched;
+    std::thread tx_thread;
+
+    if (!cfg.wideband) {
+        tx_sched = build_tx_graph(tx_source_ptr, cfg);
+        if (!tx_sched || tx_source_ptr == nullptr) {
+            gr::lora::log_ts("error", "lora_trx", "failed to build TX graph");
+            ::close(udp.fd);
+            return 1;
         }
-    });
+        tx_thread = std::thread([&tx_sched]() {
+            auto ret = tx_sched->runAndWait();
+            if (!ret.has_value()) {
+                gr::lora::log_ts("warn ", "lora_trx",
+                    "TX scheduler stopped: %s",
+                    std::format("{}", ret.error()).c_str());
+            }
+        });
+    } else {
+        gr::lora::log_ts("info ", "lora_trx", "wideband mode: TX disabled (AD9361 2-ch clock limit)");
+    }
 
     // --- Spectrum taps for waterfall display ---
     auto spectrum = std::make_shared<gr::lora::SpectrumState>();
@@ -618,8 +628,15 @@ int main(int argc, char* argv[]) {
 
     // --- Build and start RX graph in a background thread ---
     gr::Graph rx_graph;
-    std::atomic<uint64_t>* overflow_ptr = build_rx_graph(rx_graph, cfg, frame_callback, spectrum,
-                                            &channel_busy);
+    std::atomic<uint64_t>* overflow_ptr = nullptr;
+    if (cfg.wideband) {
+        gr::lora::log_ts("info ", "lora_trx", "wideband mode: %.1f MS/s, digital channelization",
+                         cfg.wideband_rate / 1e6);
+        overflow_ptr = build_wideband_graph(rx_graph, cfg, frame_callback);
+    } else {
+        overflow_ptr = build_rx_graph(rx_graph, cfg, frame_callback, spectrum,
+                                      &channel_busy);
+    }
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> rx_sched;
     rx_sched.timeout_inactivity_count  = 1U;   // sleep after 1 idle cycle; SoapySource notifies progress on data
@@ -627,8 +644,10 @@ int main(int argc, char* argv[]) {
     rx_sched.watchdog_max_warnings     = 30U;  // 30s of continuous stall → ERROR
     if (auto ret = rx_sched.exchange(std::move(rx_graph)); !ret) {
         gr::lora::log_ts("error", "lora_trx", "RX scheduler init failed");
-        tx_sched->requestStop();
-        tx_thread.join();
+        if (tx_sched) {
+            tx_sched->requestStop();
+            if (tx_thread.joinable()) tx_thread.join();
+        }
         ::close(udp.fd);
         return 1;
     }
@@ -694,42 +713,46 @@ int main(int argc, char* argv[]) {
 
     // --- TX request queue + worker thread (replaces tx_busy + io pool dispatch) ---
     TxRequestQueue tx_queue(cfg.tx_queue_depth);
+    std::thread tx_worker;
 
-    std::thread tx_worker([&tx_queue, &cfg, &udp, &tx_source, &channel_busy,
-                           tx_spectrum_ref = tx_spectrum]() {
-        while (auto req = tx_queue.pop()) {
-            // LBT: wait for channel to clear before transmitting
-            if (cfg.lbt) {
-                auto deadline = std::chrono::steady_clock::now()
-                              + std::chrono::milliseconds(cfg.lbt_timeout_ms);
-                bool timed_out = false;
-                while (channel_busy.load(std::memory_order_acquire)) {
-                    if (std::chrono::steady_clock::now() >= deadline) {
-                        timed_out = true;
-                        break;
+    if (tx_source_ptr != nullptr) {
+        gr::lora::TxQueueSource& tx_source = *tx_source_ptr;
+        tx_worker = std::thread([&tx_queue, &cfg, &udp, &tx_source, &channel_busy,
+                               tx_spectrum_ref = tx_spectrum]() {
+            while (auto req = tx_queue.pop()) {
+                // LBT: wait for channel to clear before transmitting
+                if (cfg.lbt) {
+                    auto deadline = std::chrono::steady_clock::now()
+                                  + std::chrono::milliseconds(cfg.lbt_timeout_ms);
+                    bool timed_out = false;
+                    while (channel_busy.load(std::memory_order_acquire)) {
+                        if (std::chrono::steady_clock::now() >= deadline) {
+                            timed_out = true;
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    if (timed_out) {
+                        uint64_t seq = gr::lora::cbor::get_uint_or(req->msg, "seq", 0);
+                        gr::lora::log_ts("warn ", "lora_trx",
+                            "LBT timeout (channel busy >%ums), rejecting seq=%" PRIu64,
+                            cfg.lbt_timeout_ms, seq);
+                        std::vector<uint8_t> rej;
+                        rej.reserve(80);
+                        gr::lora::cbor::encode_map_begin(rej, 4);
+                        gr::lora::cbor::kv_text(rej, "type", "lora_tx_ack");
+                        gr::lora::cbor::kv_uint(rej, "seq", seq);
+                        gr::lora::cbor::kv_bool(rej, "ok", false);
+                        gr::lora::cbor::kv_text(rej, "error", "channel_busy");
+                        udp.sendTo(rej, req->sender);
+                        continue;
+                    }
                 }
-                if (timed_out) {
-                    uint64_t seq = gr::lora::cbor::get_uint_or(req->msg, "seq", 0);
-                    gr::lora::log_ts("warn ", "lora_trx",
-                        "LBT timeout (channel busy >%ums), rejecting seq=%" PRIu64,
-                        cfg.lbt_timeout_ms, seq);
-                    std::vector<uint8_t> rej;
-                    rej.reserve(80);
-                    gr::lora::cbor::encode_map_begin(rej, 4);
-                    gr::lora::cbor::kv_text(rej, "type", "lora_tx_ack");
-                    gr::lora::cbor::kv_uint(rej, "seq", seq);
-                    gr::lora::cbor::kv_bool(rej, "ok", false);
-                    gr::lora::cbor::kv_text(rej, "error", "channel_busy");
-                    udp.sendTo(rej, req->sender);
-                    continue;
-                }
+                handle_tx_request(req->msg, cfg, udp, req->sender,
+                                  tx_source, tx_spectrum_ref.get());
             }
-            handle_tx_request(req->msg, cfg, udp, req->sender,
-                              tx_source, tx_spectrum_ref.get());
-        }
-    });
+        });
+    }
 
     // --- Main loop: recv UDP datagrams, dispatch TX requests ---
     std::vector<uint8_t> recv_buf(65536);
@@ -839,12 +862,14 @@ int main(int argc, char* argv[]) {
     // Drain TX request queue: signal stop, then join the worker thread.
     // The worker finishes any in-flight TX before exiting.
     tx_queue.request_stop();
-    tx_worker.join();
+    if (tx_worker.joinable()) tx_worker.join();
 
     // Stop TX graph after worker is done (no more IQ will be pushed).
-    tx_sched->requestStop();
-    tx_source.notifyProgress();  // wake the scheduler so it sees REQUESTED_STOP
-    tx_thread.join();
+    if (tx_sched) {
+        tx_sched->requestStop();
+        tx_source_ptr->notifyProgress();  // wake the scheduler so it sees REQUESTED_STOP
+        tx_thread.join();
+    }
 
     ::close(udp.fd);
     gr::lora::log_ts("info ", "lora_trx", "stopped");
