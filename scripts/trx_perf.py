@@ -20,6 +20,7 @@ import argparse
 import atexit
 import signal
 import sys
+import time
 from dataclasses import dataclass, field
 
 import cbor2
@@ -142,6 +143,22 @@ def main() -> None:
         for p in parts:
             print(p, flush=True)
 
+    # Cross-BW frame dedup: when multi-BW decode is active, the same frame can
+    # be decoded by multiple MultiSfDecoders. Suppress duplicates by payload_hash
+    # within a 1-second window.
+    recent_hashes: dict[int, float] = {}  # payload_hash → time.monotonic()
+
+    def is_duplicate(phash: int) -> bool:
+        now = time.monotonic()
+        # Evict stale entries
+        stale = [k for k, t in recent_hashes.items() if now - t > 1.0]
+        for k in stale:
+            del recent_hashes[k]
+        if phash in recent_hashes:
+            return True
+        recent_hashes[phash] = now
+        return False
+
     atexit.register(print_final_summary)
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
@@ -158,6 +175,12 @@ def main() -> None:
         msg_type = msg.get("type", "")
 
         if msg_type == "lora_frame":
+            # Cross-BW dedup by payload_hash
+            phash = msg.get("payload_hash", 0)
+            if phash and is_duplicate(phash):
+                stats.frame_count += 1  # count for stats but don't print
+                continue
+
             phy = msg.get("phy", {})
             crc_ok = msg.get("crc_valid", False)
             snr = phy.get("snr_db", 0.0)
