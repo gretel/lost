@@ -102,6 +102,21 @@ struct MultiSfDecoder
 
         if (_lanes.empty()) reconfigure();
 
+        // Handle overflow tags: push zeros to preserve symbol boundary alignment.
+        // At 250 kS/s overflows are rare, but when they occur the missing samples
+        // shift all subsequent symbol boundaries, corrupting dechirp+FFT output.
+        if (this->inputTagsPresent()) {
+            const auto& tag = this->mergedInputTag();
+            if (tag.map.contains("overflow") && in_span.empty() && _min_sps > 0) {
+                for (auto& lane : _lanes) {
+                    lane.accum.resize(lane.accum.size() + _min_sps, cf32{0.f, 0.f});
+                }
+                std::ignore = input.consume(0UZ);
+                output.publish(0UZ);
+                return gr::work::Status::OK;
+            }
+        }
+
         if (in_span.size() < _min_sps) {
             std::ignore = input.consume(0UZ);
             output.publish(0UZ);
