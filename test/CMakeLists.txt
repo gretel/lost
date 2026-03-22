@@ -38,6 +38,7 @@ target_compile_definitions(qa_lora_loopback PRIVATE
 add_ut_test(qa_lora_burst)
 target_compile_definitions(qa_lora_burst PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
+set_tests_properties(qa_lora_burst PROPERTIES TIMEOUT 120)
 
 add_ut_test(qa_lora_splitter)
 target_compile_definitions(qa_lora_splitter PRIVATE

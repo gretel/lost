@@ -237,4 +237,268 @@ const boost::ut::suite<"SpectrumTap"> spectrumTapTests = [] {
     };
 };
 
+// ============================================================================
+// ScanController L1 energy detection (algorithm-level, no graph needed)
+// ============================================================================
+
+const boost::ut::suite<"ScanController L1 energy detection"> scanControllerL1Tests = [] {
+    using namespace boost::ut;
+
+    // Helper: construct a ScanController with test-friendly settings and call start().
+    // Uses 1 MHz sample rate so channel_bw=62500 gives 12 usable channels (0.8 MHz / 62.5 kHz).
+    auto makeScanController = [](float sampleRate = 1e6f, float centerFreq = 868e6f,
+                                 float channelBw = 62500.f, float minRatio = 8.0f,
+                                 uint32_t fftSize = 1024, uint32_t interval = 1,
+                                 uint32_t snapshots = 4) {
+        gr::lora::ScanController sc;
+        sc.sample_rate  = sampleRate;
+        sc.center_freq  = centerFreq;
+        sc.channel_bw   = channelBw;
+        sc.min_ratio    = minRatio;
+        sc.l1_fft_size  = fftSize;
+        sc.l1_interval  = interval;
+        sc.l1_snapshots = snapshots;
+        sc.buffer_ms    = 200.f;
+        sc.probe_bws    = "62500";
+        sc.start();
+        return sc;
+    };
+
+    "channel count matches usable bandwidth"_test = [&] {
+        auto sc = makeScanController();
+        // usableBw = 1e6 * 0.8 = 800 kHz; nChannels = 800k / 62.5k = 12
+        expect(eq(sc._nChannels, 12U)) << "12 channels in 800 kHz usable BW";
+    };
+
+    "channelCenterFreq returns correct frequencies"_test = [&] {
+        auto sc = makeScanController();
+        // Band start = 868e6 - 400e3 = 867.6e6
+        // Channel 0 center = 867.6e6 + 0.5 * 62.5e3 = 867631250
+        const double bandStart = 868e6 - 0.5 * 1e6 * 0.8;
+        for (uint32_t ch = 0; ch < sc._nChannels; ++ch) {
+            const double expected = bandStart + (static_cast<double>(ch) + 0.5) * 62500.0;
+            expect(std::abs(sc.channelCenterFreq(ch) - expected) < 1.0)
+                << "channel " << ch << " center frequency";
+        }
+    };
+
+    "white noise produces no hot channels"_test = [&] {
+        auto sc = makeScanController();
+        const auto fftSize = sc.l1_fft_size;
+
+        // Generate white noise and push into ring buffer — enough for several snapshots
+        auto noise = makeNoise(fftSize * 8, 1.0f, 123U);
+        sc._ring.push(std::span<const cf32>(noise));
+
+        // Take multiple energy snapshots
+        for (uint32_t i = 0; i < sc.l1_snapshots; ++i) {
+            sc.computeEnergySnapshot();
+        }
+        expect(eq(sc._snapshotCount, sc.l1_snapshots))
+            << "all snapshots accumulated";
+
+        // Find hot channels — white noise should have uniform energy, no outliers
+        sc.findHotChannels();
+        expect(sc._hotChannels.empty())
+            << "white noise should produce no hot channels, got " << sc._hotChannels.size();
+    };
+
+    "CW tone produces detection at correct channel"_test = [&] {
+        constexpr double sampleRate = 1e6;
+        constexpr double channelBw  = 62500.0;
+        constexpr uint32_t fftSize = 1024;
+        constexpr uint32_t snaps   = 8;
+
+        auto sc = makeScanController(static_cast<float>(sampleRate), 868e6f,
+                                     static_cast<float>(channelBw), 8.0f, fftSize, 1, snaps);
+
+        // Tone at +200 kHz from center.
+        // Band start = center - usableBw/2 = center - 400 kHz
+        // Channel index = (offset + 400 kHz) / 62.5 kHz = 600/62.5 = 9.6 → ch 9
+        constexpr double toneOffset = 200e3;
+        const uint32_t expectedCh = static_cast<uint32_t>(
+            (toneOffset + 0.5 * sampleRate * 0.8) / channelBw);
+
+        // Generate tone + low-level noise (SNR ~30 dB)
+        const auto nSamples = fftSize * snaps * 2;  // extra for ring buffer fill
+        auto tone  = makeTone(nSamples, toneOffset, sampleRate, 1.0f);
+        auto noise = makeNoise(nSamples, 0.001f, 77U);
+        for (std::size_t i = 0; i < nSamples; ++i) {
+            tone[i] += noise[i];
+        }
+
+        sc._ring.push(std::span<const cf32>(tone));
+
+        for (uint32_t i = 0; i < snaps; ++i) {
+            sc.computeEnergySnapshot();
+        }
+
+        sc.findHotChannels();
+        expect(!sc._hotChannels.empty()) << "CW tone should produce at least one hot channel";
+
+        if (!sc._hotChannels.empty()) {
+            // The detected channel should be near the expected channel
+            // Allow ±1 channel tolerance for FFT bin edge effects
+            bool found = false;
+            for (uint32_t ch : sc._hotChannels) {
+                if (ch >= expectedCh - 1 && ch <= expectedCh + 1) {
+                    found = true;
+                    break;
+                }
+            }
+            expect(found) << "hot channel near expected channel " << expectedCh
+                          << ", got channels: " << [&] {
+                              std::string s;
+                              for (uint32_t c : sc._hotChannels) {
+                                  if (!s.empty()) s += ',';
+                                  s += std::to_string(c);
+                              }
+                              return s;
+                          }();
+        }
+
+        // Verify that channel energy at the tone channel is much higher than median
+        float toneEnergy = sc._channelEnergy[expectedCh];
+        std::vector<float> sorted(sc._channelEnergy.begin(),
+                                  sc._channelEnergy.begin() + static_cast<std::ptrdiff_t>(sc._nChannels));
+        std::ranges::sort(sorted);
+        float median = sorted[sorted.size() / 2];
+        expect(toneEnergy > median * 6.0f) << "tone channel energy should exceed 6× median";
+    };
+
+    "two CW tones at different frequencies"_test = [&] {
+        constexpr double sampleRate = 1e6;
+        constexpr double channelBw  = 62500.0;
+        constexpr uint32_t fftSize = 1024;
+        constexpr uint32_t snaps   = 8;
+
+        auto sc = makeScanController(static_cast<float>(sampleRate), 868e6f,
+                                     static_cast<float>(channelBw), 8.0f, fftSize, 1, snaps);
+
+        // Tone A at +200 kHz → channel ~9
+        constexpr double toneA = 200e3;
+        // Tone B at -300 kHz → channel ~(−300e3 + 400e3) / 62.5e3 = 1.6 → channel 1
+        constexpr double toneB = -300e3;
+
+        const uint32_t expectedChA = static_cast<uint32_t>(
+            (toneA + 0.5 * sampleRate * 0.8) / channelBw);
+        const uint32_t expectedChB = static_cast<uint32_t>(
+            (toneB + 0.5 * sampleRate * 0.8) / channelBw);
+
+        const auto nSamples = fftSize * snaps * 2;
+        auto sig = makeNoise(nSamples, 0.001f, 88U);  // noise floor
+        {
+            auto tA = makeTone(nSamples, toneA, sampleRate, 1.0f);
+            auto tB = makeTone(nSamples, toneB, sampleRate, 1.0f);
+            for (std::size_t i = 0; i < nSamples; ++i) {
+                sig[i] += tA[i] + tB[i];
+            }
+        }
+
+        sc._ring.push(std::span<const cf32>(sig));
+
+        for (uint32_t i = 0; i < snaps; ++i) {
+            sc.computeEnergySnapshot();
+        }
+
+        sc.findHotChannels();
+        expect(sc._hotChannels.size() >= 2U)
+            << "two tones should produce at least 2 hot channels, got " << sc._hotChannels.size();
+
+        // Check both expected channels are found (within ±1 tolerance)
+        auto channelFound = [&](uint32_t expected) {
+            for (uint32_t ch : sc._hotChannels) {
+                if (ch >= expected - 1 && ch <= expected + 1) return true;
+            }
+            return false;
+        };
+        expect(channelFound(expectedChA))
+            << "tone A channel " << expectedChA << " should be hot";
+        expect(channelFound(expectedChB))
+            << "tone B channel " << expectedChB << " should be hot";
+    };
+
+    "cluster dedup merges adjacent hot bins to single channel"_test = [&] {
+        auto sc = makeScanController();
+
+        // Direct-inject channel energy to test findHotChannels cluster dedup in isolation.
+        // Uniform noise floor at 1.0, with channels 5-7 elevated (6 is peak).
+        sc._channelEnergy.assign(sc._nChannels, 1.0f);
+        sc._snapshotCount = 4;  // non-zero so findHotChannels proceeds
+
+        // Make channels 5, 6, 7 hot (6 is peak)
+        sc._channelEnergy[5] = 100.f;
+        sc._channelEnergy[6] = 200.f;
+        sc._channelEnergy[7] = 150.f;
+
+        sc.findHotChannels();
+        // Cluster dedup should merge channels 5-7 into a single detection at channel 6 (peak)
+        expect(eq(sc._hotChannels.size(), 1UZ))
+            << "adjacent hot channels should be merged into 1 cluster";
+        if (!sc._hotChannels.empty()) {
+            expect(eq(sc._hotChannels[0], 6U))
+                << "cluster peak should be channel 6";
+        }
+    };
+
+    "findHotChannels with no snapshots returns empty"_test = [&] {
+        auto sc = makeScanController();
+        sc._snapshotCount = 0;
+        sc.findHotChannels();
+        expect(sc._hotChannels.empty()) << "no snapshots → no hot channels";
+    };
+
+    "computeEnergySnapshot requires sufficient ring buffer data"_test = [&] {
+        auto sc = makeScanController();
+        // Ring buffer has data but less than fft_size
+        std::vector<cf32> small(sc.l1_fft_size / 2, cf32(1.0f, 0.0f));
+        sc._ring.push(std::span<const cf32>(small));
+
+        sc.computeEnergySnapshot();
+        expect(eq(sc._snapshotCount, 0U))
+            << "snapshot should not be counted when ring buffer has insufficient data";
+    };
+
+    "resetAccumulation clears energy and counters"_test = [&] {
+        auto sc = makeScanController();
+        // Inject some state
+        sc._channelEnergy[0] = 999.f;
+        sc._snapshotCount = 10;
+        sc._callCount = 42;
+        sc._hotChannels.push_back(3);
+
+        sc.resetAccumulation();
+
+        expect(eq(sc._channelEnergy[0], 0.f)) << "energy cleared";
+        expect(eq(sc._snapshotCount, 0U)) << "snapshot count cleared";
+        expect(eq(sc._callCount, 0U)) << "call count cleared";
+        expect(sc._hotChannels.empty()) << "hot channels cleared";
+    };
+
+    "state machine transitions ACCUMULATE → findHotChannels on snapshot threshold"_test = [&] {
+        constexpr uint32_t fftSize = 1024;
+        constexpr uint32_t snaps   = 2;  // very low threshold for quick test
+
+        auto sc = makeScanController(1e6f, 868e6f, 62500.f, 8.0f, fftSize, 1, snaps);
+
+        // Feed noise — should complete a sweep and reset (no hot channels)
+        auto noise = makeNoise(fftSize * snaps * 4, 1.0f, 99U);
+        sc._ring.push(std::span<const cf32>(noise));
+
+        // Simulate the processBulk L1 path manually:
+        // interval=1, so every call triggers a snapshot
+        for (uint32_t i = 0; i < snaps; ++i) {
+            sc.computeEnergySnapshot();
+        }
+
+        expect(eq(sc._snapshotCount, snaps)) << "snapshot count reached threshold";
+        expect(sc._state == gr::lora::ScanController::ScanState::Accumulate)
+            << "still in Accumulate before findHotChannels";
+
+        sc.findHotChannels();
+        expect(sc._hotChannels.empty()) << "noise → no hot channels";
+        // In the real processBulk, this would trigger resetAccumulation and sweepCount++
+    };
+};
+
 int main() { /* boost.ut auto-runs */ }

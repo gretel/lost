@@ -607,6 +607,70 @@ void expect_decode_ok(const DecodeResult& result, const std::string& expected_pa
     expect(found_crc) << label << " should have crc_valid tag";
 }
 
+/// Helper: generate IQ at a specific SF/BW and run through the decode chain.
+DecodeResult run_decode_sf(const std::string& payload_str,
+                           uint8_t test_sf, uint32_t test_bw,
+                           uint8_t test_cr = CR, uint8_t test_os = OS_FACTOR,
+                           float cfo_hz = 0.f, float snr_db = 100.f) {
+    using namespace gr;
+    using namespace gr::lora;
+    using namespace gr::lora::test;
+
+    std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
+    uint32_t test_n   = 1u << test_sf;
+    uint32_t test_sps = test_n * test_os;
+    auto iq = generate_frame_iq(payload, test_sf, test_cr, test_os,
+                                SYNC_WORD, PREAMBLE_LEN,
+                                true, test_sps * 5,
+                                2,        // ldro_mode = auto
+                                test_bw);
+
+    // Apply impairments if requested
+    float sample_rate = static_cast<float>(test_bw * test_os);
+    if (snr_db < 99.f) add_awgn(iq, snr_db);
+    if (std::abs(cfo_hz) > 0.1f) apply_cfo(iq, cfo_hz, sample_rate);
+
+    Graph graph;
+
+    auto& src = graph.emplaceBlock<testing::TagSource<std::complex<float>,
+        testing::ProcessFunction::USE_PROCESS_BULK>>({
+        {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
+        {"repeat_tags", false},
+        {"mark_tag", false}
+    });
+    src.values = iq;
+
+    auto& sync = graph.emplaceBlock<FrameSync>();
+    sync.center_freq  = CENTER_FREQ;
+    sync.bandwidth    = test_bw;
+    sync.sf           = test_sf;
+    sync.sync_word    = SYNC_WORD;
+    sync.os_factor    = test_os;
+    sync.preamble_len = PREAMBLE_LEN;
+
+    auto& demod = graph.emplaceBlock<DemodDecoder>();
+    demod.sf        = test_sf;
+    demod.bandwidth = test_bw;
+
+    auto& sink = graph.emplaceBlock<testing::TagSink<uint8_t,
+        testing::ProcessFunction::USE_PROCESS_BULK>>({
+        {"log_samples", true},
+        {"log_tags", true}
+    });
+
+    (void)graph.connect<"out", "in">(src, sync);
+    (void)graph.connect<"out", "in">(sync, demod);
+    (void)graph.connect<"out", "in">(demod, sink);
+
+    scheduler::Simple sched;
+    if (auto ret = sched.exchange(std::move(graph)); !ret) {
+        throw std::runtime_error(std::format("failed to init scheduler: {}", ret.error()));
+    }
+    sched.runAndWait();
+
+    return {{sink._samples.begin(), sink._samples.end()}, sink._tags};
+}
+
 }  // namespace
 
 const boost::ut::suite<"Oversampling factor sweep"> os_factor_tests = [] {
@@ -926,6 +990,139 @@ const boost::ut::suite<"Edge case tests"> edge_case_tests = [] {
             std::printf("  Frame A: \"%s\"\n", fa.c_str());
             expect(eq(fa, std::string("ABC"))) << "Frame A payload";
         }
+    };
+};
+
+// ============================================================================
+// Test 9: Multi-SF robustness — SF7 and SF12 at BW125k
+//
+// All existing robustness tests (AWGN, CFO) use the default SF=8/BW=62.5k.
+// A preamble detection or decode regression at SF7 (shortest symbols, lowest
+// processing gain) or SF12 (longest symbols, LDRO active) would go undetected.
+//
+// SF7/BW125k:  N=128, no LDRO, 1.024ms symbol duration
+// SF12/BW125k: N=4096, LDRO active (32.768ms > 16ms threshold), 4096-pt FFT
+// ============================================================================
+
+const boost::ut::suite<"Multi-SF robustness"> multi_sf_tests = [] {
+    using namespace boost::ut;
+
+    static const std::string test_payload = "LoRa PHY test!";
+
+    // --- SF7 / BW125k ---
+
+    "SF7 BW125k +10 dB SNR"_test = [] {
+        auto result = run_decode_sf(test_payload, 7, 125000, CR, OS_FACTOR,
+                                    0.f, 10.f);
+
+        std::printf("SF7/BW125k +10dB: %zu bytes output (expected %zu)\n",
+                    result.samples.size(), test_payload.size());
+
+        expect(ge(result.samples.size(), test_payload.size()))
+            << "SF7 +10dB output too small: " << result.samples.size();
+
+        if (result.samples.size() >= test_payload.size()) {
+            std::string decoded(result.samples.begin(),
+                                result.samples.begin()
+                                + static_cast<std::ptrdiff_t>(test_payload.size()));
+            expect(eq(decoded, test_payload))
+                << "SF7 +10dB decode: \"" << decoded << "\"";
+        }
+
+        bool crc_ok = false;
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                crc_ok = it->second.value_or<bool>(false);
+            }
+        }
+        expect(crc_ok) << "SF7 +10dB CRC should be valid";
+    };
+
+    "SF7 BW125k +500 Hz CFO"_test = [] {
+        auto result = run_decode_sf(test_payload, 7, 125000, CR, OS_FACTOR,
+                                    500.f);
+
+        std::printf("SF7/BW125k +500Hz CFO: %zu bytes output (expected %zu)\n",
+                    result.samples.size(), test_payload.size());
+
+        expect(ge(result.samples.size(), test_payload.size()))
+            << "SF7 +500Hz output too small: " << result.samples.size();
+
+        if (result.samples.size() >= test_payload.size()) {
+            std::string decoded(result.samples.begin(),
+                                result.samples.begin()
+                                + static_cast<std::ptrdiff_t>(test_payload.size()));
+            expect(eq(decoded, test_payload))
+                << "SF7 +500Hz decode: \"" << decoded << "\"";
+        }
+
+        bool crc_ok = false;
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                crc_ok = it->second.value_or<bool>(false);
+            }
+        }
+        expect(crc_ok) << "SF7 +500Hz CRC should be valid";
+    };
+
+    // --- SF12 / BW125k (LDRO active, 4096-pt FFT, slow) ---
+
+    "SF12 BW125k +10 dB SNR"_test = [] {
+        auto result = run_decode_sf(test_payload, 12, 125000, CR, OS_FACTOR,
+                                    0.f, 10.f);
+
+        std::printf("SF12/BW125k +10dB: %zu bytes output (expected %zu)\n",
+                    result.samples.size(), test_payload.size());
+
+        expect(ge(result.samples.size(), test_payload.size()))
+            << "SF12 +10dB output too small: " << result.samples.size();
+
+        if (result.samples.size() >= test_payload.size()) {
+            std::string decoded(result.samples.begin(),
+                                result.samples.begin()
+                                + static_cast<std::ptrdiff_t>(test_payload.size()));
+            expect(eq(decoded, test_payload))
+                << "SF12 +10dB decode: \"" << decoded << "\"";
+        }
+
+        bool crc_ok = false;
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                crc_ok = it->second.value_or<bool>(false);
+            }
+        }
+        expect(crc_ok) << "SF12 +10dB CRC should be valid";
+    };
+
+    // Note: SF12/BW125k has 30.5 Hz bin resolution (BW/N = 125000/4096).
+    // +500 Hz = 16.4 bins of integer CFO — exceeds FrameSync's practical
+    // CFO tracking range at this SF. Use +200 Hz (6.5 bins) which is
+    // realistic for crystal oscillator drift at SF12 long-range links.
+    "SF12 BW125k +200 Hz CFO"_test = [] {
+        auto result = run_decode_sf(test_payload, 12, 125000, CR, OS_FACTOR,
+                                    200.f);
+
+        std::printf("SF12/BW125k +200Hz CFO: %zu bytes output (expected %zu)\n",
+                    result.samples.size(), test_payload.size());
+
+        expect(ge(result.samples.size(), test_payload.size()))
+            << "SF12 +200Hz output too small: " << result.samples.size();
+
+        if (result.samples.size() >= test_payload.size()) {
+            std::string decoded(result.samples.begin(),
+                                result.samples.begin()
+                                + static_cast<std::ptrdiff_t>(test_payload.size()));
+            expect(eq(decoded, test_payload))
+                << "SF12 +200Hz decode: \"" << decoded << "\"";
+        }
+
+        bool crc_ok = false;
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                crc_ok = it->second.value_or<bool>(false);
+            }
+        }
+        expect(crc_ok) << "SF12 +200Hz CRC should be valid";
     };
 };
 

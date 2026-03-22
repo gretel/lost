@@ -548,6 +548,92 @@ const boost::ut::suite<"Graph-level loopback"> graph_loopback_tests = [] {
                            SYNC_WORD, PREAMBLE_LEN, "Single byte (1B)");
     };
 
+    // Zero-byte payload: valid per LoRa spec (header-only frame, no payload
+    // data, no CRC bytes transmitted because add_crc() requires payload >= 2).
+    // The TX chain produces a well-formed header-only frame. However,
+    // DemodDecoder explicitly rejects payload_len==0 in both its inline header
+    // parse (decodeFrame line 173) and its streaming header parse (line 371),
+    // treating it as an invalid frame. The test verifies the pipeline does not
+    // crash and documents this limitation.
+    "zero-byte payload loopback"_test = [] {
+        using namespace gr;
+        using namespace gr::lora;
+
+        std::vector<uint8_t> payload{};  // empty
+        constexpr uint8_t  test_sf   = SF;
+        constexpr uint8_t  test_cr   = CR;
+        constexpr uint32_t test_bw   = BW;
+        constexpr uint8_t  os        = OS_FACTOR;
+        constexpr uint16_t sw        = SYNC_WORD;
+        constexpr uint16_t plen      = PREAMBLE_LEN;
+        uint32_t sps = (1u << test_sf) * os;
+
+        // --- TX: generate_frame_iq must not crash on empty payload ---
+        auto iq = generate_frame_iq(payload, test_sf, test_cr, os,
+                                    sw, plen, true, sps * 5, 2, test_bw, false);
+        // Header-only frame: preamble(8) + sync(2) + SFD(2.25) + header(8 symbols)
+        // + zero_pad(sps*5) — must have non-trivial length.
+        expect(boost::ut::gt(iq.size(), std::size_t{0}))
+            << "empty-payload IQ should be non-empty";
+
+        // --- Graph: run without crash ---
+        Graph graph;
+        auto& src = graph.emplaceBlock<testing::TagSource<std::complex<float>,
+            testing::ProcessFunction::USE_PROCESS_BULK>>({
+            {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
+            {"repeat_tags", false},
+            {"mark_tag", false}
+        });
+        src.values = iq;
+
+        auto& sync = graph.emplaceBlock<FrameSync>();
+        sync.center_freq  = CENTER_FREQ;
+        sync.bandwidth    = test_bw;
+        sync.sf           = test_sf;
+        sync.sync_word    = sw;
+        sync.os_factor    = os;
+        sync.preamble_len = plen;
+
+        auto& demod = graph.emplaceBlock<DemodDecoder>();
+        demod.sf        = test_sf;
+        demod.bandwidth = test_bw;
+
+        auto& sink = graph.emplaceBlock<testing::TagSink<uint8_t,
+            testing::ProcessFunction::USE_PROCESS_BULK>>({
+            {"log_samples", true},
+            {"log_tags", true}
+        });
+
+        (void)graph.connect<"out", "in">(src, sync);
+        (void)graph.connect<"out", "in">(sync, demod);
+        (void)graph.connect<"out", "in">(demod, sink);
+
+        scheduler::Simple sched;
+        if (auto ret = sched.exchange(std::move(graph)); !ret) {
+            throw std::runtime_error(
+                std::format("failed to init scheduler: {}", ret.error()));
+        }
+        sched.runAndWait();
+
+        std::printf("  zero-byte payload: %zu bytes output\n", sink._samples.size());
+
+        // DemodDecoder rejects payload_len==0 as invalid — no output expected.
+        // If a future change enables 0-byte decode, update this assertion to
+        // check for crc_valid=true instead.
+        expect(boost::ut::eq(sink._samples.size(), std::size_t{0}))
+            << "DemodDecoder rejects 0-byte payload (pay_len==0 treated as invalid)";
+
+        // No crc_valid tag should be emitted since the frame is dropped.
+        bool found_crc = false;
+        for (const auto& t : sink._tags) {
+            if (t.map.find("crc_valid") != t.map.end()) {
+                found_crc = true;
+            }
+        }
+        expect(!found_crc)
+            << "no crc_valid tag expected (frame dropped by DemodDecoder)";
+    };
+
     // LDRO configs — graph-level decode with reduced-rate payload blocks
     "SF10/BW62.5k LDRO through graph"_test = [&run_graph_loopback] {
         std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o', ' ', 'L', 'D', 'R', 'O'};
