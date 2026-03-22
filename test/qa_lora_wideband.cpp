@@ -1158,6 +1158,100 @@ const boost::ut::suite<"HalfBandDecimator"> halfBandTests = [] {
             << ", expected < 1e-6";
     };
 
+    "batch FIR matches scalar FIR"_test = [] {
+        constexpr std::size_t nStages = 4;  // decimate by 16
+        constexpr std::size_t nInput = 8192;
+
+        CascadedDecimator scalar, batch;
+        scalar.init(nStages, nInput);
+        batch.init(nStages, nInput);
+
+        // Random input
+        std::mt19937 rng(42);
+        std::uniform_real_distribution<float> dist(-1.f, 1.f);
+        std::vector<cf32> input(nInput);
+        for (auto& s : input) s = cf32(dist(rng), dist(rng));
+
+        std::vector<cf32> outScalar, outBatch;
+        scalar.process(std::span<const cf32>(input), outScalar);
+        batch.processBatch(std::span<const cf32>(input), outBatch);
+
+        expect(eq(outScalar.size(), outBatch.size())) << "output size mismatch";
+        float maxErr = 0.f;
+        for (std::size_t i = 0; i < std::min(outScalar.size(), outBatch.size()); ++i) {
+            float err = std::abs(outScalar[i] - outBatch[i]);
+            maxErr = std::max(maxErr, err);
+            expect(err < 1e-5f) << "sample " << i << " err=" << err;
+        }
+        std::fprintf(stderr, "  batch vs scalar max err: %.2e\n",
+                     static_cast<double>(maxErr));
+    };
+
+    "batch FIR multi-call matches scalar multi-call"_test = [] {
+        constexpr std::size_t nStages = 4;
+        constexpr std::size_t chunkSize = 1024;
+        constexpr std::size_t nChunks = 8;
+
+        CascadedDecimator scalar, batch;
+        scalar.init(nStages, chunkSize);
+        batch.init(nStages, chunkSize);
+
+        std::mt19937 rng(123);
+        std::uniform_real_distribution<float> dist(-1.f, 1.f);
+
+        std::vector<cf32> outScalar, outBatch;
+        for (std::size_t c = 0; c < nChunks; ++c) {
+            std::vector<cf32> chunk(chunkSize);
+            for (auto& s : chunk) s = cf32(dist(rng), dist(rng));
+            scalar.process(std::span<const cf32>(chunk), outScalar);
+            batch.processBatch(std::span<const cf32>(chunk), outBatch);
+        }
+
+        expect(eq(outScalar.size(), outBatch.size())) << "multi-call size mismatch";
+        float maxErr = 0.f;
+        for (std::size_t i = 0; i < std::min(outScalar.size(), outBatch.size()); ++i) {
+            float err = std::abs(outScalar[i] - outBatch[i]);
+            maxErr = std::max(maxErr, err);
+        }
+        std::fprintf(stderr, "  batch multi-call max err: %.2e\n",
+                     static_cast<double>(maxErr));
+        expect(maxErr < 1e-5f) << "multi-call max err: " << maxErr;
+    };
+
+    "NCO+batch FIR matches NCO+scalar FIR"_test = [] {
+        constexpr std::size_t nStages = 4;
+        constexpr std::size_t nInput = 8192;
+
+        CascadedDecimator scalar, batch;
+        scalar.init(nStages, nInput);
+        batch.init(nStages, nInput);
+
+        std::mt19937 rng(77);
+        std::uniform_real_distribution<float> dist(-1.f, 1.f);
+        std::vector<cf32> input(nInput);
+        for (auto& s : input) s = cf32(dist(rng), dist(rng));
+
+        // Same NCO params
+        const double phaseInc = 2.0 * std::numbers::pi * 100000.0 / 16000000.0;
+        const cf32 step(static_cast<float>(std::cos(phaseInc)),
+                        static_cast<float>(std::sin(phaseInc)));
+        cf32 rot1(1.f, 0.f), rot2(1.f, 0.f);
+
+        std::vector<cf32> outScalar, outBatch;
+        scalar.processWithNco(std::span<const cf32>(input), outScalar, rot1, step);
+        batch.processWithNcoBatch(std::span<const cf32>(input), outBatch, rot2, step);
+
+        expect(eq(outScalar.size(), outBatch.size()));
+        float maxErr = 0.f;
+        for (std::size_t i = 0; i < std::min(outScalar.size(), outBatch.size()); ++i) {
+            float err = std::abs(outScalar[i] - outBatch[i]);
+            maxErr = std::max(maxErr, err);
+        }
+        std::fprintf(stderr, "  NCO+batch max err: %.2e\n",
+                     static_cast<double>(maxErr));
+        expect(maxErr < 1e-5f) << "NCO+batch max err: " << maxErr;
+    };
+
     "noise power reduction"_test = [] {
         // 8-stage cascade (decimation by 256) on white noise.
         // Theoretical power reduction: 10*log10(1/256) = -24.08 dB.

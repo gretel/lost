@@ -120,7 +120,7 @@ struct ChannelSlot {
     ///
     /// Phase is continuous across calls. Output appended to nbAccum.
     void pushWideband(std::span<const cf32> wbSamples) {
-        decimator.processWithNco(wbSamples, nbAccum, ncoRot, ncoStep);
+        decimator.processWithNcoBatch(wbSamples, nbAccum, ncoRot, ncoStep);
     }
 };
 

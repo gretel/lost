@@ -60,6 +60,7 @@ struct HalfBandStage {
         delay.fill(cf32{0.f, 0.f});
         writePos    = 0;
         sampleCount = 0;
+        resetBatch();
     }
 
     /// Process input samples, appending decimated output to `out`.
@@ -108,6 +109,70 @@ struct HalfBandStage {
         }
     }
 
+    // --- Linear-buffer batch FIR state (for stages 1+) ---
+    std::vector<cf32> _tail;     // last kFilterLen-1 samples from previous call
+    std::vector<cf32> _workBuf;  // concatenation buffer: [tail | input]
+
+    /// Initialize batch FIR state. Must be called before processBatch().
+    void initBatch() {
+        using namespace halfband_detail;
+        constexpr std::size_t kTailLen = kFilterLen - 1;  // 22
+        _tail.assign(kTailLen, cf32{0.f, 0.f});
+        _workBuf.clear();
+    }
+
+    /// Reset batch FIR state alongside the circular delay line state.
+    void resetBatch() noexcept {
+        using namespace halfband_detail;
+        constexpr std::size_t kTailLen = kFilterLen - 1;
+        if (_tail.size() == kTailLen) {
+            std::fill(_tail.begin(), _tail.end(), cf32{0.f, 0.f});
+        }
+    }
+
+    /// Batch FIR with linear buffer — no modulo indexing.
+    /// Uses a persistent tail buffer for state across calls.
+    /// Produces identical output to process() but with contiguous memory access.
+    void processBatch(std::span<const cf32> input, std::vector<cf32>& out) {
+        using namespace halfband_detail;
+        constexpr std::size_t kTailLen = kFilterLen - 1;  // 22
+
+        if (input.empty()) return;
+
+        // Build linear work buffer: [tail | input]
+        const std::size_t totalLen = kTailLen + input.size();
+        _workBuf.resize(totalLen);
+        std::copy(_tail.begin(), _tail.end(), _workBuf.begin());
+        std::copy(input.begin(), input.end(), _workBuf.begin() + static_cast<std::ptrdiff_t>(kTailLen));
+
+        const cf32* buf = _workBuf.data();
+
+        // Process each input sample; output on odd sampleCount (decimate-by-2).
+        // In the linear buffer, sample i of the input is at buf[kTailLen + i].
+        // The FIR taps span buf[kTailLen + i - 22 .. kTailLen + i],
+        // i.e. buf[i .. i + 22] (since kTailLen == 22).
+        for (std::size_t i = 0; i < input.size(); ++i) {
+            if (((sampleCount + i) & 1U) == 1U) {
+                // FIR output: symmetric pairs + center tap.
+                // Tap k (oldest=0, newest=22) is at buf[i + k].
+                cf32 acc{0.f, 0.f};
+                for (std::size_t c = 0; c < kCoeffs.size(); ++c) {
+                    const std::size_t k     = c * 2;                  // 0, 2, 4, 6, 8, 10
+                    const std::size_t kMirr = kFilterLen - 1 - k;     // 22, 20, 18, 16, 14, 12
+                    acc += kCoeffs[c] * (buf[i + k] + buf[i + kMirr]);
+                }
+                acc += kCenterTap * buf[i + 11];
+                out.push_back(acc);
+            }
+        }
+
+        // Save tail (last kTailLen samples of workBuf)
+        std::copy(_workBuf.end() - static_cast<std::ptrdiff_t>(kTailLen),
+                  _workBuf.end(), _tail.begin());
+
+        sampleCount += input.size();
+    }
+
     /// Process with per-sample mixing fused into the input.
     /// mixFn(i) returns the mixed sample for index i.
     template<typename MixFn>
@@ -149,6 +214,7 @@ struct CascadedDecimator {
         stages.resize(nStages);
         for (auto& s : stages) {
             s.reset();
+            s.initBatch();
         }
         // Pre-allocate scratch buffers for the largest possible intermediate size
         scratch0.reserve(maxChunkSize);
@@ -230,6 +296,70 @@ struct CascadedDecimator {
             auto& dst = (i & 1U) ? scratch1 : scratch0;
             dst.clear();
             stages[i].process(std::span<const cf32>(src), dst);
+        }
+
+        auto& result = (stages.size() & 1U) ? scratch0 : scratch1;
+        out.insert(out.end(), result.begin(), result.end());
+    }
+
+    /// Batch-process input through all stages using linear-buffer FIR for stages 1+.
+    /// Stage 0 uses the existing circular process(). Stages 1+ use processBatch()
+    /// which eliminates modulo indexing and enables contiguous memory access.
+    void processBatch(std::span<const cf32> input, std::vector<cf32>& out) {
+        if (stages.empty()) {
+            out.insert(out.end(), input.begin(), input.end());
+            return;
+        }
+
+        // Stage 0: circular FIR (same as existing)
+        scratch0.clear();
+        stages[0].process(input, scratch0);
+
+        // Stages 1+: linear-buffer batch FIR
+        for (std::size_t i = 1; i < stages.size(); ++i) {
+            auto& src = (i & 1U) ? scratch0 : scratch1;
+            auto& dst = (i & 1U) ? scratch1 : scratch0;
+            dst.clear();
+            stages[i].processBatch(std::span<const cf32>(src), dst);
+        }
+
+        auto& result = (stages.size() & 1U) ? scratch0 : scratch1;
+        out.insert(out.end(), result.begin(), result.end());
+    }
+
+    /// Batch-process with NCO mixing fused into stage 0.
+    /// Stage 0 uses the existing processWithMix() (circular, NCO-fused).
+    /// Stages 1+ use processBatch() (linear buffer, no modulo).
+    void processWithNcoBatch(std::span<const cf32> input, std::vector<cf32>& out,
+                             cf32& rot, const cf32& step) {
+        if (stages.empty()) {
+            for (std::size_t i = 0; i < input.size(); ++i) {
+                out.push_back(input[i] * rot);
+                rot *= step;
+                if ((i & 0x3FFU) == 0x3FFU) rot /= std::abs(rot);
+            }
+            return;
+        }
+
+        // Stage 0: fused NCO + FIR via lambda (scalar, same as existing)
+        scratch0.clear();
+        std::size_t idx = 0;
+        stages[0].processWithMix(input.size(),
+            [&](std::size_t) -> cf32 {
+                cf32 s = input[idx] * rot;
+                rot *= step;
+                if ((idx & 0x3FFU) == 0x3FFU) rot /= std::abs(rot);
+                ++idx;
+                return s;
+            },
+            scratch0);
+
+        // Stages 1+: linear-buffer batch FIR
+        for (std::size_t i = 1; i < stages.size(); ++i) {
+            auto& src = (i & 1U) ? scratch0 : scratch1;
+            auto& dst = (i & 1U) ? scratch1 : scratch0;
+            dst.clear();
+            stages[i].processBatch(std::span<const cf32>(src), dst);
         }
 
         auto& result = (stages.size() & 1U) ? scratch0 : scratch1;
