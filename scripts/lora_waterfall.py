@@ -268,6 +268,10 @@ def format_freq_axis(
         if r_start + i < width:
             axis[r_start + i] = ch
     c_start = (width - len(mid_str)) // 2
+    # DC spur marker: dim ▾ above the center frequency
+    dc_pos = c_start - 1
+    if 0 <= dc_pos < width and axis[dc_pos] == " ":
+        axis[dc_pos] = "\033[2m\u25be\033[1m"  # dim ▾, then re-bold
     for i, ch in enumerate(mid_str):
         if 0 <= c_start + i < width:
             axis[c_start + i] = ch
