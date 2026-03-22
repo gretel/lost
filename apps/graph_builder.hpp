@@ -201,6 +201,8 @@ inline std::atomic<uint64_t>* build_rx_graph(
             {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
             {"rx_antennae", antennae},
             {"clock_source", cfg.clock},
+            {"lo_offset", cfg.lo_offset},
+            {"rx_dc_offset_auto", cfg.dc_offset_auto},
         });
         auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>(
             std::move(props));
@@ -219,6 +221,8 @@ inline std::atomic<uint64_t>* build_rx_graph(
             {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
             {"rx_antennae", antennae},
             {"clock_source", cfg.clock},
+            {"lo_offset", cfg.lo_offset},
+            {"rx_dc_offset_auto", cfg.dc_offset_auto},
         });
         auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapyDualSimpleSource<std::complex<float>>>(
             std::move(props));
@@ -322,6 +326,10 @@ inline ScanGraph build_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg,
     if (!cfg.clock.empty()) {
         source_props["clock_source"] = cfg.clock;
     }
+    if (cfg.lo_offset != 0.0) {
+        source_props["lo_offset"] = cfg.lo_offset;
+    }
+    source_props["rx_dc_offset_auto"] = cfg.dc_offset_auto;
     auto& source = graph.emplaceBlock<
         gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
 
@@ -393,6 +401,10 @@ inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const Sc
     if (!cfg.clock.empty()) {
         source_props["clock_source"] = cfg.clock;
     }
+    if (cfg.lo_offset != 0.0) {
+        source_props["lo_offset"] = cfg.lo_offset;
+    }
+    source_props["rx_dc_offset_auto"] = cfg.dc_offset_auto;
     auto& source = graph.emplaceBlock<
         gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
 
@@ -460,6 +472,10 @@ inline std::atomic<uint64_t>* build_wideband_graph(
     if (!cfg.clock.empty()) {
         source_props["clock_source"] = cfg.clock;
     }
+    if (cfg.lo_offset != 0.0) {
+        source_props["lo_offset"] = cfg.lo_offset;
+    }
+    source_props["rx_dc_offset_auto"] = cfg.dc_offset_auto;
     auto& source = graph.emplaceBlock<
         gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
 

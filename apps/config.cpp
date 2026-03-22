@@ -157,6 +157,10 @@ struct RadioCfg {
     double               tx_gain{75.0};
     std::vector<uint32_t> rx_channels{0};
     uint32_t             tx_channel{0};
+    double               lo_offset{0.0};        ///< LO offset tuning (Hz), 0 = disabled
+    bool                 dc_offset_auto{true};   ///< hardware DC offset correction
+    bool                 dc_blocker{true};        ///< DSP DC blocker
+    float                dc_blocker_cutoff{10.f}; ///< DC blocker cutoff (Hz)
 };
 
 static std::map<std::string, CodecCfg> parse_codecs(const toml::table& tbl) {
@@ -202,7 +206,11 @@ static std::map<std::string, RadioCfg> parse_radios(const toml::table& tbl) {
                 r.rx_channels.push_back(static_cast<uint32_t>(elem.value_or(int64_t{0})));
             }
         }
-        r.tx_channel = static_cast<uint32_t>(section["tx_channel"].value_or(int64_t{0}));
+        r.tx_channel       = static_cast<uint32_t>(section["tx_channel"].value_or(int64_t{0}));
+        r.lo_offset        = section["lo_offset"].value_or(0.0);
+        r.dc_offset_auto   = section["dc_offset_auto"].value_or(true);
+        r.dc_blocker       = section["dc_blocker"].value_or(true);
+        r.dc_blocker_cutoff = static_cast<float>(section["dc_blocker_cutoff"].value_or(10.0));
         radios[skey] = r;
     }
     return radios;
@@ -273,11 +281,15 @@ std::vector<TrxConfig> load_config(const std::string& path,
     cfg.rate    = static_cast<float>(trx_tbl->at_path("rate").value_or(250'000.0));
 
     // Radio
-    cfg.freq        = radio.freq;
-    cfg.gain_rx     = radio.rx_gain;
-    cfg.gain_tx     = radio.tx_gain;
-    cfg.rx_channels = radio.rx_channels;
-    cfg.tx_channel  = radio.tx_channel;
+    cfg.freq              = radio.freq;
+    cfg.gain_rx           = radio.rx_gain;
+    cfg.gain_tx           = radio.tx_gain;
+    cfg.rx_channels       = radio.rx_channels;
+    cfg.tx_channel        = radio.tx_channel;
+    cfg.lo_offset         = radio.lo_offset;
+    cfg.dc_offset_auto    = radio.dc_offset_auto;
+    cfg.dc_blocker        = radio.dc_blocker;
+    cfg.dc_blocker_cutoff = radio.dc_blocker_cutoff;
 
     // Codec
     cfg.sf       = codec.sf;
@@ -507,9 +519,13 @@ std::vector<ScanSetConfig> load_scan_config(const std::string& path,
     cfg.clock        = dev.clock;
     cfg.l1_rate      = scan_tbl->at_path("l1_rate").value_or(16.0e6);
     cfg.master_clock = scan_tbl->at_path("master_clock").value_or(32.0e6);
-    cfg.gain         = scan_tbl->at_path("rx_gain").value_or(radio.rx_gain);
-    cfg.freq_start   = scan_tbl->at_path("freq_start").value_or(radio.freq);
-    cfg.freq_stop    = scan_tbl->at_path("freq_stop").value_or(cfg.freq_start);
+    cfg.gain              = scan_tbl->at_path("rx_gain").value_or(radio.rx_gain);
+    cfg.freq_start        = scan_tbl->at_path("freq_start").value_or(radio.freq);
+    cfg.freq_stop         = scan_tbl->at_path("freq_stop").value_or(cfg.freq_start);
+    cfg.lo_offset         = radio.lo_offset;
+    cfg.dc_offset_auto    = radio.dc_offset_auto;
+    cfg.dc_blocker        = radio.dc_blocker;
+    cfg.dc_blocker_cutoff = radio.dc_blocker_cutoff;
 
     if (cfg.freq_start >= cfg.freq_stop) {
         gr::lora::log_ts("error", "config",

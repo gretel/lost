@@ -130,6 +130,12 @@ struct TrxConfig {
     std::vector<uint32_t>     decode_bws{};      ///< BWs to decode (empty = {bw} only)
     RawConfig                 raw{};             ///< passthrough sections for Python scripts
 
+    // DC spur mitigation (from [radio_*])
+    double               lo_offset{0.0};        ///< LO offset tuning (Hz), 0 = disabled
+    bool                 dc_offset_auto{true};   ///< hardware DC offset correction
+    bool                 dc_blocker{true};        ///< DSP DC blocker
+    float                dc_blocker_cutoff{10.f}; ///< DC blocker cutoff (Hz)
+
     // Wideband decode mode (16 MS/s, digital channelization, all SFs on all channels)
     bool                 wideband{false};
     double               wideband_rate{16.0e6};
@@ -168,6 +174,12 @@ struct ScanSetConfig {
     uint32_t     l1_accumulate{64};         ///< FFTs to average per energy report
     uint32_t     l1_reports{64};            ///< energy reports before probing
     float        channel_bw{62500.f};       ///< L1 channel grid spacing (Hz)
+
+    // DC spur mitigation (from [radio_*])
+    double       lo_offset{0.0};
+    bool         dc_offset_auto{true};
+    bool         dc_blocker{true};
+    float        dc_blocker_cutoff{10.f};
 
     // From [scan.network]
     std::string  udp_listen{"127.0.0.1"};
