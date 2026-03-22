@@ -9,6 +9,7 @@
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/Message.hpp>
+#include <gnuradio-4.0/lora/algorithm/DCBlocker.hpp>
 #include <gnuradio-4.0/lora/algorithm/SfLane.hpp>
 #include <gnuradio-4.0/lora/algorithm/SpectrumTap.hpp>
 #include <gnuradio-4.0/lora/algorithm/Telemetry.hpp>
@@ -43,14 +44,17 @@ struct MultiSfDecoder
     int32_t  rx_channel   = -1;
     uint8_t  sf_min       = 7;
     uint8_t  sf_max       = 12;
+    float    dc_blocker_cutoff = 0.f;  ///< DC blocker cutoff Hz (0 = disabled)
     bool     debug        = false;
 
     GR_MAKE_REFLECTABLE(MultiSfDecoder, in, out, msg_out,
         bandwidth, sync_word, os_factor, preamble_len,
         energy_thresh, min_snr_db, max_symbols, center_freq,
-        rx_channel, sf_min, sf_max, debug);
+        rx_channel, sf_min, sf_max, dc_blocker_cutoff, debug);
 
     std::vector<SfLane> _lanes;
+    DCBlocker _dc;
+    std::vector<cf32> _dcBuf;
     uint32_t _min_sps{0};
     float    _noise_floor_db{-999.f};
     float    _peak_db{-999.f};
@@ -94,6 +98,13 @@ struct MultiSfDecoder
         _min_sps = _lanes.front().sps;  // sf_min has smallest sps
         // Set min_samples to smallest lane's sps (minimum useful input)
         in.min_samples = _min_sps + 2u * os_factor;
+
+        // DC blocker (embedded, applied before spectrum + decode)
+        if (dc_blocker_cutoff > 0.f && bandwidth > 0) {
+            float sr = static_cast<float>(bandwidth) * static_cast<float>(os_factor);
+            _dc.init(sr, dc_blocker_cutoff);
+            _dcBuf.reserve(8192);
+        }
     }
 
     [[nodiscard]] gr::work::Status processBulk(
@@ -125,10 +136,18 @@ struct MultiSfDecoder
             return gr::work::Status::OK;
         }
 
-        // Push raw IQ to spectrum tap (waterfall display)
+        // DC blocker: filter in-place before spectrum + decode
+        std::span<const cf32> clean_span = in_span;
+        if (_dc.initialised()) {
+            _dcBuf.resize(in_span.size());
+            _dc.processBlock(in_span, std::span<cf32>(_dcBuf));
+            clean_span = std::span<const cf32>(_dcBuf);
+        }
+
+        // Push DC-cleaned IQ to spectrum tap (waterfall display)
         if (_spectrum_state) {
-            _spectrum_state->push(in_span.data(),
-                std::min(in_span.size(), static_cast<std::size_t>(_min_sps)));
+            _spectrum_state->push(clean_span.data(),
+                std::min(clean_span.size(), static_cast<std::size_t>(_min_sps)));
         }
 
         // Always consume the full input. Each lane appends to its own
@@ -139,8 +158,8 @@ struct MultiSfDecoder
         std::size_t out_idx = 0;
 
         for (auto& lane : _lanes) {
-            // Append new input to this lane's accumulation buffer
-            lane.accum.insert(lane.accum.end(), in_span.begin(), in_span.end());
+            // Append DC-cleaned input to this lane's accumulation buffer
+            lane.accum.insert(lane.accum.end(), clean_span.begin(), clean_span.end());
 
             // Process as many symbols as fit in the accumulated data
             auto accum_span = std::span<const cf32>(lane.accum);

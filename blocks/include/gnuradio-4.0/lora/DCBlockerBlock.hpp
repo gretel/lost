@@ -27,7 +27,7 @@ struct DCBlockerBlock : gr::Block<DCBlockerBlock, gr::NoDefaultTagForwarding> {
     Annotated<bool, "dc_blocker_enabled", Visible, Doc<"enable DC spur removal">>
         dc_blocker_enabled = true;
     Annotated<float, "dc_blocker_cutoff", Unit<"Hz">, Visible, Doc<"high-pass cutoff frequency">>
-        dc_blocker_cutoff = 10.f;
+        dc_blocker_cutoff = 1000.f;
     Annotated<float, "sample_rate", Unit<"Hz">, Doc<"input sample rate">>
         sample_rate = 250'000.f;
 

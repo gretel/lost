@@ -16,7 +16,6 @@
 
 #include <gnuradio-4.0/lora/MultiSfDecoder.hpp>
 #include <gnuradio-4.0/lora/WidebandDecoder.hpp>
-#include <gnuradio-4.0/lora/DCBlockerBlock.hpp>
 #include <gnuradio-4.0/lora/Splitter.hpp>
 #include <gnuradio-4.0/lora/FrameSink.hpp>
 #include <gnuradio-4.0/lora/CaptureSink.hpp>
@@ -70,6 +69,7 @@ inline gr::lora::MultiSfDecoder& add_multisf_chain(
     decoder.sf_min       = 7;
     decoder.sf_max       = 12;
     decoder.debug        = cfg.debug;
+    decoder.dc_blocker_cutoff = cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f;
     decoder._spectrum_state = std::move(spectrum);
     if (telemetry_cb) {
         decoder._telemetry = telemetry_cb;
@@ -208,23 +208,9 @@ inline std::atomic<uint64_t>* build_rx_graph(
         auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>(
             std::move(props));
         overflow_ptr = &source._totalOverFlowCount;
-        if (cfg.dc_blocker) {
-            auto& dcBlock = graph.emplaceBlock<gr::lora::DCBlockerBlock>({
-                {"dc_blocker_enabled", true},
-                {"dc_blocker_cutoff", cfg.dc_blocker_cutoff},
-                {"sample_rate", static_cast<float>(cfg.rate)},
-            });
-            if (!ok(graph.connect<"out", "in">(source, dcBlock))) {
-                gr::lora::log_ts("error", "graph", "connect source -> DCBlockerBlock failed");
-            }
-            wireDecodeChains([&graph, &dcBlock](std::size_t /*r*/, auto& downstream) {
-                return graph.connect<"out", "in">(dcBlock, downstream).has_value();
-            });
-        } else {
-            wireDecodeChains([&graph, &source](std::size_t /*r*/, auto& downstream) {
-                return graph.connect<"out", "in">(source, downstream).has_value();
-            });
-        }
+        wireDecodeChains([&graph, &source](std::size_t /*r*/, auto& downstream) {
+            return graph.connect<"out", "in">(source, downstream).has_value();
+        });
     } else {
         auto props = lora_apps::soapy_reliability_defaults();
         props.merge(gr::property_map{
@@ -242,31 +228,10 @@ inline std::atomic<uint64_t>* build_rx_graph(
         auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapyDualSimpleSource<std::complex<float>>>(
             std::move(props));
         overflow_ptr = &source._totalOverFlowCount;
-        if (cfg.dc_blocker) {
-            // one DCBlockerBlock per radio channel
-            std::vector<gr::lora::DCBlockerBlock*> dcBlocks;
-            for (std::size_t r = 0; r < nRadio; r++) {
-                auto& dcb = graph.emplaceBlock<gr::lora::DCBlockerBlock>({
-                    {"dc_blocker_enabled", true},
-                    {"dc_blocker_cutoff", cfg.dc_blocker_cutoff},
-                    {"sample_rate", static_cast<float>(cfg.rate)},
-                });
-                auto portName = "out#"s + std::to_string(r);
-                if (!ok(graph.connect(source, portName, dcb, "in"s))) {
-                    gr::lora::log_ts("error", "graph",
-                        "connect source -> DCBlockerBlock failed (radio %zu)", r);
-                }
-                dcBlocks.push_back(&dcb);
-            }
-            wireDecodeChains([&graph, &dcBlocks](std::size_t r, auto& downstream) {
-                return graph.connect<"out", "in">(*dcBlocks[r], downstream).has_value();
-            });
-        } else {
-            wireDecodeChains([&graph, &source](std::size_t r, auto& downstream) {
-                auto portName = "out#"s + std::to_string(r);
-                return graph.connect(source, portName, downstream, "in"s).has_value();
-            });
-        }
+        wireDecodeChains([&graph, &source](std::size_t r, auto& downstream) {
+            auto portName = "out#"s + std::to_string(r);
+            return graph.connect(source, portName, downstream, "in"s).has_value();
+        });
     }
 
     {
@@ -373,22 +338,8 @@ inline ScanGraph build_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg,
     auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
         {"n_outputs", gr::Size_t{2}},
     });
-    if (cfg.dc_blocker) {
-        auto& dcBlock = graph.emplaceBlock<gr::lora::DCBlockerBlock>({
-            {"dc_blocker_enabled", true},
-            {"dc_blocker_cutoff", cfg.dc_blocker_cutoff},
-            {"sample_rate", static_cast<float>(cfg.l1_rate)},
-        });
-        if (!ok(graph.connect<"out", "in">(source, dcBlock))) {
-            gr::lora::log_ts("error", "graph", "connect source -> DCBlockerBlock failed (scan)");
-        }
-        if (!ok(graph.connect<"out", "in">(dcBlock, splitter))) {
-            gr::lora::log_ts("error", "graph", "connect DCBlockerBlock -> splitter failed (scan)");
-        }
-    } else {
-        if (!ok(graph.connect<"out", "in">(source, splitter))) {
-            gr::lora::log_ts("error", "graph", "connect source -> splitter failed");
-        }
+    if (!ok(graph.connect<"out", "in">(source, splitter))) {
+        gr::lora::log_ts("error", "graph", "connect source -> splitter failed");
     }
 
     // Path 0: SpectrumTap -> NullSink (L1 energy)
@@ -479,22 +430,8 @@ inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const Sc
         {"probe_bws",     probeBwsStr},
     });
 
-    if (cfg.dc_blocker) {
-        auto& dcBlock = graph.emplaceBlock<gr::lora::DCBlockerBlock>({
-            {"dc_blocker_enabled", true},
-            {"dc_blocker_cutoff", cfg.dc_blocker_cutoff},
-            {"sample_rate", static_cast<float>(cfg.l1_rate)},
-        });
-        if (!ok(graph.connect<"out", "in">(source, dcBlock))) {
-            gr::lora::log_ts("error", "graph", "connect source -> DCBlockerBlock failed");
-        }
-        if (!ok(graph.connect<"out", "in">(dcBlock, controller))) {
-            gr::lora::log_ts("error", "graph", "connect DCBlockerBlock -> controller failed");
-        }
-    } else {
-        if (!ok(graph.connect<"out", "in">(source, controller))) {
-            gr::lora::log_ts("error", "graph", "connect source -> controller failed");
-        }
+    if (!ok(graph.connect<"out", "in">(source, controller))) {
+        gr::lora::log_ts("error", "graph", "connect source -> controller failed");
     }
 
     // ScanSink: receives spectrum (with embedded detections) from ScanController

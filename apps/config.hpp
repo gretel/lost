@@ -134,7 +134,7 @@ struct TrxConfig {
     double               lo_offset{0.0};        ///< LO offset tuning (Hz), 0 = disabled
     bool                 dc_offset_auto{true};   ///< hardware DC offset correction
     bool                 dc_blocker{true};        ///< DSP DC blocker
-    float                dc_blocker_cutoff{10.f}; ///< DC blocker cutoff (Hz)
+    float                dc_blocker_cutoff{1000.f}; ///< DC blocker cutoff (Hz)
 
     // Wideband decode mode (16 MS/s, digital channelization, all SFs on all channels)
     bool                 wideband{false};
