@@ -84,6 +84,8 @@ set_tests_properties(qa_lora_wideband PROPERTIES TIMEOUT 120)
 
 add_ut_test(qa_lora_tx_queue)
 
+add_ut_test(qa_lora_dc_blocker)
+
 # --- SoapyLoopback: hardware-free SoapySDR loopback testing ---
 # Override with -DFETCHCONTENT_SOURCE_DIR_SOAPYLOOPBACK=<path> for local development
 FetchContent_Declare(
