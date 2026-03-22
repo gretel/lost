@@ -280,6 +280,31 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
             << "more input produces more output";
     };
 
+    "activate with custom SF range limits lanes"_test = [] {
+        gr::lora::ChannelSlot slot;
+        std::vector<uint8_t> sfs = {7, 8, 9};
+        slot.activate(869e6, 866.5e6, 16e6, 256, 0, 62500, 0x12, 8, sfs);
+        expect(eq(slot.sfLanes.size(), 3UZ));
+        expect(eq(slot.sfLanes[0].sf, uint8_t{7}));
+        expect(eq(slot.sfLanes[1].sf, uint8_t{8}));
+        expect(eq(slot.sfLanes[2].sf, uint8_t{9}));
+
+        // Default (empty span) should still give SF7-12
+        gr::lora::ChannelSlot slot2;
+        slot2.activate(869e6, 866.5e6, 16e6, 256);
+        expect(eq(slot2.sfLanes.size(), 6UZ));
+        expect(eq(slot2.sfLanes[0].sf, uint8_t{7}));
+        expect(eq(slot2.sfLanes[5].sf, uint8_t{12}));
+    };
+
+    "activate with single SF"_test = [] {
+        gr::lora::ChannelSlot slot;
+        std::vector<uint8_t> sfs = {8};
+        slot.activate(869e6, 866.5e6, 16e6, 256, 0, 62500, 0x12, 8, sfs);
+        expect(eq(slot.sfLanes.size(), 1UZ));
+        expect(eq(slot.sfLanes[0].sf, uint8_t{8}));
+    };
+
     "DC signal at center freq passes through unchanged"_test = [] {
         constexpr uint32_t osFactor = 128;
         constexpr std::size_t nSamples = osFactor * 128;  // extra for FIR warmup
@@ -578,6 +603,55 @@ const boost::ut::suite<"WidebandDecoder block skeleton"> wbBlockTests = [] {
 
         decoder._slots[0].deactivate();
         expect(eq(decoder.activeSlotCount(), 1U)) << "one deactivated";
+    };
+
+    "decode_sfs_str limits SfLanes in activated slots"_test = [] {
+        gr::lora::WidebandDecoder decoder;
+        decoder.sample_rate = 16e6f;
+        decoder.center_freq = 866.5e6f;
+        decoder.channel_bw  = 62500.f;
+        decoder.decode_bw_str = "62500";
+        decoder.decode_sfs_str = "7,8,9";
+        decoder.max_channels = 8;
+        decoder.start();
+
+        // Simulate: force one hot channel
+        decoder._hotChannels = {100};
+        decoder.updateActiveChannels();
+
+        // Should have 1 active slot with 3 SfLanes (SF7,8,9)
+        expect(eq(decoder.activeSlotCount(), 1U));
+        for (const auto& slot : decoder._slots) {
+            if (slot.state != gr::lora::ChannelSlot::State::Idle) {
+                expect(eq(slot.sfLanes.size(), 3UZ))
+                    << "expected 3 SfLanes, got " << slot.sfLanes.size();
+                expect(eq(slot.sfLanes[0].sf, uint8_t{7}));
+                expect(eq(slot.sfLanes[1].sf, uint8_t{8}));
+                expect(eq(slot.sfLanes[2].sf, uint8_t{9}));
+            }
+        }
+    };
+
+    "decode_sfs_str empty gives all SFs"_test = [] {
+        gr::lora::WidebandDecoder decoder;
+        decoder.sample_rate = 16e6f;
+        decoder.center_freq = 866.5e6f;
+        decoder.channel_bw  = 62500.f;
+        decoder.decode_bw_str = "62500";
+        decoder.decode_sfs_str = "";  // empty = all SF7-12
+        decoder.max_channels = 8;
+        decoder.start();
+
+        decoder._hotChannels = {100};
+        decoder.updateActiveChannels();
+
+        expect(eq(decoder.activeSlotCount(), 1U));
+        for (const auto& slot : decoder._slots) {
+            if (slot.state != gr::lora::ChannelSlot::State::Idle) {
+                expect(eq(slot.sfLanes.size(), 6UZ))
+                    << "expected 6 SfLanes, got " << slot.sfLanes.size();
+            }
+        }
     };
 
     "multi-BW: three slots activated per hot channel"_test = [] {

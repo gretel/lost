@@ -54,6 +54,7 @@
 
 #include <gnuradio-4.0/lora/FrameSink.hpp>
 #include <gnuradio-4.0/lora/TxQueueSource.hpp>
+#include <gnuradio-4.0/lora/algorithm/Telemetry.hpp>
 #include <gnuradio-4.0/lora/cbor.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
@@ -632,7 +633,11 @@ int main(int argc, char* argv[]) {
     if (cfg.wideband) {
         gr::lora::log_ts("info ", "lora_trx", "wideband mode: %.1f MS/s, digital channelization",
                          cfg.wideband_rate / 1e6);
-        overflow_ptr = build_wideband_graph(rx_graph, cfg, frame_callback);
+        auto wb_telemetry = [&udp](const gr::property_map& evt) {
+            udp.broadcast_all(gr::lora::telemetry::encode(evt));
+        };
+        overflow_ptr = build_wideband_graph(rx_graph, cfg, frame_callback,
+                                            std::move(wb_telemetry));
     } else {
         overflow_ptr = build_rx_graph(rx_graph, cfg, frame_callback, spectrum,
                                       &channel_busy);

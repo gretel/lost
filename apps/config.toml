@@ -93,6 +93,7 @@ decode_bws = [62500, 125000, 250000]    # RX BWs (one MultiSfDecoder per BW)
 wideband             = false
 wideband_rate        = 16000000     # wideband sample rate (Hz)
 wideband_master_clock = 32000000    # FPGA master clock (Hz)
+# decode_sfs         = [7, 8, 9]   # limit SFs for wideband mode (default: all 7-12)
 
 [trx.network]
 udp_listen      = "127.0.0.1"

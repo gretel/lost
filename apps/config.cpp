@@ -415,6 +415,20 @@ std::vector<TrxConfig> load_config(const std::string& path,
         cfg.wideband_master_clock = *v;
     }
 
+    // decode_sfs for wideband mode (comma-separated or array)
+    if (auto v = trx_tbl->at_path("decode_sfs").value<std::string>()) {
+        cfg.decode_sfs_str = *v;
+    } else if (auto* sf_arr = trx_tbl->at_path("decode_sfs").as_array()) {
+        std::string sfs_str;
+        for (auto& elem : *sf_arr) {
+            if (auto sv = elem.value<int64_t>()) {
+                if (!sfs_str.empty()) sfs_str += ',';
+                sfs_str += std::to_string(*sv);
+            }
+        }
+        cfg.decode_sfs_str = sfs_str;
+    }
+
     // Validate
     for (uint32_t ch : cfg.rx_channels) {
         if (ch > 3) {

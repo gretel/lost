@@ -52,6 +52,14 @@ inline void encode_uint(std::vector<uint8_t>& buf, uint64_t val) {
     encode_head(buf, 0, val);
 }
 
+inline void encode_sint(std::vector<uint8_t>& buf, int64_t val) {
+    if (val >= 0) {
+        encode_head(buf, 0, static_cast<uint64_t>(val));
+    } else {
+        encode_head(buf, 1, static_cast<uint64_t>(-1 - val));  // CBOR major 1
+    }
+}
+
 inline void encode_text(std::vector<uint8_t>& buf, const std::string& s) {
     encode_head(buf, 3, s.size());
     buf.insert(buf.end(), s.begin(), s.end());
@@ -89,6 +97,12 @@ inline void kv_uint(std::vector<uint8_t>& buf,
                     const std::string& key, uint64_t val) {
     encode_text(buf, key);
     encode_uint(buf, val);
+}
+
+inline void kv_sint(std::vector<uint8_t>& buf,
+                    const std::string& key, int64_t val) {
+    encode_text(buf, key);
+    encode_sint(buf, val);
 }
 
 inline void kv_text(std::vector<uint8_t>& buf,

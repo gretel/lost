@@ -134,6 +134,7 @@ struct TrxConfig {
     bool                 wideband{false};
     double               wideband_rate{16.0e6};
     double               wideband_master_clock{32.0e6};
+    std::string          decode_sfs_str{};       ///< comma-separated SFs for wideband (empty = all 7-12)
 };
 
 /// Scan-specific configuration (parsed from [scan] section).

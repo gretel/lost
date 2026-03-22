@@ -38,6 +38,16 @@ class FrameStats:
     sf_counts: dict[int, int] = field(default_factory=dict)
 
 
+@dataclass
+class WidebandStats:
+    """Accumulates wideband sweep statistics."""
+
+    sweep_count: int = 0
+    tainted_count: int = 0
+    sweep_durations: list[int] = field(default_factory=list)
+    hot_counts: list[int] = field(default_factory=list)
+
+
 def format_bw(bw: float) -> str:
     """Format BW as human-readable (62500 -> '62.5k')."""
     if bw >= 1000:
@@ -114,11 +124,23 @@ def main() -> None:
     sock, _sub_msg, _addr = create_udp_subscriber(args.host, args.port)
 
     stats = FrameStats()
+    wb_stats = WidebandStats()
     summary_interval = 10
 
     def print_final_summary() -> None:
+        parts = []
         if stats.frame_count > 0:
-            print(emit_summary(stats), flush=True)
+            parts.append(emit_summary(stats))
+        if wb_stats.sweep_count > 0:
+            avg_dur = sum(wb_stats.sweep_durations) / len(wb_stats.sweep_durations)
+            avg_hot = sum(wb_stats.hot_counts) / len(wb_stats.hot_counts)
+            parts.append(
+                f"WB_SUMMARY sweeps={wb_stats.sweep_count} "
+                f"tainted={wb_stats.tainted_count} "
+                f"avg_dur={avg_dur:.0f}ms avg_hot={avg_hot:.1f}"
+            )
+        for p in parts:
+            print(p, flush=True)
 
     atexit.register(print_final_summary)
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
@@ -134,27 +156,69 @@ def main() -> None:
             continue
 
         msg_type = msg.get("type", "")
-        if msg_type != "lora_frame":
-            continue
 
-        phy = msg.get("phy", {})
-        crc_ok = msg.get("crc_valid", False)
-        snr = phy.get("snr_db", 0.0)
-        sf = phy.get("sf", 0)
+        if msg_type == "lora_frame":
+            phy = msg.get("phy", {})
+            crc_ok = msg.get("crc_valid", False)
+            snr = phy.get("snr_db", 0.0)
+            sf = phy.get("sf", 0)
 
-        stats.frame_count += 1
-        if crc_ok:
-            stats.crc_ok += 1
-        else:
-            stats.crc_fail += 1
-        stats.snr_values.append(snr)
-        if sf > 0:
-            stats.sf_counts[sf] = stats.sf_counts.get(sf, 0) + 1
+            stats.frame_count += 1
+            if crc_ok:
+                stats.crc_ok += 1
+            else:
+                stats.crc_fail += 1
+            stats.snr_values.append(snr)
+            if sf > 0:
+                stats.sf_counts[sf] = stats.sf_counts.get(sf, 0) + 1
 
-        print(emit_frame(msg), flush=True)
+            print(emit_frame(msg), flush=True)
 
-        if stats.frame_count % summary_interval == 0:
-            print(emit_summary(stats), flush=True)
+            if stats.frame_count % summary_interval == 0:
+                print(emit_summary(stats), flush=True)
+
+        elif msg_type == "wideband_sweep":
+            sweep = msg.get("sweep", 0)
+            dur = msg.get("duration_ms", 0)
+            n_hot = msg.get("n_hot", 0)
+            n_active = msg.get("n_active", 0)
+            max_slots = msg.get("max_slots", 0)
+            tainted = msg.get("tainted", False)
+
+            wb_stats.sweep_count += 1
+            wb_stats.sweep_durations.append(dur)
+            wb_stats.hot_counts.append(n_hot)
+            if tainted:
+                wb_stats.tainted_count += 1
+
+            tag = " TAINTED" if tainted else ""
+            print(
+                f"WB_SWEEP sweep={sweep} dur={dur}ms "
+                f"hot={n_hot} active={n_active}/{max_slots}{tag}",
+                flush=True,
+            )
+
+            if wb_stats.sweep_count % summary_interval == 0:
+                avg_dur = sum(wb_stats.sweep_durations) / len(wb_stats.sweep_durations)
+                avg_hot = sum(wb_stats.hot_counts) / len(wb_stats.hot_counts)
+                print(
+                    f"WB_SUMMARY sweeps={wb_stats.sweep_count} "
+                    f"tainted={wb_stats.tainted_count} "
+                    f"avg_dur={avg_dur:.0f}ms avg_hot={avg_hot:.1f}",
+                    flush=True,
+                )
+
+        elif msg_type == "wideband_slot":
+            action = msg.get("action", "?")
+            slot = msg.get("slot", 0)
+            freq = msg.get("freq", 0)
+            bw = msg.get("bw", 0)
+            freq_mhz = freq / 1e6 if freq else 0
+            bw_str = format_bw(bw) if bw else "?"
+            print(
+                f"WB_SLOT {action} slot={slot} freq={freq_mhz:.3f}MHz BW{bw_str}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

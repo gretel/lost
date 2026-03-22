@@ -435,7 +435,8 @@ inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const Sc
 /// decode internally. No Splitter or per-BW chains needed.
 inline std::atomic<uint64_t>* build_wideband_graph(
         gr::Graph& graph, const TrxConfig& cfg,
-        std::function<void(const std::vector<uint8_t>&, bool)> callback) {
+        std::function<void(const std::vector<uint8_t>&, bool)> callback,
+        std::function<void(const gr::property_map&)> telemetry_cb = {}) {
     auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
 
     const auto& dc = cfg.decode_configs[0];
@@ -458,7 +459,7 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
 
     // WidebandDecoder
-    auto& decoder = graph.emplaceBlock<gr::lora::WidebandDecoder>({
+    gr::property_map wb_props{
         {"sample_rate", static_cast<float>(cfg.wideband_rate)},
         {"center_freq", static_cast<float>(cfg.freq)},
         {"channel_bw", 62500.f},
@@ -468,7 +469,14 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         {"sync_word", dc.sync_word},
         {"preamble_len", cfg.preamble},
         {"debug", cfg.debug},
-    });
+    };
+    if (!cfg.decode_sfs_str.empty()) {
+        wb_props["decode_sfs_str"] = cfg.decode_sfs_str;
+    }
+    auto& decoder = graph.emplaceBlock<gr::lora::WidebandDecoder>(std::move(wb_props));
+    if (telemetry_cb) {
+        decoder._telemetry = std::move(telemetry_cb);
+    }
 
     // FrameSink
     auto& sink = graph.emplaceBlock<gr::lora::FrameSink>({
@@ -487,8 +495,9 @@ inline std::atomic<uint64_t>* build_wideband_graph(
     }
 
     gr::lora::log_ts("info ", "graph",
-        "wideband graph: %.1f MS/s, %.3f MHz center, BW%u, SF7-12",
-        cfg.wideband_rate / 1e6, cfg.freq / 1e6, cfg.bw);
+        "wideband graph: %.1f MS/s, %.3f MHz center, BW%u, %s",
+        cfg.wideband_rate / 1e6, cfg.freq / 1e6, cfg.bw,
+        cfg.decode_sfs_str.empty() ? "SF7-12" : ("SF=" + cfg.decode_sfs_str).c_str());
 
     return &source._totalOverFlowCount;
 }

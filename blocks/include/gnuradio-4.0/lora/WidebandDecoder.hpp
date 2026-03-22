@@ -30,6 +30,7 @@
 #include <gnuradio-4.0/lora/algorithm/HalfBandDecimator.hpp>
 #include <gnuradio-4.0/lora/algorithm/RingBuffer.hpp>
 #include <gnuradio-4.0/lora/algorithm/SfLane.hpp>
+#include <gnuradio-4.0/lora/algorithm/Telemetry.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
 namespace gr::lora {
@@ -67,9 +68,11 @@ struct ChannelSlot {
     std::vector<SfLane> sfLanes;
 
     /// Activate the slot for a given channel.  Resets all internal state.
+    /// @param sfs  spreading factors to decode (empty = all SF7-12)
     void activate(double channel_freq, double center_freq,
                   double sample_rate, uint32_t os_factor, uint32_t ch_idx = 0,
-                  uint32_t bw = 62500, uint16_t sync = 0x12, uint16_t preamble = 8) {
+                  uint32_t bw = 62500, uint16_t sync = 0x12, uint16_t preamble = 8,
+                  std::span<const uint8_t> sfs = {}) {
         state       = State::Active;
         channelFreq = channel_freq;
         centerFreq  = center_freq;
@@ -95,12 +98,20 @@ struct ChannelSlot {
         decodeBw = bw;
         nbAccum.clear();
 
-        // Initialize SfLanes for SF7-12 at os_factor=1
+        // Initialize SfLanes at os_factor=1 (configurable SF range)
         sfLanes.clear();
-        sfLanes.reserve(6);
-        for (uint8_t sf = 7; sf <= 12; ++sf) {
-            sfLanes.emplace_back();
-            sfLanes.back().init(sf, bw, 1, preamble, sync);
+        if (sfs.empty()) {
+            sfLanes.reserve(6);
+            for (uint8_t sf = 7; sf <= 12; ++sf) {
+                sfLanes.emplace_back();
+                sfLanes.back().init(sf, bw, 1, preamble, sync);
+            }
+        } else {
+            sfLanes.reserve(sfs.size());
+            for (uint8_t sf : sfs) {
+                sfLanes.emplace_back();
+                sfLanes.back().init(sf, bw, 1, preamble, sync);
+            }
         }
     }
 
@@ -143,6 +154,7 @@ struct WidebandDecoder
     float       channel_bw{62500.f};       // L1 channel grid spacing (Hz)
     float       decode_bw{62500.f};        // decode bandwidth for channelization (Hz)
     std::string decode_bw_str{"62500"};    // comma-separated BWs for multi-BW decode
+    std::string decode_sfs_str{""};        // comma-separated SFs to decode, empty = all (7-12)
     float       min_ratio{8.0f};           // min L2 CAD peak ratio (unused in M3)
     float       buffer_ms{512.f};          // ring buffer duration (ms)
     uint32_t    max_channels{24};          // max simultaneous decode channels
@@ -157,7 +169,8 @@ struct WidebandDecoder
     bool        debug{false};              // verbose logging
 
     GR_MAKE_REFLECTABLE(WidebandDecoder, in, out, msg_out,
-        sample_rate, center_freq, channel_bw, decode_bw, decode_bw_str, min_ratio,
+        sample_rate, center_freq, channel_bw, decode_bw, decode_bw_str,
+        decode_sfs_str, min_ratio,
         buffer_ms, max_channels, l1_interval, l1_snapshots, l1_fft_size,
         sync_word, preamble_len, energy_thresh, min_snr_db, max_symbols, debug);
 
@@ -180,6 +193,7 @@ struct WidebandDecoder
     // Hot channel tracking
     std::vector<uint32_t>     _hotChannels;
     std::vector<uint32_t>                _decodeBws;
+    std::vector<uint8_t>                 _decodeSfs;   // SF range (empty = all SF7-12)
     std::vector<std::vector<uint32_t>>   _activeChannelMap;  // channelIdx → list of slotIdx
 
     // DC removal (IIR high-pass: y[n] = x[n] - x[n-1] + alpha * y[n-1])
@@ -191,6 +205,10 @@ struct WidebandDecoder
 
     // Noise floor tracking
     float                     _noise_floor_db{-999.f};
+
+    // Telemetry callback (set by app, fires on sweep completion and slot changes)
+    std::function<void(const gr::property_map&)> _telemetry;
+    std::chrono::steady_clock::time_point        _sweepStartTime;
 
     // --- lifecycle ---
 
@@ -230,6 +248,24 @@ struct WidebandDecoder
         if (_decodeBws.empty()) {
             _decodeBws.push_back(static_cast<uint32_t>(decode_bw));
         }
+
+        // Parse decode_sfs_str into _decodeSfs
+        _decodeSfs.clear();
+        if (!decode_sfs_str.empty()) {
+            std::istringstream iss2(decode_sfs_str);
+            std::string token;
+            while (std::getline(iss2, token, ',')) {
+                token.erase(0, token.find_first_not_of(" \t"));
+                token.erase(token.find_last_not_of(" \t") + 1);
+                if (token.empty()) continue;
+                auto sf = static_cast<uint8_t>(std::stoul(token));
+                if (sf >= 7 && sf <= 12) {
+                    _decodeSfs.push_back(sf);
+                }
+            }
+            std::ranges::sort(_decodeSfs);
+        }
+
         _activeChannelMap.assign(_nChannels, {});
 
         // Channel slots
@@ -246,18 +282,31 @@ struct WidebandDecoder
 
         _dcBuf.reserve(8192);           // typical chunk size
         _fftBuf.reserve(l1_fft_size);   // persistent L1 FFT buffer
-        _callCount     = 0;
-        _snapshotCount = 0;
-        _sweepCount    = 0;
+        _callCount      = 0;
+        _snapshotCount  = 0;
+        _sweepCount     = 0;
+        _sweepStartTime = std::chrono::steady_clock::now();
 
-        log_ts("info ", "wideband",
-            "started: %.1f MS/s, %.3f MHz center, %u ch (%.1f kHz), %u slots, buffer %u ms",
-            static_cast<double>(sample_rate) / 1e6,
-            static_cast<double>(center_freq) / 1e6,
-            _nChannels,
-            static_cast<double>(channel_bw) / 1e3,
-            max_channels,
-            static_cast<unsigned>(buffer_ms));
+        {
+            std::string sf_desc;
+            if (_decodeSfs.empty()) {
+                sf_desc = "SF7-12";
+            } else {
+                for (std::size_t i = 0; i < _decodeSfs.size(); ++i) {
+                    if (i > 0) sf_desc += ',';
+                    sf_desc += "SF" + std::to_string(_decodeSfs[i]);
+                }
+            }
+            log_ts("info ", "wideband",
+                "started: %.1f MS/s, %.3f MHz center, %u ch (%.1f kHz), %u slots, buffer %u ms, %s",
+                static_cast<double>(sample_rate) / 1e6,
+                static_cast<double>(center_freq) / 1e6,
+                _nChannels,
+                static_cast<double>(channel_bw) / 1e3,
+                max_channels,
+                static_cast<unsigned>(buffer_ms),
+                sf_desc.c_str());
+        }
     }
 
     // --- processBulk ---
@@ -268,12 +317,13 @@ struct WidebandDecoder
     {
         auto in_span = std::span(input);
 
-        // 1. Handle overflow tags — reset everything and mark sweep tainted
+        // 1. Handle overflow tags — deactivate slots but let sweep complete
+        //    (tainted sweep is discarded at step 5; resetting _snapshotCount
+        //    here would prevent the sweep from ever finishing when overflow
+        //    tags trickle in one-per-call from the startup burst).
         if (this->inputTagsPresent()) {
             const auto& tag = this->mergedInputTag();
             if (tag.map.contains("overflow")) {
-                _snapshotCount = 0;
-                _channelEnergy.assign(_nChannels, 0.f);
                 _overflowInSweep = true;  // discard this sweep's results
                 for (auto& slot : _slots) {
                     if (slot.state != ChannelSlot::State::Idle) {
@@ -327,21 +377,47 @@ struct WidebandDecoder
             }
             _channelEnergy.assign(_nChannels, 0.f);
             _snapshotCount = 0;
+            bool wasTainted = _overflowInSweep;
             _overflowInSweep = false;
             _sweepCount++;
 
-            // Periodic status (every 10 sweeps, ~5s)
+            // sweep timing
+            auto now = std::chrono::steady_clock::now();
+            auto durMs = static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - _sweepStartTime).count());
+            _sweepStartTime = now;
+
+            // active slot count
+            uint32_t nActive = 0;
+            for (const auto& slot : _slots) {
+                if (slot.state != ChannelSlot::State::Idle) ++nActive;
+            }
+
+            // telemetry event (every sweep, ~2/s)
+            if (_telemetry) {
+                gr::property_map evt;
+                evt["type"]        = std::pmr::string("wideband_sweep");
+                evt["sweep"]       = _sweepCount;
+                evt["tainted"]     = wasTainted;
+                evt["duration_ms"] = durMs;
+                evt["n_snapshots"] = static_cast<uint32_t>(l1_snapshots);
+                evt["n_hot"]       = static_cast<uint32_t>(_hotChannels.size());
+                evt["n_active"]    = nActive;
+                evt["max_slots"]   = max_channels;
+                _telemetry(evt);
+            }
+
+            // periodic console status (every 10 sweeps)
             if (_sweepCount % 10 == 0) {
-                uint32_t nActive = 0;
-                for (const auto& slot : _slots) {
-                    if (slot.state != ChannelSlot::State::Idle) ++nActive;
-                }
                 log_ts("info ", "wideband",
-                    "sweep %u  hot %zu  active %u/%u",
+                    "sweep %u  hot %zu  active %u/%u  dur %ums%s",
                     _sweepCount,
                     _hotChannels.size(),
                     nActive,
-                    static_cast<uint32_t>(max_channels));
+                    static_cast<uint32_t>(max_channels),
+                    durMs,
+                    wasTainted ? " TAINTED" : "");
             }
         }
 
@@ -544,9 +620,15 @@ struct WidebandDecoder
             bool stillHot = std::ranges::find(_hotChannels, ch) != _hotChannels.end();
             if (!stillHot) {
                 for (uint32_t slotIdx : _activeChannelMap[ch]) {
-                    if (debug) {
-                        log_ts("debug", "wideband", "deactivate slot %u (ch %u, BW %u)",
-                            slotIdx, ch, _slots[slotIdx].decodeBw);
+                    if (_telemetry) {
+                        gr::property_map evt;
+                        evt["type"]    = std::pmr::string("wideband_slot");
+                        evt["action"]  = std::pmr::string("deactivate");
+                        evt["slot"]    = slotIdx;
+                        evt["channel"] = ch;
+                        evt["freq"]    = _slots[slotIdx].channelFreq;
+                        evt["bw"]      = _slots[slotIdx].decodeBw;
+                        _telemetry(evt);
                     }
                     _slots[slotIdx].deactivate();
                 }
@@ -578,7 +660,8 @@ struct WidebandDecoder
                     std::round(static_cast<double>(sample_rate) / static_cast<double>(bw)));
 
                 _slots[freeSlot].activate(freq, static_cast<double>(center_freq),
-                    static_cast<double>(sample_rate), os, ch, bw, sync_word, preamble_len);
+                    static_cast<double>(sample_rate), os, ch, bw, sync_word, preamble_len,
+                    std::span<const uint8_t>(_decodeSfs));
                 _activeChannelMap[ch].push_back(freeSlot);
 
                 // No ring buffer replay — start decode from the live stream.
@@ -586,9 +669,15 @@ struct WidebandDecoder
                 // 8 symbols (~33ms at SF8/BW62.5k), so the next ADVERT will
                 // be caught from the start.
 
-                if (debug) {
-                    log_ts("debug", "wideband", "activate slot %u -> ch %u BW %u (%.3f MHz, os=%u)",
-                        freeSlot, ch, bw, freq / 1e6, os);
+                if (_telemetry) {
+                    gr::property_map evt;
+                    evt["type"]    = std::pmr::string("wideband_slot");
+                    evt["action"]  = std::pmr::string("activate");
+                    evt["slot"]    = freeSlot;
+                    evt["channel"] = ch;
+                    evt["freq"]    = freq;
+                    evt["bw"]      = bw;
+                    _telemetry(evt);
                 }
             }
         }
