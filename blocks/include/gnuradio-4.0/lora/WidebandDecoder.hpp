@@ -65,6 +65,9 @@ struct ChannelSlot {
     // Narrowband output samples (accumulated between drain calls)
     std::vector<cf32> nbAccum;
 
+    // Pre-allocated zero buffer for overflow gap filling
+    std::vector<cf32> _gapBuf;
+
     // Per-SF decode lanes (SF7-12, os_factor=1 since channelizer already decimated)
     std::vector<SfLane> sfLanes;
 
@@ -89,8 +92,10 @@ struct ChannelSlot {
                        static_cast<float>(std::sin(ncoPhaseInc)));
         ncoRot  = cf32(1.f, 0.f);  // start at 0 phase
 
-        // Cascaded half-band FIR: os_factor must be power of 2
-        if ((os_factor & (os_factor - 1)) != 0) {
+        // Cascaded half-band FIR: os_factor must be power of 2 and >= 1
+        if (os_factor < 1 || (os_factor & (os_factor - 1)) != 0) {
+            std::fprintf(stderr, "[wideband] activate: invalid os_factor %u, must be power of 2\n",
+                         os_factor);
             state = State::Idle;
             return;
         }
@@ -99,6 +104,7 @@ struct ChannelSlot {
         decimator.init(nStages);
         decodeBw = bw;
         nbAccum.clear();
+        _gapBuf.assign(8192, cf32{0.f, 0.f});
 
         // Initialize SfLanes at os_factor=1 (configurable SF range)
         sfLanes.clear();
@@ -139,6 +145,9 @@ struct ChannelSlot {
             // narrowband output but prevent timing shifts that corrupt dechirp.
             if (_gapBuf.size() < gapSamples) {
                 _gapBuf.assign(gapSamples, cf32{0.f, 0.f});
+            } else {
+                // Always zero the used span — buffer may have stale data
+                std::fill_n(_gapBuf.begin(), gapSamples, cf32{0.f, 0.f});
             }
             decimator.processWithNcoBatch(
                 std::span<const cf32>(_gapBuf.data(), gapSamples),
@@ -147,7 +156,6 @@ struct ChannelSlot {
         }
         decimator.processWithNcoBatch(wbSamples, nbAccum, ncoRot, ncoStep);
     }
-    std::vector<cf32> _gapBuf;  // pre-allocated zero buffer for overflow gap filling
 };
 
 // ─── WidebandDecoder block (M3) ─────────────────────────────────────────────
@@ -252,7 +260,12 @@ struct WidebandDecoder
                 token.erase(0, token.find_first_not_of(" \t"));
                 token.erase(token.find_last_not_of(" \t") + 1);
                 if (token.empty()) continue;
-                auto bw = static_cast<uint32_t>(std::stoul(token));
+                uint32_t bw = 0;
+                try { bw = static_cast<uint32_t>(std::stoul(token)); }
+                catch (...) {
+                    log_ts("warn ", "wideband", "invalid BW token '%s', skipping", token.c_str());
+                    continue;
+                }
                 uint32_t os = static_cast<uint32_t>(
                     std::round(static_cast<double>(sample_rate) / static_cast<double>(bw)));
                 if (os == 0 || (os & (os - 1)) != 0) {
@@ -278,7 +291,12 @@ struct WidebandDecoder
                 token.erase(0, token.find_first_not_of(" \t"));
                 token.erase(token.find_last_not_of(" \t") + 1);
                 if (token.empty()) continue;
-                auto sf = static_cast<uint8_t>(std::stoul(token));
+                uint8_t sf = 0;
+                try { sf = static_cast<uint8_t>(std::stoul(token)); }
+                catch (...) {
+                    log_ts("warn ", "wideband", "invalid SF token '%s', skipping", token.c_str());
+                    continue;
+                }
                 if (sf >= 7 && sf <= 12) {
                     _decodeSfs.push_back(sf);
                 }
@@ -392,6 +410,8 @@ struct WidebandDecoder
             _channelEnergy.assign(_nChannels, 0.f);
             _fftBinMag.assign(l1_fft_size, 0.f);
             _snapshotCount = 0;
+            uint32_t sweepZeroCalls  = _zeroCalls;
+            uint32_t sweepTotalCalls = _totalCalls;
             _zeroCalls = 0;
             _totalCalls = 0;
             uint32_t sweepOverflows = _overflowsInSweep;
@@ -414,19 +434,21 @@ struct WidebandDecoder
 
             // telemetry event (every sweep, ~2/s)
             if (_telemetry) {
-                gr::property_map evt;
-                evt["type"]        = std::pmr::string("wideband_sweep");
-                evt["sweep"]       = _sweepCount;
-                evt["tainted"]     = wasTainted;
-                evt["overflows"]   = sweepOverflows;
-                evt["zero_calls"]  = _zeroCalls;
-                evt["total_calls"] = _totalCalls;
-                evt["duration_ms"] = durMs;
-                evt["n_snapshots"] = static_cast<uint32_t>(l1_snapshots);
-                evt["n_hot"]       = static_cast<uint32_t>(_hotChannels.size());
-                evt["n_active"]    = nActive;
-                evt["max_slots"]   = max_channels;
-                _telemetry(evt);
+                try {
+                    gr::property_map evt;
+                    evt["type"]        = std::pmr::string("wideband_sweep");
+                    evt["sweep"]       = _sweepCount;
+                    evt["tainted"]     = wasTainted;
+                    evt["overflows"]   = sweepOverflows;
+                    evt["zero_calls"]  = sweepZeroCalls;
+                    evt["total_calls"] = sweepTotalCalls;
+                    evt["duration_ms"] = durMs;
+                    evt["n_snapshots"] = static_cast<uint32_t>(l1_snapshots);
+                    evt["n_hot"]       = static_cast<uint32_t>(_hotChannels.size());
+                    evt["n_active"]    = nActive;
+                    evt["max_slots"]   = max_channels;
+                    _telemetry(evt);
+                } catch (...) {}
             }
 
             // periodic console status (every 10 sweeps)
@@ -509,48 +531,6 @@ struct WidebandDecoder
 
     // --- L1 energy detection (adapted from ScanController) ---
 
-    void computeEnergySnapshot() noexcept {
-        if (_ring.count < l1_fft_size) return;
-
-        // Copy recent samples into persistent buffer (must copy — Hann windowing modifies in-place)
-        auto [v1, v2] = _ring.recentView(l1_fft_size);
-        if (v1.empty() && v2.empty()) return;
-        _fftBuf.resize(l1_fft_size);
-        std::copy(v1.begin(), v1.end(), _fftBuf.begin());
-        if (!v2.empty())
-            std::copy(v2.begin(), v2.end(), _fftBuf.begin() + static_cast<std::ptrdiff_t>(v1.size()));
-
-        // Apply Hann window
-        for (uint32_t i = 0; i < l1_fft_size; ++i) {
-            _fftBuf[i] *= _window[i];
-        }
-
-        auto fftOut = _fft.compute(
-            std::span<const cf32>(_fftBuf.data(), l1_fft_size));
-
-        // Accumulate |FFT|^2 into channel bins (DC-centered via fftshift)
-        const auto half    = l1_fft_size / 2;
-        const float binBw  = sample_rate / static_cast<float>(l1_fft_size);
-        const auto binsPerCh = static_cast<uint32_t>(channel_bw / binBw);
-
-        const float usableBw = sample_rate * 0.8f;
-        const auto  startBin = static_cast<uint32_t>(
-            (static_cast<float>(l1_fft_size) - usableBw / binBw) / 2.f);
-
-        for (uint32_t ch = 0; ch < _nChannels
-             && ch * binsPerCh + startBin + binsPerCh <= l1_fft_size; ++ch) {
-            float energy = 0.f;
-            for (uint32_t b = 0; b < binsPerCh; ++b) {
-                const auto fftIdx = (startBin + ch * binsPerCh + b + half) % l1_fft_size;
-                const auto& s = fftOut[fftIdx];
-                energy += s.real() * s.real() + s.imag() * s.imag();
-            }
-            _channelEnergy[ch] += energy;
-        }
-
-        ++_snapshotCount;
-    }
-
     /// Compute L1 energy snapshot directly from the input span (no ring buffer).
     /// Uses the last l1_fft_size samples from the input span.
     void computeEnergySnapshotFromSpan(std::span<const cf32> span) noexcept {
@@ -588,12 +568,15 @@ struct WidebandDecoder
             _fftBinMag[i] += s.real() * s.real() + s.imag() * s.imag();
         }
 
-        // Accumulate into channel bins
+        // Accumulate into channel bins (from fftOut directly, not _fftBinMag,
+        // to avoid quadratic growth — _fftBinMag accumulates across snapshots)
         for (uint32_t ch = 0; ch < _nChannels
              && ch * binsPerCh + startBin + binsPerCh <= l1_fft_size; ++ch) {
             float energy = 0.f;
             for (uint32_t b = 0; b < binsPerCh; ++b) {
-                energy += _fftBinMag[startBin + ch * binsPerCh + b];
+                const auto fftIdx = (startBin + ch * binsPerCh + b + half) % l1_fft_size;
+                const auto& s = fftOut[fftIdx];
+                energy += s.real() * s.real() + s.imag() * s.imag();
             }
             _channelEnergy[ch] += energy;
         }
@@ -669,14 +652,16 @@ struct WidebandDecoder
             if (!nearbyHot && !holdActive) {
                 for (uint32_t slotIdx : _activeChannelMap[ch]) {
                     if (_telemetry) {
-                        gr::property_map evt;
-                        evt["type"]    = std::pmr::string("wideband_slot");
-                        evt["action"]  = std::pmr::string("deactivate");
-                        evt["slot"]    = slotIdx;
-                        evt["channel"] = ch;
-                        evt["freq"]    = _slots[slotIdx].channelFreq;
-                        evt["bw"]      = _slots[slotIdx].decodeBw;
-                        _telemetry(evt);
+                        try {
+                            gr::property_map evt;
+                            evt["type"]    = std::pmr::string("wideband_slot");
+                            evt["action"]  = std::pmr::string("deactivate");
+                            evt["slot"]    = slotIdx;
+                            evt["channel"] = ch;
+                            evt["freq"]    = _slots[slotIdx].channelFreq;
+                            evt["bw"]      = _slots[slotIdx].decodeBw;
+                            _telemetry(evt);
+                        } catch (...) {}
                     }
                     _slots[slotIdx].deactivate();
                 }
@@ -725,14 +710,16 @@ struct WidebandDecoder
                 // be caught from the start.
 
                 if (_telemetry) {
-                    gr::property_map evt;
-                    evt["type"]    = std::pmr::string("wideband_slot");
-                    evt["action"]  = std::pmr::string("activate");
-                    evt["slot"]    = freeSlot;
-                    evt["channel"] = ch;
-                    evt["freq"]    = freq;
-                    evt["bw"]      = bw;
-                    _telemetry(evt);
+                    try {
+                        gr::property_map evt;
+                        evt["type"]    = std::pmr::string("wideband_slot");
+                        evt["action"]  = std::pmr::string("activate");
+                        evt["slot"]    = freeSlot;
+                        evt["channel"] = ch;
+                        evt["freq"]    = freq;
+                        evt["bw"]      = bw;
+                        _telemetry(evt);
+                    } catch (...) {}
                 }
             }
         }
@@ -749,33 +736,6 @@ struct WidebandDecoder
         const double centerBin = startBin + ch * bpC + bpC / 2.0;
         return static_cast<double>(center_freq)
              + (centerBin - static_cast<double>(l1_fft_size) / 2.0) * binBw;
-    }
-
-    /// Refined frequency from L1 FFT peak bin within a channel's bin range.
-    /// Falls back to channelCenterFreq() if no FFT data is available.
-    [[nodiscard]] double peakBinFreq(uint32_t ch) const noexcept {
-        if (_fftBinMag.size() < l1_fft_size) return channelCenterFreq(ch);
-
-        const double binBw   = static_cast<double>(sample_rate) / l1_fft_size;
-        const double usableBins = static_cast<double>(sample_rate) * 0.8 / binBw;
-        const auto   startBin   = static_cast<uint32_t>(std::round(
-            (static_cast<double>(l1_fft_size) - usableBins) / 2.0));
-        const auto   bpC = static_cast<uint32_t>(static_cast<double>(channel_bw) / binBw);
-
-        // Find peak bin within channel's range
-        uint32_t peakBin = startBin + ch * bpC;
-        float peakVal = 0.f;
-        for (uint32_t b = 0; b < bpC; ++b) {
-            uint32_t bin = startBin + ch * bpC + b;
-            if (bin < l1_fft_size && _fftBinMag[bin] > peakVal) {
-                peakVal = _fftBinMag[bin];
-                peakBin = bin;
-            }
-        }
-
-        return static_cast<double>(center_freq)
-             + (static_cast<double>(peakBin) + 0.5
-                - static_cast<double>(l1_fft_size) / 2.0) * binBw;
     }
 
     // =========================================================================

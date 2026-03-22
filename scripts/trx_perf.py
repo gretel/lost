@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import signal
+import socket
 import sys
 import time
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ class FrameStats:
     """Accumulates cross-frame statistics."""
 
     frame_count: int = 0
+    dedup_count: int = 0
     crc_ok: int = 0
     crc_fail: int = 0
     snr_values: list[float] = field(default_factory=list)
@@ -164,7 +166,11 @@ def main() -> None:
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
     while True:
-        data, _ = sock.recvfrom(65536)
+        try:
+            data, _ = sock.recvfrom(65536)
+        except socket.timeout:
+            print("No data received, exiting.", file=sys.stderr)
+            break
         try:
             msg = cbor2.loads(data)
         except Exception:
@@ -178,7 +184,7 @@ def main() -> None:
             # Cross-BW dedup by payload_hash
             phash = msg.get("payload_hash", 0)
             if phash and is_duplicate(phash):
-                stats.frame_count += 1  # count for stats but don't print
+                stats.dedup_count += 1
                 continue
 
             phy = msg.get("phy", {})

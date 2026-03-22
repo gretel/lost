@@ -56,7 +56,8 @@ inline void encode_sint(std::vector<uint8_t>& buf, int64_t val) {
     if (val >= 0) {
         encode_head(buf, 0, static_cast<uint64_t>(val));
     } else {
-        encode_head(buf, 1, static_cast<uint64_t>(-1 - val));  // CBOR major 1
+        // Use unsigned arithmetic to avoid UB when val == INT64_MIN
+        encode_head(buf, 1, static_cast<uint64_t>(-1) - static_cast<uint64_t>(val));
     }
 }
 

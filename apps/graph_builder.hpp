@@ -501,10 +501,11 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         gr::lora::log_ts("error", "graph", "connect WidebandDecoder -> FrameSink failed");
     }
 
+    const auto sf_desc = cfg.decode_sfs_str.empty()
+        ? std::string("SF7-12") : ("SF=" + cfg.decode_sfs_str);
     gr::lora::log_ts("info ", "graph",
         "wideband graph: %.1f MS/s, %.3f MHz center, BW%u, %s",
-        cfg.wideband_rate / 1e6, cfg.freq / 1e6, cfg.bw,
-        cfg.decode_sfs_str.empty() ? "SF7-12" : ("SF=" + cfg.decode_sfs_str).c_str());
+        cfg.wideband_rate / 1e6, cfg.freq / 1e6, cfg.bw, sf_desc.c_str());
 
     return &source._totalOverFlowCount;
 }

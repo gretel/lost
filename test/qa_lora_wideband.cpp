@@ -557,13 +557,19 @@ const boost::ut::suite<"WidebandDecoder block skeleton"> wbBlockTests = [] {
             expect(false) << "scheduler exchange failed";
             return;
         }
-        sched.runAndWait();
+        auto result = sched.runAndWait();
 
-        // The block should have detected the tone channel and activated a slot.
-        // Since we don't have a way to query the block after exchange (type-erased),
-        // and there's no decode yet (M4), we just verify it ran without crash.
-        // The real signal test is M4+M5.
-        expect(true) << "block ran successfully with strong tone input";
+        // Verify the scheduler completed successfully (not stuck/timeout)
+        expect(result.has_value()) << "scheduler completed without error";
+
+        // A CW tone activates L1 channel detection but produces no decoded
+        // LoRa frames, so sink output may be 0 samples. The meaningful check
+        // is that the scheduler ran to completion without deadlock — a stuck
+        // block would cause a timeout. The source pushed all samples through
+        // the WidebandDecoder, which means L1 energy detection + slot
+        // management executed without crash.
+        expect(src._nSamplesProduced > 0U)
+            << "source produced samples into the graph";
     };
 
     "channelCenterFreq maps channel indices to frequencies"_test = [] {

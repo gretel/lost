@@ -627,7 +627,7 @@ def parse_host_port(
         return host, port
 
     colon = spec.rfind(":")
-    if colon <= 0:
+    if colon < 0:
         raise ValueError(
             f"invalid HOST:PORT spec '{spec}' (expected host:port, e.g. 127.0.0.1:5555)"
         )

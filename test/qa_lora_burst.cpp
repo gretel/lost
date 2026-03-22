@@ -739,20 +739,27 @@ const boost::ut::suite<"Error path tests"> error_path_tests = [] {
     "CRC failure is flagged (corrupted payload IQ)"_test = [] {
         auto iq = make_frame_iq("LoRa PHY test!");
 
-        // Corrupt a payload symbol by zeroing out one symbol's worth of IQ
-        // in the middle of the payload. The preamble is ~12.25 symbols.
+        // Corrupt several payload symbols to overwhelm Hamming FEC. The
+        // preamble + header (first ~20 symbols) are untouched so FrameSync
+        // *may* still detect the frame, but dechirp tracking through multiple
+        // corrupted symbols is unreliable. We accept two outcomes:
+        //   (a) No output — detection lost lock (acceptable)
+        //   (b) Output with crc_valid=false — decode succeeded but CRC failed
+        // We reject: output with crc_valid=true (would be a false positive).
         std::size_t payload_start = static_cast<std::size_t>(12.25 * SPS);
-        std::size_t corrupt_sym = 5;  // corrupt the 6th payload symbol
-        std::size_t corrupt_start = payload_start + corrupt_sym * SPS;
-        for (std::size_t i = corrupt_start; i < corrupt_start + SPS && i < iq.size(); i++) {
-            iq[i] = std::complex<float>(0.f, 0.f);
+        // Corrupt symbols 10-12 (3 consecutive post-header symbols) — exceeds
+        // CR4 error correction capacity (can correct 1 symbol error per block)
+        for (std::size_t sym = 10; sym < 13; ++sym) {
+            std::size_t corrupt_start = payload_start + sym * SPS;
+            for (std::size_t i = corrupt_start; i < corrupt_start + SPS && i < iq.size(); i++) {
+                iq[i] = std::complex<float>{0.f, 0.f};  // zero out — more aggressive than phase flip
+            }
         }
 
         auto result = run_decode(iq);
 
-        // DemodDecoder should still output bytes, but crc_valid=false
-        // (it always outputs payload on header success, regardless of CRC)
         if (!result.samples.empty()) {
+            // Outcome (b): decoder produced output — CRC must be invalid
             bool found_crc = false;
             bool crc_valid = true;
             for (const auto& t : result.tags) {
@@ -761,13 +768,12 @@ const boost::ut::suite<"Error path tests"> error_path_tests = [] {
                     found_crc = true;
                 }
             }
-            // If we got output, CRC should be flagged invalid
             if (found_crc) {
                 expect(!crc_valid) << "CRC should be invalid for corrupted frame";
             }
         }
-        // Either no output (detection failed) or output with crc_valid=false.
-        // Both are acceptable — the key is no false positive.
+        // Outcome (a): no output is also acceptable (detection lost lock)
+        expect(true) << "no false positive CRC=OK from corrupted payload";
     };
 
     "Low SNR (-15 dB) does not produce false positive"_test = [] {

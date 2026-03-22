@@ -114,11 +114,15 @@ struct HalfBandStage {
     std::vector<cf32> _workBuf;  // concatenation buffer: [tail | input]
 
     /// Initialize batch FIR state. Must be called before processBatch().
-    void initBatch() {
+    /// @param maxInputSize  max expected input chunk size (for pre-allocation)
+    void initBatch(std::size_t maxInputSize = 0) {
         using namespace halfband_detail;
         constexpr std::size_t kTailLen = kFilterLen - 1;  // 22
         _tail.assign(kTailLen, cf32{0.f, 0.f});
         _workBuf.clear();
+        if (maxInputSize > 0) {
+            _workBuf.reserve(kTailLen + maxInputSize);
+        }
     }
 
     /// Reset batch FIR state alongside the circular delay line state.
@@ -212,9 +216,12 @@ struct CascadedDecimator {
     /// maxChunkSize is the maximum expected input chunk size (for pre-allocation).
     void init(std::size_t nStages, std::size_t maxChunkSize = 8192) {
         stages.resize(nStages);
+        // Each stage's input is half the previous stage's output
+        std::size_t stageInput = maxChunkSize;
         for (auto& s : stages) {
             s.reset();
-            s.initBatch();
+            s.initBatch(stageInput);
+            stageInput = (stageInput + 1) / 2;  // decimate-by-2
         }
         // Pre-allocate scratch buffers for the largest possible intermediate size
         scratch0.reserve(maxChunkSize);

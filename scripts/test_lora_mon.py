@@ -814,5 +814,111 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(lora_common.config_udp_port(cfg), 9999)
 
 
+# ---- sanitize_text ----
+
+
+class TestSanitizeText(unittest.TestCase):
+    """Tests for lora_common.sanitize_text()."""
+
+    def test_ascii_passthrough(self):
+        """Normal printable ASCII passes through unchanged."""
+        self.assertEqual(lora_common.sanitize_text("Hello, World!"), "Hello, World!")
+
+    def test_c0_nul(self):
+        """NUL (U+0000) is escaped."""
+        self.assertEqual(lora_common.sanitize_text("\x00"), "\\x00")
+
+    def test_c0_bell(self):
+        """BEL (U+0007) is escaped."""
+        self.assertEqual(lora_common.sanitize_text("\x07"), "\\x07")
+
+    def test_c0_tab(self):
+        """TAB (U+0009) is escaped (C0 control)."""
+        self.assertEqual(lora_common.sanitize_text("\t"), "\\x09")
+
+    def test_c0_newline(self):
+        """LF (U+000A) is escaped (C0 control)."""
+        self.assertEqual(lora_common.sanitize_text("\n"), "\\x0a")
+
+    def test_c0_carriage_return(self):
+        """CR (U+000D) is escaped (C0 control)."""
+        self.assertEqual(lora_common.sanitize_text("\r"), "\\x0d")
+
+    def test_del(self):
+        """DEL (U+007F) is escaped."""
+        self.assertEqual(lora_common.sanitize_text("\x7f"), "\\x7f")
+
+    def test_empty_string(self):
+        """Empty string returns empty string."""
+        self.assertEqual(lora_common.sanitize_text(""), "")
+
+    def test_mixed_content(self):
+        """Mixed printable + control chars."""
+        result = lora_common.sanitize_text("OK\x00end")
+        self.assertEqual(result, "OK\\x00end")
+
+    def test_c1_control(self):
+        """C1 control (U+009B = CSI) is escaped."""
+        result = lora_common.sanitize_text("\u009b")
+        self.assertEqual(result, "\\u009b")
+
+    def test_bidi_override(self):
+        """Bidi override (U+202E = RLO) is escaped."""
+        result = lora_common.sanitize_text("\u202e")
+        self.assertEqual(result, "\\u202e")
+
+    def test_unicode_passthrough(self):
+        """Normal Unicode (emoji, CJK) passes through."""
+        self.assertEqual(lora_common.sanitize_text("café ☕ 你好"), "café ☕ 你好")
+
+
+# ---- parse_host_port ----
+
+
+class TestParseHostPort(unittest.TestCase):
+    """Tests for lora_common.parse_host_port()."""
+
+    def test_ipv4(self):
+        host, port = lora_common.parse_host_port("127.0.0.1:5555")
+        self.assertEqual(host, "127.0.0.1")
+        self.assertEqual(port, 5555)
+
+    def test_ipv6_bracket_with_port(self):
+        host, port = lora_common.parse_host_port("[::1]:5555")
+        self.assertEqual(host, "::1")
+        self.assertEqual(port, 5555)
+
+    def test_ipv6_bracket_default_port(self):
+        host, port = lora_common.parse_host_port("[::1]", default_port=5556)
+        self.assertEqual(host, "::1")
+        self.assertEqual(port, 5556)
+
+    def test_hostname_port(self):
+        host, port = lora_common.parse_host_port("localhost:8080")
+        self.assertEqual(host, "localhost")
+        self.assertEqual(port, 8080)
+
+    def test_no_colon_raises(self):
+        with self.assertRaises(ValueError):
+            lora_common.parse_host_port("no-colon-here")
+
+    def test_port_only(self):
+        """':5555' yields (empty host, 5555) via rfind(':') at index 0."""
+        host, port = lora_common.parse_host_port(":5555")
+        self.assertEqual(host, "")
+        self.assertEqual(port, 5555)
+
+    def test_default_port_ipv4(self):
+        """Default port used when not specified in ipv4 format — but colon is required."""
+        # parse_host_port requires a colon for non-bracket notation
+        with self.assertRaises(ValueError):
+            lora_common.parse_host_port("127.0.0.1")
+
+    def test_ipv6_full_address(self):
+        host, port = lora_common.parse_host_port("[2001:db8::1]:9999")
+        self.assertEqual(host, "2001:db8::1")
+        self.assertEqual(port, 9999)
+
+
 if __name__ == "__main__":
     unittest.main()

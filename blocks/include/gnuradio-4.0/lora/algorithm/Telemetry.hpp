@@ -58,7 +58,8 @@ inline void encodeValue(std::vector<uint8_t>& buf, const pmt::Value& val) {
     // bool
     if (auto* p = val.get_if<bool>())     { cb::encode_bool(buf, *p); return; }
 
-    // string (pmr::string is the native storage type)
+    // string (pmr::string is the native storage type in pmt::Value;
+    // std::string is explicitly excluded by pmt::Value::get_if constraints)
     if (auto* p = val.get_if<std::pmr::string>()) {
         cb::encode_text(buf, std::string(*p));
         return;

@@ -306,11 +306,13 @@ struct MultiSfDecoder
             lane.k_hat = multisf_detail::most_frequent(lane.preamb_up_vals);
 
             if (_telemetry) {
-                gr::property_map evt;
-                evt["type"] = std::pmr::string("multisf_detect");
-                evt["sf"]   = static_cast<uint32_t>(lane.sf);
-                evt["bin"]  = static_cast<uint32_t>(lane.bin_idx_new);
-                _telemetry(evt);
+                try {
+                    gr::property_map evt;
+                    evt["type"] = std::pmr::string("multisf_detect");
+                    evt["sf"]   = static_cast<uint32_t>(lane.sf);
+                    evt["bin"]  = static_cast<uint32_t>(lane.bin_idx_new);
+                    _telemetry(evt);
+                } catch (...) {}
             }
 
             if (debug) {
@@ -584,13 +586,15 @@ struct MultiSfDecoder
             lane.cr = 4;
 
             if (_telemetry) {
-                gr::property_map evt;
-                evt["type"]     = std::pmr::string("multisf_sync");
-                evt["sf"]       = static_cast<uint32_t>(lane.sf);
-                evt["cfo_int"]  = static_cast<int32_t>(lane.cfo_int);
-                evt["cfo_frac"] = lane.cfo_frac;
-                evt["snr_db"]   = static_cast<double>(lane.snr_db);
-                _telemetry(evt);
+                try {
+                    gr::property_map evt;
+                    evt["type"]     = std::pmr::string("multisf_sync");
+                    evt["sf"]       = static_cast<uint32_t>(lane.sf);
+                    evt["cfo_int"]  = static_cast<int32_t>(lane.cfo_int);
+                    evt["cfo_frac"] = lane.cfo_frac;
+                    evt["snr_db"]   = static_cast<double>(lane.snr_db);
+                    _telemetry(evt);
+                } catch (...) {}
             }
 
             // Update sto_frac to payload beginning
@@ -766,14 +770,16 @@ struct MultiSfDecoder
         gr::sendMessage<gr::message::Command::Notify>(msg_out, "", "payload", msg_data);
 
         if (_telemetry) {
-            gr::property_map evt;
-            evt["type"]   = std::pmr::string("multisf_frame");
-            evt["sf"]     = static_cast<uint32_t>(lane.sf);
-            evt["crc_ok"] = frame.crc_valid;
-            evt["len"]    = static_cast<uint32_t>(frame.pay_len);
-            evt["cr"]     = static_cast<uint32_t>(frame.cr);
-            evt["snr_db"] = static_cast<double>(lane.snr_db);
-            _telemetry(evt);
+            try {
+                gr::property_map evt;
+                evt["type"]   = std::pmr::string("multisf_frame");
+                evt["sf"]     = static_cast<uint32_t>(lane.sf);
+                evt["crc_ok"] = frame.crc_valid;
+                evt["len"]    = static_cast<uint32_t>(frame.pay_len);
+                evt["cr"]     = static_cast<uint32_t>(frame.cr);
+                evt["snr_db"] = static_cast<double>(lane.snr_db);
+                _telemetry(evt);
+            } catch (...) {}
         }
 
         if (debug) {

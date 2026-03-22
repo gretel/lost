@@ -72,10 +72,16 @@ target_compile_definitions(qa_lora_scan PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
 set_tests_properties(qa_lora_scan PROPERTIES TIMEOUT 60)
 
+add_ut_test(qa_lora_cbor)
+target_compile_definitions(qa_lora_cbor PRIVATE
+    TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
+
 add_ut_test(qa_lora_wideband)
 target_compile_definitions(qa_lora_wideband PRIVATE
     TEST_VECTORS_DIR="${PROJECT_SOURCE_DIR}/test_vectors")
 set_tests_properties(qa_lora_wideband PROPERTIES TIMEOUT 120)
+
+add_ut_test(qa_lora_tx_queue)
 
 # --- SoapyLoopback: hardware-free SoapySDR loopback testing ---
 # Override with -DFETCHCONTENT_SOURCE_DIR_SOAPYLOOPBACK=<path> for local development

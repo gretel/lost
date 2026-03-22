@@ -680,11 +680,13 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 _k_hat = detail::most_frequent(_preamb_up_vals);
 
                 if (_telemetry) {
-                    gr::property_map evt;
-                    evt["type"] = std::pmr::string("framesync_detect");
-                    evt["sf"]   = static_cast<uint32_t>(sf);
-                    evt["bin"]  = static_cast<uint32_t>(_bin_idx_new);
-                    _telemetry(evt);
+                    try {
+                        gr::property_map evt;
+                        evt["type"] = std::pmr::string("framesync_detect");
+                        evt["sf"]   = static_cast<uint32_t>(sf);
+                        evt["bin"]  = static_cast<uint32_t>(_bin_idx_new);
+                        _telemetry(evt);
+                    } catch (...) {}
                 }
 
                 if (debug) {
@@ -993,13 +995,15 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 _state = OUTPUT;
 
                 if (_telemetry) {
-                    gr::property_map evt;
-                    evt["type"]     = std::pmr::string("framesync_sync");
-                    evt["sf"]       = static_cast<uint32_t>(sf);
-                    evt["cfo_int"]  = static_cast<int32_t>(_cfo_int);
-                    evt["cfo_frac"] = static_cast<double>(_cfo_frac);
-                    evt["snr_db"]   = static_cast<double>(_snr_db);
-                    _telemetry(evt);
+                    try {
+                        gr::property_map evt;
+                        evt["type"]     = std::pmr::string("framesync_sync");
+                        evt["sf"]       = static_cast<uint32_t>(sf);
+                        evt["cfo_int"]  = static_cast<int32_t>(_cfo_int);
+                        evt["cfo_frac"] = static_cast<double>(_cfo_frac);
+                        evt["snr_db"]   = static_cast<double>(_snr_db);
+                        _telemetry(evt);
+                    } catch (...) {}
                 }
 
                 if (debug) {
