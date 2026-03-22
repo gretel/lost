@@ -130,9 +130,22 @@ struct ChannelSlot {
     /// 128 KB of memory traffic per call (8192 × 16 bytes).
     ///
     /// Phase is continuous across calls. Output appended to nbAccum.
-    void pushWideband(std::span<const cf32> wbSamples) {
+    void pushWideband(std::span<const cf32> wbSamples, std::size_t gapSamples = 0) {
+        if (wbSamples.empty() && gapSamples > 0) {
+            // Overflow: no IQ data but time advanced. Insert zeros to preserve
+            // symbol boundary alignment. The zeros produce noise in the
+            // narrowband output but prevent timing shifts that corrupt dechirp.
+            if (_gapBuf.size() < gapSamples) {
+                _gapBuf.assign(gapSamples, cf32{0.f, 0.f});
+            }
+            decimator.processWithNcoBatch(
+                std::span<const cf32>(_gapBuf.data(), gapSamples),
+                nbAccum, ncoRot, ncoStep);
+            return;
+        }
         decimator.processWithNcoBatch(wbSamples, nbAccum, ncoRot, ncoStep);
     }
+    std::vector<cf32> _gapBuf;  // pre-allocated zero buffer for overflow gap filling
 };
 
 // ─── WidebandDecoder block (M3) ─────────────────────────────────────────────
@@ -191,6 +204,8 @@ struct WidebandDecoder
     uint32_t                  _sweepCount{0};
     uint32_t                  _overflowsInSweep{0};
     uint32_t                  _overflowLogSuppress{0}; // suppress overflow log for N calls after first
+    uint32_t                  _zeroCalls{0};   // processBulk calls with 0 input samples (per sweep)
+    uint32_t                  _totalCalls{0};  // total processBulk calls (per sweep)
 
     // Hot channel tracking
     std::vector<uint32_t>     _hotChannels;
@@ -320,6 +335,8 @@ struct WidebandDecoder
         gr::OutputSpanLike auto& output) noexcept
     {
         auto in_span = std::span(input);
+        ++_totalCalls;
+        if (in_span.empty()) ++_zeroCalls;
 
         // 1. Count overflow tags (informational — do NOT deactivate slots).
         //    At 16 MS/s the B210 produces ~1 overflow per processBulk call.
@@ -345,10 +362,13 @@ struct WidebandDecoder
         }
         auto clean_span = std::span<const cf32>(_dcBuf);
 
-        // 3. Push DC-removed input through all active ChannelSlots
+        // 3. Push DC-removed input through all active ChannelSlots.
+        //    On overflow (0 input samples), insert zeros to preserve timing.
+        constexpr std::size_t kExpectedChunk = 8192;
+        const std::size_t gapSize = in_span.empty() ? kExpectedChunk : 0;
         for (auto& slot : _slots) {
             if (slot.state == ChannelSlot::State::Active) {
-                slot.pushWideband(clean_span);
+                slot.pushWideband(clean_span, gapSize);
             }
         }
 
@@ -370,6 +390,8 @@ struct WidebandDecoder
             _channelEnergy.assign(_nChannels, 0.f);
             _fftBinMag.assign(l1_fft_size, 0.f);
             _snapshotCount = 0;
+            _zeroCalls = 0;
+            _totalCalls = 0;
             uint32_t sweepOverflows = _overflowsInSweep;
             bool wasTainted = (sweepOverflows > overflow_max_per_sweep);
             _overflowsInSweep = 0;
@@ -395,6 +417,8 @@ struct WidebandDecoder
                 evt["sweep"]       = _sweepCount;
                 evt["tainted"]     = wasTainted;
                 evt["overflows"]   = sweepOverflows;
+                evt["zero_calls"]  = _zeroCalls;
+                evt["total_calls"] = _totalCalls;
                 evt["duration_ms"] = durMs;
                 evt["n_snapshots"] = static_cast<uint32_t>(l1_snapshots);
                 evt["n_hot"]       = static_cast<uint32_t>(_hotChannels.size());
