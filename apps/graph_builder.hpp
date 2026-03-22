@@ -469,8 +469,8 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         {"sync_word", dc.sync_word},
         {"preamble_len", cfg.preamble},
         {"debug", cfg.debug},
-        {"l1_interval", uint32_t{64}},    // L1 FFT every 64 calls = 33ms
-        {"l1_snapshots", uint32_t{16}},   // 16 snapshots = 524ms sweep (stable detection)
+        {"l1_interval", uint32_t{16}},    // L1 FFT every 16 calls = 8ms
+        {"l1_snapshots", uint32_t{4}},    // 4 snapshots = 33ms sweep (catches brief ADVERTs)
     };
     if (!cfg.decode_sfs_str.empty()) {
         wb_props["decode_sfs_str"] = cfg.decode_sfs_str;

@@ -48,6 +48,7 @@ struct ChannelSlot {
     double   sampleRate{0.0};    // wideband sample rate (Hz)
     uint32_t osFactor{1};        // decimation factor = sample_rate / bw
     uint32_t channelIdx{0};      // L1 channel index that activated this slot
+    uint32_t activeSweeps{0};    // sweeps since activation (for min hold time)
 
     // Phase-continuous NCO state
     // Double-precision phaseInc kept for computing the single-precision step phasor
@@ -73,8 +74,9 @@ struct ChannelSlot {
                   double sample_rate, uint32_t os_factor, uint32_t ch_idx = 0,
                   uint32_t bw = 62500, uint16_t sync = 0x12, uint16_t preamble = 8,
                   std::span<const uint8_t> sfs = {}) {
-        state       = State::Active;
-        channelFreq = channel_freq;
+        state        = State::Active;
+        activeSweeps = 0;
+        channelFreq  = channel_freq;
         centerFreq  = center_freq;
         sampleRate  = sample_rate;
         osFactor    = os_factor;
@@ -643,17 +645,28 @@ struct WidebandDecoder
     // --- Channel pool management ---
 
     void updateActiveChannels() noexcept {
-        // 1. Deactivate slots for channels no longer hot
+        // 1. Deactivate slots for channels no longer hot (with minimum hold time)
+        constexpr uint32_t kMinHoldSweeps = 20;  // ~660ms at 33ms/sweep, ~10s at 524ms
         for (uint32_t ch = 0; ch < _nChannels; ++ch) {
             if (_activeChannelMap[ch].empty()) continue;
-            // Keep slot alive if this channel OR an adjacent channel is hot.
-            // This prevents slot churn when the DC spur / signal peak jitters
-            // between neighboring L1 bins across sweeps.
+            // Increment sweep counter for all active slots on this channel
+            for (uint32_t slotIdx : _activeChannelMap[ch]) {
+                ++_slots[slotIdx].activeSweeps;
+            }
+            // Keep slot alive if nearby channel is hot OR minimum hold not reached
+            constexpr uint32_t kSlotKeepRadius = 2;
             bool nearbyHot = false;
             for (uint32_t h : _hotChannels) {
-                if (h >= ch - 1 && h <= ch + 1) { nearbyHot = true; break; }
+                uint32_t dist = (h > ch) ? (h - ch) : (ch - h);
+                if (dist <= kSlotKeepRadius) { nearbyHot = true; break; }
             }
-            if (!nearbyHot) {
+            bool holdActive = false;
+            for (uint32_t slotIdx : _activeChannelMap[ch]) {
+                if (_slots[slotIdx].activeSweeps < kMinHoldSweeps) {
+                    holdActive = true; break;
+                }
+            }
+            if (!nearbyHot && !holdActive) {
                 for (uint32_t slotIdx : _activeChannelMap[ch]) {
                     if (_telemetry) {
                         gr::property_map evt;
@@ -675,10 +688,12 @@ struct WidebandDecoder
         for (uint32_t ch : _hotChannels) {
             if (ch >= _nChannels) continue;
             for (uint32_t bw : _decodeBws) {
-                // Check if this or adjacent channel already has an active slot at this BW
+                // Check if a nearby channel already has an active slot at this BW
+                constexpr uint32_t kSlotActivateRadius = 2;
                 bool alreadyActive = false;
-                for (uint32_t adj = (ch > 0 ? ch - 1 : 0);
-                     adj <= std::min(ch + 1, _nChannels - 1); ++adj) {
+                uint32_t lo = (ch > kSlotActivateRadius) ? (ch - kSlotActivateRadius) : 0;
+                uint32_t hi = std::min(ch + kSlotActivateRadius, _nChannels - 1);
+                for (uint32_t adj = lo; adj <= hi; ++adj) {
                     for (uint32_t slotIdx : _activeChannelMap[adj]) {
                         if (_slots[slotIdx].decodeBw == bw) { alreadyActive = true; break; }
                     }
@@ -695,7 +710,7 @@ struct WidebandDecoder
                     break;
                 }
 
-                double freq = peakBinFreq(ch);
+                double freq = channelCenterFreq(ch);
                 uint32_t os = static_cast<uint32_t>(
                     std::round(static_cast<double>(sample_rate) / static_cast<double>(bw)));
 
