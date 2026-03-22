@@ -33,7 +33,7 @@ using cf32 = std::complex<float>;
 
 struct DCBlocker {
     float _sampleRate{0.f};
-    float _cutoffHz{1000.f};
+    float _cutoffHz{2000.f};
     bool  _initialised{false};
 
     // double precision avoids float32 coefficient quantisation at low fc/fs ratios

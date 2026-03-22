@@ -191,7 +191,7 @@ struct WidebandDecoder
     float       min_snr_db{-10.0f};        // minimum SNR for decode
     uint32_t    max_symbols{600};          // max symbols per frame
     uint32_t    overflow_max_per_sweep{5}; // overflows tolerated per sweep before tainting
-    float       dc_blocker_cutoff{1000.f};  // DC blocker cutoff (Hz)
+    float       dc_blocker_cutoff{2000.f};  // DC blocker cutoff (Hz)
     bool        debug{false};              // verbose logging
 
     GR_MAKE_REFLECTABLE(WidebandDecoder, in, out, msg_out,

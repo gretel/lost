@@ -48,7 +48,7 @@ tx_gain    = 75
 # lo_offset        = 0     # LO offset tuning (Hz), 0 = disabled
 # dc_offset_auto   = true  # hardware DC offset correction (AD9361)
 dc_blocker       = true    # DSP DC blocker (2nd-order Butterworth HP)
-dc_blocker_cutoff = 1000   # DC blocker cutoff frequency (Hz)
+dc_blocker_cutoff = 2000   # DC blocker cutoff frequency (Hz)
 
 # [radio_433]
 # freq       = 433650000

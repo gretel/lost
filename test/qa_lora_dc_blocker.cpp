@@ -39,7 +39,7 @@ using cf32 = std::complex<float>;
 constexpr float kSampleRate = 250'000.f;  // narrowband rate
 constexpr float kCutoffHz   = 10.f;
 
-// settling time: ~5 time constants for a 2nd-order Butterworth
+// settling time for 2nd-order Butterworth HP
 // τ = 1/(2π·fc), need ~5τ samples at sample rate fs
 constexpr std::size_t settlingsamples(float fs, float fc) {
     return static_cast<std::size_t>(5.0 * fs / (2.0 * std::numbers::pi * static_cast<double>(fc)));
