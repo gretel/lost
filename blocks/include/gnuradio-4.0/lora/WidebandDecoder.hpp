@@ -27,6 +27,7 @@
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/Message.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
+#include <gnuradio-4.0/lora/algorithm/DCBlocker.hpp>
 #include <gnuradio-4.0/lora/algorithm/HalfBandDecimator.hpp>
 #include <gnuradio-4.0/lora/algorithm/RingBuffer.hpp>
 #include <gnuradio-4.0/lora/algorithm/SfLane.hpp>
@@ -190,6 +191,7 @@ struct WidebandDecoder
     float       min_snr_db{-10.0f};        // minimum SNR for decode
     uint32_t    max_symbols{600};          // max symbols per frame
     uint32_t    overflow_max_per_sweep{5}; // overflows tolerated per sweep before tainting
+    float       dc_blocker_cutoff{10.f};   // DC blocker cutoff (Hz)
     bool        debug{false};              // verbose logging
 
     GR_MAKE_REFLECTABLE(WidebandDecoder, in, out, msg_out,
@@ -197,7 +199,7 @@ struct WidebandDecoder
         decode_sfs_str, min_ratio,
         buffer_ms, max_channels, l1_interval, l1_snapshots, l1_fft_size,
         sync_word, preamble_len, energy_thresh, min_snr_db, max_symbols,
-        overflow_max_per_sweep, debug);
+        overflow_max_per_sweep, dc_blocker_cutoff, debug);
 
     // --- internal state ---
 
@@ -223,10 +225,8 @@ struct WidebandDecoder
     std::vector<uint8_t>                 _decodeSfs;   // SF range (empty = all SF7-12)
     std::vector<std::vector<uint32_t>>   _activeChannelMap;  // channelIdx → list of slotIdx
 
-    // DC removal (IIR high-pass: y[n] = x[n] - x[n-1] + alpha * y[n-1])
-    cf32                      _dc_prev_in{0.f, 0.f};
-    cf32                      _dc_prev_out{0.f, 0.f};
-    static constexpr float    _dc_alpha{0.999f};
+    // DC removal (2nd-order Butterworth high-pass, double-precision coefficients)
+    DCBlocker                 _dc;
     std::vector<cf32>         _dcBuf;   // persistent buffer (avoids per-call heap alloc)
     std::vector<cf32>         _fftBuf;  // persistent L1 FFT buffer (avoids ~30/s heap allocs)
     std::vector<float>        _fftBinMag; // per-bin |FFT|^2 from last snapshot (for peak-bin NCO refinement)
@@ -318,6 +318,7 @@ struct WidebandDecoder
         }
         _fft = gr::algorithm::FFT<cf32>{};
 
+        _dc.init(sample_rate, dc_blocker_cutoff);
         _dcBuf.reserve(8192);           // typical chunk size
         _fftBuf.reserve(l1_fft_size);   // persistent L1 FFT buffer
         _fftBinMag.assign(l1_fft_size, 0.f);
@@ -370,16 +371,9 @@ struct WidebandDecoder
             }
         }
 
-        // 2. DC removal (IIR high-pass) — needed when signal is at/near center
-        //    frequency where B210 DC spur corrupts the channel.
+        // 2. DC removal (2nd-order Butterworth high-pass) — removes B210 DC spur
         _dcBuf.resize(in_span.size());
-        for (std::size_t i = 0; i < in_span.size(); ++i) {
-            cf32 s = in_span[i];
-            cf32 out_val = s - _dc_prev_in + cf32(_dc_alpha, 0.f) * _dc_prev_out;
-            _dc_prev_in  = s;
-            _dc_prev_out = out_val;
-            _dcBuf[i] = out_val;
-        }
+        _dc.processBlock(in_span, std::span<cf32>(_dcBuf));
         auto clean_span = std::span<const cf32>(_dcBuf);
 
         // 3. Push DC-removed input through all active ChannelSlots.
