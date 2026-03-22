@@ -18,7 +18,13 @@
 
 #include <boost/ut.hpp>
 
+#include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/Graph.hpp>
+#include <gnuradio-4.0/Scheduler.hpp>
+#include <gnuradio-4.0/testing/TagMonitors.hpp>
+
 #include <gnuradio-4.0/lora/algorithm/DCBlocker.hpp>
+#include <gnuradio-4.0/lora/DCBlockerBlock.hpp>
 
 using namespace boost::ut;
 using namespace boost::ut::literals;
@@ -249,6 +255,138 @@ const suite<"DCBlocker algorithm"> dcBlockerTests = [] {
         float lossDb = 20.f * std::log10(rms(std::span(output).subspan(settle)) / rms(std::span(input).subspan(settle)));
         std::fprintf(stderr, "16 MS/s, 1 kHz loss: %.3f dB (settle=%zu, N=%zu)\n", lossDb, settle, N);
         expect(lossDb > -0.1f) << "1 kHz at 16 MS/s should pass clean";
+    };
+};
+
+const suite<"DCBlockerBlock GR4"> dcBlockerBlockTests = [] {
+    using namespace gr;
+    using BulkSrc  = testing::TagSource<cf32, testing::ProcessFunction::USE_PROCESS_BULK>;
+    using BulkSink = testing::TagSink<cf32, testing::ProcessFunction::USE_PROCESS_BULK>;
+
+    "graph: DC removed, signal preserved"_test = [] {
+        constexpr float fs     = 250'000.f;
+        constexpr float cutoff = 10.f;
+
+        const std::size_t settle = settlingsamples(fs, cutoff);
+        const std::size_t N      = settle + 25'000;
+
+        auto input = generateTone(500.f, fs, N, 0.5f);
+        for (auto& s : input) {
+            s += cf32{0.3f, -0.2f};
+        }
+
+        Graph graph;
+        auto& src  = graph.emplaceBlock<BulkSrc>({
+            {"n_samples_max", static_cast<gr::Size_t>(N)},
+            {"repeat_tags", false}});
+        src.values = input;
+
+        auto& dc   = graph.emplaceBlock<lora::DCBlockerBlock>({
+            {"dc_blocker_enabled", true},
+            {"dc_blocker_cutoff", cutoff},
+            {"sample_rate", fs}});
+        auto& sink = graph.emplaceBlock<BulkSink>({{"log_samples", true}});
+
+        (void)graph.connect<"out", "in">(src, dc);
+        (void)graph.connect<"out", "in">(dc, sink);
+
+        scheduler::Simple sched;
+        expect(sched.exchange(std::move(graph)).has_value());
+        sched.runAndWait();
+
+        auto result = std::vector<cf32>(sink._samples.begin(), sink._samples.end());
+        expect(result.size() == N) << "expected" << N << "samples, got" << result.size();
+
+        auto outSteady = std::span(result).subspan(settle);
+        cf32 mean{0.f, 0.f};
+        for (const auto& s : outSteady) {
+            mean += s;
+        }
+        mean /= static_cast<float>(outSteady.size());
+
+        std::fprintf(stderr, "graph residual DC: I=%.6f Q=%.6f\n", mean.real(), mean.imag());
+        expect(std::abs(mean.real()) < 0.005f) << "residual DC I should be near zero";
+        expect(std::abs(mean.imag()) < 0.005f) << "residual DC Q should be near zero";
+
+        float outRms = rms(outSteady);
+        expect(outRms > 0.3f) << "signal should be preserved";
+    };
+
+    "graph: disabled is passthrough"_test = [] {
+        constexpr std::size_t N = 1'000;
+
+        std::vector<cf32> input(N);
+        for (std::size_t i = 0; i < N; ++i) {
+            input[i] = cf32{static_cast<float>(i) * 0.01f, static_cast<float>(i) * -0.01f};
+        }
+
+        Graph graph;
+        auto& src  = graph.emplaceBlock<BulkSrc>({
+            {"n_samples_max", static_cast<gr::Size_t>(N)},
+            {"repeat_tags", false}});
+        src.values = input;
+
+        auto& dc   = graph.emplaceBlock<lora::DCBlockerBlock>({
+            {"dc_blocker_enabled", false},
+            {"sample_rate", 250'000.f}});
+        auto& sink = graph.emplaceBlock<BulkSink>({{"log_samples", true}});
+
+        (void)graph.connect<"out", "in">(src, dc);
+        (void)graph.connect<"out", "in">(dc, sink);
+
+        scheduler::Simple sched;
+        expect(sched.exchange(std::move(graph)).has_value());
+        sched.runAndWait();
+
+        auto result = std::vector<cf32>(sink._samples.begin(), sink._samples.end());
+        expect(result.size() == N);
+
+        for (std::size_t i = 0; i < N; ++i) {
+            expect(result[i] == input[i]) << "sample" << i << "should pass through unchanged";
+        }
+    };
+
+    "graph: tags forwarded"_test = [] {
+        constexpr std::size_t N = 500;
+
+        std::vector<cf32> input(N, cf32{0.1f, 0.2f});
+
+        Graph graph;
+        auto& src  = graph.emplaceBlock<BulkSrc>({
+            {"n_samples_max", static_cast<gr::Size_t>(N)},
+            {"repeat_tags", false}});
+        src.values = input;
+        src._tags = {{0, {{"test_key", pmt::Value(int64_t{42})}, {"sf", pmt::Value(int64_t{8})}}}};
+
+        auto& dc   = graph.emplaceBlock<lora::DCBlockerBlock>({
+            {"dc_blocker_enabled", true},
+            {"dc_blocker_cutoff", 10.f},
+            {"sample_rate", 250'000.f}});
+        auto& sink = graph.emplaceBlock<BulkSink>({
+            {"log_samples", true}, {"log_tags", true}});
+
+        (void)graph.connect<"out", "in">(src, dc);
+        (void)graph.connect<"out", "in">(dc, sink);
+
+        scheduler::Simple sched;
+        expect(sched.exchange(std::move(graph)).has_value());
+        sched.runAndWait();
+
+        bool foundTestKey = false;
+        bool foundSf      = false;
+        for (const auto& tag : sink._tags) {
+            for (const auto& [key, val] : tag.map) {
+                if (std::string(key) == "test_key") {
+                    foundTestKey = true;
+                    expect(val.value_or<int64_t>(0) == 42) << "test_key value should be 42";
+                }
+                if (std::string(key) == "sf") {
+                    foundSf = true;
+                }
+            }
+        }
+        expect(foundTestKey) << "custom tag 'test_key' should be forwarded through DCBlockerBlock";
+        expect(foundSf) << "custom tag 'sf' should be forwarded through DCBlockerBlock";
     };
 };
 
