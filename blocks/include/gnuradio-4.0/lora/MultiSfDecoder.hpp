@@ -11,6 +11,7 @@
 #include <gnuradio-4.0/Message.hpp>
 #include <gnuradio-4.0/lora/algorithm/SfLane.hpp>
 #include <gnuradio-4.0/lora/algorithm/SpectrumTap.hpp>
+#include <gnuradio-4.0/lora/algorithm/Telemetry.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
 namespace gr::lora {
@@ -57,6 +58,7 @@ struct MultiSfDecoder
     bool     _noise_ema_init{false};
     std::atomic<bool>* _channel_busy{nullptr};  // LBT: set by any lane in SYNC/OUTPUT
     std::shared_ptr<SpectrumState> _spectrum_state;  // spectrum tap for waterfall display
+    std::function<void(const gr::property_map&)> _telemetry;  // telemetry callback
 
     /// Set external channel-busy flag for listen-before-talk.
     void set_channel_busy_flag(std::atomic<bool>* flag) { _channel_busy = flag; }
@@ -302,6 +304,14 @@ struct MultiSfDecoder
             lane.symbol_cnt = 0;
             lane.cfo_frac_sto_frac_est = false;
             lane.k_hat = multisf_detail::most_frequent(lane.preamb_up_vals);
+
+            if (_telemetry) {
+                gr::property_map evt;
+                evt["type"] = std::pmr::string("multisf_detect");
+                evt["sf"]   = static_cast<uint32_t>(lane.sf);
+                evt["bin"]  = static_cast<uint32_t>(lane.bin_idx_new);
+                _telemetry(evt);
+            }
 
             if (debug) {
                 log_ts("debug", "MultiSf", "SF%u DETECT->SYNC: k_hat=%d",
@@ -573,6 +583,16 @@ struct MultiSfDecoder
             lane.symb_numb = 0;
             lane.cr = 4;
 
+            if (_telemetry) {
+                gr::property_map evt;
+                evt["type"]     = std::pmr::string("multisf_sync");
+                evt["sf"]       = static_cast<uint32_t>(lane.sf);
+                evt["cfo_int"]  = static_cast<int32_t>(lane.cfo_int);
+                evt["cfo_frac"] = lane.cfo_frac;
+                evt["snr_db"]   = static_cast<double>(lane.snr_db);
+                _telemetry(evt);
+            }
+
             // Update sto_frac to payload beginning
             lane.sto_frac += lane.sfo_hat * 4.25f;
             lane.sfo_cum = ((lane.sto_frac * static_cast<float>(os_factor))
@@ -744,6 +764,17 @@ struct MultiSfDecoder
         msg_data["crc_valid"]     = gr::pmt::Value(frame.crc_valid);
         msg_data["is_downchirp"]  = gr::pmt::Value(false);
         gr::sendMessage<gr::message::Command::Notify>(msg_out, "", "payload", msg_data);
+
+        if (_telemetry) {
+            gr::property_map evt;
+            evt["type"]   = std::pmr::string("multisf_frame");
+            evt["sf"]     = static_cast<uint32_t>(lane.sf);
+            evt["crc_ok"] = frame.crc_valid;
+            evt["len"]    = static_cast<uint32_t>(frame.pay_len);
+            evt["cr"]     = static_cast<uint32_t>(frame.cr);
+            evt["snr_db"] = static_cast<double>(lane.snr_db);
+            _telemetry(evt);
+        }
 
         if (debug) {
             log_ts("info ", "MultiSf",

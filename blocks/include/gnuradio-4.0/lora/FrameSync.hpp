@@ -17,6 +17,7 @@
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/algorithm/SpectrumTap.hpp>
+#include <gnuradio-4.0/lora/algorithm/Telemetry.hpp>
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
@@ -174,6 +175,9 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
     // Spectrum tap: shared state for waterfall display (optional, set by app)
     std::shared_ptr<SpectrumState> _spectrum_state;
+
+    // Telemetry callback (optional, set by app)
+    std::function<void(const gr::property_map&)> _telemetry;
 
     // Periodic noise floor logging (debug mode)
     uint64_t           _nf_sample_cnt   = 0;       ///< samples processed since last log
@@ -675,6 +679,14 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 _cfo_frac_sto_frac_est = false;
                 _k_hat = detail::most_frequent(_preamb_up_vals);
 
+                if (_telemetry) {
+                    gr::property_map evt;
+                    evt["type"] = std::pmr::string("framesync_detect");
+                    evt["sf"]   = static_cast<uint32_t>(sf);
+                    evt["bin"]  = static_cast<uint32_t>(_bin_idx_new);
+                    _telemetry(evt);
+                }
+
                 if (debug) {
                     if (rx_channel >= 0)
                         log_ts("debug", "FrameSync", "DETECT->SYNC: k_hat=%d  ch=%d", _k_hat, rx_channel);
@@ -979,6 +991,17 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                     break;
                 }
                 _state = OUTPUT;
+
+                if (_telemetry) {
+                    gr::property_map evt;
+                    evt["type"]     = std::pmr::string("framesync_sync");
+                    evt["sf"]       = static_cast<uint32_t>(sf);
+                    evt["cfo_int"]  = static_cast<int32_t>(_cfo_int);
+                    evt["cfo_frac"] = static_cast<double>(_cfo_frac);
+                    evt["snr_db"]   = static_cast<double>(_snr_db);
+                    _telemetry(evt);
+                }
+
                 if (debug) {
                     if (rx_channel >= 0)
                         log_ts("info ", "FrameSync",

@@ -55,7 +55,8 @@ inline gr::lora::MultiSfDecoder& add_multisf_chain(
         gr::Graph& graph, const TrxConfig& cfg,
         int32_t rx_channel, const DecodeConfig& dc,
         std::function<void(const std::vector<uint8_t>&, bool)> callback,
-        std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr) {
+        std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
+        std::function<void(const gr::property_map&)> telemetry_cb = {}) {
     auto os = static_cast<uint8_t>(cfg.rate / static_cast<float>(cfg.bw));
 
     auto& decoder = graph.emplaceBlock<gr::lora::MultiSfDecoder>();
@@ -69,6 +70,9 @@ inline gr::lora::MultiSfDecoder& add_multisf_chain(
     decoder.sf_max       = 12;
     decoder.debug        = cfg.debug;
     decoder._spectrum_state = std::move(spectrum);
+    if (telemetry_cb) {
+        decoder._telemetry = telemetry_cb;
+    }
 
     // Apply block-level overrides from config
     if (auto it = dc.block_overrides.find("energy_thresh"); it != dc.block_overrides.end()) {
@@ -110,7 +114,8 @@ inline std::atomic<uint64_t>* build_rx_graph(
         gr::Graph& graph, const TrxConfig& cfg,
         std::function<void(const std::vector<uint8_t>&, bool)> callback,
         std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
-        std::atomic<bool>* channel_busy = nullptr) {
+        std::atomic<bool>* channel_busy = nullptr,
+        std::function<void(const gr::property_map&)> telemetry_cb = {}) {
     auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
     using std::string_literals::operator""s;
 
@@ -141,7 +146,7 @@ inline std::atomic<uint64_t>* build_rx_graph(
 
                 TrxConfig bw_cfg = cfg;
                 bw_cfg.bw = bws[0];
-                auto& decoder = add_multisf_chain(graph, bw_cfg, rx_ch, dc, callback, spec);
+                auto& decoder = add_multisf_chain(graph, bw_cfg, rx_ch, dc, callback, spec, telemetry_cb);
 
                 if (firstRadio && channel_busy != nullptr) {
                     decoder.set_channel_busy_flag(channel_busy);
@@ -166,7 +171,7 @@ inline std::atomic<uint64_t>* build_rx_graph(
 
                     TrxConfig bw_cfg = cfg;
                     bw_cfg.bw = bws[b];
-                    auto& decoder = add_multisf_chain(graph, bw_cfg, rx_ch, dc, callback, spec);
+                    auto& decoder = add_multisf_chain(graph, bw_cfg, rx_ch, dc, callback, spec, telemetry_cb);
 
                     if (firstRadio && b == 0 && channel_busy != nullptr) {
                         decoder.set_channel_busy_flag(channel_busy);

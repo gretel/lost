@@ -639,8 +639,11 @@ int main(int argc, char* argv[]) {
         overflow_ptr = build_wideband_graph(rx_graph, cfg, frame_callback,
                                             std::move(wb_telemetry));
     } else {
+        auto rx_telemetry = [&udp](const gr::property_map& evt) {
+            udp.broadcast_all(gr::lora::telemetry::encode(evt));
+        };
         overflow_ptr = build_rx_graph(rx_graph, cfg, frame_callback, spectrum,
-                                      &channel_busy);
+                                       &channel_busy, std::move(rx_telemetry));
     }
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> rx_sched;
