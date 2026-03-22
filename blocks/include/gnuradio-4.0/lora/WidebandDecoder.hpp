@@ -368,6 +368,7 @@ struct WidebandDecoder
             findHotChannels();
             updateActiveChannels();
             _channelEnergy.assign(_nChannels, 0.f);
+            _fftBinMag.assign(l1_fft_size, 0.f);
             _snapshotCount = 0;
             uint32_t sweepOverflows = _overflowsInSweep;
             bool wasTainted = (sweepOverflows > overflow_max_per_sweep);
@@ -552,11 +553,13 @@ struct WidebandDecoder
         const auto  startBin = static_cast<uint32_t>(std::round(
             (static_cast<float>(l1_fft_size) - usableBw / binBw) / 2.f));
 
-        _fftBinMag.resize(l1_fft_size);
+        if (_fftBinMag.size() < l1_fft_size) {
+            _fftBinMag.assign(l1_fft_size, 0.f);
+        }
         for (uint32_t i = 0; i < l1_fft_size; ++i) {
             const auto fftIdx = (i + half) % l1_fft_size;
             const auto& s = fftOut[fftIdx];
-            _fftBinMag[i] = s.real() * s.real() + s.imag() * s.imag();
+            _fftBinMag[i] += s.real() * s.real() + s.imag() * s.imag();
         }
 
         // Accumulate into channel bins
