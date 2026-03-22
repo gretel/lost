@@ -204,6 +204,7 @@ struct WidebandDecoder
     static constexpr float    _dc_alpha{0.999f};
     std::vector<cf32>         _dcBuf;   // persistent buffer (avoids per-call heap alloc)
     std::vector<cf32>         _fftBuf;  // persistent L1 FFT buffer (avoids ~30/s heap allocs)
+    std::vector<float>        _fftBinMag; // per-bin |FFT|^2 from last snapshot (for peak-bin NCO refinement)
 
     // Noise floor tracking
     float                     _noise_floor_db{-999.f};
@@ -284,6 +285,7 @@ struct WidebandDecoder
 
         _dcBuf.reserve(8192);           // typical chunk size
         _fftBuf.reserve(l1_fft_size);   // persistent L1 FFT buffer
+        _fftBinMag.assign(l1_fft_size, 0.f);
         _callCount      = 0;
         _snapshotCount  = 0;
         _sweepCount     = 0;
@@ -540,22 +542,29 @@ struct WidebandDecoder
         auto fftOut = _fft.compute(
             std::span<const cf32>(_fftBuf.data(), l1_fft_size));
 
-        // Accumulate |FFT|^2 into channel bins (DC-centered via fftshift)
+        // Compute |FFT|^2 per bin and store for peak-bin NCO refinement.
+        // Bins are in fftshift domain: bin 0 = most negative freq.
         const auto half    = l1_fft_size / 2;
         const float binBw  = sample_rate / static_cast<float>(l1_fft_size);
         const auto binsPerCh = static_cast<uint32_t>(channel_bw / binBw);
 
         const float usableBw = sample_rate * 0.8f;
-        const auto  startBin = static_cast<uint32_t>(
-            (static_cast<float>(l1_fft_size) - usableBw / binBw) / 2.f);
+        const auto  startBin = static_cast<uint32_t>(std::round(
+            (static_cast<float>(l1_fft_size) - usableBw / binBw) / 2.f));
 
+        _fftBinMag.resize(l1_fft_size);
+        for (uint32_t i = 0; i < l1_fft_size; ++i) {
+            const auto fftIdx = (i + half) % l1_fft_size;
+            const auto& s = fftOut[fftIdx];
+            _fftBinMag[i] = s.real() * s.real() + s.imag() * s.imag();
+        }
+
+        // Accumulate into channel bins
         for (uint32_t ch = 0; ch < _nChannels
              && ch * binsPerCh + startBin + binsPerCh <= l1_fft_size; ++ch) {
             float energy = 0.f;
             for (uint32_t b = 0; b < binsPerCh; ++b) {
-                const auto fftIdx = (startBin + ch * binsPerCh + b + half) % l1_fft_size;
-                const auto& s = fftOut[fftIdx];
-                energy += s.real() * s.real() + s.imag() * s.imag();
+                energy += _fftBinMag[startBin + ch * binsPerCh + b];
             }
             _channelEnergy[ch] += energy;
         }
@@ -610,8 +619,14 @@ struct WidebandDecoder
         // 1. Deactivate slots for channels no longer hot
         for (uint32_t ch = 0; ch < _nChannels; ++ch) {
             if (_activeChannelMap[ch].empty()) continue;
-            bool stillHot = std::ranges::find(_hotChannels, ch) != _hotChannels.end();
-            if (!stillHot) {
+            // Keep slot alive if this channel OR an adjacent channel is hot.
+            // This prevents slot churn when the DC spur / signal peak jitters
+            // between neighboring L1 bins across sweeps.
+            bool nearbyHot = false;
+            for (uint32_t h : _hotChannels) {
+                if (h >= ch - 1 && h <= ch + 1) { nearbyHot = true; break; }
+            }
+            if (!nearbyHot) {
                 for (uint32_t slotIdx : _activeChannelMap[ch]) {
                     if (_telemetry) {
                         gr::property_map evt;
@@ -633,9 +648,14 @@ struct WidebandDecoder
         for (uint32_t ch : _hotChannels) {
             if (ch >= _nChannels) continue;
             for (uint32_t bw : _decodeBws) {
+                // Check if this or adjacent channel already has an active slot at this BW
                 bool alreadyActive = false;
-                for (uint32_t slotIdx : _activeChannelMap[ch]) {
-                    if (_slots[slotIdx].decodeBw == bw) { alreadyActive = true; break; }
+                for (uint32_t adj = (ch > 0 ? ch - 1 : 0);
+                     adj <= std::min(ch + 1, _nChannels - 1); ++adj) {
+                    for (uint32_t slotIdx : _activeChannelMap[adj]) {
+                        if (_slots[slotIdx].decodeBw == bw) { alreadyActive = true; break; }
+                    }
+                    if (alreadyActive) break;
                 }
                 if (alreadyActive) continue;
 
@@ -648,7 +668,7 @@ struct WidebandDecoder
                     break;
                 }
 
-                double freq = channelCenterFreq(ch);
+                double freq = peakBinFreq(ch);
                 uint32_t os = static_cast<uint32_t>(
                     std::round(static_cast<double>(sample_rate) / static_cast<double>(bw)));
 
@@ -679,18 +699,41 @@ struct WidebandDecoder
     // --- Helpers ---
 
     [[nodiscard]] double channelCenterFreq(uint32_t ch) const noexcept {
-        // Must match L1 FFT bin mapping exactly.  The L1 FFT assigns channel
-        // ch to bins [startBin + ch*bpC .. startBin + ch*bpC + bpC-1] in the
-        // frequency-ordered (fftshift) domain.  Channel center is at the
-        // middle of that range.
         const double binBw   = static_cast<double>(sample_rate) / l1_fft_size;
         const double usableBins = static_cast<double>(sample_rate) * 0.8 / binBw;
-        const auto   startBin   = static_cast<uint32_t>(
-            (static_cast<double>(l1_fft_size) - usableBins) / 2.0);
+        const auto   startBin   = static_cast<uint32_t>(std::round(
+            (static_cast<double>(l1_fft_size) - usableBins) / 2.0));
         const auto   bpC = static_cast<uint32_t>(static_cast<double>(channel_bw) / binBw);
         const double centerBin = startBin + ch * bpC + bpC / 2.0;
         return static_cast<double>(center_freq)
              + (centerBin - static_cast<double>(l1_fft_size) / 2.0) * binBw;
+    }
+
+    /// Refined frequency from L1 FFT peak bin within a channel's bin range.
+    /// Falls back to channelCenterFreq() if no FFT data is available.
+    [[nodiscard]] double peakBinFreq(uint32_t ch) const noexcept {
+        if (_fftBinMag.size() < l1_fft_size) return channelCenterFreq(ch);
+
+        const double binBw   = static_cast<double>(sample_rate) / l1_fft_size;
+        const double usableBins = static_cast<double>(sample_rate) * 0.8 / binBw;
+        const auto   startBin   = static_cast<uint32_t>(std::round(
+            (static_cast<double>(l1_fft_size) - usableBins) / 2.0));
+        const auto   bpC = static_cast<uint32_t>(static_cast<double>(channel_bw) / binBw);
+
+        // Find peak bin within channel's range
+        uint32_t peakBin = startBin + ch * bpC;
+        float peakVal = 0.f;
+        for (uint32_t b = 0; b < bpC; ++b) {
+            uint32_t bin = startBin + ch * bpC + b;
+            if (bin < l1_fft_size && _fftBinMag[bin] > peakVal) {
+                peakVal = _fftBinMag[bin];
+                peakBin = bin;
+            }
+        }
+
+        return static_cast<double>(center_freq)
+             + (static_cast<double>(peakBin) + 0.5
+                - static_cast<double>(l1_fft_size) / 2.0) * binBw;
     }
 
     // =========================================================================
