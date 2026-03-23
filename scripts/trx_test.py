@@ -44,6 +44,7 @@ class TestConfig:
     adverts: int = 3
     gap_s: float = 5.0
     flush_s: float = 15.0
+    tx_power: int | None = None  # per-config TX power override (dBm)
 
 
 BASIC_CONFIGS = [
@@ -61,6 +62,21 @@ FULL_CONFIGS = [
     TestConfig("SF7/BW125k LoRaWAN", sf=7, bw_hz=125000, freq_mhz=868.100),
     TestConfig("SF8/BW125k mid-band", sf=8, bw_hz=125000, freq_mhz=867.500),
     TestConfig("SF8/BW250k center", sf=8, bw_hz=250000, freq_mhz=866.500),
+]
+
+# DC blocker edge-case matrix: varied SF/BW/power, no duplicates.
+# Tests sync word notch (SF9-12/BW62k), low power, and wider BWs.
+DC_EDGE_CONFIGS = [
+    TestConfig("SF8/BW62k 2dBm", sf=8, bw_hz=62500, freq_mhz=869.618, tx_power=2),
+    TestConfig("SF7/BW125k 2dBm", sf=7, bw_hz=125000, freq_mhz=869.618, tx_power=2),
+    TestConfig("SF12/BW62k 2dBm", sf=12, bw_hz=62500, freq_mhz=869.618, tx_power=2),
+    TestConfig("SF10/BW125k 2dBm", sf=10, bw_hz=125000, freq_mhz=869.618, tx_power=2),
+    TestConfig("SF9/BW62k 2dBm", sf=9, bw_hz=62500, freq_mhz=869.618, tx_power=2),
+    TestConfig("SF7/BW250k 2dBm", sf=7, bw_hz=250000, freq_mhz=869.618, tx_power=2),
+    TestConfig("SF8/BW62k -4dBm", sf=8, bw_hz=62500, freq_mhz=869.618, tx_power=-4),
+    TestConfig("SF12/BW125k -4dBm", sf=12, bw_hz=125000, freq_mhz=869.618, tx_power=-4),
+    TestConfig("SF8/BW125k -9dBm", sf=8, bw_hz=125000, freq_mhz=869.618, tx_power=-9),
+    TestConfig("SF10/BW62k -4dBm", sf=10, bw_hz=62500, freq_mhz=869.618, tx_power=-4),
 ]
 
 
@@ -138,6 +154,11 @@ def run_config(
         print(f"  FAIL: set_radio({cfg.freq_mhz},{bw_khz},{cfg.sf})", flush=True)
         return result
 
+    # Per-config TX power override
+    if cfg.tx_power is not None:
+        if not companion.set_tx_power(cfg.tx_power):
+            print(f"  WARNING: set_tx_power({cfg.tx_power}) failed", flush=True)
+
     # Let pipeline settle after radio change
     time.sleep(2.0)
 
@@ -187,18 +208,20 @@ def run_config(
         if cfo_int is not None:
             result.cfo_ints.append(int(cfo_int))
 
-        result.frame_details.append({
-            "seq": ev.get("seq", 0),
-            "sf": sf,
-            "bw": phy.get("bw", 0),
-            "crc_ok": crc_ok,
-            "snr_db": snr,
-            "channel_freq": channel_freq,
-            "decode_bw": phy.get("decode_bw", 0),
-            "cfo_int": cfo_int,
-            "cfo_frac": phy.get("cfo_frac", None),
-            "sfo_hat": phy.get("sfo_hat", None),
-        })
+        result.frame_details.append(
+            {
+                "seq": ev.get("seq", 0),
+                "sf": sf,
+                "bw": phy.get("bw", 0),
+                "crc_ok": crc_ok,
+                "snr_db": snr,
+                "channel_freq": channel_freq,
+                "decode_bw": phy.get("decode_bw", 0),
+                "cfo_int": cfo_int,
+                "cfo_frac": phy.get("cfo_frac", None),
+                "sfo_hat": phy.get("sfo_hat", None),
+            }
+        )
 
     return result
 
@@ -222,11 +245,7 @@ def print_summary(label: str, results: list[TrxResult]) -> None:
             else "-"
         )
         snr_str = f"{r.best_snr:.1f}" if r.best_snr > -999.0 else "-"
-        cfo_str = (
-            f"{min(r.cfo_ints)}..{max(r.cfo_ints)}"
-            if r.cfo_ints
-            else "-"
-        )
+        cfo_str = f"{min(r.cfo_ints)}..{max(r.cfo_ints)}" if r.cfo_ints else "-"
         print(
             f"{r.config.label:<25} {r.frames:>6} {r.crc_ok:>6} {r.crc_fail:>8} "
             f"{sf_str:>7} {snr_str:>6} {cfo_str:>7}",
@@ -237,7 +256,10 @@ def print_summary(label: str, results: list[TrxResult]) -> None:
     total_frames = sum(r.frames for r in results)
     total_ok = sum(r.crc_ok for r in results)
     total_fail = sum(r.crc_fail for r in results)
-    print(f"\nTotal: {total_frames} frames, {total_ok} CRC OK, {total_fail} CRC FAIL", flush=True)
+    print(
+        f"\nTotal: {total_frames} frames, {total_ok} CRC OK, {total_fail} CRC FAIL",
+        flush=True,
+    )
 
 
 def write_results(path: str, label: str, results: list[TrxResult]) -> None:
@@ -282,7 +304,9 @@ def main() -> None:
     parser.add_argument("--label", default="trx")
     parser.add_argument("--output", default="", help="JSON output path")
     parser.add_argument("--tx-power", type=int, default=2)
-    parser.add_argument("--configs", choices=["basic", "full"], default="basic")
+    parser.add_argument(
+        "--configs", choices=["basic", "full", "dc_edge"], default="basic"
+    )
     parser.add_argument(
         "--serial", default=None, help="direct serial port (skip bridge)"
     )
@@ -292,7 +316,11 @@ def main() -> None:
     args = parser.parse_args()
 
     # Select config matrix
-    configs = BASIC_CONFIGS if args.configs == "basic" else FULL_CONFIGS
+    configs = {
+        "basic": BASIC_CONFIGS,
+        "full": FULL_CONFIGS,
+        "dc_edge": DC_EDGE_CONFIGS,
+    }[args.configs]
 
     # Apply CLI overrides to all configs
     for cfg in configs:
@@ -342,9 +370,10 @@ def main() -> None:
 
     results: list[TrxResult] = []
     for i, cfg in enumerate(configs):
+        pwr = f" {cfg.tx_power}dBm" if cfg.tx_power is not None else ""
         print(
             f"[{i + 1}/{len(configs)}] {cfg.label} "
-            f"(SF{cfg.sf}/BW{cfg.bw_hz / 1000:.0f}k @ {cfg.freq_mhz:.3f} MHz)",
+            f"(SF{cfg.sf}/BW{cfg.bw_hz / 1000:.0f}k @ {cfg.freq_mhz:.3f} MHz{pwr})",
             flush=True,
         )
         result = run_config(cfg, companion, collector)

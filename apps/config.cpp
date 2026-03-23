@@ -210,7 +210,7 @@ static std::map<std::string, RadioCfg> parse_radios(const toml::table& tbl) {
         r.lo_offset        = section["lo_offset"].value_or(0.0);
         r.dc_offset_auto   = section["dc_offset_auto"].value_or(true);
         r.dc_blocker       = section["dc_blocker"].value_or(true);
-        r.dc_blocker_cutoff = static_cast<float>(section["dc_blocker_cutoff"].value_or(10.0));
+        r.dc_blocker_cutoff = static_cast<float>(section["dc_blocker_cutoff"].value_or(2000.0));
         radios[skey] = r;
     }
     return radios;

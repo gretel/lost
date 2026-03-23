@@ -179,7 +179,7 @@ struct ScanSetConfig {
     double       lo_offset{0.0};
     bool         dc_offset_auto{true};
     bool         dc_blocker{true};
-    float        dc_blocker_cutoff{10.f};
+    float        dc_blocker_cutoff{2000.f};
 
     // From [scan.network]
     std::string  udp_listen{"127.0.0.1"};

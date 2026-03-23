@@ -13,8 +13,9 @@
 // Input and output remain cf32; the double-to-float conversion at the I/O
 // boundary is lossless for typical SDR dynamic range.
 //
-// Default cutoff: 10 Hz — narrow enough to preserve LoRa chirps (lowest bin
-// resolution is ~30.5 Hz at SF12/BW125k) while fully rejecting the DC spur.
+// Default cutoff: 2000 Hz — tuned for B210 AD9361 whose DC offset modulates
+// at up to ~1 kHz (AGC loop, temperature tracking). At BW62.5k this notches
+// ~6% of bins; sync word 0x12 bins fall inside for SF9-12.
 //
 // Usage:
 //   DCBlocker dc;

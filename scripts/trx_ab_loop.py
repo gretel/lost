@@ -35,7 +35,9 @@ SCRIPT_DIR = Path(__file__).parent
 def start_process(cmd: list[str], log_path: str) -> subprocess.Popen:
     log_fd = open(log_path, "w")
     return subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=log_fd,
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=log_fd,
         preexec_fn=os.setpgrp,
     )
 
@@ -59,8 +61,14 @@ def stop_process(proc: subprocess.Popen | None) -> None:
 
 def start_bridge(serial: str, port: int, log_path: str) -> subprocess.Popen:
     return start_process(
-        [sys.executable, str(SCRIPT_DIR / "serial_bridge.py"),
-         "--serial", serial, "--tcp-port", str(port)],
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "serial_bridge.py"),
+            "--serial",
+            serial,
+            "--tcp-port",
+            str(port),
+        ],
         log_path,
     )
 
@@ -110,12 +118,33 @@ def wait_for_udp(port: int, timeout: float = 30.0) -> bool:
 # ---- Companion ----
 
 
-def companion_cmd(bridge_port: int, *args: str, timeout: float = 20.0) -> tuple[bool, str]:
+def companion_cmd(
+    bridge_port: int,
+    *args: str,
+    serial: str = "",
+    timeout: float = 20.0,
+) -> tuple[bool, str]:
+    """Send a command to the companion device.
+
+    If *serial* is set, uses direct serial (``-s``); otherwise uses TCP
+    bridge (``-t``).  Direct serial reboots the Heltec V3 on every call
+    (DTR/RTS), so the caller must sleep between invocations.
+    """
     try:
-        r = subprocess.run(
-            ["uvx", "meshcore-cli", "-q", "-t", "127.0.0.1", "-p", str(bridge_port), *args],
-            capture_output=True, text=True, timeout=timeout,
-        )
+        if serial:
+            cmd = ["uvx", "meshcore-cli", "-q", "-s", serial, *args]
+        else:
+            cmd = [
+                "uvx",
+                "meshcore-cli",
+                "-q",
+                "-t",
+                "127.0.0.1",
+                "-p",
+                str(bridge_port),
+                *args,
+            ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode == 0, r.stdout.strip()
     except Exception as e:
         return False, str(e)
@@ -153,7 +182,9 @@ def collect_frames(port: int, duration: float) -> list[dict]:
 def build_trx() -> bool:
     r = subprocess.run(
         ["cmake", "--build", "build", "--", "-j4"],
-        capture_output=True, text=True, timeout=300,
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
     if r.returncode != 0:
         print(f"BUILD FAILED:\n{r.stderr[-500:]}", flush=True)
@@ -162,12 +193,24 @@ def build_trx() -> bool:
 
 def run_unit_tests() -> tuple[bool, str]:
     r = subprocess.run(
-        ["ctest", "--test-dir", "build", "-R", "qa_lora",
-         "--output-on-failure", "--timeout", "60"],
-        capture_output=True, text=True, timeout=300,
+        [
+            "ctest",
+            "--test-dir",
+            "build",
+            "-R",
+            "qa_lora",
+            "--output-on-failure",
+            "--timeout",
+            "60",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
     lines = r.stdout.strip().split("\n")
-    summary = next((l for l in reversed(lines) if "tests passed" in l or "tests failed" in l), "")
+    summary = next(
+        (l for l in reversed(lines) if "tests passed" in l or "tests failed" in l), ""
+    )
     return r.returncode == 0, summary
 
 
@@ -193,10 +236,14 @@ class RoundResult:
 
 
 def print_round(r: RoundResult) -> None:
-    sf_str = ",".join(f"SF{sf}:{c}" for sf, c in sorted(r.sfs.items())) if r.sfs else "-"
+    sf_str = (
+        ",".join(f"SF{sf}:{c}" for sf, c in sorted(r.sfs.items())) if r.sfs else "-"
+    )
     snr_str = f"{r.best_snr:.1f}" if r.best_snr > -999.0 else "-"
     cfo_str = f"{min(r.cfo_ints)}..{max(r.cfo_ints)}" if r.cfo_ints else "-"
-    status = "PASS" if r.crc_ok > 0 else ("BUILD_FAIL" if not r.build_ok else "NO_DECODE")
+    status = (
+        "PASS" if r.crc_ok > 0 else ("BUILD_FAIL" if not r.build_ok else "NO_DECODE")
+    )
     print(
         f"  R{r.round_num}: {status}  frames={r.frames_total} "
         f"crc_ok={r.crc_ok} crc_fail={r.crc_fail} "
@@ -224,7 +271,7 @@ def run_round(
 
     # 1. Build
     if not skip_build:
-        print(f"\n{'='*60}\nRound {round_num}: build", flush=True)
+        print(f"\n{'=' * 60}\nRound {round_num}: build", flush=True)
         if not build_trx():
             result.notes = "build failed"
             result.duration_s = time.monotonic() - t0
@@ -270,7 +317,7 @@ def run_round(
         print(f"Round {round_num}: sending {adverts} ADVERTs", flush=True)
         for i in range(adverts):
             ok, _ = companion_cmd(bridge_port, "advert")
-            print(f"  advert {i+1}/{adverts}: {'ok' if ok else 'FAIL'}", flush=True)
+            print(f"  advert {i + 1}/{adverts}: {'ok' if ok else 'FAIL'}", flush=True)
             if i < adverts - 1:
                 time.sleep(gap_s)
 
@@ -289,10 +336,13 @@ def run_round(
                     crc = "OK" if msg.get("crc_valid") else "FAIL"
                     snr = phy.get("snr_db", 0)
                     freq = phy.get("channel_freq", 0)
-                    freq_str = f" freq={freq/1e6:.3f}" if freq else ""
+                    freq_str = f" freq={freq / 1e6:.3f}" if freq else ""
                     cfo = phy.get("cfo_int")
                     cfo_str = f" cfo={int(cfo)}" if cfo is not None else ""
-                    print(f"    FRAME SF{sf} CRC={crc} SNR={snr:.1f}{freq_str}{cfo_str}", flush=True)
+                    print(
+                        f"    FRAME SF{sf} CRC={crc} SNR={snr:.1f}{freq_str}{cfo_str}",
+                        flush=True,
+                    )
             except TimeoutError:
                 continue
             except Exception:
@@ -348,7 +398,9 @@ def main() -> None:
     os.makedirs("tmp", exist_ok=True)
 
     # Start serial_bridge
-    print(f"Starting serial_bridge on {args.serial} port {args.bridge_port}", flush=True)
+    print(
+        f"Starting serial_bridge on {args.serial} port {args.bridge_port}", flush=True
+    )
     bridge_proc = start_bridge(args.serial, args.bridge_port, "tmp/bridge.log")
     if not wait_for_bridge(args.bridge_port):
         print("ERROR: serial_bridge didn't start (see tmp/bridge.log)", flush=True)
@@ -386,14 +438,17 @@ def main() -> None:
         stop_process(bridge_proc)
 
     # Summary
-    print(f"\n{'='*60}\nA/B TEST SUMMARY\n{'='*60}", flush=True)
+    print(f"\n{'=' * 60}\nA/B TEST SUMMARY\n{'=' * 60}", flush=True)
     for r in results:
         print_round(r)
 
     total_ok = sum(r.crc_ok for r in results)
     total_fail = sum(r.crc_fail for r in results)
     total_frames = sum(r.frames_total for r in results)
-    print(f"\nTotal: {total_frames} frames, {total_ok} CRC OK, {total_fail} CRC FAIL", flush=True)
+    print(
+        f"\nTotal: {total_frames} frames, {total_ok} CRC OK, {total_fail} CRC FAIL",
+        flush=True,
+    )
 
     # JSON
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
