@@ -681,7 +681,12 @@ struct MultiSfDecoder
         }
 
         // Demodulate this symbol (fused: skip intermediate cf32 buffer)
-        uint16_t symbol = lane.demodSymbol(lane.in_down.data());
+        uint16_t symbol;
+        if constexpr (SfLane::kUseSoftDecode) {
+            symbol = lane.demodSymbolSoft(lane.in_down.data());
+        } else {
+            symbol = lane.demodSymbol(lane.in_down.data());
+        }
         lane.symbol_buffer.push_back(symbol);
         lane.total_symbols_rx++;
         lane.output_symb_cnt++;

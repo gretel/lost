@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
+#include <gnuradio-4.0/lora/algorithm/GrayPartition.hpp>
 #include <gnuradio-4.0/lora/algorithm/SfLaneDetail.hpp>
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
@@ -96,6 +97,16 @@ struct SfLane {
     // enough for one symbol period.
     std::vector<std::complex<float>> accum;
 
+    // === Soft decode ===
+    static constexpr bool kUseSoftDecode = true;   // enable soft Hamming decode path
+    static constexpr float kPmrConfidenceThreshold = 4.0f;  // below this, scale LLR by 0.5
+
+    GrayPartition gray_partition;
+    // Per-symbol soft data: one vector of sf_app LLR values per symbol
+    std::vector<std::vector<double>> soft_symbol_llrs;
+    // Per-symbol PMR values (for confidence scaling)
+    std::vector<float> soft_symbol_pmrs;
+
     // === Preamble buffers ===
     std::vector<int>  preamb_up_vals;
     std::vector<std::complex<float>> in_down;          // length N (downsampled input)
@@ -158,6 +169,9 @@ struct SfLane {
         dechirped.resize(N);
 
         accum.clear();
+        if constexpr (kUseSoftDecode) {
+            gray_partition.init(sf);
+        }
         fft = gr::algorithm::FFT<std::complex<float>>{};
         resetToDetect();
     }
@@ -188,6 +202,8 @@ struct SfLane {
         cr = 4;
         pay_len = 0;
         stall_count = 0;
+        soft_symbol_llrs.clear();
+        soft_symbol_pmrs.clear();
     }
 
     // === DSP helper methods (ported from FrameSync) ===
@@ -390,14 +406,155 @@ struct SfLane {
             mod(static_cast<int64_t>(max_idx) - 1, static_cast<int64_t>(N)));
     }
 
+    /// Soft demodulate: returns hard symbol AND stores per-bit LLR + PMR.
+    [[nodiscard]] uint16_t demodSymbolSoft(const std::complex<float>* samples) {
+        auto result = dechirp_soft(samples, cfo_downchirp.data(),
+                                   dechirped.data(), N, fft);
+        auto hard_sym = static_cast<uint16_t>(
+            mod(static_cast<int64_t>(result.bin) - 1, static_cast<int64_t>(N)));
+
+        soft_symbol_pmrs.push_back(result.pmr);
+
+        // Remap mag_sq from FFT bin order to symbol order (subtract 1 mod N)
+        // since symbol s maps to FFT bin (s+1) mod N.
+        std::vector<float> sym_mag_sq(N);
+        for (uint32_t s = 0; s < N; s++) {
+            sym_mag_sq[s] = result.mag_sq[(s + 1) % N];
+        }
+
+        // Compute per-bit LLR for sf bits (we'll reduce to sf_app later in processBlockSoft)
+        std::vector<double> llrs(sf);
+        compute_symbol_llr(sym_mag_sq.data(), N, sf, gray_partition, llrs.data());
+
+        // Apply PMR-based confidence scaling: low PMR → unreliable symbol
+        if (result.pmr < kPmrConfidenceThreshold) {
+            for (auto& l : llrs) l *= 0.5;
+        }
+
+        soft_symbol_llrs.push_back(std::move(llrs));
+        return hard_sym;
+    }
+
     [[nodiscard]] static uint16_t grayMap(uint16_t symbol) {
         return static_cast<uint16_t>(symbol ^ (symbol >> 1));
     }
 
+    /// Compute per-Gray-bit LLR from FFT magnitude-squared vector (max-log approx).
+    /// llr_out must have sf_bits elements. llr_out[k] > 0 means Gray bit k is likely 1.
+    /// k=0 is the LSB of the Gray code.
+    static void compute_symbol_llr(
+            const float* mag_sq, uint32_t M, uint8_t sf_bits,
+            const GrayPartition& gp,
+            double* llr_out) {
+        for (uint8_t k = 0; k < sf_bits; k++) {
+            float max_one = -std::numeric_limits<float>::infinity();
+            for (uint32_t s : gp.ones[k])
+                if (s < M) max_one = std::max(max_one, mag_sq[s]);
+            float max_zero = -std::numeric_limits<float>::infinity();
+            for (uint32_t s : gp.zeros[k])
+                if (s < M) max_zero = std::max(max_zero, mag_sq[s]);
+            llr_out[k] = static_cast<double>(max_one - max_zero);
+        }
+    }
+
+    /// Soft deinterleaver: permutes per-bit LLRs using the same diagonal
+    /// pattern as the hard deinterleaver but operates on LLR values.
+    ///
+    /// Input:  cw_len symbols, each with sf_app LLR values
+    /// Output: sf_app codewords, each with cw_len LLR values
+    [[nodiscard]] static std::vector<std::vector<double>> deinterleave_block_soft(
+            const std::vector<std::vector<double>>& symbol_llrs,
+            uint8_t sf_app, uint8_t cw_len) {
+        // symbol_llrs[i] has sf_app LLRs (one per bit position, k=0 is LSB)
+        // The interleaver maps: inter[i][j] = cw[mod(i-j-1, sf_app)][i]
+        // So the deinterleaver reverses: cw[mod(i-j-1, sf_app)][i] = inter[i][j]
+        //
+        // In our LLR representation, symbol_llrs[i][k] is the LLR for bit k
+        // (Gray bit position, k=0=LSB) of symbol i.
+        //
+        // The hard deinterleaver treats the sf_app-bit symbol as MSB-first
+        // via int2bool(symbol, sf_app), then does:
+        //   deinter[mod(i-j-1, sf_app)][i] = inter_bin[i][j]
+        //
+        // For the soft version, the int2bool expansion maps bit j (in the
+        // sf_app-wide MSB-first vector) to Gray bit position (sf_app-1-j)
+        // (since int2bool puts MSB at index 0).
+        //
+        // So we permute: cw_llr[mod(i-j-1, sf_app)][i] = symbol_llrs[i][sf_app-1-j]
+
+        std::vector<std::vector<double>> cw_llrs(sf_app, std::vector<double>(cw_len, 0.0));
+
+        for (std::size_t i = 0; i < cw_len; i++) {
+            for (std::size_t j = 0; j < sf_app; j++) {
+                auto row = static_cast<std::size_t>(
+                    mod(static_cast<int>(i) - static_cast<int>(j) - 1,
+                        static_cast<int64_t>(sf_app)));
+                // Map from Gray bit position to MSB-first bit position
+                std::size_t gray_bit_k = sf_app - 1 - j;
+                if (i < symbol_llrs.size() && gray_bit_k < symbol_llrs[i].size()) {
+                    cw_llrs[row][i] = symbol_llrs[i][gray_bit_k];
+                }
+            }
+        }
+        return cw_llrs;
+    }
+
+    /// Soft decode path: takes per-symbol LLR vectors, deinterleaves in LLR domain,
+    /// then calls hamming_decode_soft() per codeword.
+    [[nodiscard]] std::vector<uint8_t> processBlockSoft(
+            const std::vector<std::vector<double>>& sym_llrs,
+            uint8_t sf_app, uint8_t cw_len, uint8_t cr_app) {
+        // For LDRO (sf_app < sf): only the lower sf_app bits are meaningful.
+        // Trim each symbol's LLR to sf_app entries (keeping only the lower bits).
+        std::vector<std::vector<double>> trimmed;
+        trimmed.reserve(sym_llrs.size());
+        for (const auto& llrs : sym_llrs) {
+            // llrs has sf entries (k=0=LSB .. k=sf-1=MSB).
+            // Keep only the lower sf_app bits (k=0..sf_app-1).
+            std::vector<double> t(llrs.begin(),
+                                   llrs.begin() + static_cast<std::ptrdiff_t>(
+                                       std::min(static_cast<std::size_t>(sf_app), llrs.size())));
+            trimmed.push_back(std::move(t));
+        }
+
+        auto cw_llrs = deinterleave_block_soft(trimmed, sf_app, cw_len);
+
+        std::vector<uint8_t> nibs;
+        nibs.reserve(cw_llrs.size());
+        for (const auto& cw : cw_llrs) {
+            nibs.push_back(hamming_decode_soft(cw.data(), cr_app));
+        }
+        return nibs;
+    }
+
+    /// Decode one interleaver block. When soft LLRs are available
+    /// (kUseSoftDecode && soft_symbol_llrs not empty), uses the soft path;
+    /// otherwise falls back to hard decode.
+    ///
+    /// Soft LLRs are consumed from the front of soft_symbol_llrs in lock-step
+    /// with symbol_buffer — callers must ensure they are accumulated together
+    /// via demodSymbolSoft().
     [[nodiscard]] std::vector<uint8_t> processBlock(
             const std::vector<uint16_t>& symbols,
             uint8_t sf_app, uint8_t cw_len, uint8_t cr_app,
             bool /*is_header_block*/) {
+        // Soft path: use accumulated LLRs if available
+        if constexpr (kUseSoftDecode) {
+            if (soft_symbol_llrs.size() >= symbols.size()) {
+                std::vector<std::vector<double>> block_llrs(
+                    soft_symbol_llrs.begin(),
+                    soft_symbol_llrs.begin() + static_cast<std::ptrdiff_t>(symbols.size()));
+                // Consume the LLRs and PMRs we just used
+                soft_symbol_llrs.erase(soft_symbol_llrs.begin(),
+                    soft_symbol_llrs.begin() + static_cast<std::ptrdiff_t>(symbols.size()));
+                soft_symbol_pmrs.erase(soft_symbol_pmrs.begin(),
+                    soft_symbol_pmrs.begin() + static_cast<std::ptrdiff_t>(
+                        std::min(symbols.size(), soft_symbol_pmrs.size())));
+                return processBlockSoft(block_llrs, sf_app, cw_len, cr_app);
+            }
+        }
+
+        // Hard decode fallback
         std::vector<uint16_t> gray_syms;
         gray_syms.reserve(symbols.size());
         for (auto s : symbols) gray_syms.push_back(grayMap(s));

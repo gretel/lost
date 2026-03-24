@@ -154,6 +154,42 @@ struct DechirpResult {
     return {max_idx, pmr};
 }
 
+/// Result of soft dechirp: argmax bin, peak-to-mean ratio, and per-bin |Y[s]|².
+struct DechirpSoftResult {
+    uint32_t           bin;      ///< argmax (hard symbol)
+    float              pmr;      ///< peak-to-mean ratio
+    std::vector<float> mag_sq;   ///< |Y[s]|² for all M bins
+};
+
+/// Dechirp + FFT returning both the hard symbol AND per-bin magnitude-squared
+/// for soft-decision decoding (LLR extraction via GrayPartition).
+[[nodiscard]] inline DechirpSoftResult dechirp_soft(
+        const std::complex<float>* samples,
+        const std::complex<float>* ref_chirp,
+        std::complex<float>* scratch, uint32_t N,
+        gr::algorithm::FFT<std::complex<float>>& fft) {
+    for (uint32_t i = 0; i < N; i++)
+        scratch[i] = samples[i] * ref_chirp[i];
+    auto fft_out = fft.compute(std::span<const std::complex<float>>(scratch, N));
+
+    DechirpSoftResult result;
+    result.mag_sq.resize(N);
+    float max_val = 0.f, total = 0.f;
+    uint32_t max_idx = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        float ms = fft_out[i].real() * fft_out[i].real()
+                 + fft_out[i].imag() * fft_out[i].imag();
+        result.mag_sq[i] = ms;
+        float mag = std::sqrt(ms);
+        total += mag;
+        if (ms > max_val) { max_val = ms; max_idx = i; }
+    }
+    result.bin = max_idx;
+    float mean = total / static_cast<float>(N);
+    result.pmr = (mean > 0.f) ? (std::sqrt(max_val) / mean) : 0.f;
+    return result;
+}
+
 }  // namespace gr::lora
 
 #endif  // GNURADIO_LORA_UTILITIES_HPP
