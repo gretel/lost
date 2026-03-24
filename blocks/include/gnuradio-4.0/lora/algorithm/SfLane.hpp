@@ -98,7 +98,7 @@ struct SfLane {
     std::vector<std::complex<float>> accum;
 
     // === Soft decode ===
-    static constexpr bool kUseSoftDecode = true;   // soft Hamming decode via LLR + ML-LUT
+    static constexpr bool kUseSoftDecode = false;  // HW-validated: 0 frames when true (loopback OK). Needs investigation.
     static constexpr float kPmrConfidenceThreshold = 4.0f;  // below this, scale LLR by 0.5
 
     GrayPartition gray_partition;
