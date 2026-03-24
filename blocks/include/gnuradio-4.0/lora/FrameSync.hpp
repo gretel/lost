@@ -326,13 +326,11 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
             }
         }
 
+        // Peak-bin cross-symbol correlation for CFO estimation.
         std::complex<float> four_cum(0.f, 0.f);
         for (uint32_t i = 0; i + 1 < n_syms; i++) {
-            for (int p = -2; p <= 2; p++) {
-                uint32_t bin = (idx_max + static_cast<uint32_t>(p + static_cast<int>(_N))) % _N;
-                four_cum += _fft_val_buf[bin + _N * i]
-                          * std::conj(_fft_val_buf[bin + _N * (i + 1)]);
-            }
+            four_cum += _fft_val_buf[idx_max + _N * i]
+                      * std::conj(_fft_val_buf[idx_max + _N * (i + 1)]);
         }
         float cfo_frac = -std::arg(four_cum) / (2.f * static_cast<float>(std::numbers::pi));
 
@@ -355,9 +353,7 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         if (n_syms == 0) return 0.f;
 
         uint32_t pk = L_STO_int % _N;
-        std::complex<float> Y_sum_m1(0.f, 0.f);
-        std::complex<float> Y_sum_0(0.f, 0.f);
-        std::complex<float> Y_sum_p1(0.f, 0.f);
+        std::complex<double> Y_m1(0.0, 0.0), Y_0(0.0, 0.0), Y_p1(0.0, 0.0);
 
         for (uint32_t i = 0; i < n_syms; i++) {
             detail::complex_multiply(_scratch_N.data(), &_preamble_upchirps[_N * i],
@@ -365,23 +361,27 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
             auto fft_out = _fft.compute(
                 std::span<const std::complex<float>>(_scratch_N.data(), _N));
 
-            Y_sum_m1 += fft_out[(pk + _N - 1) % _N];
-            Y_sum_0  += fft_out[pk];
-            Y_sum_p1 += fft_out[(pk + 1) % _N];
+            auto to_d = [](std::complex<float> c) {
+                return std::complex<double>(static_cast<double>(c.real()),
+                                            static_cast<double>(c.imag()));
+            };
+            Y_m1 += to_d(fft_out[(pk + _N - 1) % _N]);
+            Y_0  += to_d(fft_out[pk]);
+            Y_p1 += to_d(fft_out[(pk + 1) % _N]);
         }
 
         uint32_t M_hat = (_N - L_STO_int % _N) % _N;
-        float phase = 2.f * static_cast<float>(std::numbers::pi)
-                    * static_cast<float>(M_hat) / static_cast<float>(_N);
-        auto e_pos = std::complex<float>(std::cos(phase),  std::sin(phase));
-        auto e_neg = std::complex<float>(std::cos(phase), -std::sin(phase));
+        double phase = 2.0 * std::numbers::pi * static_cast<double>(M_hat)
+                     / static_cast<double>(_N);
+        auto e_pos = std::complex<double>(std::cos(phase),  std::sin(phase));
+        auto e_neg = std::complex<double>(std::cos(phase), -std::sin(phase));
 
-        auto num = e_neg * Y_sum_p1 - e_pos * Y_sum_m1;
-        auto den = 2.f * Y_sum_0 - e_neg * Y_sum_p1 - e_pos * Y_sum_m1;
+        auto num = e_neg * Y_p1 - e_pos * Y_m1;
+        auto den = 2.0 * Y_0 - e_neg * Y_p1 - e_pos * Y_m1;
 
-        if (std::abs(den) < 1e-10f) return 0.f;
+        if (std::abs(den) < 1e-15) return 0.f;
 
-        float lambda_STO = -std::real(num / den);
+        float lambda_STO = static_cast<float>(-std::real(num / den));
         return std::clamp(lambda_STO, -0.5f, 0.5f);
     }
 

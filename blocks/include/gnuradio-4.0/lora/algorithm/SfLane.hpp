@@ -56,8 +56,7 @@ struct SfLane {
     // === FFT engine + scratch ===
     gr::algorithm::FFT<std::complex<float>> fft;
     std::vector<std::complex<float>> scratch_N;    // length N
-    std::vector<std::complex<float>> scratch_2N;   // length 2*N
-    std::vector<float>               scratch_2N_f; // length 2*N
+    std::vector<std::complex<float>> scratch_2N;   // length 2*N (used for net_id decimation)
     std::vector<std::complex<float>> corr_vec;     // preamble correction vector
     std::vector<std::complex<float>> fft_val_buf;  // CFO estimation FFT values
 
@@ -151,7 +150,6 @@ struct SfLane {
         symb_corr.resize(N);
         scratch_N.resize(N);
         scratch_2N.resize(2 * N);
-        scratch_2N_f.resize(2 * N);
         auto max_corr = static_cast<std::size_t>(n_up_req + multisf_detail::kMaxAdditionalUpchirps) * N;
         corr_vec.resize(max_corr);
         fft_val_buf.resize(static_cast<std::size_t>(up_symb_to_use) * N);
@@ -209,7 +207,9 @@ struct SfLane {
         return energy >= energy_thresh;
     }
 
-    float estimate_CFO_frac_Bernier(const std::complex<float>* samples) {
+    /// CFO fractional estimation using peak-bin cross-symbol correlation.
+    /// Stores per-symbol complex FFT values in fft_val_buf for later use.
+    float estimate_CFO_frac(const std::complex<float>* samples) {
         const auto n_syms = up_symb_to_use;
         float k0_best_mag = 0.f;
         uint32_t idx_max = 0;
@@ -236,13 +236,14 @@ struct SfLane {
             }
         }
 
+        // Peak-bin cross-symbol correlation for CFO estimation.
+        // Multi-bin (Xhonneux Eq. 14) introduces systematic phase bias due to
+        // STO-dependent phase structure across chirp dechirp bins — reverted to
+        // single peak bin which is unbiased for any STO.
         std::complex<float> four_cum(0.f, 0.f);
         for (uint32_t i = 0; i + 1 < n_syms; i++) {
-            for (int p = -2; p <= 2; p++) {
-                uint32_t bin = (idx_max + static_cast<uint32_t>(p + static_cast<int>(N))) % N;
-                four_cum += fft_val_buf[bin + N * i]
-                          * std::conj(fft_val_buf[bin + N * (i + 1)]);
-            }
+            four_cum += fft_val_buf[idx_max + N * i]
+                      * std::conj(fft_val_buf[idx_max + N * (i + 1)]);
         }
         float cfo_f = -std::arg(four_cum) / (2.f * static_cast<float>(std::numbers::pi));
 
@@ -258,41 +259,80 @@ struct SfLane {
         return cfo_f;
     }
 
+    /// Backward-compatible alias.
+    float estimate_CFO_frac_Bernier(const std::complex<float>* samples) {
+        return estimate_CFO_frac(samples);
+    }
+
+    /// Fractional STO estimation using Xhonneux Eq. 20 (phase-corrected
+    /// 3-bin interpolation on complex DFT values).
+    ///
+    /// Uses `k_hat` (integer STO from DETECT) to set M̂ = N − k_hat.
+    /// Averages complex bins {i-1, i, i+1} over `up_symb_to_use` preamble
+    /// chirps for noise reduction, then applies the closed-form estimator.
     float estimate_STO_frac() {
         const auto n_syms = up_symb_to_use;
-        std::fill(scratch_2N_f.begin(), scratch_2N_f.end(), 0.f);
+        if (n_syms == 0) return 0.f;
+
+        // Peak bin from preamble detection (integer STO estimate)
+        uint32_t pk = static_cast<uint32_t>(std::max(0, k_hat)) % N;
+
+        // Accumulate complex FFT bins {pk-1, pk, pk+1} across preamble symbols
+        std::complex<double> Y_m1(0.0, 0.0), Y_0(0.0, 0.0), Y_p1(0.0, 0.0);
 
         for (uint32_t i = 0; i < n_syms; i++) {
             multisf_detail::complex_multiply(scratch_N.data(), &preamble_upchirps[N * i],
                                       downchirp.data(), N);
-            std::copy_n(scratch_N.begin(), N, scratch_2N.begin());
-            std::fill(scratch_2N.begin() + N, scratch_2N.end(),
-                      std::complex<float>(0.f, 0.f));
             auto fft_out = fft.compute(
-                std::span<const std::complex<float>>(scratch_2N.data(), 2 * N));
-            for (uint32_t j = 0; j < 2 * N; j++) {
-                scratch_2N_f[j] += fft_out[j].real() * fft_out[j].real()
-                                  + fft_out[j].imag() * fft_out[j].imag();
-            }
+                std::span<const std::complex<float>>(scratch_N.data(), N));
+
+            auto to_d = [](std::complex<float> c) {
+                return std::complex<double>(static_cast<double>(c.real()),
+                                            static_cast<double>(c.imag()));
+            };
+            Y_m1 += to_d(fft_out[(pk + N - 1) % N]);
+            Y_0  += to_d(fft_out[pk]);
+            Y_p1 += to_d(fft_out[(pk + 1) % N]);
         }
 
-        auto max_it = std::max_element(scratch_2N_f.begin(), scratch_2N_f.end());
-        auto k0 = static_cast<uint32_t>(std::distance(scratch_2N_f.begin(), max_it));
+        // Xhonneux Eq. 20: λ̂_STO = −Re[ (e^{−j2πM̂/N}·Y_{i+1} − e^{j2πM̂/N}·Y_{i−1})
+        //                              / (2·Y_i − e^{−j2πM̂/N}·Y_{i+1} − e^{j2πM̂/N}·Y_{i−1}) ]
+        // where M̂ = N − L̂_STO, and L̂_STO = k_hat (integer STO from preamble peak)
+        uint32_t M_hat = (N - pk) % N;
+        double phase = 2.0 * std::numbers::pi * static_cast<double>(M_hat)
+                     / static_cast<double>(N);
+        auto e_pos = std::complex<double>(std::cos(phase),  std::sin(phase));  // exp(+j2πM̂/N)
+        auto e_neg = std::complex<double>(std::cos(phase), -std::sin(phase));  // exp(-j2πM̂/N)
 
-        auto wrap = [N2 = 2LL * static_cast<int64_t>(N)](int64_t i) -> std::size_t {
-            return static_cast<std::size_t>(mod(i, N2));
-        };
-        double Y_1 = static_cast<double>(scratch_2N_f[wrap(static_cast<int64_t>(k0) - 1)]);
-        double Y0  = static_cast<double>(scratch_2N_f[k0]);
-        double Y1  = static_cast<double>(scratch_2N_f[wrap(static_cast<int64_t>(k0) + 1)]);
+        auto num = e_neg * Y_p1 - e_pos * Y_m1;
+        auto den = 2.0 * Y_0 - e_neg * Y_p1 - e_pos * Y_m1;
 
-        double u = 64.0 * N / 406.5506497;
-        double v = u * 2.4674;
-        double wa = (Y1 - Y_1) / (u * (Y1 + Y_1) + v * Y0);
-        double ka = wa * N / std::numbers::pi;
-        double k_residual = std::fmod((k0 + ka) / 2.0, 1.0);
-        float sto_f = static_cast<float>(k_residual - (k_residual > 0.5 ? 1.0 : 0.0));
-        return sto_f;
+        if (std::abs(den) < 1e-15) return 0.f;
+
+        float lambda_STO = static_cast<float>(-std::real(num / den));
+        return std::clamp(lambda_STO, -0.5f, 0.5f);
+    }
+
+    /// Overload accepting explicit integer STO (for re-estimation after CFO_int correction).
+    float estimate_STO_frac(uint32_t L_STO_int) {
+        int saved = k_hat;
+        k_hat = static_cast<int>(L_STO_int);
+        float result = estimate_STO_frac();
+        k_hat = saved;
+        return result;
+    }
+
+    /// Mod-8 sync-word-independent STO refinement.
+    /// Sync word symbols are encoded as `nibble << 3`, so valid values are
+    /// multiples of 8. Any residual mod-8 in the demodulated sync word bins
+    /// reveals STO that wasn't captured by the integer estimate.
+    [[nodiscard]] int mod8_sto_correction(int netid1, int netid2) const {
+        uint32_t r1 = static_cast<uint32_t>(mod(static_cast<int64_t>(netid1), 8LL));
+        uint32_t r2 = static_cast<uint32_t>(mod(static_cast<int64_t>(netid2), 8LL));
+        if (r1 != r2 || r1 == 0) return 0;
+        int delta = static_cast<int>(r1);
+        if (delta > 3) delta -= 8;  // wrap: 4→-4, 5→-3, 6→-2, 7→-1
+        return delta;
     }
 
     struct SnrResult { float snr_db{0.f}; float signal_db{-999.f}; };
