@@ -983,6 +983,20 @@ struct WidebandDecoder
             int netid2 = static_cast<int>(
                 lane.get_symbol_val(&lane.scratch_2N[lane.N], lane.downchirp.data()));
 
+            // Mod-8 sync-word-independent STO correction (gateway_arch §3)
+            {
+                uint32_t r1 = static_cast<uint32_t>(mod(static_cast<int64_t>(netid1), 8LL));
+                uint32_t r2 = static_cast<uint32_t>(mod(static_cast<int64_t>(netid2), 8LL));
+                if (r1 == r2 && r1 != 0) {
+                    int delta = static_cast<int>(r1);
+                    if (delta > 3) delta -= 8;
+                    netid1 = static_cast<int>(mod(
+                        static_cast<int64_t>(netid1) - delta, static_cast<int64_t>(lane.N)));
+                    netid2 = static_cast<int>(mod(
+                        static_cast<int64_t>(netid2) - delta, static_cast<int64_t>(lane.N)));
+                }
+            }
+
             // Sync word verification
             bool sync_ok = false;
             int net_id_off = 0;
