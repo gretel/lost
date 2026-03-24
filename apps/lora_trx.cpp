@@ -334,7 +334,8 @@ gr::property_map cbor_to_phy_props(const gr::lora::cbor::Map& msg, bool& valid) 
             valid = false;
             return {};
         }
-        props["sf"] = static_cast<uint8_t>(sf_val);
+        props["sf_min"] = static_cast<uint8_t>(sf_val);
+        props["sf_max"] = static_cast<uint8_t>(sf_val);
     }
     if (bw_val  > 0) props["bandwidth"]    = static_cast<uint32_t>(bw_val);
     if (sw_val  > 0) props["sync_word"]    = static_cast<uint16_t>(sw_val);
@@ -401,7 +402,7 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
     }
 
     // Update TrxConfig snapshot (affects future TX requests + config broadcast)
-    if (auto it = phy_props.find("sf"); it != phy_props.end()) {
+    if (auto it = phy_props.find("sf_min"); it != phy_props.end()) {
         if (auto* ptr = it->second.get_if<uint8_t>()) cfg.sf = *ptr;
     }
     if (auto it = phy_props.find("bandwidth"); it != phy_props.end()) {
