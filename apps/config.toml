@@ -45,7 +45,7 @@ rx_channel = [1, 2]
 tx_channel = 0
 rx_gain    = 32
 tx_gain    = 75
-# lo_offset        = 0     # LO offset tuning (Hz), 0 = disabled
+lo_offset         = 62500  # Hz — shifts DC spur out of BW62.5k passband
 # dc_offset_auto   = true  # hardware DC offset correction (AD9361)
 dc_blocker       = true    # DSP DC blocker (2nd-order Butterworth HP)
 dc_blocker_cutoff = 2000   # DC blocker cutoff frequency (Hz)
