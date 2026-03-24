@@ -857,6 +857,11 @@ class CompanionDriver:
         ok, _ = self._run("advert")
         return ok
 
+    def send_msg(self, contact_name: str, text: str) -> bool:
+        """Send a TXT_MSG to a contact by name via meshcore-cli."""
+        ok, _ = self._run("msg", contact_name, text)
+        return ok
+
     def get_radio(self) -> str:
         ok, out = self._run("get", "radio")
         return out if ok else ""
@@ -875,3 +880,58 @@ class CompanionDriver:
         """Return the node's contact URI (contains pubkey)."""
         ok, out = self._run("card")
         return out if ok else ""
+
+
+# ---- Runtime reconfiguration ----
+
+#: Valid keys for lora_config messages (see docs/cbor-schemas.md).
+_LORA_CONFIG_KEYS: frozenset[str] = frozenset(
+    ("sf", "bw", "freq", "sync_word", "preamble", "rx_gain", "tx_gain")
+)
+
+
+def send_lora_config(
+    sock: socket.socket,
+    addr: tuple[str, int],
+    timeout: float = 2.0,
+    **kwargs: int | float,
+) -> bool:
+    """Send a ``lora_config`` CBOR message and wait for ack.
+
+    *kwargs* can include: ``sf``, ``bw``, ``freq``, ``sync_word``,
+    ``preamble``, ``rx_gain``, ``tx_gain``.  Only keys with non-zero
+    values are included in the message.
+
+    Returns ``True`` if a ``lora_config_ack`` with ``ok=True`` is
+    received within *timeout* seconds, ``False`` otherwise.
+    """
+    msg: dict[str, Any] = {"type": "lora_config"}
+    for key, value in kwargs.items():
+        if key not in _LORA_CONFIG_KEYS:
+            raise ValueError(f"unknown lora_config key: {key!r}")
+        if value:
+            msg[key] = value
+
+    sock.sendto(cbor2.dumps(msg), addr)
+
+    old_timeout = sock.gettimeout()
+    try:
+        sock.settimeout(timeout)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            sock.settimeout(remaining)
+            try:
+                data, _ = sock.recvfrom(65536)
+            except socket.timeout:
+                return False
+            try:
+                resp = cbor2.loads(data)
+            except Exception:
+                continue
+            if isinstance(resp, dict) and resp.get("type") == "lora_config_ack":
+                return bool(resp.get("ok"))
+    finally:
+        sock.settimeout(old_timeout)

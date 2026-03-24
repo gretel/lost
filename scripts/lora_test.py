@@ -14,8 +14,14 @@ Design principles:
   - Harness manages all processes; do not pre-start serial_bridge or lora_trx
 
 Usage:
+    # USB serial (local companion):
     python3 scripts/lora_test.py decode --matrix full --serial /dev/cu.usbserial-0001
     python3 scripts/lora_test.py scan --matrix basic --serial /dev/cu.usbserial-0001
+
+    # TCP (remote companion via WiFi serial bridge):
+    python3 scripts/lora_test.py decode --matrix full --tcp 192.168.1.42:4000
+    python3 scripts/lora_test.py scan --matrix basic --tcp 10.0.0.5:7835
+
     python3 scripts/lora_test.py decode --matrix dc_edge --label dc-on \\
         --hypothesis "2kHz DC blocker does not degrade SF12" --serial ...
 """
@@ -26,6 +32,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import re
 import signal
 import socket
@@ -39,7 +46,12 @@ from pathlib import Path
 
 import cbor2
 
-from lora_common import CompanionDriver, create_udp_subscriber
+from lora_common import (
+    CompanionDriver,
+    create_udp_subscriber,
+    parse_host_port,
+    send_lora_config,
+)
 
 SCRIPT_DIR = Path(__file__).parent
 
@@ -49,7 +61,9 @@ SETTLE_S = 2.0  # wait after radio change for PLL lock
 FLUSH_DECODE_S = 5.0  # wait after TX for decode pipeline
 FLUSH_SCAN_S = 3.0  # wait after TX for scan sweeps (2-3 sweep cycles)
 FLUSH_TX_S = 3.0  # wait after SDR TX for Heltec to receive
-BRIDGE_PORT = 7835
+FLUSH_BRIDGE_S = 5.0  # wait for bridge RX path (decode + companion protocol)
+BRIDGE_PORT = 7835  # serial_bridge TCP port
+MESHCORE_BRIDGE_PORT = 7834  # meshcore_bridge TCP port
 TRX_PORT = 5556  # lora_trx UDP port (accepts lora_tx messages)
 MIN_RATIO = 8.0  # scan detection threshold
 
@@ -468,17 +482,33 @@ class MeshCoreCompanion:
     def __init__(self):
         self._mc = None
         self._serial_port = ""
+        self._tcp_host = ""
+        self._tcp_port = 0
         self._adverts: list[dict] = []
         self._messages: list[dict] = []
         self._lock = threading.Lock()
         self._pubkey = ""
 
-    async def connect(self, serial_port: str) -> bool:
+    async def connect(
+        self,
+        serial_port: str | None = None,
+        *,
+        tcp_host: str | None = None,
+        tcp_port: int | None = None,
+    ) -> bool:
         from meshcore import MeshCore
         from meshcore.events import EventType
 
-        self._serial_port = serial_port
-        self._mc = await MeshCore.create_serial(serial_port, 115200)
+        if tcp_host is not None and tcp_port is not None:
+            self._serial_port = ""
+            self._tcp_host = tcp_host
+            self._tcp_port = tcp_port
+            self._mc = await MeshCore.create_tcp(tcp_host, tcp_port)
+        else:
+            self._serial_port = serial_port or ""
+            self._tcp_host = ""
+            self._tcp_port = 0
+            self._mc = await MeshCore.create_serial(self._serial_port, 115200)
         if self._mc is None:
             return False
 
@@ -573,7 +603,10 @@ class MeshCoreCompanion:
         except Exception:
             pass
         await asyncio.sleep(3.0)  # wait for Heltec reboot
-        self._mc = await MeshCore.create_serial(self._serial_port, 115200)
+        if self._tcp_host:
+            self._mc = await MeshCore.create_tcp(self._tcp_host, self._tcp_port)
+        else:
+            self._mc = await MeshCore.create_serial(self._serial_port, 115200)
         if self._mc is None:
             _err("reconnect failed")
             return False
@@ -583,6 +616,28 @@ class MeshCoreCompanion:
         await self._mc.start_auto_message_fetching()
         _info("  reconnected")
         return True
+
+    async def send_advert(self) -> bool:
+        """Send an ADVERT from the Heltec via meshcore_py."""
+        try:
+            result = await self._mc.commands.send_advert()
+            from meshcore.events import EventType
+
+            return result.type == EventType.OK
+        except Exception as e:
+            _info(f"  send_advert failed: {e}")
+            return False
+
+    async def send_message(self, dest_pubkey: bytes, text: str) -> bool:
+        """Send a TXT_MSG to a destination by pubkey bytes."""
+        try:
+            result = await self._mc.commands.send_msg(dest_pubkey, text)
+            from meshcore.events import EventType
+
+            return result.type in (EventType.OK, EventType.MSG_SENT)
+        except Exception as e:
+            _info(f"  send_message failed: {e}")
+            return False
 
     def drain_adverts(self) -> list[dict]:
         with self._lock:
@@ -695,6 +750,186 @@ async def run_tx_point(
     return result
 
 
+# -- Bridge mode ---------------------------------------------------------------
+
+
+def bridge_payload(point: ConfigPoint) -> str:
+    """Build a unique payload string for bridge mode.
+
+    Format: sf{sf}bw{bw_khz}f{freq_khz}_{nonce:02x}
+    Example: sf8bw62f869618_a7
+    """
+    bw_khz = int(point.bw / 1000)
+    freq_khz = int(point.freq_mhz * 1000)
+    nonce = random.randint(0, 255)
+    return f"sf{point.sf}bw{bw_khz}f{freq_khz}_{nonce:02x}"
+
+
+def _extract_pubkey_from_card(card_output: str) -> str:
+    """Extract the 64-char hex pubkey from meshcore-cli card output.
+
+    The card output is a URI like:
+        meshcore://contact/add?name=...&public_key=<64hex>&type=1
+    or a raw hex bizcard:
+        meshcore://<hex>
+    """
+    m = re.search(r"public_key=([0-9a-fA-F]{64})", card_output)
+    if m:
+        return m.group(1).lower()
+    # Try extracting from raw bizcard (first 32 bytes = 64 hex chars after prefix)
+    m = re.search(r"meshcore://([0-9a-fA-F]+)", card_output)
+    if m:
+        hexdata = m.group(1)
+        if len(hexdata) >= 64:
+            # ADVERT format: pubkey is bytes 6..38 (offset depends on header)
+            # For now, return first 64 hex chars as best effort
+            return hexdata[:64].lower()
+    return ""
+
+
+async def run_bridge_point(
+    point: ConfigPoint,
+    companion: MeshCoreCompanion,
+    driver: CompanionDriver,
+    config_sock: socket.socket,
+    config_addr: tuple[str, int],
+    sdr_pubkey: str,
+    heltec_name: str,
+    contact_exchanged: bool,
+) -> dict:
+    """Run one bridge test point with phases A-D."""
+    result: dict = {
+        "config": asdict(point),
+        "advert_rx": None,  # Phase A (None = skipped)
+        "advert_tx": False,  # Phase B
+        "advert_tx_snr": None,
+        "msg_tx": False,  # Phase C
+        "msg_tx_payload": "",
+        "msg_rx": False,  # Phase D
+        "msg_rx_payload": "",
+        "phases_passed": 0,
+        "phases_total": 4,
+    }
+
+    # Step 0: Reconfigure PHY
+    _info("  Step 0: reconfigure PHY")
+    send_lora_config(
+        config_sock,
+        config_addr,
+        sf=point.sf,
+        bw=point.bw,
+        freq=int(point.freq_mhz * 1e6),
+    )
+    bw_khz = point.bw / 1000.0
+    if not await companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8):
+        _err(f"  set_radio failed for {point_label(point)}")
+        return result
+    await asyncio.sleep(SETTLE_S)
+
+    # Phase A: Heltec ADVERT → Bridge RX (contact exchange)
+    if not contact_exchanged:
+        _info("  Phase A: Heltec ADVERT → Bridge RX")
+        await companion.send_advert()
+        await asyncio.sleep(FLUSH_BRIDGE_S)
+        contacts_out = driver.get_contacts()
+        heltec_pk = companion.pubkey.lower()
+        advert_rx = heltec_pk[:12] in contacts_out.lower() if heltec_pk else False
+        result["advert_rx"] = advert_rx
+        if advert_rx:
+            result["phases_passed"] += 1
+            _info("  Phase A: PASS (contact seen)")
+        else:
+            _info(f"  Phase A: FAIL (pubkey {heltec_pk[:12]} not in contacts)")
+    else:
+        result["advert_rx"] = True  # already exchanged
+        result["phases_passed"] += 1
+        _info("  Phase A: SKIP (contact already exchanged)")
+
+    # Phase B: Bridge ADVERT → Heltec RX
+    _info("  Phase B: Bridge ADVERT → Heltec RX")
+    companion.drain_adverts()  # discard stale
+    driver.send_advert()
+    await asyncio.sleep(FLUSH_TX_S)
+    adverts = companion.drain_adverts()
+    advert_tx = any(
+        a.get("adv_key", "").lower().startswith(sdr_pubkey[:12].lower())
+        for a in adverts
+    )
+    result["advert_tx"] = advert_tx
+    if advert_tx:
+        result["phases_passed"] += 1
+        snr = next(
+            (
+                a["snr"]
+                for a in adverts
+                if a.get("adv_key", "").lower().startswith(sdr_pubkey[:12].lower())
+            ),
+            None,
+        )
+        result["advert_tx_snr"] = snr
+        _info(f"  Phase B: PASS (SNR={snr})")
+    else:
+        keys = [a.get("adv_key", "")[:12] for a in adverts]
+        _info(f"  Phase B: FAIL (saw {len(adverts)} adverts: {keys})")
+
+    # Phase C: Bridge TXT_MSG → Heltec RX
+    _info("  Phase C: Bridge TXT_MSG → Heltec RX")
+    companion.drain_messages()  # discard stale
+    payload_c = bridge_payload(point)
+    result["msg_tx_payload"] = payload_c
+    driver.send_msg(heltec_name, payload_c)
+    await asyncio.sleep(FLUSH_TX_S)
+    msgs = companion.drain_messages()
+    msg_tx = any(payload_c in m.get("text", "") for m in msgs)
+    result["msg_tx"] = msg_tx
+    if msg_tx:
+        result["phases_passed"] += 1
+        _info(f"  Phase C: PASS ('{payload_c}')")
+    else:
+        texts = [m.get("text", "")[:40] for m in msgs]
+        _info(f"  Phase C: FAIL (sent '{payload_c}', saw {len(msgs)} msgs: {texts})")
+
+    # Phase D: Heltec TXT_MSG → Bridge RX
+    _info("  Phase D: Heltec TXT_MSG → Bridge RX")
+    payload_d = bridge_payload(point)
+    result["msg_rx_payload"] = payload_d
+    sdr_pubkey_bytes = bytes.fromhex(sdr_pubkey)
+    await companion.send_message(sdr_pubkey_bytes, payload_d)
+    await asyncio.sleep(FLUSH_BRIDGE_S)
+    recv_out = driver.recv_msg(timeout=5.0)
+    msg_rx = payload_d in recv_out if recv_out else False
+    result["msg_rx"] = msg_rx
+    if msg_rx:
+        result["phases_passed"] += 1
+        _info(f"  Phase D: PASS ('{payload_d}')")
+    else:
+        _info(
+            f"  Phase D: FAIL (sent '{payload_d}', recv='{recv_out[:60] if recv_out else ''}')"
+        )
+
+    return result
+
+
+def _collect_bridge(results: list[dict]) -> dict:
+    """Build bridge mode summary."""
+    n = len(results)
+    advert_rx = sum(1 for r in results if r.get("advert_rx"))
+    advert_tx = sum(1 for r in results if r.get("advert_tx"))
+    msg_tx = sum(1 for r in results if r.get("msg_tx"))
+    msg_rx = sum(1 for r in results if r.get("msg_rx"))
+    return {
+        "mode": "bridge",
+        "points": n,
+        "advert_rx": advert_rx,
+        "advert_tx": advert_tx,
+        "msg_tx": msg_tx,
+        "msg_rx": msg_rx,
+        "pass_rate": round(
+            (advert_rx + advert_tx + msg_tx + msg_rx) / max(1, 4 * n), 3
+        ),
+    }
+
+
 # -- Summary builder -----------------------------------------------------------
 
 
@@ -756,9 +991,18 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    for name in ("decode", "scan", "tx"):
+    for name in ("decode", "scan", "tx", "bridge"):
         p = sub.add_parser(name)
-        p.add_argument("--serial", required=True, help="Companion serial port")
+        conn = p.add_mutually_exclusive_group(required=True)
+        conn.add_argument(
+            "--serial",
+            help="Companion serial port (USB, e.g. /dev/cu.usbserial-0001)",
+        )
+        conn.add_argument(
+            "--tcp",
+            metavar="HOST:PORT",
+            help="Companion TCP address (WiFi bridge, e.g. 192.168.1.42:4000)",
+        )
         p.add_argument(
             "--matrix",
             choices=list(MATRICES.keys()),
@@ -775,11 +1019,20 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Parse --tcp early so we get a clear error for bad HOST:PORT
+    tcp_host: str | None = None
+    tcp_port: int | None = None
+    if args.tcp:
+        try:
+            tcp_host, tcp_port = parse_host_port(args.tcp)
+        except ValueError as e:
+            parser.error(f"--tcp: {e}")
+
     matrix = list(MATRICES[args.matrix])
     mode = args.mode
 
     # Resolve binary and UDP port from mode
-    if mode == "decode" or mode == "tx":
+    if mode in ("decode", "tx", "bridge"):
         binary = "./build/apps/lora_trx"
         udp_port = TRX_PORT
         event_types = {"lora_frame"}
@@ -796,29 +1049,60 @@ def main() -> None:
 
     # -- TX mode: separate path (meshcore_py, no serial_bridge) ---
     if mode == "tx":
-        asyncio.run(_run_tx_experiment(args, matrix, binary, label, output_path))
+        asyncio.run(
+            _run_tx_experiment(
+                args,
+                matrix,
+                binary,
+                label,
+                output_path,
+                tcp_host=tcp_host,
+                tcp_port=tcp_port,
+            )
+        )
         return
 
-    # -- decode/scan: serial_bridge + CompanionDriver ---
-    _info(f"Starting serial_bridge on {args.serial}")
-    bridge_proc = _start_process(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "serial_bridge.py"),
-            "--serial",
-            args.serial,
-            "--tcp-port",
-            str(BRIDGE_PORT),
-        ],
-        "tmp/bridge.log",
-    )
-    if not _wait_tcp(BRIDGE_PORT):
-        _err("serial_bridge failed (see tmp/bridge.log)")
-        _stop_process(bridge_proc)
-        sys.exit(1)
-    _info("serial_bridge ready")
+    # -- Bridge mode: lora_trx + meshcore_bridge + meshcore_py ---
+    if mode == "bridge":
+        asyncio.run(
+            _run_bridge_experiment(
+                args,
+                matrix,
+                binary,
+                label,
+                output_path,
+                tcp_host=tcp_host,
+                tcp_port=tcp_port,
+            )
+        )
+        return
 
-    companion = CompanionDriver(bridge_host="127.0.0.1", bridge_port=BRIDGE_PORT)
+    # -- decode/scan: companion via serial_bridge (USB) or direct TCP ---
+    bridge_proc = None
+    if tcp_host is not None:
+        # Remote companion: connect directly via TCP (no local serial_bridge)
+        _info(f"Connecting to companion via TCP {tcp_host}:{tcp_port}")
+        companion = CompanionDriver(bridge_host=tcp_host, bridge_port=tcp_port)
+    else:
+        # Local companion: spawn serial_bridge for DTR-safe USB passthrough
+        _info(f"Starting serial_bridge on {args.serial}")
+        bridge_proc = _start_process(
+            [
+                sys.executable,
+                str(SCRIPT_DIR / "serial_bridge.py"),
+                "--serial",
+                args.serial,
+                "--tcp-port",
+                str(BRIDGE_PORT),
+            ],
+            "tmp/bridge.log",
+        )
+        if not _wait_tcp(BRIDGE_PORT):
+            _err("serial_bridge failed (see tmp/bridge.log)")
+            _stop_process(bridge_proc)
+            sys.exit(1)
+        _info("serial_bridge ready")
+        companion = CompanionDriver(bridge_host="127.0.0.1", bridge_port=BRIDGE_PORT)
     radio_info = companion.get_radio()
     if not radio_info:
         _err("companion not responding")
@@ -879,8 +1163,11 @@ async def _run_tx_experiment(
     binary: str,
     label: str,
     output_path: str,
+    *,
+    tcp_host: str | None = None,
+    tcp_port: int | None = None,
 ) -> None:
-    """TX experiment: meshcore_py connects directly to serial, no bridge."""
+    """TX experiment: meshcore_py connects via serial or TCP, no bridge."""
     # Start lora_trx (needed for SDR TX via UDP)
     _info(f"Starting {binary}")
     binary_proc = _start_process(
@@ -893,10 +1180,17 @@ async def _run_tx_experiment(
         sys.exit(1)
     _info(f"{binary} ready")
 
-    # Connect to Heltec via meshcore_py
+    # Connect to Heltec via meshcore_py (TCP or serial)
     companion = MeshCoreCompanion()
-    _info(f"Connecting to companion on {args.serial}")
-    if not await companion.connect(args.serial):
+    if tcp_host is not None:
+        conn_label = f"{tcp_host}:{tcp_port}"
+        _info(f"Connecting to companion via TCP {conn_label}")
+        connected = await companion.connect(tcp_host=tcp_host, tcp_port=tcp_port)
+    else:
+        conn_label = args.serial
+        _info(f"Connecting to companion on {conn_label}")
+        connected = await companion.connect(args.serial)
+    if not connected:
         _err("meshcore_py: cannot connect to companion")
         _stop_process(binary_proc)
         sys.exit(1)
@@ -930,6 +1224,157 @@ async def _run_tx_experiment(
         _stop_process(binary_proc)
 
     _write_results(output_path, label, args, "tx", binary, results)
+
+
+async def _run_bridge_experiment(
+    args,
+    matrix: list[ConfigPoint],
+    binary: str,
+    label: str,
+    output_path: str,
+    *,
+    tcp_host: str | None = None,
+    tcp_port: int | None = None,
+) -> None:
+    """Bridge experiment: full bidirectional message exchange via meshcore_bridge."""
+    # 1. Start lora_trx
+    _info(f"Starting {binary}")
+    binary_proc = _start_process(
+        [binary, "--config", args.config],
+        "tmp/bridge_trx.log",
+    )
+    if not _wait_udp(TRX_PORT):
+        _err(f"{binary} failed to start (see tmp/bridge_trx.log)")
+        _stop_process(binary_proc)
+        sys.exit(1)
+    _info(f"{binary} ready")
+
+    # 2. Start meshcore_bridge.py
+    _info("Starting meshcore_bridge")
+    bridge_cmd = [
+        sys.executable,
+        str(SCRIPT_DIR / "meshcore_bridge.py"),
+        "--connect",
+        f"127.0.0.1:{TRX_PORT}",
+        "--port",
+        str(MESHCORE_BRIDGE_PORT),
+    ]
+    bridge_proc = _start_process(bridge_cmd, "tmp/meshcore_bridge.log")
+    if not _wait_tcp(MESHCORE_BRIDGE_PORT):
+        _err("meshcore_bridge failed (see tmp/meshcore_bridge.log)")
+        _stop_process(bridge_proc)
+        _stop_process(binary_proc)
+        sys.exit(1)
+    _info("meshcore_bridge ready")
+
+    # 3. Connect to Heltec via meshcore_py (same as tx mode)
+    companion = MeshCoreCompanion()
+    if tcp_host is not None:
+        conn_label = f"{tcp_host}:{tcp_port}"
+        _info(f"Connecting to companion via TCP {conn_label}")
+        connected = await companion.connect(tcp_host=tcp_host, tcp_port=tcp_port)
+    else:
+        conn_label = args.serial
+        _info(f"Connecting to companion on {conn_label}")
+        connected = await companion.connect(args.serial)
+    if not connected:
+        _err("meshcore_py: cannot connect to companion")
+        _stop_process(bridge_proc)
+        _stop_process(binary_proc)
+        sys.exit(1)
+    heltec_pubkey = companion.pubkey
+    _info(f"Heltec pubkey: {heltec_pubkey[:16]}...")
+
+    # 4. Create CompanionDriver for the bridge
+    driver = CompanionDriver(bridge_host="127.0.0.1", bridge_port=MESHCORE_BRIDGE_PORT)
+
+    # 5. Get SDR pubkey from bridge's card
+    card_out = driver.get_card()
+    sdr_pubkey = _extract_pubkey_from_card(card_out)
+    if not sdr_pubkey:
+        _err(f"cannot extract SDR pubkey from card output: {card_out[:80]}")
+        await companion.close()
+        _stop_process(bridge_proc)
+        _stop_process(binary_proc)
+        sys.exit(1)
+    _info(f"SDR pubkey: {sdr_pubkey[:16]}...")
+
+    # 6. Heltec contact name (for meshcore-cli msg <name> <text>)
+    # meshcore-cli uses the node name from the ADVERT; we'll use the first
+    # portion of the pubkey as fallback
+    heltec_name = heltec_pubkey[:8]  # short prefix as contact name
+
+    # 7. Create UDP socket for lora_config messages
+    config_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    config_sock.bind(("127.0.0.1", 0))
+    config_addr = ("127.0.0.1", TRX_PORT)
+
+    _info(f"\n--- bridge: {len(matrix)} points, matrix={args.matrix} ---")
+    if args.hypothesis:
+        _info(f"H: {args.hypothesis}")
+    _info("")
+
+    # 8. Run each config point
+    bridge_results: list[dict] = []
+    contact_exchanged = False
+    try:
+        for i, point in enumerate(matrix):
+            _info(f"[{i + 1}/{len(matrix)}] {point_label(point)}")
+            result = await run_bridge_point(
+                point,
+                companion,
+                driver,
+                config_sock,
+                config_addr,
+                sdr_pubkey,
+                heltec_name,
+                contact_exchanged,
+            )
+            bridge_results.append(result)
+            passed = result["phases_passed"]
+            total = result["phases_total"]
+            _info(f"  => {passed}/{total} phases passed")
+            # After first successful Phase A, skip it for subsequent points
+            if result.get("advert_rx"):
+                contact_exchanged = True
+    except KeyboardInterrupt:
+        _info("\nInterrupted")
+    finally:
+        config_sock.close()
+        await companion.set_radio(869.618, 62.5, 8, cr=8)
+        await companion.close()
+        _stop_process(bridge_proc)
+        _stop_process(binary_proc)
+
+    # 9. Write results
+    summary = _collect_bridge(bridge_results)
+    doc = {
+        "experiment": label,
+        "hypothesis": args.hypothesis,
+        "mode": "bridge",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "git_sha": _git_sha(),
+        "binary": binary,
+        "config_file": args.config,
+        "matrix": args.matrix,
+        "results": bridge_results,
+        "summary": summary,
+    }
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(doc, f, indent=2)
+    _info(f"\nResults: {output_path}")
+
+    n = summary["points"]
+    _info(
+        f"BRIDGE {n}/{n} points: "
+        f"advert_rx={summary['advert_rx']}/{n} "
+        f"advert_tx={summary['advert_tx']}/{n} "
+        f"msg_tx={summary['msg_tx']}/{n} "
+        f"msg_rx={summary['msg_rx']}/{n}"
+    )
+    json.dump(summary, sys.stdout, indent=2)
+    print(file=sys.stdout)
 
 
 def _write_results(
