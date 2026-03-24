@@ -71,7 +71,8 @@ inline gr::lora::MultiSfDecoder& add_multisf_chain(
     decoder.debug        = cfg.debug;
     decoder.soft_decode  = cfg.soft_decode;
     if (cfg.lo_offset > 0.0) {
-        // LO offset moves DC spur out of band; reduce blocker to catch residual drift only
+        // LO offset shifts DC spur out of passband; reduce HP cutoff to
+        // avoid attenuating low-bin sync word symbols (SF8/BW62.5k sw0 = 1953 Hz)
         decoder.dc_blocker_cutoff = cfg.dc_blocker ? 100.f : 0.f;
     } else {
         decoder.dc_blocker_cutoff = cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f;
@@ -250,12 +251,6 @@ inline std::atomic<uint64_t>* build_rx_graph(
         gr::lora::log_ts("debug", "graph",
             "RX graph: %zu radio(s) x %zu BW(s) [%s], MultiSfDecoder SF7-12",
             nRadio, nBW, bw_list.c_str());
-    }
-
-    if (cfg.lo_offset > 0.0) {
-        gr::lora::log_ts("info ", "graph",
-            "LO offset %.0f Hz active -> DC blocker cutoff reduced to 100 Hz",
-            cfg.lo_offset);
     }
 
     return overflow_ptr;
@@ -440,16 +435,8 @@ inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const Sc
         {"l1_snapshots",      uint32_t{16}},
         {"l1_fft_size",       cfg.l1_fft_size},
         {"probe_bws",         probeBwsStr},
-        {"dc_blocker_cutoff", (cfg.lo_offset > 0.0)
-            ? (cfg.dc_blocker ? 100.f : 0.f)
-            : (cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f)},
+        {"dc_blocker_cutoff", cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f},
     });
-
-    if (cfg.lo_offset > 0.0) {
-        gr::lora::log_ts("info ", "graph",
-            "LO offset %.0f Hz active -> DC blocker cutoff reduced to 100 Hz",
-            cfg.lo_offset);
-    }
 
     if (!ok(graph.connect<"out", "in">(source, controller))) {
         gr::lora::log_ts("error", "graph", "connect source -> controller failed");
@@ -513,9 +500,7 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         {"debug", cfg.debug},
         {"l1_interval", uint32_t{16}},    // L1 FFT every 16 calls = 8ms
         {"l1_snapshots", uint32_t{4}},    // 4 snapshots = 33ms sweep (catches brief ADVERTs)
-        {"dc_blocker_cutoff", (cfg.lo_offset > 0.0)
-            ? (cfg.dc_blocker ? 100.f : 0.f)
-            : (cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f)},
+        {"dc_blocker_cutoff", cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f},
         {"soft_decode", cfg.soft_decode},
     };
     if (!cfg.decode_sfs_str.empty()) {
@@ -535,11 +520,6 @@ inline std::atomic<uint64_t>* build_wideband_graph(
     });
     sink._frame_callback = callback;
 
-    if (cfg.lo_offset > 0.0) {
-        gr::lora::log_ts("info ", "graph",
-            "LO offset %.0f Hz active -> DC blocker cutoff reduced to 100 Hz",
-            cfg.lo_offset);
-    }
 
     if (!ok(graph.connect<"out", "in">(source, decoder))) {
         gr::lora::log_ts("error", "graph", "connect source -> WidebandDecoder failed");
