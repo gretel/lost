@@ -468,12 +468,19 @@ struct MultiSfDecoder
             break;
         }
         case SfLane::QUARTER_DOWN: {
-            // Integer CFO from downchirp
-            if (static_cast<uint32_t>(lane.down_val) < lane.N / 2) {
-                lane.cfo_int = lane.down_val / 2;
-            } else {
-                lane.cfo_int = (lane.down_val - static_cast<int>(lane.N)) / 2;
+            // Integer CFO/STO separation (Xhonneux §5.2):
+            //   s_up   = k_hat       = (L_CFO + L_STO) mod N
+            //   s_down = down_val    = (L_CFO - L_STO) mod N
+            //   L_CFO  = Γ_N[(s_up + s_down) mod N] / 2
+            // where Γ_N maps to [-N/2, N/2-1].
+            // Previous code used down_val/2 only, which is wrong when L_STO ≠ 0.
+            auto sum = static_cast<int>(mod(
+                static_cast<int64_t>(lane.k_hat) + static_cast<int64_t>(lane.down_val),
+                static_cast<int64_t>(lane.N)));
+            if (static_cast<uint32_t>(sum) >= lane.N / 2) {
+                sum -= static_cast<int>(lane.N);
             }
+            lane.cfo_int = sum / 2;
 
             // Correct STOint and CFOint in preamble upchirps
             auto rot_off = static_cast<std::size_t>(

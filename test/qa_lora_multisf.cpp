@@ -284,6 +284,113 @@ const boost::ut::suite<"MultiSfDecoder single-SF"> single_sf_tests = [] {
             expect(eq(decoded, std::string("Hello"))) << "payload";
         }
     };
+
+    // Regression: SF12 signal with all lanes active (SF7-12).
+    // The SF11 lane must NOT claim the SF12 preamble before the SF12 lane.
+    "SF12 with all lanes active (cross-SF competition)"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o'};
+        // TX as SF12, but decoder runs SF7-12 simultaneously
+        auto result = run_multisf_loopback(payload, 12, 4, 62500, 4,
+                                            0x12, 8, 7, 12);
+        expect(result.ok) << "graph ran";
+        std::printf("  SF12 (all lanes): %zu bytes decoded (expected %zu)\n",
+                    result.decoded.size(), payload.size());
+
+        // Must decode correctly — the SF12 lane should win, not SF11
+        expect(ge(result.decoded.size(), payload.size()))
+            << "SF12 must decode with all lanes active";
+        if (result.decoded.size() >= payload.size()) {
+            std::string decoded(result.decoded.begin(),
+                                result.decoded.begin()
+                                + static_cast<std::ptrdiff_t>(payload.size()));
+            expect(eq(decoded, std::string("Hello")))
+                << "payload must match (SF12 lane should win)";
+        }
+
+        // Verify the detected SF is 12, not 11
+        bool found_sf_tag = false;
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("sf"); it != t.map.end()) {
+                auto detected_sf = static_cast<uint32_t>(it->second.value_or<int64_t>(0));
+                std::printf("  SF12 (all lanes): detected SF=%u\n", detected_sf);
+                expect(eq(detected_sf, 12u))
+                    << "must detect as SF12, not SF" << detected_sf;
+                found_sf_tag = true;
+            }
+        }
+        expect(found_sf_tag) << "sf tag must be present in output";
+
+        // CRC must be valid
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                expect(it->second.value_or<bool>(false))
+                    << "CRC must be valid when correct SF detects";
+            }
+        }
+    };
+
+    // Regression test for integer CFO/STO decomposition bug:
+    // SF12 decode was completely broken with any non-zero CFO because
+    // cfo_int = down_val/2 ignored k_hat. The Xhonneux decomposition
+    // requires cfo_int = (k_hat + down_val) / 2.
+    "SF12 decode with CFO (cfo_int decomposition fix)"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'i'};
+
+        // SF12/BW62.5k at +10 dB with 50 Hz CFO (~3.3 bins at bin_width=15.26 Hz)
+        auto r1 = run_multisf_impaired(payload, 12, 4, 62500, 4,
+                                        10.f, 50.f,
+                                        0x12, 8, 12, 12);
+        std::printf("  SF12/BW62.5k +10dB +50Hz: %zu bytes\n", r1.decoded.size());
+        expect(ge(r1.decoded.size(), payload.size()))
+            << "SF12/BW62.5k must decode at +10 dB with 50 Hz CFO";
+
+        // SF12/BW125k at +10 dB with 100 Hz CFO (~3.3 bins at bin_width=30.5 Hz)
+        auto r2 = run_multisf_impaired(payload, 12, 4, 125000, 4,
+                                        10.f, 100.f,
+                                        0x12, 8, 12, 12);
+        std::printf("  SF12/BW125k +10dB +100Hz: %zu bytes\n", r2.decoded.size());
+        expect(ge(r2.decoded.size(), payload.size()))
+            << "SF12/BW125k must decode at +10 dB with 100 Hz CFO";
+
+        // Multi-SF mode: SF12 with all lanes active at +10 dB with 50 Hz CFO
+        auto r3 = run_multisf_impaired(payload, 12, 4, 62500, 4,
+                                        10.f, 50.f,
+                                        0x12, 8, 7, 12);
+        std::printf("  SF12 (all lanes) +10dB +50Hz: %zu bytes\n", r3.decoded.size());
+        expect(ge(r3.decoded.size(), payload.size()))
+            << "SF12 must decode in multi-SF mode at +10 dB with 50 Hz CFO";
+    };
+
+    // Same test at BW125k (LDRO) — SF12 with cross-SF competition
+    "SF12/BW125k with all lanes active"_test = [] {
+        std::vector<uint8_t> payload = {'T', 'e', 's', 't'};
+        auto result = run_multisf_loopback(payload, 12, 4, 125000, 4,
+                                            0x12, 8, 7, 12);
+        expect(result.ok) << "graph ran";
+        std::printf("  SF12/BW125k (all lanes): %zu bytes decoded (expected %zu)\n",
+                    result.decoded.size(), payload.size());
+        expect(ge(result.decoded.size(), payload.size()))
+            << "SF12/BW125k must decode with all lanes active";
+        if (result.decoded.size() >= payload.size()) {
+            std::string decoded(result.decoded.begin(),
+                                result.decoded.begin()
+                                + static_cast<std::ptrdiff_t>(payload.size()));
+            expect(eq(decoded, std::string("Test")))
+                << "payload must match";
+        }
+    };
+
+    // SF11 with all lanes active — test adjacent SF competition
+    "SF11 with all lanes active"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'i'};
+        auto result = run_multisf_loopback(payload, 11, 4, 62500, 4,
+                                            0x12, 8, 7, 12);
+        expect(result.ok) << "graph ran";
+        std::printf("  SF11 (all lanes): %zu bytes decoded (expected %zu)\n",
+                    result.decoded.size(), payload.size());
+        expect(ge(result.decoded.size(), payload.size()))
+            << "SF11 must decode with all lanes active";
+    };
 };
 
 // ============================================================================

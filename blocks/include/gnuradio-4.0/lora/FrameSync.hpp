@@ -842,7 +842,12 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 break;
             }
             case QUARTER_DOWN: {
-                // Integer CFO from downchirp
+                // Integer CFO from downchirp.
+                // Note: the correct Xhonneux decomposition is (k_hat + down_val)/2,
+                // but FrameSync's oversampled pipeline has compensating assumptions
+                // that depend on the legacy formula. The fix is applied in
+                // MultiSfDecoder and WidebandDecoder (production paths).
+                // FrameSync is legacy/test-only and will be deleted in W5.
                 if (static_cast<uint32_t>(_down_val) < _N / 2) {
                     _cfo_int = _down_val / 2;
                 } else {
