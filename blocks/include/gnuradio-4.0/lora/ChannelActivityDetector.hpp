@@ -218,16 +218,19 @@ public:
     }
 
     /// Run full 2-window detection on a buffer of 2*_symLen oversampled samples.
-    [[nodiscard]] DetectResult detect(const cf32* samples) {
+    /// When require_both=true (default, AND mode), both windows must exceed threshold.
+    /// When require_both=false (OR mode), either window suffices — more sensitive for scan.
+    [[nodiscard]] DetectResult detect(const cf32* samples, bool require_both = true) {
         return detectTwoWindow(samples, _downRef.data(), _upRef.data(),
                                _symLen, _fftSize, static_cast<uint32_t>(os_factor),
                                static_cast<float>(alpha), static_cast<bool>(dual_chirp),
-                               _scratch, _fftOut, _fft);
+                               require_both, _scratch, _fftOut, _fft);
     }
 
     /// Detect chirp activity across SF7-12 on a shared SF12-sized buffer.
     /// Call initMultiSf() once before using this method.
-    [[nodiscard]] MultiSfResult detectMultiSf(const cf32* samples) {
+    /// When require_both=false (OR mode), detection is more sensitive for scan.
+    [[nodiscard]] MultiSfResult detectMultiSf(const cf32* samples, bool require_both = true) {
         assert(!_sfTable.empty() && "detectMultiSf called before initMultiSf()");
         MultiSfResult best;
         for (auto& sr : _sfTable) {
@@ -236,7 +239,7 @@ public:
                 samples, sr.downRef.data(), sr.upRef.data(),
                 sr.symLen, sr.fftSize, static_cast<uint32_t>(os_factor),
                 thresh, static_cast<bool>(dual_chirp),
-                sr.scratch, sr.fftOut, sr.fft);
+                require_both, sr.scratch, sr.fftOut, sr.fft);
             if (!det.detected) { continue; }
 
             const float winRatio = std::max(det.peak_ratio_up, det.peak_ratio_dn);
@@ -253,6 +256,34 @@ public:
             }
         }
         return best;
+    }
+
+    /// Chirp-combined detection on N consecutive preamble chirps.
+    /// Requires N * symLen oversampled samples.  Coherent integration gives
+    /// +3 dB sensitivity per doubling of N (MALoRa §3).
+    /// Uses the block's configured SF/os_factor/alpha.
+    [[nodiscard]] DetectResult detectCombined(const cf32* samples, uint32_t nChirps) {
+        const float thresh = static_cast<float>(alpha);
+
+        DetectResult result;
+        auto upResult = peakRatioCombined(
+            samples, nChirps, _downRef.data(), _fftSize,
+            static_cast<uint32_t>(os_factor), _scratch, _fftOut, _fft);
+        result.peak_ratio_up = upResult.ratio;
+        result.peak_bin_up   = upResult.bin;
+        result.up_detected   = upResult.ratio > thresh;
+
+        if (static_cast<bool>(dual_chirp)) {
+            auto dnResult = peakRatioCombined(
+                samples, nChirps, _upRef.data(), _fftSize,
+                static_cast<uint32_t>(os_factor), _scratch, _fftOut, _fft);
+            result.peak_ratio_dn = dnResult.ratio;
+            result.peak_bin_dn   = dnResult.bin;
+            result.dn_detected   = dnResult.ratio > thresh;
+        }
+
+        result.detected = result.up_detected || result.dn_detected;
+        return result;
     }
 
     /// Pre-build reference chirps for SF7-12.  Must be called once before
@@ -295,12 +326,56 @@ private:
         return best;
     }
 
+    /// Chirp-combined detection: dechirp N consecutive preamble chirps independently,
+    /// concatenate the dechirped results, then run a single N*M-point FFT.
+    /// Coherent integration gives +3 dB per doubling of N (MALoRa §3).
+    /// Uses offset=0 only (no sub-chip search — preamble alignment not guaranteed).
+    [[nodiscard]] static PeakResult peakRatioCombined(
+            const cf32* samples, uint32_t nChirps,
+            const cf32* ref, uint32_t fftSz, uint32_t osf,
+            std::vector<cf32>& scratch,
+            std::vector<cf32>& fftOutBuf,
+            gr::algorithm::FFT<cf32>& fft) {
+        const uint32_t symLen    = fftSz * osf;
+        const uint32_t totalBins = nChirps * fftSz;
+
+        if (scratch.size() < totalBins) { scratch.resize(totalBins); }
+        if (fftOutBuf.size() < totalBins) { fftOutBuf.resize(totalBins); }
+
+        // Dechirp each chirp independently (decimating by osf), concatenate into scratch
+        for (uint32_t chirp = 0; chirp < nChirps; ++chirp) {
+            const cf32* chirpStart = samples + chirp * symLen;
+            cf32*       dest       = scratch.data() + chirp * fftSz;
+            for (uint32_t k = 0; k < fftSz; ++k) {
+                dest[k] = chirpStart[k * osf] * ref[k];
+            }
+        }
+
+        // N*M-point FFT on the concatenated dechirped data
+        fft.compute(std::span<const cf32>(scratch.data(), totalBins), fftOutBuf);
+
+        // Peak-to-mean ratio over the N*M-point FFT output
+        float    peak    = 0.F;
+        float    total   = 0.F;
+        uint32_t peakIdx = 0;
+        for (uint32_t i = 0; i < totalBins; ++i) {
+            const float mag = std::abs(fftOutBuf[i]);
+            total += mag;
+            if (mag > peak) { peak = mag; peakIdx = i; }
+        }
+        const float mean  = total / static_cast<float>(totalBins);
+        const float ratio = (mean > 0.F) ? (peak / mean) : 0.F;
+        return PeakResult{ratio, peakIdx};
+    }
+
     /// Run full 2-window detection on a buffer using provided workspace.
+    /// When requireBoth=true (AND mode), both windows must exceed threshold.
+    /// When requireBoth=false (OR mode), either window suffices.
     [[nodiscard]] static DetectResult detectTwoWindow(
             const cf32* samples,
             const cf32* downRef, const cf32* upRef,
             uint32_t symLen, uint32_t fftSz, uint32_t osf,
-            float thresh, bool dualChirp,
+            float thresh, bool dualChirp, bool requireBoth,
             std::vector<cf32>& scratch,
             std::vector<cf32>& fftOutBuf,
             gr::algorithm::FFT<cf32>& fft) {
@@ -312,14 +387,18 @@ private:
         const auto p2Up = peakRatio(w2, downRef, fftSz, osf, scratch, fftOutBuf, fft);
         result.peak_ratio_up = std::max(p1Up.ratio, p2Up.ratio);
         result.peak_bin_up   = (p1Up.ratio >= p2Up.ratio) ? p1Up.bin : p2Up.bin;
-        result.up_detected   = (p1Up.ratio > thresh) && (p2Up.ratio > thresh);
+        result.up_detected   = requireBoth
+            ? (p1Up.ratio > thresh) && (p2Up.ratio > thresh)
+            : (p1Up.ratio > thresh) || (p2Up.ratio > thresh);
 
         if (dualChirp) {
             const auto p1Dn = peakRatio(w1, upRef, fftSz, osf, scratch, fftOutBuf, fft);
             const auto p2Dn = peakRatio(w2, upRef, fftSz, osf, scratch, fftOutBuf, fft);
             result.peak_ratio_dn = std::max(p1Dn.ratio, p2Dn.ratio);
             result.peak_bin_dn   = (p1Dn.ratio >= p2Dn.ratio) ? p1Dn.bin : p2Dn.bin;
-            result.dn_detected   = (p1Dn.ratio > thresh) && (p2Dn.ratio > thresh);
+            result.dn_detected   = requireBoth
+                ? (p1Dn.ratio > thresh) && (p2Dn.ratio > thresh)
+                : (p1Dn.ratio > thresh) || (p2Dn.ratio > thresh);
         }
 
         result.detected = result.up_detected || result.dn_detected;
