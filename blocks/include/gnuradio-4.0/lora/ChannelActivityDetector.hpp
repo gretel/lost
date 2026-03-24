@@ -9,6 +9,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <numbers>
 #include <span>
 #include <vector>
 
@@ -190,13 +191,22 @@ public:
     /// Set an external channel-busy flag for listen-before-talk.
     void set_channel_busy_flag(std::atomic<bool>* flag) { _channelBusy = flag; }
 
-    /// SF-dependent detection threshold (Vangelista & Calvagno 2022, P_fa = 1e-3).
-    static constexpr float default_alpha(uint32_t sfVal) {
-        constexpr std::array<float, 13> kTable = {
-            0.F, 0.F, 0.F, 0.F, 0.F, 0.F, 0.F,
-            4.23F, 4.16F, 4.09F, 4.04F, 3.98F, 3.91F,
-        };
-        return (sfVal < kTable.size()) ? kTable[sfVal] : 0.F;
+    /// Compute CAD detection threshold per Vangelista & Calvagno (2022).
+    /// α = sqrt(−(4/π)·ln(1−(1−p_fa)^{1/L})), where L = os_factor × M.
+    /// Higher SF → more bins (M = 2^SF) → higher alpha for same P_fa.
+    [[nodiscard]] static float compute_alpha(
+            uint32_t sfVal, uint32_t osf, float p_fa = 0.001f) {
+        const double M     = static_cast<double>(1U << sfVal);
+        const double L     = static_cast<double>(osf) * M;
+        const double inner = 1.0 - std::pow(1.0 - static_cast<double>(p_fa), 1.0 / L);
+        return static_cast<float>(std::sqrt(-(4.0 / std::numbers::pi) * std::log(inner)));
+    }
+
+    /// Backward-compatible wrapper: compute_alpha with os_factor=1, P_fa=0.001.
+    /// Returns 0 for SF outside [7, 12].
+    [[nodiscard]] static float default_alpha(uint32_t sfVal) {
+        if (sfVal < 7U || sfVal > 12U) return 0.F;
+        return compute_alpha(sfVal, 1U, 0.001f);
     }
 
     /// Compute the best peak_ratio across os_factor sub-chip timing offsets.
@@ -221,7 +231,7 @@ public:
         assert(!_sfTable.empty() && "detectMultiSf called before initMultiSf()");
         MultiSfResult best;
         for (auto& sr : _sfTable) {
-            const float thresh = default_alpha(sr.sf);
+            const float thresh = compute_alpha(sr.sf, static_cast<uint32_t>(os_factor));
             const auto det = detectTwoWindow(
                 samples, sr.downRef.data(), sr.upRef.data(),
                 sr.symLen, sr.fftSize, static_cast<uint32_t>(os_factor),

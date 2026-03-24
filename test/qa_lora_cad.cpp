@@ -190,11 +190,12 @@ const boost::ut::suite<"CAD algorithm direct"> algo_tests = [] {
         constexpr uint8_t  kOS     = 4;
         constexpr uint32_t kN      = 1U << kSF;
         constexpr uint32_t kSymLen = kN * kOS;
+        const float kAlpha = ChannelActivityDetector::default_alpha(kSF);
 
         ChannelActivityDetector block;
         block.sf        = kSF;
         block.os_factor = kOS;
-        block.alpha     = 4.16f;
+        block.alpha     = kAlpha;
         block.start();
 
         std::vector<cf32> chirp(kSymLen);
@@ -202,7 +203,7 @@ const boost::ut::suite<"CAD algorithm direct"> algo_tests = [] {
 
         float ratio = block.compute_peak_ratio(chirp.data(),
                                                ChannelActivityDetector::RefType::UpchirpRef);
-        expect(gt(ratio, 4.16f)) << "clean upchirp should give peak_ratio > alpha";
+        expect(gt(ratio, kAlpha)) << "clean upchirp should give peak_ratio > alpha";
     };
 
     "clean downchirp gives peak_ratio >> alpha (SF8)"_test = [] {
@@ -210,11 +211,12 @@ const boost::ut::suite<"CAD algorithm direct"> algo_tests = [] {
         constexpr uint8_t  kOS     = 4;
         constexpr uint32_t kN      = 1U << kSF;
         constexpr uint32_t kSymLen = kN * kOS;
+        const float kAlpha = ChannelActivityDetector::default_alpha(kSF);
 
         ChannelActivityDetector block;
         block.sf        = kSF;
         block.os_factor = kOS;
-        block.alpha     = 4.16f;
+        block.alpha     = kAlpha;
         block.start();
 
         // Downchirp = conjugate of upchirp
@@ -224,17 +226,19 @@ const boost::ut::suite<"CAD algorithm direct"> algo_tests = [] {
 
         float ratio = block.compute_peak_ratio(chirp.data(),
                                                ChannelActivityDetector::RefType::DownchirpRef);
-        expect(gt(ratio, 4.16f)) << "clean downchirp should give peak_ratio > alpha";
+        expect(gt(ratio, kAlpha)) << "clean downchirp should give peak_ratio > alpha";
     };
 
-    "default_alpha returns correct values for SF7-12"_test = [] {
+    "default_alpha increases with SF (Vangelista formula)"_test = [] {
         using gr::lora::ChannelActivityDetector;
-        expect(eq(ChannelActivityDetector::default_alpha(7U), 4.23f));
-        expect(eq(ChannelActivityDetector::default_alpha(8U), 4.16f));
-        expect(eq(ChannelActivityDetector::default_alpha(9U), 4.09f));
-        expect(eq(ChannelActivityDetector::default_alpha(10U), 4.04f));
-        expect(eq(ChannelActivityDetector::default_alpha(11U), 3.98f));
-        expect(eq(ChannelActivityDetector::default_alpha(12U), 3.91f));
+        // Alpha must INCREASE with SF: more bins → higher threshold for same P_fa
+        float prev = 0.f;
+        for (uint32_t sfVal = 7; sfVal <= 12; sfVal++) {
+            float a = ChannelActivityDetector::default_alpha(sfVal);
+            expect(gt(a, prev)) << "alpha(" << sfVal << ")=" << a << " should increase";
+            prev = a;
+        }
+        // Out-of-range returns 0
         expect(eq(ChannelActivityDetector::default_alpha(6U), 0.f));
         expect(eq(ChannelActivityDetector::default_alpha(13U), 0.f));
     };
@@ -255,7 +259,8 @@ const boost::ut::suite<"CAD algorithm direct"> algo_tests = [] {
 
         expect(r.detected)    << "detect() should find upchirp at +20 dB";
         expect(r.up_detected) << "up_detected should be true";
-        expect(gt(r.peak_ratio_up, 4.16f)) << "peak_ratio_up should exceed alpha";
+        expect(gt(r.peak_ratio_up, ChannelActivityDetector::default_alpha(kSF)))
+            << "peak_ratio_up should exceed alpha";
     };
 
     "detect() does not fire on noise"_test = [] {
@@ -292,7 +297,8 @@ const boost::ut::suite<"CAD algorithm direct"> algo_tests = [] {
 
         expect(r.detected)    << "detect() should find downchirp at +20 dB";
         expect(r.dn_detected) << "dn_detected should be true";
-        expect(gt(r.peak_ratio_dn, 4.16f)) << "peak_ratio_dn should exceed alpha";
+        expect(gt(r.peak_ratio_dn, ChannelActivityDetector::default_alpha(kSF)))
+            << "peak_ratio_dn should exceed alpha";
     };
 
     "pure noise gives peak_ratio < alpha (SF8)"_test = [] {
@@ -300,11 +306,12 @@ const boost::ut::suite<"CAD algorithm direct"> algo_tests = [] {
         constexpr uint8_t  kOS     = 4;
         constexpr uint32_t kN      = 1U << kSF;
         constexpr uint32_t kSymLen = kN * kOS;
+        const float kAlpha = ChannelActivityDetector::default_alpha(kSF);
 
         ChannelActivityDetector block;
         block.sf        = kSF;
         block.os_factor = kOS;
-        block.alpha     = 4.16f;
+        block.alpha     = kAlpha;
         block.start();
 
         std::mt19937 rng(42U);
@@ -315,7 +322,7 @@ const boost::ut::suite<"CAD algorithm direct"> algo_tests = [] {
         float ratio = block.compute_peak_ratio(noise.data(),
                                                ChannelActivityDetector::RefType::UpchirpRef);
         // Noise peak_ratio is typically < 4 for N=256; just ensure it's well below alpha
-        expect(lt(ratio, 4.16f)) << "noise peak_ratio should be below alpha";
+        expect(lt(ratio, kAlpha)) << "noise peak_ratio should be below alpha";
     };
 };
 
@@ -323,22 +330,26 @@ const boost::ut::suite<"CAD known upchirp"> upchirp_tests = [] {
     using namespace boost::ut;
 
     "High-SNR upchirp is detected"_test = [] {
+        using gr::lora::ChannelActivityDetector;
         // SF8, os_factor=4, SNR=+20 dB — well above the -10 dB minimum
         constexpr uint8_t sf = 8;
         constexpr uint8_t os = 4;
+        const float kAlpha = ChannelActivityDetector::default_alpha(sf);
         auto win = make_upchirp_window(sf, os, 20.f);
-        auto res = run_cad(win, sf, os, 4.16f, true);
+        auto res = run_cad(win, sf, os, kAlpha, true);
 
         expect(res.detected)  << "Should detect upchirp at +20 dB SNR";
         expect(res.upchirp)   << "upchirp flag should be set";
-        expect(gt(res.peak_ratio_up, 4.16)) << "peak_ratio_up should exceed alpha";
+        expect(gt(res.peak_ratio_up, static_cast<double>(kAlpha))) << "peak_ratio_up should exceed alpha";
     };
 
     "Upchirp detection works at SF7"_test = [] {
+        using gr::lora::ChannelActivityDetector;
         constexpr uint8_t sf = 7;
         constexpr uint8_t os = 4;
+        const float kAlpha = ChannelActivityDetector::default_alpha(sf);
         auto win = make_upchirp_window(sf, os, 20.f);
-        auto res = run_cad(win, sf, os, 4.23f, true);
+        auto res = run_cad(win, sf, os, kAlpha, true);
 
         expect(res.detected) << "Should detect SF7 upchirp at +20 dB SNR";
         expect(res.upchirp)  << "upchirp flag should be set for SF7";
@@ -349,11 +360,12 @@ const boost::ut::suite<"CAD noise floor"> noise_tests = [] {
     using namespace boost::ut;
 
     "Pure noise below threshold is not detected"_test = [] {
+        using gr::lora::ChannelActivityDetector;
         // Use many noise trials and verify detection rate < 10%
         // (true P_fa target is 10^-3 but we test conservatively with fewer trials)
         constexpr uint8_t sf = 8;
         constexpr uint8_t os = 4;
-        constexpr float alpha = 4.16f;
+        const float alpha = ChannelActivityDetector::default_alpha(sf);
 
         int detects = 0;
         constexpr int kTrials = 100;
@@ -374,21 +386,25 @@ const boost::ut::suite<"CAD downchirp"> downchirp_tests = [] {
     using namespace boost::ut;
 
     "High-SNR downchirp is detected when dual_chirp=true"_test = [] {
+        using gr::lora::ChannelActivityDetector;
         constexpr uint8_t sf = 8;
         constexpr uint8_t os = 4;
+        const float kAlpha = ChannelActivityDetector::default_alpha(sf);
         auto win = make_downchirp_window(sf, os, 20.f);
-        auto res = run_cad(win, sf, os, 4.16f, /*dual_chirp=*/true);
+        auto res = run_cad(win, sf, os, kAlpha, /*dual_chirp=*/true);
 
         expect(res.detected)   << "Should detect downchirp at +20 dB SNR";
         expect(res.downchirp)  << "downchirp flag should be set";
-        expect(gt(res.peak_ratio_down, 4.16)) << "peak_ratio_down should exceed alpha";
+        expect(gt(res.peak_ratio_down, static_cast<double>(kAlpha))) << "peak_ratio_down should exceed alpha";
     };
 
     "Downchirp not flagged when dual_chirp=false"_test = [] {
+        using gr::lora::ChannelActivityDetector;
         constexpr uint8_t sf = 8;
         constexpr uint8_t os = 4;
+        const float kAlpha = ChannelActivityDetector::default_alpha(sf);
         auto win = make_downchirp_window(sf, os, 20.f);
-        auto res = run_cad(win, sf, os, 4.16f, /*dual_chirp=*/false);
+        auto res = run_cad(win, sf, os, kAlpha, /*dual_chirp=*/false);
 
         // With dual_chirp off, downchirp path is skipped so bit 1 is always 0
         expect(!res.downchirp) << "downchirp flag should be clear when dual_chirp=false";
@@ -399,14 +415,63 @@ const boost::ut::suite<"CAD minimum SNR"> snr_tests = [] {
     using namespace boost::ut;
 
     "Upchirp detected at minimum working SNR for SF8 (-10 dB)"_test = [] {
+        using gr::lora::ChannelActivityDetector;
         // Minimum working SNR per Vangelista & Calvagno table: SF8 -> -10 dB.
         // We use -8 dB to account for AWGN randomness in a single-trial test.
         constexpr uint8_t sf = 8;
         constexpr uint8_t os = 4;
+        const float kAlpha = ChannelActivityDetector::default_alpha(sf);
         auto win = make_upchirp_window(sf, os, -8.f, 777U);
-        auto res = run_cad(win, sf, os, 4.16f, false);
+        auto res = run_cad(win, sf, os, kAlpha, false);
 
         expect(res.detected) << "Should detect SF8 upchirp at -8 dB SNR";
+    };
+};
+
+const boost::ut::suite<"CAD alpha formula"> alpha_tests = [] {
+    using namespace boost::ut;
+    using gr::lora::ChannelActivityDetector;
+
+    "compute_alpha matches Vangelista formula"_test = [] {
+        // α = sqrt(−(4/π)·ln(1−(1−p_fa)^{1/L})), L = os_factor * M
+        // os_factor=1 (scan mode), P_fa=0.001
+        auto alpha7  = ChannelActivityDetector::compute_alpha(7, 1, 0.001f);
+        auto alpha12 = ChannelActivityDetector::compute_alpha(12, 1, 0.001f);
+
+        // Reference values from Vangelista & Calvagno 2022
+        expect(approx(alpha7, 3.87f, 0.05f))
+            << "SF7 alpha should be ~3.87, got " << alpha7;
+        expect(approx(alpha12, 4.40f, 0.05f))
+            << "SF12 alpha should be ~4.40, got " << alpha12;
+
+        // Verify ordering: alpha INCREASES with SF (more bins = higher threshold)
+        float prev = 0.f;
+        for (uint32_t sfVal = 7; sfVal <= 12; sfVal++) {
+            float a = ChannelActivityDetector::compute_alpha(sfVal, 1, 0.001f);
+            expect(gt(a, prev))
+                << "alpha(" << sfVal << ")=" << a << " should be > alpha(" << (sfVal - 1) << ")=" << prev;
+            prev = a;
+        }
+
+        // Verify os_factor influence: higher os = higher alpha
+        auto alpha_os1 = ChannelActivityDetector::compute_alpha(8, 1, 0.001f);
+        auto alpha_os4 = ChannelActivityDetector::compute_alpha(8, 4, 0.001f);
+        expect(gt(alpha_os4, alpha_os1))
+            << "alpha at os=4 (" << alpha_os4 << ") should be > alpha at os=1 (" << alpha_os1 << ")";
+    };
+
+    "default_alpha delegates to compute_alpha with os=1"_test = [] {
+        // default_alpha(sf) should be equivalent to compute_alpha(sf, 1, 0.001f)
+        for (uint32_t sfVal = 7; sfVal <= 12; sfVal++) {
+            float from_default = ChannelActivityDetector::default_alpha(sfVal);
+            float from_compute = ChannelActivityDetector::compute_alpha(sfVal, 1, 0.001f);
+            expect(approx(from_default, from_compute, 0.001f))
+                << "default_alpha(" << sfVal << ")=" << from_default
+                << " should match compute_alpha(" << sfVal << ",1)=" << from_compute;
+        }
+        // Out-of-range: default_alpha returns 0
+        expect(eq(ChannelActivityDetector::default_alpha(6U), 0.f));
+        expect(eq(ChannelActivityDetector::default_alpha(13U), 0.f));
     };
 };
 
@@ -436,7 +501,8 @@ const boost::ut::suite<"CAD multi-SF detection"> multi_sf_tests = [] {
         auto r = block.detectMultiSf(buf.data());
         expect(r.detected) << "detectMultiSf should detect the SF8 chirp";
         expect(eq(r.sf, 8U)) << "winning SF should be 8, got " << r.sf;
-        expect(gt(r.best_ratio, 4.16f)) << "best_ratio should exceed SF8 alpha";
+        expect(gt(r.best_ratio, ChannelActivityDetector::default_alpha(kTargetSf)))
+            << "best_ratio should exceed SF8 alpha";
     };
 
     "detectMultiSf identifies SF12 chirp"_test = [] {
