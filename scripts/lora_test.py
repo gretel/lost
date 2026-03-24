@@ -886,6 +886,10 @@ async def run_bridge_point(
         result["phases_passed"] += 1
         _info("  Phase A: SKIP (contact already exchanged)")
 
+    # Inter-phase gap: let the radio settle between TX bursts to avoid
+    # overlapping transmissions that crash the B210 USB transport.
+    await asyncio.sleep(1.0)
+
     # Phase B: Bridge ADVERT → Heltec RX
     _info("  Phase B: Bridge ADVERT → Heltec RX")
     companion.drain_adverts()  # discard stale
@@ -917,6 +921,8 @@ async def run_bridge_point(
         keys = [a.get("adv_key", "")[:12] for a in adverts]
         _info(f"  Phase B: FAIL (saw {len(adverts)} adverts: {keys})")
 
+    await asyncio.sleep(1.0)
+
     # Phase C: Bridge TXT_MSG → Heltec RX
     _info("  Phase C: Bridge TXT_MSG → Heltec RX")
     companion.drain_messages()  # discard stale
@@ -936,22 +942,40 @@ async def run_bridge_point(
         texts = [m.get("text", "")[:40] for m in msgs]
         _info(f"  Phase C: FAIL (sent '{payload_c}', saw {len(msgs)} msgs: {texts})")
 
+    await asyncio.sleep(1.0)
+
     # Phase D: Heltec TXT_MSG → Bridge RX
     _info("  Phase D: Heltec TXT_MSG → Bridge RX")
     payload_d = bridge_payload(point)
     result["msg_rx_payload"] = payload_d
     sdr_pubkey_bytes = bytes.fromhex(sdr_pubkey)
     await companion.send_message(sdr_pubkey_bytes, payload_d)
-    await asyncio.sleep(FLUSH_BRIDGE_S)
-    recv_out = driver.recv_msg(timeout=5.0)
-    msg_rx = payload_d in recv_out if recv_out else False
+    # Poll for the expected payload with retries.  The Heltec→RF→decode→bridge
+    # chain has variable latency (decode time depends on SF), so we poll the
+    # message queue repeatedly instead of a single fixed sleep.
+    tx_air_d = lora_airtime_s(point.sf, point.bw, n_bytes=40)
+    deadline = asyncio.get_event_loop().time() + max(FLUSH_BRIDGE_S, tx_air_d + 3.0)
+    all_recv: list[str] = []
+    msg_rx = False
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(1.0)
+        for _ in range(10):
+            recv_out = driver.recv_msg(timeout=1.0)
+            if not recv_out:
+                break
+            all_recv.append(recv_out)
+            if payload_d in recv_out:
+                msg_rx = True
+        if msg_rx:
+            break
     result["msg_rx"] = msg_rx
     if msg_rx:
         result["phases_passed"] += 1
         _info(f"  Phase D: PASS ('{payload_d}')")
     else:
+        shown = [r[-40:] for r in all_recv[:3]]
         _info(
-            f"  Phase D: FAIL (sent '{payload_d}', recv='{recv_out[:60] if recv_out else ''}')"
+            f"  Phase D: FAIL (sent '{payload_d}', got {len(all_recv)} msgs: {shown})"
         )
 
     return result
