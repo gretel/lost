@@ -187,8 +187,7 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
     // Pre-allocated scratch buffers (avoid per-call heap allocation)
     std::vector<std::complex<float>> _scratch_N;      ///< N-element scratch for dechirp
-    std::vector<std::complex<float>> _scratch_2N;     ///< 2N-element scratch
-    std::vector<float>               _scratch_2N_f;   ///< 2N-element float scratch
+    std::vector<std::complex<float>> _scratch_2N;     ///< 2N-element scratch (net_id decimation)
     std::vector<std::complex<float>> _corr_vec;       ///< preamble-length correction vector
     std::vector<std::complex<float>> _fft_val_buf;    ///< CFO estimation FFT values
 
@@ -259,7 +258,6 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         _symb_corr.resize(_N);
         _scratch_N.resize(_N);
         _scratch_2N.resize(2 * _N);
-        _scratch_2N_f.resize(2 * _N);
         auto max_corr = static_cast<std::size_t>(
             _n_up_req + kMaxAdditionalUpchirps) * _N;
         _corr_vec.resize(max_corr);
@@ -297,8 +295,8 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         return dechirp_argmax(samples, ref_chirp, _scratch_N.data(), _N, _fft);
     }
 
-    /// CFO fractional estimation using Bernier's algorithm.
-    /// Uses pre-allocated _scratch_N, _fft_val_buf, _corr_vec.
+    /// CFO fractional estimation using 5-bin cross-symbol correlation
+    /// (Xhonneux Eq. 14). Uses pre-allocated _scratch_N, _fft_val_buf, _corr_vec.
     float estimate_CFO_frac_Bernier(const std::complex<float>* samples) {
         const auto n_syms = _up_symb_to_use;
 
@@ -898,8 +896,9 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                 detail::complex_multiply(_preamble_upchirps.data(), _preamble_upchirps.data(),
                                          _corr_vec.data(), _up_symb_to_use * _N);
 
-                // Re-estimate STO frac after SFO correction
-                float tmp_sto_frac = estimate_STO_frac();
+                // Re-estimate STO frac after SFO correction.
+                // After CFO_int rotation + SFO correction, peak is near bin 0.
+                float tmp_sto_frac = estimate_STO_frac(0);
                 float diff_sto_frac = _sto_frac - tmp_sto_frac;
                 float os_thresh = static_cast<float>(os_factor - 1u)
                                 / static_cast<float>(os_factor);
@@ -947,6 +946,20 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
                     get_symbol_val(_scratch_2N.data(), _downchirp.data()));
                 int netid2 = static_cast<int>(
                     get_symbol_val(&_scratch_2N[_N], _downchirp.data()));
+
+                // Mod-8 sync-word-independent STO correction (W3c)
+                {
+                    uint32_t r1 = static_cast<uint32_t>(mod(static_cast<int64_t>(netid1), 8LL));
+                    uint32_t r2 = static_cast<uint32_t>(mod(static_cast<int64_t>(netid2), 8LL));
+                    if (r1 == r2 && r1 != 0) {
+                        int delta = static_cast<int>(r1);
+                        if (delta > 3) delta -= 8;
+                        netid1 = static_cast<int>(mod(
+                            static_cast<int64_t>(netid1) - delta, static_cast<int64_t>(_N)));
+                        netid2 = static_cast<int>(mod(
+                            static_cast<int64_t>(netid2) - delta, static_cast<int64_t>(_N)));
+                    }
+                }
 
                 // Sync word verification
                 bool sync_ok = false;
