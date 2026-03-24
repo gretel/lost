@@ -648,6 +648,22 @@ class TestExtractPubkey(unittest.TestCase):
             pk, "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
         )
 
+    def test_bizcard_uri(self):
+        """Extract pubkey from raw bizcard URI (header+path_len+pubkey+...)."""
+        # ADVERT wire: header(0x11) + path_len(0x00) + pubkey(32B) + ...
+        pubkey_hex = "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
+        # header=0x11 path_len=0x00 then pubkey then some more data (ts+sig)
+        wire_hex = "1100" + pubkey_hex + "00" * 68  # ts(4)+sig(64)
+        uri = f"meshcore://{wire_hex}"
+        pk = _extract_pubkey_from_card(uri)
+        self.assertEqual(pk, pubkey_hex)
+
+    def test_bizcard_too_short(self):
+        """Bizcard URI with insufficient hex data returns empty."""
+        uri = "meshcore://1100aabbccdd"  # only 12 hex chars after prefix
+        pk = _extract_pubkey_from_card(uri)
+        self.assertEqual(pk, "")
+
 
 class TestCLIBridgeMode(unittest.TestCase):
     """Test that bridge mode is accepted by the CLI parser."""

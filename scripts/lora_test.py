@@ -776,14 +776,14 @@ def _extract_pubkey_from_card(card_output: str) -> str:
     m = re.search(r"public_key=([0-9a-fA-F]{64})", card_output)
     if m:
         return m.group(1).lower()
-    # Try extracting from raw bizcard (first 32 bytes = 64 hex chars after prefix)
+    # Try extracting from raw bizcard: meshcore://<hex wire packet>
+    # ADVERT wire format: header(1) + path_len(1) + pubkey(32) + ...
+    # So pubkey starts at byte 2 = hex offset 4.
     m = re.search(r"meshcore://([0-9a-fA-F]+)", card_output)
     if m:
         hexdata = m.group(1)
-        if len(hexdata) >= 64:
-            # ADVERT format: pubkey is bytes 6..38 (offset depends on header)
-            # For now, return first 64 hex chars as best effort
-            return hexdata[:64].lower()
+        if len(hexdata) >= 68:  # 4 (header+path) + 64 (pubkey)
+            return hexdata[4:68].lower()
     return ""
 
 
