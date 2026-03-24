@@ -9,8 +9,6 @@ gr_add_block_library(
     GrLoraBlocks
     MAKE_SHARED_LIBRARY
     HEADERS
-        include/gnuradio-4.0/lora/FrameSync.hpp
-        include/gnuradio-4.0/lora/DemodDecoder.hpp
         include/gnuradio-4.0/lora/Splitter.hpp
         include/gnuradio-4.0/lora/ChannelActivityDetector.hpp
         include/gnuradio-4.0/lora/FrameSink.hpp
