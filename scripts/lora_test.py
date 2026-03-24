@@ -67,6 +67,30 @@ MESHCORE_BRIDGE_PORT = 7834  # meshcore_bridge TCP port
 TRX_PORT = 5556  # lora_trx UDP port (accepts lora_tx messages)
 MIN_RATIO = 8.0  # scan detection threshold
 
+
+def lora_airtime_s(
+    sf: int,
+    bw: int,
+    n_bytes: int = 126,
+    cr: int = 4,
+    preamble: int = 8,
+    explicit_header: bool = True,
+) -> float:
+    """Estimate LoRa packet airtime in seconds (Semtech AN1200.13).
+
+    Default *n_bytes* = 126 (typical ADVERT with name + location).
+    """
+    t_sym = (1 << sf) / bw
+    n_preamble = (preamble + 4.25) * t_sym
+    de = 1 if (sf >= 11 and bw == 125000) or (sf == 12 and bw <= 125000) else 0
+    ih = 0 if explicit_header else 1
+    payload_bits = 8 * n_bytes - 4 * sf + 28 + 16 - 20 * ih
+    n_payload = 8 + max(
+        0, ((payload_bits + 4 * (sf - 2 * de) - 1) // (4 * (sf - 2 * de)))
+    ) * (cr + 4)
+    return n_preamble + n_payload * t_sym
+
+
 # -- Config point -------------------------------------------------------------
 
 
@@ -813,6 +837,17 @@ async def run_bridge_point(
 
     # Step 0: Reconfigure PHY
     _info("  Step 0: reconfigure PHY")
+    # Update lora_trx decode + TX params via CBOR
+    # Drain stale spectrum/status messages before sending config —
+    # lora_trx floods subscribers at ~50 spectrum msgs/s and the ack
+    # gets buried if we don't flush first.
+    config_sock.setblocking(False)
+    try:
+        while True:
+            config_sock.recvfrom(65536)
+    except BlockingIOError:
+        pass
+    config_sock.setblocking(True)
     send_lora_config(
         config_sock,
         config_addr,
@@ -820,7 +855,12 @@ async def run_bridge_point(
         bw=point.bw,
         freq=int(point.freq_mhz * 1e6),
     )
+    # Update bridge TX params via companion protocol (CMD_SET_RADIO_PARAMS).
+    # The bridge may not receive the lora_trx config broadcast reliably,
+    # so we set its state directly.
     bw_khz = point.bw / 1000.0
+    driver.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8)
+    # Update Heltec radio (triggers reboot + auto-reconnect)
     if not await companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8):
         _err(f"  set_radio failed for {point_label(point)}")
         return result
@@ -830,7 +870,8 @@ async def run_bridge_point(
     if not contact_exchanged:
         _info("  Phase A: Heltec ADVERT → Bridge RX")
         await companion.send_advert()
-        await asyncio.sleep(FLUSH_BRIDGE_S)
+        tx_air_a = lora_airtime_s(point.sf, point.bw)
+        await asyncio.sleep(max(FLUSH_BRIDGE_S, tx_air_a + 2.0))
         contacts_out = driver.get_contacts()
         heltec_pk = companion.pubkey.lower()
         advert_rx = heltec_pk[:12] in contacts_out.lower() if heltec_pk else False
@@ -849,7 +890,11 @@ async def run_bridge_point(
     _info("  Phase B: Bridge ADVERT → Heltec RX")
     companion.drain_adverts()  # discard stale
     driver.send_advert()
-    await asyncio.sleep(FLUSH_TX_S)
+    # Wait for TX airtime + propagation.  At high SF the ADVERT airtime is
+    # significant (SF9/BW62.5k ≈ 2s, SF12/BW62.5k ≈ 17s).  The B210 USB
+    # transport crashes if another TX is queued while the radio is busy.
+    tx_air = lora_airtime_s(point.sf, point.bw)
+    await asyncio.sleep(max(FLUSH_TX_S, tx_air + 1.0))
     adverts = companion.drain_adverts()
     advert_tx = any(
         a.get("adv_key", "").lower().startswith(sdr_pubkey[:12].lower())
@@ -878,7 +923,9 @@ async def run_bridge_point(
     payload_c = bridge_payload(point)
     result["msg_tx_payload"] = payload_c
     driver.send_msg(heltec_name, payload_c)
-    await asyncio.sleep(FLUSH_TX_S)
+    # TXT_MSG is shorter than ADVERT but still needs airtime margin
+    tx_air_c = lora_airtime_s(point.sf, point.bw, n_bytes=40)
+    await asyncio.sleep(max(FLUSH_TX_S, tx_air_c + 1.0))
     msgs = companion.drain_messages()
     msg_tx = any(payload_c in m.get("text", "") for m in msgs)
     result["msg_tx"] = msg_tx
@@ -1304,10 +1351,22 @@ async def _run_bridge_experiment(
     # portion of the pubkey as fallback
     heltec_name = heltec_pubkey[:8]  # short prefix as contact name
 
-    # 7. Create UDP socket for lora_config messages
+    # 7. Create UDP socket for lora_config messages.
+    # Pre-subscribe and drain: lora_trx floods subscribers with ~50 spectrum
+    # messages/s. Without draining first, send_lora_config's ack gets buried
+    # and times out.
     config_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     config_sock.bind(("127.0.0.1", 0))
     config_addr = ("127.0.0.1", TRX_PORT)
+    config_sock.sendto(cbor2.dumps({"type": "subscribe"}), config_addr)
+    await asyncio.sleep(1.0)
+    config_sock.settimeout(0.1)
+    try:
+        while True:
+            config_sock.recvfrom(65536)
+    except socket.timeout:
+        pass
+    config_sock.settimeout(None)
 
     _info(f"\n--- bridge: {len(matrix)} points, matrix={args.matrix} ---")
     if args.hypothesis:

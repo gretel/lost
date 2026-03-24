@@ -68,7 +68,7 @@ struct MultiSfDecoder
     /// Set external channel-busy flag for listen-before-talk.
     void set_channel_busy_flag(std::atomic<bool>* flag) { _channel_busy = flag; }
 
-    void start() { reconfigure(); }
+    void start() { reconfigure(true); }
 
     void settingsChanged(const gr::property_map& /*oldSettings*/,
                          const gr::property_map& newSettings) {
@@ -80,11 +80,11 @@ struct MultiSfDecoder
             return newSettings.contains(k);
         });
         if (needRecalc && !_lanes.empty()) {
-            reconfigure();
+            reconfigure(false);
         }
     }
 
-    void reconfigure() {
+    void reconfigure(bool isStartup = false) {
         assert(sf_min >= 7 && sf_max <= 12 && sf_min <= sf_max);
         assert(bandwidth > 0 && os_factor >= 1 && preamble_len >= 5);
 
@@ -97,8 +97,16 @@ struct MultiSfDecoder
         }
 
         _min_sps = _lanes.front().sps;  // sf_min has smallest sps
-        // Set min_samples to smallest lane's sps (minimum useful input)
-        in.min_samples = _min_sps + 2u * os_factor;
+
+        // Only set in.min_samples at startup. Changing it at runtime can
+        // disrupt the scheduler's buffer management and cause USB transport
+        // errors (LIBUSB_ERROR_OTHER) on B210. The worst-case value (SF12)
+        // set at start() works for all SFs — smaller SFs just process more
+        // symbols per processBulk call.
+        if (isStartup) {
+            auto worst_sps = static_cast<uint32_t>((1u << 12) * os_factor);
+            in.min_samples = worst_sps + 2u * os_factor;
+        }
 
         // DC blocker (embedded, applied before spectrum + decode)
         if (dc_blocker_cutoff > 0.f && bandwidth > 0) {
