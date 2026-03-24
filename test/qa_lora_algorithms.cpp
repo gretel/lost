@@ -2,11 +2,15 @@
 #include "test_helpers.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <numeric>
 #include <random>
 
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
+#include <gnuradio-4.0/lora/algorithm/SfLane.hpp>
 #include <gnuradio-4.0/lora/algorithm/tables.hpp>
+#include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
@@ -467,6 +471,195 @@ const boost::ut::suite<"LoRa full TX pipeline"> pipeline_tests = [] {
             gray_mapped.push_back((g + 1) % N);
         }
         expect_vectors_equal(gray_mapped, load_u32("tx_06_gray_mapped.u32"), "stage 6 gray demap");
+    };
+};
+
+// =============================================================================
+// Sync algorithm tests: CFO, Xhonneux Eq.20 STO, mod-8 correction
+// =============================================================================
+
+namespace {
+
+/// Helper: generate a preamble with known CFO applied, at os_factor=1.
+std::vector<std::complex<float>> make_preamble_with_cfo(
+        uint8_t sf, float cfo_frac, uint32_t n_syms, uint32_t sto_int = 0,
+        std::mt19937* rng = nullptr, float noise_sigma = 0.f) {
+    const uint32_t Nfft = 1u << sf;
+    std::vector<std::complex<float>> upchirp(Nfft);
+    gr::lora::build_upchirp(upchirp.data(), sto_int, sf, 1);
+
+    std::vector<std::complex<float>> out;
+    out.reserve(static_cast<std::size_t>(Nfft) * n_syms);
+    std::normal_distribution<float> dist(0.f, noise_sigma);
+
+    for (uint32_t s = 0; s < n_syms; s++) {
+        for (uint32_t n = 0; n < Nfft; n++) {
+            float phase = 2.f * static_cast<float>(std::numbers::pi) * cfo_frac
+                        / static_cast<float>(Nfft) * static_cast<float>(s * Nfft + n);
+            auto rot = std::complex<float>(std::cos(phase), std::sin(phase));
+            auto sample = upchirp[n] * rot;
+            if (rng && noise_sigma > 0.f) {
+                sample += std::complex<float>(dist(*rng), dist(*rng));
+            }
+            out.push_back(sample);
+        }
+    }
+    return out;
+}
+
+/// Helper: initialize an SfLane for testing.
+gr::lora::SfLane make_test_lane(uint8_t sf, uint32_t bw = 62500,
+                                 uint16_t sync_word = 0x12, uint16_t preamble_len = 8) {
+    gr::lora::SfLane lane;
+    lane.init(sf, bw, 1 /*os_factor=1*/, preamble_len, sync_word);
+    return lane;
+}
+
+}  // namespace
+
+const boost::ut::suite<"CFO estimation"> cfo_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "CFO estimate at clean SNR"_test = [] {
+        constexpr uint8_t sf = 8;
+        constexpr float cfo_true = 0.3f;
+        auto lane = make_test_lane(sf);
+        auto preamble = make_preamble_with_cfo(sf, cfo_true, lane.n_up_req);
+        std::copy(preamble.begin(), preamble.end(), lane.preamble_raw.begin());
+
+        float cfo_est = lane.estimate_CFO_frac(preamble.data());
+        float err = std::abs(cfo_est - cfo_true);
+        std::printf("  CFO clean: true=%.3f est=%.3f err=%.4f\n",
+                    static_cast<double>(cfo_true), static_cast<double>(cfo_est),
+                    static_cast<double>(err));
+        expect(lt(err, 0.01f)) << "CFO error should be < 0.01 at high SNR";
+    };
+
+    "CFO estimate negative value"_test = [] {
+        constexpr uint8_t sf = 8;
+        constexpr float cfo_true = -0.25f;
+        auto lane = make_test_lane(sf);
+        auto preamble = make_preamble_with_cfo(sf, cfo_true, lane.n_up_req);
+        std::copy(preamble.begin(), preamble.end(), lane.preamble_raw.begin());
+
+        float cfo_est = lane.estimate_CFO_frac(preamble.data());
+        float err = std::abs(cfo_est - cfo_true);
+        std::printf("  CFO negative: true=%.3f est=%.3f err=%.4f\n",
+                    static_cast<double>(cfo_true), static_cast<double>(cfo_est),
+                    static_cast<double>(err));
+        expect(lt(err, 0.01f)) << "negative CFO error should be < 0.01 at high SNR";
+    };
+};
+
+const boost::ut::suite<"Xhonneux Eq.20 STO estimation (W3b)"> sto_eq20_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "STO frac estimate clean (sto_int=5)"_test = [] {
+        constexpr uint8_t sf = 8;
+        constexpr uint32_t sto_int = 5;
+        auto lane = make_test_lane(sf);
+
+        auto preamble = make_preamble_with_cfo(sf, 0.f, lane.n_up_req, sto_int);
+        lane.k_hat = static_cast<int>(sto_int);
+        std::copy(preamble.begin(), preamble.end(), lane.preamble_raw.begin());
+        lane.estimate_CFO_frac(preamble.data());
+
+        float sto_f = lane.estimate_STO_frac(sto_int);
+        std::printf("  STO frac (integer STO=%u): est=%.4f (expect ~0)\n",
+                    sto_int, static_cast<double>(sto_f));
+        expect(lt(std::abs(sto_f), 0.1f)) << "fractional STO should be near 0 for integer STO";
+    };
+
+    "STO frac estimate with fractional offset"_test = [] {
+        constexpr uint8_t sf = 8;
+        constexpr uint32_t Nfft = 1u << sf;
+        constexpr uint8_t os = 4;
+        constexpr float sto_frac_true = 0.3f;
+        constexpr uint32_t sto_int = 0;
+
+        auto lane = make_test_lane(sf);
+        lane.k_hat = 0;
+
+        std::vector<std::complex<float>> upchirp_os(Nfft * os);
+        build_upchirp(upchirp_os.data(), sto_int, sf, os);
+
+        std::vector<std::complex<float>> preamble;
+        preamble.reserve(static_cast<std::size_t>(Nfft) * lane.n_up_req);
+        for (uint32_t s = 0; s < lane.n_up_req; s++) {
+            for (uint32_t n = 0; n < Nfft; n++) {
+                float pos = (static_cast<float>(n) + sto_frac_true) * static_cast<float>(os);
+                auto idx0 = static_cast<uint32_t>(std::floor(pos)) % (Nfft * os);
+                auto idx1 = (idx0 + 1) % (Nfft * os);
+                float frac = pos - std::floor(pos);
+                auto sample = upchirp_os[idx0] * (1.f - frac) + upchirp_os[idx1] * frac;
+                preamble.push_back(sample);
+            }
+        }
+
+        std::copy(preamble.begin(), preamble.end(), lane.preamble_raw.begin());
+        lane.estimate_CFO_frac(preamble.data());
+        float sto_f = lane.estimate_STO_frac(sto_int);
+        std::printf("  STO frac (true=%.3f): est=%.4f\n",
+                    static_cast<double>(sto_frac_true), static_cast<double>(sto_f));
+        expect(lt(std::abs(sto_f - sto_frac_true), 0.2f))
+            << "STO frac should be within 0.2 of true value";
+    };
+
+    "STO frac bounded output [-0.5, 0.5]"_test = [] {
+        constexpr uint8_t sf = 8;
+        auto lane = make_test_lane(sf);
+        lane.k_hat = 0;
+
+        auto preamble = make_preamble_with_cfo(sf, 0.f, lane.n_up_req);
+        std::copy(preamble.begin(), preamble.end(), lane.preamble_raw.begin());
+        lane.estimate_CFO_frac(preamble.data());
+
+        float sto_f = lane.estimate_STO_frac(0);
+        expect(ge(sto_f, -0.5f)) << "STO frac must be >= -0.5";
+        expect(le(sto_f, 0.5f))  << "STO frac must be <= 0.5";
+    };
+};
+
+const boost::ut::suite<"Mod-8 sync word STO correction (W3c)"> mod8_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "mod8 correction with residual +2"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(10, 18);
+        expect(eq(delta, 2)) << "mod-8 residual +2 should give delta=+2";
+    };
+
+    "mod8 correction with residual -1 (=7 mod 8)"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(7, 15);
+        expect(eq(delta, -1)) << "mod-8 residual 7 should give delta=-1";
+    };
+
+    "mod8 no correction when residuals match sync word"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(8, 16);
+        expect(eq(delta, 0)) << "exact match should give delta=0";
+    };
+
+    "mod8 no correction when residuals differ"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(10, 19);
+        expect(eq(delta, 0)) << "mismatched residuals should give delta=0";
+    };
+
+    "mod8 correction wraps for residual +4"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(12, 20);
+        expect(eq(delta, -4)) << "residual 4 should wrap to delta=-4";
+    };
+
+    "mod8 correction with large symbol values"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(253, 245);
+        expect(eq(delta, -3)) << "large values: residual 5 should wrap to delta=-3";
     };
 };
 

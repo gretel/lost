@@ -368,7 +368,7 @@ struct MultiSfDecoder
             if (cfo_offset + lane.up_symb_to_use * lane.N > lane.preamble_raw.size()) {
                 cfo_offset = static_cast<std::size_t>(lane.N);
             }
-            lane.cfo_frac = lane.estimate_CFO_frac_Bernier(&lane.preamble_raw[cfo_offset]);
+            lane.cfo_frac = lane.estimate_CFO_frac(&lane.preamble_raw[cfo_offset]);
             lane.sto_frac = lane.estimate_STO_frac();
 
             for (uint32_t n = 0; n < lane.N; n++) {
@@ -517,8 +517,9 @@ struct MultiSfDecoder
             multisf_detail::complex_multiply(lane.preamble_upchirps.data(), lane.preamble_upchirps.data(),
                                       lane.corr_vec.data(), lane.up_symb_to_use * lane.N);
 
-            // Re-estimate STO frac after SFO correction
-            float tmp_sto_frac = lane.estimate_STO_frac();
+            // Re-estimate STO frac after SFO correction.
+            // After CFO_int rotation + SFO correction, peak is near bin 0.
+            float tmp_sto_frac = lane.estimate_STO_frac(0);
             float diff = lane.sto_frac - tmp_sto_frac;
             float os_thresh = static_cast<float>(os_factor - 1u) / static_cast<float>(os_factor);
             if (std::abs(diff) <= os_thresh) lane.sto_frac = tmp_sto_frac;
