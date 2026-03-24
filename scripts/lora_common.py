@@ -860,3 +860,18 @@ class CompanionDriver:
     def get_radio(self) -> str:
         ok, out = self._run("get", "radio")
         return out if ok else ""
+
+    def get_contacts(self) -> str:
+        """Return raw output of 'contacts' command."""
+        ok, out = self._run("contacts")
+        return out if ok else ""
+
+    def recv_msg(self, timeout: float = 5.0) -> str:
+        """Return the next queued message text, or empty string."""
+        ok, out = self._run("recv", timeout=timeout)
+        return out if ok else ""
+
+    def get_card(self) -> str:
+        """Return the node's contact URI (contains pubkey)."""
+        ok, out = self._run("card")
+        return out if ok else ""

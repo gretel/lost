@@ -6,6 +6,7 @@ requires-python = ">=3.14"
 dependencies = [
     "cbor2",
     "duckdb",
+    "meshcore>=2.3",
     "pynacl",
     "pycryptodome",
     "segno",
