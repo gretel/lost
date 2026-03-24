@@ -98,12 +98,7 @@ struct SfLane {
     std::vector<std::complex<float>> accum;
 
     // === Soft decode ===
-    // DISABLED: soft decode passes loopback tests but causes 0 frame detection on
-    // hardware (HW Session B, 2026-03-24). The code path (demodSymbolSoft → LLR →
-    // processBlockSoft) is structurally correct but something about the real-RF
-    // signal characteristics causes failure. Investigation needed: compare hard vs
-    // soft symbol decisions on captured IQ, check LLR magnitude distribution.
-    static constexpr bool kUseSoftDecode = false;
+    static constexpr bool kUseSoftDecode = true;   // soft Hamming decode via LLR + ML-LUT
     static constexpr float kPmrConfidenceThreshold = 4.0f;  // below this, scale LLR by 0.5
 
     GrayPartition gray_partition;
