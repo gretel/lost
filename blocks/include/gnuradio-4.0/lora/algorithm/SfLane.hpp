@@ -98,7 +98,12 @@ struct SfLane {
     std::vector<std::complex<float>> accum;
 
     // === Soft decode ===
-    static constexpr bool kUseSoftDecode = true;   // enable soft Hamming decode path
+    // DISABLED: soft decode passes loopback tests but causes 0 frame detection on
+    // hardware (HW Session B, 2026-03-24). The code path (demodSymbolSoft → LLR →
+    // processBlockSoft) is structurally correct but something about the real-RF
+    // signal characteristics causes failure. Investigation needed: compare hard vs
+    // soft symbol decisions on captured IQ, check LLR magnitude distribution.
+    static constexpr bool kUseSoftDecode = false;
     static constexpr float kPmrConfidenceThreshold = 4.0f;  // below this, scale LLR by 0.5
 
     GrayPartition gray_partition;
@@ -504,17 +509,20 @@ struct SfLane {
     [[nodiscard]] std::vector<uint8_t> processBlockSoft(
             const std::vector<std::vector<double>>& sym_llrs,
             uint8_t sf_app, uint8_t cw_len, uint8_t cr_app) {
-        // For LDRO (sf_app < sf): only the lower sf_app bits are meaningful.
-        // Trim each symbol's LLR to sf_app entries (keeping only the lower bits).
+        // For header/LDRO (sf_app < sf): the hard path does gray >>= (sf - sf_app),
+        // dropping the lowest (sf - sf_app) bits.  In the LLR domain (k=0=LSB),
+        // we keep the UPPER sf_app bits: llrs[sf-sf_app .. sf-1], renumbered
+        // to 0..sf_app-1 so the soft deinterleaver sees the same bit positions
+        // as the hard deinterleaver sees after the shift.
+        const uint8_t drop = sf - sf_app;  // 0 for payload, 2 for header/LDRO
         std::vector<std::vector<double>> trimmed;
         trimmed.reserve(sym_llrs.size());
         for (const auto& llrs : sym_llrs) {
-            // llrs has sf entries (k=0=LSB .. k=sf-1=MSB).
-            // Keep only the lower sf_app bits (k=0..sf_app-1).
-            std::vector<double> t(llrs.begin(),
-                                   llrs.begin() + static_cast<std::ptrdiff_t>(
-                                       std::min(static_cast<std::size_t>(sf_app), llrs.size())));
-            trimmed.push_back(std::move(t));
+            auto begin = llrs.begin() + static_cast<std::ptrdiff_t>(
+                std::min(static_cast<std::size_t>(drop), llrs.size()));
+            auto end = llrs.begin() + static_cast<std::ptrdiff_t>(
+                std::min(static_cast<std::size_t>(sf), llrs.size()));
+            trimmed.emplace_back(begin, end);
         }
 
         auto cw_llrs = deinterleave_block_soft(trimmed, sf_app, cw_len);
