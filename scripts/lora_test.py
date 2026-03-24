@@ -694,68 +694,6 @@ async def run_tx_point(
 
     return result
 
-    time.sleep(SETTLE_S)
-
-    # --- ADVERT test ---
-    ok = _sdr_tx_advert(TRX_PORT, point.freq_mhz, point.sf, point.bw)
-    result.tx_ok = ok
-    _info(f"  ADVERT TX {'ok' if ok else 'FAIL'}")
-    if not ok:
-        return result
-
-    time.sleep(FLUSH_TX_S)
-
-    contacts_after = companion.get_contacts()
-    advert_ok = _pubkey_in_contacts(sdr_pubkey, contacts_after)
-    result.frames.append(
-        {
-            "test": "advert_rx",
-            "passed": advert_ok,
-        }
-    )
-    if advert_ok:
-        result.crc_ok += 1
-        _info("  ADVERT RX: Heltec learned SDR contact")
-    else:
-        result.crc_fail += 1
-        _info("  ADVERT RX: NOT received")
-
-    # --- TXT_MSG test ---
-    if heltec_pubkey:
-        ts = int(time.time())
-        msg_text = f"test_{ts}"
-        ok = _sdr_tx_msg(
-            TRX_PORT,
-            heltec_pubkey,
-            msg_text,
-            point.freq_mhz,
-            point.sf,
-            point.bw,
-        )
-        _info(f"  TXT_MSG TX {'ok' if ok else 'FAIL'}")
-        if ok:
-            time.sleep(FLUSH_TX_S)
-            recv = companion.recv_msg()
-            msg_ok = msg_text in recv if recv else False
-            result.frames.append(
-                {
-                    "test": "txt_msg_rx",
-                    "passed": msg_ok,
-                    "sent": msg_text,
-                    "received": recv[:200] if recv else "",
-                }
-            )
-            if msg_ok:
-                result.crc_ok += 1
-                _info(f"  TXT_MSG RX: received '{msg_text}'")
-            else:
-                result.crc_fail += 1
-                _info(f"  TXT_MSG RX: NOT received (got: {recv[:80]!r})")
-    else:
-        _info("  TXT_MSG: skipped (no Heltec pubkey)")
-
-    return result
-
 
 # -- Summary builder -----------------------------------------------------------
 

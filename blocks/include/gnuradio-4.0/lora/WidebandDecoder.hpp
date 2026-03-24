@@ -29,7 +29,6 @@
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/algorithm/DCBlocker.hpp>
 #include <gnuradio-4.0/lora/algorithm/HalfBandDecimator.hpp>
-#include <gnuradio-4.0/lora/algorithm/RingBuffer.hpp>
 #include <gnuradio-4.0/lora/algorithm/SfLane.hpp>
 #include <gnuradio-4.0/lora/algorithm/Telemetry.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
@@ -180,7 +179,6 @@ struct WidebandDecoder
     std::string decode_bw_str{"62500"};    // comma-separated BWs for multi-BW decode
     std::string decode_sfs_str{""};        // comma-separated SFs to decode, empty = all (7-12)
     float       min_ratio{8.0f};           // min L2 CAD peak ratio (unused in M3)
-    float       buffer_ms{512.f};          // ring buffer duration (ms)
     uint32_t    max_channels{24};          // max simultaneous decode channels
     uint32_t    l1_interval{64};           // processBulk calls between L1 snapshots
     uint32_t    l1_snapshots{16};          // snapshots to accumulate before probing
@@ -197,13 +195,12 @@ struct WidebandDecoder
     GR_MAKE_REFLECTABLE(WidebandDecoder, in, out, msg_out,
         sample_rate, center_freq, channel_bw, decode_bw, decode_bw_str,
         decode_sfs_str, min_ratio,
-        buffer_ms, max_channels, l1_interval, l1_snapshots, l1_fft_size,
+        max_channels, l1_interval, l1_snapshots, l1_fft_size,
         sync_word, preamble_len, energy_thresh, min_snr_db, max_symbols,
         overflow_max_per_sweep, dc_blocker_cutoff, debug);
 
     // --- internal state ---
 
-    RingBuffer                _ring;
     std::vector<ChannelSlot>  _slots;
 
     // L1 energy detection
@@ -229,10 +226,6 @@ struct WidebandDecoder
     DCBlocker                 _dc;
     std::vector<cf32>         _dcBuf;   // persistent buffer (avoids per-call heap alloc)
     std::vector<cf32>         _fftBuf;  // persistent L1 FFT buffer (avoids ~30/s heap allocs)
-    std::vector<float>        _fftBinMag; // per-bin |FFT|^2 from last snapshot (for peak-bin NCO refinement)
-
-    // Noise floor tracking
-    float                     _noise_floor_db{-999.f};
 
     // Telemetry callback (set by app, fires on sweep completion and slot changes)
     std::function<void(const gr::property_map&)> _telemetry;
@@ -241,11 +234,6 @@ struct WidebandDecoder
     // --- lifecycle ---
 
     void start() {
-        // Ring buffer
-        const auto bufferSamples = static_cast<std::size_t>(
-            buffer_ms * sample_rate / 1000.f);
-        _ring.resize(bufferSamples);
-
         // L1 channel grid
         const float usableBw = sample_rate * 0.8f;
         _nChannels = static_cast<uint32_t>(usableBw / channel_bw);
@@ -321,7 +309,6 @@ struct WidebandDecoder
         _dc.init(sample_rate, dc_blocker_cutoff);
         _dcBuf.reserve(8192);           // typical chunk size
         _fftBuf.reserve(l1_fft_size);   // persistent L1 FFT buffer
-        _fftBinMag.assign(l1_fft_size, 0.f);
         _callCount      = 0;
         _snapshotCount  = 0;
         _sweepCount     = 0;
@@ -338,13 +325,12 @@ struct WidebandDecoder
                 }
             }
             log_ts("info ", "wideband",
-                "started: %.1f MS/s, %.3f MHz center, %u ch (%.1f kHz), %u slots, buffer %u ms, %s",
+                "started: %.1f MS/s, %.3f MHz center, %u ch (%.1f kHz), %u slots, %s",
                 static_cast<double>(sample_rate) / 1e6,
                 static_cast<double>(center_freq) / 1e6,
                 _nChannels,
                 static_cast<double>(channel_bw) / 1e3,
                 max_channels,
-                static_cast<unsigned>(buffer_ms),
                 sf_desc.c_str());
         }
     }
@@ -402,7 +388,6 @@ struct WidebandDecoder
             findHotChannels();
             updateActiveChannels();
             _channelEnergy.assign(_nChannels, 0.f);
-            _fftBinMag.assign(l1_fft_size, 0.f);
             _snapshotCount = 0;
             uint32_t sweepZeroCalls  = _zeroCalls;
             uint32_t sweepTotalCalls = _totalCalls;
@@ -543,7 +528,7 @@ struct WidebandDecoder
         auto fftOut = _fft.compute(
             std::span<const cf32>(_fftBuf.data(), l1_fft_size));
 
-        // Compute |FFT|^2 per bin and store for peak-bin NCO refinement.
+        // Accumulate |FFT|^2 into channel bins.
         // Bins are in fftshift domain: bin 0 = most negative freq.
         const auto half    = l1_fft_size / 2;
         const float binBw  = sample_rate / static_cast<float>(l1_fft_size);
@@ -552,18 +537,6 @@ struct WidebandDecoder
         const float usableBw = sample_rate * 0.8f;
         const auto  startBin = static_cast<uint32_t>(std::round(
             (static_cast<float>(l1_fft_size) - usableBw / binBw) / 2.f));
-
-        if (_fftBinMag.size() < l1_fft_size) {
-            _fftBinMag.assign(l1_fft_size, 0.f);
-        }
-        for (uint32_t i = 0; i < l1_fft_size; ++i) {
-            const auto fftIdx = (i + half) % l1_fft_size;
-            const auto& s = fftOut[fftIdx];
-            _fftBinMag[i] += s.real() * s.real() + s.imag() * s.imag();
-        }
-
-        // Accumulate into channel bins (from fftOut directly, not _fftBinMag,
-        // to avoid quadratic growth — _fftBinMag accumulates across snapshots)
         for (uint32_t ch = 0; ch < _nChannels
              && ch * binsPerCh + startBin + binsPerCh <= l1_fft_size; ++ch) {
             float energy = 0.f;
@@ -1233,9 +1206,6 @@ struct WidebandDecoder
         out_tag["cfo_int"]       = gr::pmt::Value(static_cast<int64_t>(lane.cfo_int));
         out_tag["cfo_frac"]      = gr::pmt::Value(static_cast<double>(lane.cfo_frac));
         out_tag["sfo_hat"]       = gr::pmt::Value(static_cast<double>(lane.sfo_hat));
-        if (_noise_floor_db > -999.f) {
-            out_tag["noise_floor_db"] = gr::pmt::Value(static_cast<double>(_noise_floor_db));
-        }
         this->publishTag(out_tag, 0UZ);
 
         // Publish message

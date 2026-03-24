@@ -488,7 +488,6 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         {"channel_bw", 62500.f},
         {"decode_bw", static_cast<float>(cfg.bw)},
         {"max_channels", uint32_t{8}},
-        {"buffer_ms", 512.f},
         {"sync_word", dc.sync_word},
         {"preamble_len", cfg.preamble},
         {"debug", cfg.debug},
