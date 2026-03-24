@@ -238,8 +238,11 @@ struct SfLane {
 
         std::complex<float> four_cum(0.f, 0.f);
         for (uint32_t i = 0; i + 1 < n_syms; i++) {
-            four_cum += fft_val_buf[idx_max + N * i]
-                      * std::conj(fft_val_buf[idx_max + N * (i + 1)]);
+            for (int p = -2; p <= 2; p++) {
+                uint32_t bin = (idx_max + static_cast<uint32_t>(p + static_cast<int>(N))) % N;
+                four_cum += fft_val_buf[bin + N * i]
+                          * std::conj(fft_val_buf[bin + N * (i + 1)]);
+            }
         }
         float cfo_f = -std::arg(four_cum) / (2.f * static_cast<float>(std::numbers::pi));
 

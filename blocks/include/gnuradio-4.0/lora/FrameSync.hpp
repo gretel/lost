@@ -330,8 +330,11 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
 
         std::complex<float> four_cum(0.f, 0.f);
         for (uint32_t i = 0; i + 1 < n_syms; i++) {
-            four_cum += _fft_val_buf[idx_max + _N * i]
-                      * std::conj(_fft_val_buf[idx_max + _N * (i + 1)]);
+            for (int p = -2; p <= 2; p++) {
+                uint32_t bin = (idx_max + static_cast<uint32_t>(p + static_cast<int>(_N))) % _N;
+                four_cum += _fft_val_buf[bin + _N * i]
+                          * std::conj(_fft_val_buf[bin + _N * (i + 1)]);
+            }
         }
         float cfo_frac = -std::arg(four_cum) / (2.f * static_cast<float>(std::numbers::pi));
 
@@ -347,50 +350,46 @@ struct FrameSync : gr::Block<FrameSync, gr::NoDefaultTagForwarding> {
         return cfo_frac;
     }
 
-    /// STO fractional estimation using zero-padded FFT with RCTSL interpolation.
-    /// Uses pre-allocated _scratch_N (dechirp), _scratch_2N (FFT input), _scratch_2N_f (mag accum).
-    float estimate_STO_frac() {
+    /// Fractional STO estimation using Xhonneux Eq. 20 (phase-corrected
+    /// 3-bin interpolation on N-point FFT of CFO-corrected preamble).
+    float estimate_STO_frac(uint32_t L_STO_int) {
         const auto n_syms = _up_symb_to_use;
+        if (n_syms == 0) return 0.f;
 
-        // Zero the accumulator
-        std::fill(_scratch_2N_f.begin(), _scratch_2N_f.end(), 0.f);
+        uint32_t pk = L_STO_int % _N;
+        std::complex<float> Y_sum_m1(0.f, 0.f);
+        std::complex<float> Y_sum_0(0.f, 0.f);
+        std::complex<float> Y_sum_p1(0.f, 0.f);
 
         for (uint32_t i = 0; i < n_syms; i++) {
             detail::complex_multiply(_scratch_N.data(), &_preamble_upchirps[_N * i],
                                      _downchirp.data(), _N);
-
-            std::copy_n(_scratch_N.begin(), _N, _scratch_2N.begin());
-            std::fill(_scratch_2N.begin() + _N, _scratch_2N.end(),
-                      std::complex<float>(0.f, 0.f));
-
             auto fft_out = _fft.compute(
-                std::span<const std::complex<float>>(_scratch_2N.data(), 2 * _N));
+                std::span<const std::complex<float>>(_scratch_N.data(), _N));
 
-            for (uint32_t j = 0; j < 2 * _N; j++) {
-                _scratch_2N_f[j] += fft_out[j].real() * fft_out[j].real()
-                                  + fft_out[j].imag() * fft_out[j].imag();
-            }
+            Y_sum_m1 += fft_out[(pk + _N - 1) % _N];
+            Y_sum_0  += fft_out[pk];
+            Y_sum_p1 += fft_out[(pk + 1) % _N];
         }
 
-        auto max_it = std::max_element(_scratch_2N_f.begin(), _scratch_2N_f.end());
-        auto k0 = static_cast<uint32_t>(std::distance(_scratch_2N_f.begin(), max_it));
+        uint32_t M_hat = (_N - L_STO_int % _N) % _N;
+        float phase = 2.f * static_cast<float>(std::numbers::pi)
+                    * static_cast<float>(M_hat) / static_cast<float>(_N);
+        auto e_pos = std::complex<float>(std::cos(phase),  std::sin(phase));
+        auto e_neg = std::complex<float>(std::cos(phase), -std::sin(phase));
 
-        // RCTSL interpolation
-        auto wrap = [N2 = 2LL * static_cast<int64_t>(_N)](int64_t i) -> std::size_t {
-            return static_cast<std::size_t>(mod(i, N2));
-        };
-        double Y_1 = static_cast<double>(_scratch_2N_f[wrap(static_cast<int64_t>(k0) - 1)]);
-        double Y0  = static_cast<double>(_scratch_2N_f[k0]);
-        double Y1  = static_cast<double>(_scratch_2N_f[wrap(static_cast<int64_t>(k0) + 1)]);
+        auto num = e_neg * Y_sum_p1 - e_pos * Y_sum_m1;
+        auto den = 2.f * Y_sum_0 - e_neg * Y_sum_p1 - e_pos * Y_sum_m1;
 
-        double u = 64.0 * _N / 406.5506497;
-        double v = u * 2.4674;
-        double wa = (Y1 - Y_1) / (u * (Y1 + Y_1) + v * Y0);
-        double ka = wa * _N / std::numbers::pi;
-        double k_residual = std::fmod((k0 + ka) / 2.0, 1.0);
-        float sto_frac = static_cast<float>(k_residual - (k_residual > 0.5 ? 1.0 : 0.0));
+        if (std::abs(den) < 1e-10f) return 0.f;
 
-        return sto_frac;
+        float lambda_STO = -std::real(num / den);
+        return std::clamp(lambda_STO, -0.5f, 0.5f);
+    }
+
+    /// Overload using _k_hat for backward compatibility.
+    float estimate_STO_frac() {
+        return estimate_STO_frac(static_cast<uint32_t>(std::max(0, _k_hat)));
     }
 
     /// Preamble-based SNR estimation (GR3 determine_snr algorithm).
