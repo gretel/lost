@@ -419,15 +419,16 @@ inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const Sc
     if (probeBwsStr.empty()) probeBwsStr = "62500";
 
     auto& controller = graph.emplaceBlock<gr::lora::ScanController>({
-        {"sample_rate",   static_cast<float>(cfg.l1_rate)},
-        {"center_freq",   static_cast<float>(centerFreq)},
-        {"min_ratio",     cfg.min_ratio},
-        {"buffer_ms",     cfg.buffer_ms},
-        {"channel_bw",    cfg.channel_bw},
-        {"l1_interval",   cfg.l1_reports},
-        {"l1_snapshots",  uint32_t{16}},
-        {"l1_fft_size",   cfg.l1_fft_size},
-        {"probe_bws",     probeBwsStr},
+        {"sample_rate",       static_cast<float>(cfg.l1_rate)},
+        {"center_freq",       static_cast<float>(centerFreq)},
+        {"min_ratio",         cfg.min_ratio},
+        {"buffer_ms",         cfg.buffer_ms},
+        {"channel_bw",        cfg.channel_bw},
+        {"l1_interval",       cfg.l1_reports},
+        {"l1_snapshots",      uint32_t{16}},
+        {"l1_fft_size",       cfg.l1_fft_size},
+        {"probe_bws",         probeBwsStr},
+        {"dc_blocker_cutoff", cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f},
     });
 
     if (!ok(graph.connect<"out", "in">(source, controller))) {

@@ -17,6 +17,7 @@
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
 #include <gnuradio-4.0/lora/algorithm/Channelize.hpp>
+#include <gnuradio-4.0/lora/algorithm/DCBlocker.hpp>
 #include <gnuradio-4.0/lora/algorithm/RingBuffer.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
@@ -41,11 +42,12 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     uint32_t    l1_snapshots{16};      // snapshots to accumulate before probing
     uint32_t    l1_fft_size{4096};
     std::string probe_bws{"62500"};    // comma-separated BWs to probe (Hz)
+    float       dc_blocker_cutoff{2000.f};  // DSP DC blocker cutoff (Hz), 0 = disabled
 
     GR_MAKE_REFLECTABLE(ScanController, in, detect_out, spectrum_out,
                         sample_rate, center_freq, min_ratio, buffer_ms,
                         channel_bw, l1_interval, l1_snapshots, l1_fft_size,
-                        probe_bws);
+                        probe_bws, dc_blocker_cutoff);
 
     // --- internal types ---
 
@@ -82,6 +84,10 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     std::vector<float>       _window;
 
     std::vector<ChannelActivityDetector> _cadPerBw;
+
+    // DC blocker (embedded, applied before ring buffer push + L1 FFT)
+    DCBlocker           _dc;
+    std::vector<cf32>   _dcBuf;
 
     // --- lifecycle ---
 
@@ -134,12 +140,18 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         _snapshotCount = 0;
         _sweepCount    = 0;
 
+        // DC blocker: remove DC spur before L1 energy + ring buffer
+        if (dc_blocker_cutoff > 0.f) {
+            _dc.init(sample_rate, dc_blocker_cutoff);
+        }
+
         gr::lora::log_ts("info ", "scanctrl",
-            "started: %.1f MS/s, %.3f MHz center, %u ch (%.1f kHz), buffer %u ms, L1 every %u calls",
+            "started: %.1f MS/s, %.3f MHz center, %u ch (%.1f kHz), buffer %u ms, L1 every %u calls, dc_hp %.0f Hz",
             static_cast<double>(sample_rate) / 1e6,
             static_cast<double>(center_freq) / 1e6, _nChannels,
             static_cast<double>(channel_bw) / 1e3,
-            static_cast<unsigned>(buffer_ms), l1_interval);
+            static_cast<unsigned>(buffer_ms), l1_interval,
+            static_cast<double>(dc_blocker_cutoff));
     }
 
     // --- processBulk ---
@@ -160,9 +172,15 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             }
         }
 
-        // 2. Push all input into ring buffer
+        // 2. DC blocker + push into ring buffer
         auto inSpan = std::span(inPort);
-        _ring.push(inSpan);
+        std::span<const cf32> cleanSpan = inSpan;
+        if (_dc.initialised()) {
+            _dcBuf.resize(inSpan.size());
+            _dc.processBlock(inSpan, std::span<cf32>(_dcBuf));
+            cleanSpan = std::span<const cf32>(_dcBuf);
+        }
+        _ring.push(cleanSpan);
         std::ignore = inPort.consume(inSpan.size());
 
         // 3. Periodic L1 energy snapshot (cheap: one FFT per interval)

@@ -43,9 +43,9 @@ struct DCBlocker {
 
     DCBlocker() = default;
 
-    explicit DCBlocker(float sampleRate, float cutoffHz = 10.f) { init(sampleRate, cutoffHz); }
+    explicit DCBlocker(float sampleRate, float cutoffHz = 2000.f) { init(sampleRate, cutoffHz); }
 
-    void init(float sampleRate, float cutoffHz = 10.f) {
+    void init(float sampleRate, float cutoffHz = 2000.f) {
         _sampleRate  = sampleRate;
         _cutoffHz    = cutoffHz;
         _initialised = false;
@@ -54,10 +54,15 @@ struct DCBlocker {
             return;
         }
 
+        // Order must be ≤ 2. Order 4 is numerically unstable in double precision
+        // at extreme fc/fs ratios (e.g. 10 Hz / 250 kHz) — coefficients lose
+        // significance and the filter produces garbage or diverges.
+        constexpr std::size_t kOrder = 2UZ;
+
         auto coeffs = gr::filter::iir::designFilter<double>(
             gr::filter::Type::HIGHPASS,
             gr::filter::FilterParameters{
-                .order = 2UZ,
+                .order = kOrder,
                 .fHigh = static_cast<double>(cutoffHz),
                 .fs    = static_cast<double>(sampleRate)},
             gr::filter::iir::Design::BUTTERWORTH);

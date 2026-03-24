@@ -852,8 +852,9 @@ def main() -> None:
 
     label = args.label or f"{mode}_{args.matrix}"
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output_path = f"tmp/lora_test_{label}_{ts}.json"
-    os.makedirs("tmp", exist_ok=True)
+    output_dir = os.path.join("data", "testing")
+    output_path = os.path.join(output_dir, f"lora_test_{label}_{ts}.json")
+    os.makedirs(output_dir, exist_ok=True)
 
     # -- TX mode: separate path (meshcore_py, no serial_bridge) ---
     if mode == "tx":

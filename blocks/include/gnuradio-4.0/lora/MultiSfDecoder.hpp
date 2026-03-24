@@ -246,7 +246,7 @@ struct MultiSfDecoder
                        std::size_t in_offset) {
         auto [dechirp_bin, dechirp_pmr] = dechirp_and_quality(
             lane.in_down.data(), lane.downchirp.data(),
-            lane.scratch_N.data(), lane.N, lane.fft, /*remove_dc=*/true);
+            lane.scratch_N.data(), lane.N, lane.fft, /*remove_dc=*/!_dc.initialised());
         lane.bin_idx_new = static_cast<int32_t>(dechirp_bin);
 
 

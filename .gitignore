@@ -18,4 +18,5 @@ Makefile
 opencode.json
 out/
 scripts/data
+data/testing/
 tmp/
