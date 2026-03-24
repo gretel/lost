@@ -69,6 +69,7 @@ inline gr::lora::MultiSfDecoder& add_multisf_chain(
     decoder.sf_min       = 7;
     decoder.sf_max       = 12;
     decoder.debug        = cfg.debug;
+    decoder.soft_decode  = cfg.soft_decode;
     if (cfg.lo_offset > 0.0) {
         // LO offset moves DC spur out of band; reduce blocker to catch residual drift only
         decoder.dc_blocker_cutoff = cfg.dc_blocker ? 100.f : 0.f;
@@ -515,6 +516,7 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         {"dc_blocker_cutoff", (cfg.lo_offset > 0.0)
             ? (cfg.dc_blocker ? 100.f : 0.f)
             : (cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f)},
+        {"soft_decode", cfg.soft_decode},
     };
     if (!cfg.decode_sfs_str.empty()) {
         wb_props["decode_sfs_str"] = cfg.decode_sfs_str;

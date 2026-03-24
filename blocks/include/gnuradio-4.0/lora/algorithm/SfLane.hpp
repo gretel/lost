@@ -98,12 +98,17 @@ struct SfLane {
     std::vector<std::complex<float>> accum;
 
     // === Soft decode ===
-    static constexpr bool kUseSoftDecode = false;  // HW-validated: 0 frames when true (loopback OK). Needs investigation.
+    bool use_soft_decode{false};  // runtime toggle (config.toml: soft_decode = true/false)
     static constexpr float kPmrConfidenceThreshold = 4.0f;  // below this, scale LLR by 0.5
 
     GrayPartition gray_partition;
-    // Per-symbol soft data: one vector of sf_app LLR values per symbol
-    std::vector<std::vector<double>> soft_symbol_llrs;
+    // Pre-allocated soft decode buffers (avoid per-symbol heap allocation)
+    std::vector<float>  _soft_mag_sq;       // size N, reused per symbol
+    std::vector<float>  _soft_sym_mag_sq;   // size N, reused per symbol (remapped)
+    std::vector<double> _soft_llr_buf;      // size sf, reused per symbol
+    // Flat LLR storage: _soft_llr_flat[symbol_idx * sf + bit_idx]
+    std::vector<double> _soft_llr_flat;
+    size_t              _soft_llr_count{0}; // number of symbols stored
     // Per-symbol PMR values (for confidence scaling)
     std::vector<float> soft_symbol_pmrs;
 
@@ -133,13 +138,14 @@ struct SfLane {
     std::vector<uint8_t> nibbles;
 
     void init(uint8_t sf_, uint32_t bandwidth_, uint8_t os_factor_,
-              uint16_t preamble_len_, uint16_t sync_word) {
+              uint16_t preamble_len_, uint16_t sync_word, bool soft_decode = false) {
         sf = sf_;
         N  = 1u << sf;
         os_factor = os_factor_;
         sps = N * os_factor;
         bandwidth = bandwidth_;
         preamble_len = preamble_len_;
+        use_soft_decode = soft_decode;
 
         sw0 = static_cast<uint16_t>(((sync_word & 0xF0) >> 4) << 3);
         sw1 = static_cast<uint16_t>((sync_word & 0x0F) << 3);
@@ -169,8 +175,13 @@ struct SfLane {
         dechirped.resize(N);
 
         accum.clear();
-        if constexpr (kUseSoftDecode) {
+        if (use_soft_decode) {
             gray_partition.init(sf);
+            _soft_mag_sq.resize(N);
+            _soft_sym_mag_sq.resize(N);
+            _soft_llr_buf.resize(sf);
+            _soft_llr_flat.reserve(256 * sf);  // pre-reserve for typical frame
+            soft_symbol_pmrs.reserve(256);
         }
         fft = gr::algorithm::FFT<std::complex<float>>{};
         resetToDetect();
@@ -202,7 +213,8 @@ struct SfLane {
         cr = 4;
         pay_len = 0;
         stall_count = 0;
-        soft_symbol_llrs.clear();
+        _soft_llr_flat.clear();
+        _soft_llr_count = 0;
         soft_symbol_pmrs.clear();
     }
 
@@ -407,31 +419,37 @@ struct SfLane {
     }
 
     /// Soft demodulate: returns hard symbol AND stores per-bit LLR + PMR.
+    /// Zero heap allocations — uses pre-allocated buffers and flat LLR storage.
     [[nodiscard]] uint16_t demodSymbolSoft(const std::complex<float>* samples) {
         auto result = dechirp_soft(samples, cfo_downchirp.data(),
-                                   dechirped.data(), N, fft);
+                                   dechirped.data(), N, fft,
+                                   _soft_mag_sq.data());  // pre-allocated
         auto hard_sym = static_cast<uint16_t>(
             mod(static_cast<int64_t>(result.bin) - 1, static_cast<int64_t>(N)));
 
-        soft_symbol_pmrs.push_back(result.pmr);
+        soft_symbol_pmrs.push_back(result.pmr);  // pre-reserved, no realloc
 
         // Remap mag_sq from FFT bin order to symbol order (subtract 1 mod N)
         // since symbol s maps to FFT bin (s+1) mod N.
-        std::vector<float> sym_mag_sq(N);
         for (uint32_t s = 0; s < N; s++) {
-            sym_mag_sq[s] = result.mag_sq[(s + 1) % N];
+            _soft_sym_mag_sq[s] = _soft_mag_sq[(s + 1) % N];
         }
 
-        // Compute per-bit LLR for sf bits (we'll reduce to sf_app later in processBlockSoft)
-        std::vector<double> llrs(sf);
-        compute_symbol_llr(sym_mag_sq.data(), N, sf, gray_partition, llrs.data());
+        // Compute per-bit LLR for sf bits into pre-allocated buffer
+        compute_symbol_llr(_soft_sym_mag_sq.data(), N, sf, gray_partition,
+                           _soft_llr_buf.data());
 
         // Apply PMR-based confidence scaling: low PMR → unreliable symbol
         if (result.pmr < kPmrConfidenceThreshold) {
-            for (auto& l : llrs) l *= 0.5;
+            for (uint8_t k = 0; k < sf; k++) _soft_llr_buf[k] *= 0.5;
         }
 
-        soft_symbol_llrs.push_back(std::move(llrs));
+        // Append to flat storage (no inner vector allocation)
+        _soft_llr_flat.insert(_soft_llr_flat.end(),
+                              _soft_llr_buf.begin(),
+                              _soft_llr_buf.begin() + sf);
+        _soft_llr_count++;
+
         return hard_sym;
     }
 
@@ -531,25 +549,32 @@ struct SfLane {
     }
 
     /// Decode one interleaver block. When soft LLRs are available
-    /// (kUseSoftDecode && soft_symbol_llrs not empty), uses the soft path;
+    /// (kUseSoftDecode && flat LLR storage not empty), uses the soft path;
     /// otherwise falls back to hard decode.
     ///
-    /// Soft LLRs are consumed from the front of soft_symbol_llrs in lock-step
+    /// Soft LLRs are consumed from the front of _soft_llr_flat in lock-step
     /// with symbol_buffer — callers must ensure they are accumulated together
     /// via demodSymbolSoft().
     [[nodiscard]] std::vector<uint8_t> processBlock(
             const std::vector<uint16_t>& symbols,
             uint8_t sf_app, uint8_t cw_len, uint8_t cr_app,
             bool /*is_header_block*/) {
-        // Soft path: use accumulated LLRs if available
-        if constexpr (kUseSoftDecode) {
-            if (soft_symbol_llrs.size() >= symbols.size()) {
-                std::vector<std::vector<double>> block_llrs(
-                    soft_symbol_llrs.begin(),
-                    soft_symbol_llrs.begin() + static_cast<std::ptrdiff_t>(symbols.size()));
+        // Soft path: use accumulated LLRs from flat storage
+        if (use_soft_decode) {
+            if (_soft_llr_count >= symbols.size()) {
+                // Extract block's LLRs from flat storage into per-symbol vectors
+                // (one alloc per interleaver block of ~8 symbols, not per symbol)
+                std::vector<std::vector<double>> block_llrs;
+                block_llrs.reserve(symbols.size());
+                for (size_t i = 0; i < symbols.size() && i < _soft_llr_count; i++) {
+                    const double* base = &_soft_llr_flat[i * sf];
+                    block_llrs.emplace_back(base, base + sf);
+                }
                 // Consume the LLRs and PMRs we just used
-                soft_symbol_llrs.erase(soft_symbol_llrs.begin(),
-                    soft_symbol_llrs.begin() + static_cast<std::ptrdiff_t>(symbols.size()));
+                size_t consumed = std::min(symbols.size(), _soft_llr_count);
+                _soft_llr_flat.erase(_soft_llr_flat.begin(),
+                    _soft_llr_flat.begin() + static_cast<std::ptrdiff_t>(consumed * sf));
+                _soft_llr_count -= consumed;
                 soft_symbol_pmrs.erase(soft_symbol_pmrs.begin(),
                     soft_symbol_pmrs.begin() + static_cast<std::ptrdiff_t>(
                         std::min(symbols.size(), soft_symbol_pmrs.size())));

@@ -134,6 +134,9 @@ struct TrxConfig {
     bool                 dc_blocker{true};        ///< DSP DC blocker
     float                dc_blocker_cutoff{2000.f}; ///< DC blocker cutoff (Hz)
 
+    // Decode options
+    bool                 soft_decode{false};      ///< soft-decision (LLR) Hamming decode (experimental)
+
     // Wideband decode mode (16 MS/s, digital channelization, all SFs on all channels)
     bool                 wideband{false};
     double               wideband_rate{16.0e6};

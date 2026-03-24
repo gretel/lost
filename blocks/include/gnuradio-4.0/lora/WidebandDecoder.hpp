@@ -76,7 +76,7 @@ struct ChannelSlot {
     void activate(double channel_freq, double center_freq,
                   double sample_rate, uint32_t os_factor, uint32_t ch_idx = 0,
                   uint32_t bw = 62500, uint16_t sync = 0x12, uint16_t preamble = 8,
-                  std::span<const uint8_t> sfs = {}) {
+                  std::span<const uint8_t> sfs = {}, bool soft_dec = false) {
         state        = State::Active;
         activeSweeps = 0;
         channelFreq  = channel_freq;
@@ -112,13 +112,13 @@ struct ChannelSlot {
             sfLanes.reserve(6);
             for (uint8_t sf = 7; sf <= 12; ++sf) {
                 sfLanes.emplace_back();
-                sfLanes.back().init(sf, bw, 1, preamble, sync);
+                sfLanes.back().init(sf, bw, 1, preamble, sync, soft_dec);
             }
         } else {
             sfLanes.reserve(sfs.size());
             for (uint8_t sf : sfs) {
                 sfLanes.emplace_back();
-                sfLanes.back().init(sf, bw, 1, preamble, sync);
+                sfLanes.back().init(sf, bw, 1, preamble, sync, soft_dec);
             }
         }
     }
@@ -190,6 +190,7 @@ struct WidebandDecoder
     uint32_t    max_symbols{600};          // max symbols per frame
     uint32_t    overflow_max_per_sweep{5}; // overflows tolerated per sweep before tainting
     float       dc_blocker_cutoff{2000.f};  // DC blocker cutoff (Hz)
+    bool        soft_decode{false};         // use soft-decision (LLR) Hamming decode
     bool        debug{false};              // verbose logging
 
     GR_MAKE_REFLECTABLE(WidebandDecoder, in, out, msg_out,
@@ -197,7 +198,7 @@ struct WidebandDecoder
         decode_sfs_str, min_ratio,
         max_channels, l1_interval, l1_snapshots, l1_fft_size,
         sync_word, preamble_len, energy_thresh, min_snr_db, max_symbols,
-        overflow_max_per_sweep, dc_blocker_cutoff, debug);
+        overflow_max_per_sweep, dc_blocker_cutoff, soft_decode, debug);
 
     // --- internal state ---
 
@@ -668,7 +669,7 @@ struct WidebandDecoder
 
                 _slots[freeSlot].activate(freq, static_cast<double>(center_freq),
                     static_cast<double>(sample_rate), os, ch, bw, sync_word, preamble_len,
-                    std::span<const uint8_t>(_decodeSfs));
+                    std::span<const uint8_t>(_decodeSfs), soft_decode);
                 _activeChannelMap[ch].push_back(freeSlot);
 
                 // No ring buffer replay — start decode from the live stream.
@@ -1093,7 +1094,7 @@ struct WidebandDecoder
 
         // Demodulate this symbol
         uint16_t symbol;
-        if constexpr (SfLane::kUseSoftDecode) {
+        if (lane.use_soft_decode) {
             symbol = lane.demodSymbolSoft(lane.in_down.data());
         } else {
             symbol = lane.demodSymbol(lane.in_down.data());

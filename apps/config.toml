@@ -91,6 +91,7 @@ radio      = "radio_868"
 codec      = "codec_meshcore_868"
 rate       = 250000                     # RX/TX sample rate (Hz)
 decode_bws = [62500, 125000, 250000]    # RX BWs (one MultiSfDecoder per BW)
+# soft_decode = false                   # experimental: soft-decision (LLR) Hamming decode
 
 # Wideband mode: 16 MS/s capture, digital channelization, all SFs on all channels
 # When enabled, decode_bws and rate are ignored (uses wideband_rate instead)

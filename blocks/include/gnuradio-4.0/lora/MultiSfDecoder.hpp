@@ -45,12 +45,13 @@ struct MultiSfDecoder
     uint8_t  sf_min       = 7;
     uint8_t  sf_max       = 12;
     float    dc_blocker_cutoff = 0.f;  ///< DC blocker cutoff Hz (0 = disabled)
+    bool     soft_decode  = false;   ///< Use soft-decision (LLR) Hamming decode
     bool     debug        = false;
 
     GR_MAKE_REFLECTABLE(MultiSfDecoder, in, out, msg_out,
         bandwidth, sync_word, os_factor, preamble_len,
         energy_thresh, min_snr_db, max_symbols, center_freq,
-        rx_channel, sf_min, sf_max, dc_blocker_cutoff, debug);
+        rx_channel, sf_min, sf_max, dc_blocker_cutoff, soft_decode, debug);
 
     std::vector<SfLane> _lanes;
     DCBlocker _dc;
@@ -92,7 +93,7 @@ struct MultiSfDecoder
 
         for (uint8_t s = sf_min; s <= sf_max; s++) {
             _lanes.emplace_back();
-            _lanes.back().init(s, bandwidth, os_factor, preamble_len, sync_word);
+            _lanes.back().init(s, bandwidth, os_factor, preamble_len, sync_word, soft_decode);
         }
 
         _min_sps = _lanes.front().sps;  // sf_min has smallest sps
@@ -682,7 +683,7 @@ struct MultiSfDecoder
 
         // Demodulate this symbol (fused: skip intermediate cf32 buffer)
         uint16_t symbol;
-        if constexpr (SfLane::kUseSoftDecode) {
+        if (lane.use_soft_decode) {
             symbol = lane.demodSymbolSoft(lane.in_down.data());
         } else {
             symbol = lane.demodSymbol(lane.in_down.data());
