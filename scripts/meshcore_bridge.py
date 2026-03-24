@@ -2519,8 +2519,10 @@ def run_bridge(
                     client_sock = conn
                     client_decoder = FrameDecoder()
                     sel.register(client_sock, selectors.EVENT_READ, data="tcp_rx")
-                    # Reset message queue for new client
-                    state.msg_queue.clear()
+                    # Keep message queue across reconnects — one-shot companion
+                    # CLI tools (meshcore-cli) reconnect for every command, and
+                    # clearing the queue loses messages that arrived between calls.
+                    # Only reset the sequence counter.
                     state.msg_seq = 0
 
                 # --- TCP receive ---
