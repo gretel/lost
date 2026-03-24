@@ -282,17 +282,26 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         _hotChannels.clear();
         if (_nChannels == 0 || _snapshotCount == 0) return;
 
-        // Threshold: channels with energy > 6× median
-        std::vector<float> sorted(_channelEnergy.begin(),
-                                  _channelEnergy.begin() + static_cast<std::ptrdiff_t>(_nChannels));
+        // Threshold: channels with energy > 6× median (excluding DC center channels)
+        const uint32_t centerCh = _nChannels / 2;
+        const uint32_t dcSkip   = 3;  // skip ±3 channels around center (DC spur skirt)
+        std::vector<float> sorted;
+        sorted.reserve(_nChannels);
+        for (uint32_t ch = 0; ch < _nChannels; ++ch) {
+            if (ch >= centerCh - dcSkip && ch <= centerCh + dcSkip) continue;
+            sorted.push_back(_channelEnergy[ch]);
+        }
         std::ranges::sort(sorted);
         const float median = sorted[sorted.size() / 2];
 
         constexpr float kHotMultiplier = 6.0f;
         const float threshold = median * kHotMultiplier;
 
+        // Exclude center channel(s) — DC spur at 0 Hz baseband always dominates.
+        // No real LoRa signal lives at exactly the tuned center frequency.
         std::vector<uint32_t> raw;
         for (uint32_t ch = 0; ch < _nChannels; ++ch) {
+            if (ch >= centerCh - dcSkip && ch <= centerCh + dcSkip) continue;
             if (_channelEnergy[ch] > threshold) {
                 raw.push_back(ch);
             }
