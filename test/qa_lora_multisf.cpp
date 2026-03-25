@@ -284,6 +284,113 @@ const boost::ut::suite<"MultiSfDecoder single-SF"> single_sf_tests = [] {
             expect(eq(decoded, std::string("Hello"))) << "payload";
         }
     };
+
+    // Regression: SF12 signal with all lanes active (SF7-12).
+    // The SF11 lane must NOT claim the SF12 preamble before the SF12 lane.
+    "SF12 with all lanes active (cross-SF competition)"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o'};
+        // TX as SF12, but decoder runs SF7-12 simultaneously
+        auto result = run_multisf_loopback(payload, 12, 4, 62500, 4,
+                                            0x12, 8, 7, 12);
+        expect(result.ok) << "graph ran";
+        std::printf("  SF12 (all lanes): %zu bytes decoded (expected %zu)\n",
+                    result.decoded.size(), payload.size());
+
+        // Must decode correctly — the SF12 lane should win, not SF11
+        expect(ge(result.decoded.size(), payload.size()))
+            << "SF12 must decode with all lanes active";
+        if (result.decoded.size() >= payload.size()) {
+            std::string decoded(result.decoded.begin(),
+                                result.decoded.begin()
+                                + static_cast<std::ptrdiff_t>(payload.size()));
+            expect(eq(decoded, std::string("Hello")))
+                << "payload must match (SF12 lane should win)";
+        }
+
+        // Verify the detected SF is 12, not 11
+        bool found_sf_tag = false;
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("sf"); it != t.map.end()) {
+                auto detected_sf = static_cast<uint32_t>(it->second.value_or<int64_t>(0));
+                std::printf("  SF12 (all lanes): detected SF=%u\n", detected_sf);
+                expect(eq(detected_sf, 12u))
+                    << "must detect as SF12, not SF" << detected_sf;
+                found_sf_tag = true;
+            }
+        }
+        expect(found_sf_tag) << "sf tag must be present in output";
+
+        // CRC must be valid
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                expect(it->second.value_or<bool>(false))
+                    << "CRC must be valid when correct SF detects";
+            }
+        }
+    };
+
+    // Regression test for integer CFO/STO decomposition bug:
+    // SF12 decode was completely broken with any non-zero CFO because
+    // cfo_int = down_val/2 ignored k_hat. The Xhonneux decomposition
+    // requires cfo_int = (k_hat + down_val) / 2.
+    "SF12 decode with CFO (cfo_int decomposition fix)"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'i'};
+
+        // SF12/BW62.5k at +10 dB with 50 Hz CFO (~3.3 bins at bin_width=15.26 Hz)
+        auto r1 = run_multisf_impaired(payload, 12, 4, 62500, 4,
+                                        10.f, 50.f,
+                                        0x12, 8, 12, 12);
+        std::printf("  SF12/BW62.5k +10dB +50Hz: %zu bytes\n", r1.decoded.size());
+        expect(ge(r1.decoded.size(), payload.size()))
+            << "SF12/BW62.5k must decode at +10 dB with 50 Hz CFO";
+
+        // SF12/BW125k at +10 dB with 100 Hz CFO (~3.3 bins at bin_width=30.5 Hz)
+        auto r2 = run_multisf_impaired(payload, 12, 4, 125000, 4,
+                                        10.f, 100.f,
+                                        0x12, 8, 12, 12);
+        std::printf("  SF12/BW125k +10dB +100Hz: %zu bytes\n", r2.decoded.size());
+        expect(ge(r2.decoded.size(), payload.size()))
+            << "SF12/BW125k must decode at +10 dB with 100 Hz CFO";
+
+        // Multi-SF mode: SF12 with all lanes active at +10 dB with 50 Hz CFO
+        auto r3 = run_multisf_impaired(payload, 12, 4, 62500, 4,
+                                        10.f, 50.f,
+                                        0x12, 8, 7, 12);
+        std::printf("  SF12 (all lanes) +10dB +50Hz: %zu bytes\n", r3.decoded.size());
+        expect(ge(r3.decoded.size(), payload.size()))
+            << "SF12 must decode in multi-SF mode at +10 dB with 50 Hz CFO";
+    };
+
+    // Same test at BW125k (LDRO) — SF12 with cross-SF competition
+    "SF12/BW125k with all lanes active"_test = [] {
+        std::vector<uint8_t> payload = {'T', 'e', 's', 't'};
+        auto result = run_multisf_loopback(payload, 12, 4, 125000, 4,
+                                            0x12, 8, 7, 12);
+        expect(result.ok) << "graph ran";
+        std::printf("  SF12/BW125k (all lanes): %zu bytes decoded (expected %zu)\n",
+                    result.decoded.size(), payload.size());
+        expect(ge(result.decoded.size(), payload.size()))
+            << "SF12/BW125k must decode with all lanes active";
+        if (result.decoded.size() >= payload.size()) {
+            std::string decoded(result.decoded.begin(),
+                                result.decoded.begin()
+                                + static_cast<std::ptrdiff_t>(payload.size()));
+            expect(eq(decoded, std::string("Test")))
+                << "payload must match";
+        }
+    };
+
+    // SF11 with all lanes active — test adjacent SF competition
+    "SF11 with all lanes active"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'i'};
+        auto result = run_multisf_loopback(payload, 11, 4, 62500, 4,
+                                            0x12, 8, 7, 12);
+        expect(result.ok) << "graph ran";
+        std::printf("  SF11 (all lanes): %zu bytes decoded (expected %zu)\n",
+                    result.decoded.size(), payload.size());
+        expect(ge(result.decoded.size(), payload.size()))
+            << "SF11 must decode with all lanes active";
+    };
 };
 
 // ============================================================================
@@ -835,6 +942,176 @@ const boost::ut::suite<"Multi-BW decode via Splitter"> multi_bw_tests = [] {
         // Log what they produced for diagnostic visibility.
         std::printf("  BW125k sink: %zu bytes\n", sink_125k._samples.size());
         std::printf("  BW250k sink: %zu bytes\n", sink_250k._samples.size());
+    };
+};
+
+// ============================================================================
+// Runtime reconfiguration via settings().set()
+// ============================================================================
+
+const boost::ut::suite<"MultiSfDecoder runtime reconfig"> reconfig_tests = [] {
+    using namespace boost::ut;
+
+    "SF change via settings().set() triggers reconfigure"_test = [] {
+        using namespace gr;
+        using namespace gr::lora;
+
+        // --- Phase 1: decode SF8 frame with initial SF8 config ---
+        std::vector<uint8_t> payload_sf8 = {'S', 'F', '8'};
+        auto r1 = run_multisf_loopback(payload_sf8, 8, 4, 125000, 4,
+                                        0x12, 8, 8, 8);
+        expect(r1.ok) << "SF8 graph ran";
+        expect(ge(r1.decoded.size(), payload_sf8.size()))
+            << "SF8 decode output too small: " << r1.decoded.size();
+
+        if (r1.decoded.size() >= payload_sf8.size()) {
+            std::string decoded(r1.decoded.begin(),
+                                r1.decoded.begin()
+                                + static_cast<std::ptrdiff_t>(payload_sf8.size()));
+            expect(eq(decoded, std::string("SF8")))
+                << "SF8 payload mismatch: \"" << decoded << "\"";
+        }
+
+        // --- Phase 2: verify settings().set() accepts all kPhyKeys ---
+        // Create a standalone decoder to test the settings machinery.
+        Graph graph;
+        auto& decoder = graph.emplaceBlock<MultiSfDecoder>();
+        decoder.bandwidth    = 125000;
+        decoder.sync_word    = 0x12;
+        decoder.os_factor    = 4;
+        decoder.preamble_len = 8;
+        decoder.sf_min       = 8;
+        decoder.sf_max       = 8;
+
+        // Force initial lane build (as start() would)
+        decoder.start();
+        expect(eq(decoder._lanes.size(), 1UZ)) << "initial: 1 lane (SF8 only)";
+        expect(eq(static_cast<uint8_t>(decoder.sf_min), uint8_t{8})) << "initial sf_min=8";
+        expect(eq(static_cast<uint8_t>(decoder.sf_max), uint8_t{8})) << "initial sf_max=8";
+
+        // Apply runtime settings change: switch to SF12/BW62.5k
+        auto rejected = decoder.settings().set({
+            {"sf_min",       uint8_t{12}},
+            {"sf_max",       uint8_t{12}},
+            {"bandwidth",    uint32_t{62500}},
+        });
+        expect(rejected.empty())
+            << "settings().set() should accept all kPhyKeys, rejected "
+            << rejected.size() << " keys";
+
+        // Activate context then apply (triggers settingsChanged + reconfigure)
+        std::ignore = decoder.settings().activateContext();
+        auto applyResult = decoder.settings().applyStagedParameters();
+        std::printf("  reconfig: applied %zu params, forwarded %zu\n",
+                    applyResult.appliedParameters.size(),
+                    applyResult.forwardParameters.size());
+
+        // Verify fields updated
+        expect(eq(static_cast<uint8_t>(decoder.sf_min), uint8_t{12})) << "sf_min updated to 12";
+        expect(eq(static_cast<uint8_t>(decoder.sf_max), uint8_t{12})) << "sf_max updated to 12";
+        expect(eq(static_cast<uint32_t>(decoder.bandwidth), uint32_t{62500})) << "bandwidth updated to 62500";
+
+        // Verify lanes rebuilt for SF12
+        expect(eq(decoder._lanes.size(), 1UZ)) << "reconfigured: 1 lane (SF12 only)";
+        if (!decoder._lanes.empty()) {
+            expect(eq(decoder._lanes[0].sf, uint8_t{12})) << "lane SF should be 12";
+        }
+
+        // --- Phase 3: decode SF12 frame to prove reconfigure works end-to-end ---
+        std::vector<uint8_t> payload_sf12 = {'1', '2'};
+        auto r2 = run_multisf_loopback(payload_sf12, 12, 4, 62500, 4,
+                                        0x12, 8, 12, 12);
+        expect(r2.ok) << "SF12 graph ran";
+        std::printf("  SF12 reconfig: %zu bytes decoded (expected %zu)\n",
+                     r2.decoded.size(), payload_sf12.size());
+        expect(ge(r2.decoded.size(), payload_sf12.size()))
+            << "SF12 decode output too small: " << r2.decoded.size();
+
+        if (r2.decoded.size() >= payload_sf12.size()) {
+            std::string decoded(r2.decoded.begin(),
+                                r2.decoded.begin()
+                                + static_cast<std::ptrdiff_t>(payload_sf12.size()));
+            expect(eq(decoded, std::string("12")))
+                << "SF12 payload mismatch: \"" << decoded << "\"";
+        }
+
+        // Verify CRC valid on SF12 decode
+        bool found_crc = false;
+        for (const auto& t : r2.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                expect(it->second.value_or<bool>(false))
+                    << "SF12 CRC should be valid";
+                found_crc = true;
+            }
+        }
+        expect(found_crc) << "SF12 should have crc_valid tag";
+    };
+
+    "settings().set() with os_factor and sync_word"_test = [] {
+        using namespace gr;
+        using namespace gr::lora;
+
+        // Verify additional kPhyKeys are accepted
+        Graph graph;
+        auto& decoder = graph.emplaceBlock<MultiSfDecoder>();
+        decoder.bandwidth    = 125000;
+        decoder.os_factor    = 4;
+        decoder.preamble_len = 8;
+        decoder.sync_word    = 0x12;
+        decoder.sf_min       = 7;
+        decoder.sf_max       = 12;
+        decoder.start();
+
+        expect(eq(decoder._lanes.size(), 6UZ)) << "initial: 6 lanes (SF7-12)";
+
+        // Change os_factor, sync_word, preamble_len
+        auto rejected = decoder.settings().set({
+            {"os_factor",    uint8_t{1}},
+            {"sync_word",    uint16_t{0x34}},
+            {"preamble_len", uint16_t{12}},
+        });
+        expect(rejected.empty())
+            << "all phy keys should be accepted, rejected " << rejected.size();
+
+        std::ignore = decoder.settings().activateContext();
+        auto applyResult = decoder.settings().applyStagedParameters();
+        (void)applyResult;
+
+        expect(eq(static_cast<uint8_t>(decoder.os_factor), uint8_t{1})) << "os_factor updated";
+        expect(eq(static_cast<uint16_t>(decoder.sync_word), uint16_t{0x34})) << "sync_word updated";
+        expect(eq(static_cast<uint16_t>(decoder.preamble_len), uint16_t{12})) << "preamble_len updated";
+
+        // Lanes should still be 6 (SF range unchanged) but rebuilt with new params
+        expect(eq(decoder._lanes.size(), 6UZ)) << "still 6 lanes after reconfig";
+    };
+
+    "non-phy settings do not trigger reconfigure"_test = [] {
+        using namespace gr;
+        using namespace gr::lora;
+
+        Graph graph;
+        auto& decoder = graph.emplaceBlock<MultiSfDecoder>();
+        decoder.bandwidth    = 125000;
+        decoder.os_factor    = 4;
+        decoder.sf_min       = 8;
+        decoder.sf_max       = 8;
+        decoder.start();
+
+        expect(eq(decoder._lanes.size(), 1UZ)) << "initial: 1 lane";
+
+        // Change non-phy setting (center_freq is NOT in kPhyKeys)
+        auto rejected = decoder.settings().set({
+            {"center_freq", uint32_t{868000000}},
+        });
+        expect(rejected.empty()) << "center_freq should be accepted";
+
+        std::ignore = decoder.settings().activateContext();
+        auto applyResult = decoder.settings().applyStagedParameters();
+        (void)applyResult;
+
+        // Lanes should remain unchanged (no reconfigure triggered)
+        expect(eq(decoder._lanes.size(), 1UZ)) << "lanes unchanged for non-phy setting";
+        expect(eq(static_cast<uint32_t>(decoder.center_freq), uint32_t{868000000})) << "center_freq updated";
     };
 };
 

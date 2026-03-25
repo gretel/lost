@@ -43,11 +43,11 @@ level = "INFO"
 freq       = 869618000
 rx_channel = [1, 2]
 tx_channel = 0
-rx_gain    = 32
-tx_gain    = 75
-# lo_offset        = 0     # LO offset tuning (Hz), 0 = disabled
-# dc_offset_auto   = true  # hardware DC offset correction (AD9361)
-dc_blocker       = true    # DSP DC blocker (2nd-order Butterworth HP)
+rx_gain    = 35
+tx_gain    = 70
+lo_offset         = 62500  # Hz — shifts DC spur out of BW62.5k passband
+dc_offset_auto   = true     # hardware DC offset correction (AD9361)
+dc_blocker       = true     # DSP DC blocker (2nd-order Butterworth HP)
 dc_blocker_cutoff = 2000   # DC blocker cutoff frequency (Hz)
 
 # [radio_433]
@@ -91,12 +91,13 @@ radio      = "radio_868"
 codec      = "codec_meshcore_868"
 rate       = 250000                     # RX/TX sample rate (Hz)
 decode_bws = [62500, 125000, 250000]    # RX BWs (one MultiSfDecoder per BW)
+# soft_decode = false                   # experimental: soft-decision (LLR) Hamming decode
 
 # Wideband mode: 16 MS/s capture, digital channelization, all SFs on all channels
 # When enabled, decode_bws and rate are ignored (uses wideband_rate instead)
 wideband             = false
-wideband_rate        = 16000000     # wideband sample rate (Hz)
-wideband_master_clock = 32000000    # FPGA master clock (Hz)
+# wideband_rate         = 16000000     # wideband sample rate (Hz)
+# wideband_master_clock = 32000000    # FPGA master clock (Hz)
 # decode_sfs         = [7, 8, 9]   # limit SFs for wideband mode (default: all 7-12)
 
 [trx.network]
@@ -158,7 +159,7 @@ streaming    = true                     # streaming pipeline (no retune)
 
 # Streaming-mode parameters (ignored when streaming = false)
 buffer_ms     = 512                     # IQ ring buffer duration (ms)
-l1_fft_size   = 1024                    # FFT bins for L1 energy
+l1_fft_size   = 4096                    # FFT bins for L1 energy
 l1_accumulate = 64                      # FFTs to average per energy report
 l1_reports    = 64                      # energy reports before probing
 channel_bw    = 62500                   # L1 channel grid spacing (Hz)

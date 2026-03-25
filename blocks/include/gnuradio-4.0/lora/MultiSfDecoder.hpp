@@ -45,12 +45,13 @@ struct MultiSfDecoder
     uint8_t  sf_min       = 7;
     uint8_t  sf_max       = 12;
     float    dc_blocker_cutoff = 0.f;  ///< DC blocker cutoff Hz (0 = disabled)
+    bool     soft_decode  = false;   ///< Use soft-decision (LLR) Hamming decode
     bool     debug        = false;
 
     GR_MAKE_REFLECTABLE(MultiSfDecoder, in, out, msg_out,
         bandwidth, sync_word, os_factor, preamble_len,
         energy_thresh, min_snr_db, max_symbols, center_freq,
-        rx_channel, sf_min, sf_max, dc_blocker_cutoff, debug);
+        rx_channel, sf_min, sf_max, dc_blocker_cutoff, soft_decode, debug);
 
     std::vector<SfLane> _lanes;
     DCBlocker _dc;
@@ -67,7 +68,7 @@ struct MultiSfDecoder
     /// Set external channel-busy flag for listen-before-talk.
     void set_channel_busy_flag(std::atomic<bool>* flag) { _channel_busy = flag; }
 
-    void start() { reconfigure(); }
+    void start() { reconfigure(true); }
 
     void settingsChanged(const gr::property_map& /*oldSettings*/,
                          const gr::property_map& newSettings) {
@@ -79,11 +80,11 @@ struct MultiSfDecoder
             return newSettings.contains(k);
         });
         if (needRecalc && !_lanes.empty()) {
-            reconfigure();
+            reconfigure(false);
         }
     }
 
-    void reconfigure() {
+    void reconfigure(bool isStartup = false) {
         assert(sf_min >= 7 && sf_max <= 12 && sf_min <= sf_max);
         assert(bandwidth > 0 && os_factor >= 1 && preamble_len >= 5);
 
@@ -92,12 +93,21 @@ struct MultiSfDecoder
 
         for (uint8_t s = sf_min; s <= sf_max; s++) {
             _lanes.emplace_back();
-            _lanes.back().init(s, bandwidth, os_factor, preamble_len, sync_word);
+            _lanes.back().init(s, bandwidth, os_factor, preamble_len, sync_word, soft_decode);
         }
 
         _min_sps = _lanes.front().sps;  // sf_min has smallest sps
-        // Set min_samples to smallest lane's sps (minimum useful input)
-        in.min_samples = _min_sps + 2u * os_factor;
+
+        // Only set in.min_samples at startup. Changing it at runtime can
+        // disrupt the scheduler's buffer management and cause USB transport
+        // errors (LIBUSB_ERROR_OTHER) on B210. Use sf_max (not always SF12)
+        // to avoid starving the scheduler when only lower SFs are configured
+        // — with SF12's min_samples (16392 at os=4), the scheduler stops
+        // delivering when fewer samples remain, preventing short-frame decode.
+        if (isStartup) {
+            auto worst_sps = static_cast<uint32_t>((1u << sf_max) * os_factor);
+            in.min_samples = worst_sps + 2u * os_factor;
+        }
 
         // DC blocker (embedded, applied before spectrum + decode)
         if (dc_blocker_cutoff > 0.f && bandwidth > 0) {
@@ -368,7 +378,7 @@ struct MultiSfDecoder
             if (cfo_offset + lane.up_symb_to_use * lane.N > lane.preamble_raw.size()) {
                 cfo_offset = static_cast<std::size_t>(lane.N);
             }
-            lane.cfo_frac = lane.estimate_CFO_frac_Bernier(&lane.preamble_raw[cfo_offset]);
+            lane.cfo_frac = lane.estimate_CFO_frac(&lane.preamble_raw[cfo_offset]);
             lane.sto_frac = lane.estimate_STO_frac();
 
             for (uint32_t n = 0; n < lane.N; n++) {
@@ -467,12 +477,19 @@ struct MultiSfDecoder
             break;
         }
         case SfLane::QUARTER_DOWN: {
-            // Integer CFO from downchirp
-            if (static_cast<uint32_t>(lane.down_val) < lane.N / 2) {
-                lane.cfo_int = lane.down_val / 2;
-            } else {
-                lane.cfo_int = (lane.down_val - static_cast<int>(lane.N)) / 2;
+            // Integer CFO/STO separation (Xhonneux §5.2):
+            //   s_up   = k_hat       = (L_CFO + L_STO) mod N
+            //   s_down = down_val    = (L_CFO - L_STO) mod N
+            //   L_CFO  = Γ_N[(s_up + s_down) mod N] / 2
+            // where Γ_N maps to [-N/2, N/2-1].
+            // Previous code used down_val/2 only, which is wrong when L_STO ≠ 0.
+            auto sum = static_cast<int>(mod(
+                static_cast<int64_t>(lane.k_hat) + static_cast<int64_t>(lane.down_val),
+                static_cast<int64_t>(lane.N)));
+            if (static_cast<uint32_t>(sum) >= lane.N / 2) {
+                sum -= static_cast<int>(lane.N);
             }
+            lane.cfo_int = sum / 2;
 
             // Correct STOint and CFOint in preamble upchirps
             auto rot_off = static_cast<std::size_t>(
@@ -517,8 +534,9 @@ struct MultiSfDecoder
             multisf_detail::complex_multiply(lane.preamble_upchirps.data(), lane.preamble_upchirps.data(),
                                       lane.corr_vec.data(), lane.up_symb_to_use * lane.N);
 
-            // Re-estimate STO frac after SFO correction
-            float tmp_sto_frac = lane.estimate_STO_frac();
+            // Re-estimate STO frac after SFO correction.
+            // After CFO_int rotation + SFO correction, peak is near bin 0.
+            float tmp_sto_frac = lane.estimate_STO_frac(0);
             float diff = lane.sto_frac - tmp_sto_frac;
             float os_thresh = static_cast<float>(os_factor - 1u) / static_cast<float>(os_factor);
             if (std::abs(diff) <= os_thresh) lane.sto_frac = tmp_sto_frac;
@@ -559,6 +577,22 @@ struct MultiSfDecoder
                 lane.get_symbol_val(lane.scratch_2N.data(), lane.downchirp.data()));
             int netid2 = static_cast<int>(
                 lane.get_symbol_val(&lane.scratch_2N[lane.N], lane.downchirp.data()));
+
+            // Mod-8 sync-word-independent STO correction (gateway_arch §3).
+            // Sync word values are nibble<<3, so valid demod values are multiples of 8.
+            // Non-zero mod-8 residual reveals residual STO not captured by integer estimate.
+            {
+                uint32_t r1 = static_cast<uint32_t>(mod(static_cast<int64_t>(netid1), 8LL));
+                uint32_t r2 = static_cast<uint32_t>(mod(static_cast<int64_t>(netid2), 8LL));
+                if (r1 == r2 && r1 != 0) {
+                    int delta = static_cast<int>(r1);
+                    if (delta > 3) delta -= 8;  // wrap: 4→-4, 5→-3, 6→-2, 7→-1
+                    netid1 = static_cast<int>(mod(
+                        static_cast<int64_t>(netid1) - delta, static_cast<int64_t>(lane.N)));
+                    netid2 = static_cast<int>(mod(
+                        static_cast<int64_t>(netid2) - delta, static_cast<int64_t>(lane.N)));
+                }
+            }
 
             // Sync word verification
             bool sync_ok = false;
@@ -664,7 +698,12 @@ struct MultiSfDecoder
         }
 
         // Demodulate this symbol (fused: skip intermediate cf32 buffer)
-        uint16_t symbol = lane.demodSymbol(lane.in_down.data());
+        uint16_t symbol;
+        if (lane.use_soft_decode) {
+            symbol = lane.demodSymbolSoft(lane.in_down.data());
+        } else {
+            symbol = lane.demodSymbol(lane.in_down.data());
+        }
         lane.symbol_buffer.push_back(symbol);
         lane.total_symbols_rx++;
         lane.output_symb_cnt++;

@@ -423,7 +423,7 @@ const boost::ut::suite<"WidebandDecoder block skeleton"> wbBlockTests = [] {
             {"channel_bw", 62500.f},
             {"decode_bw", 62500.f},
             {"max_channels", uint32_t{8}},
-            {"buffer_ms", 100.f},
+
             {"l1_interval", uint32_t{4}},
             {"l1_snapshots", uint32_t{4}},
             {"l1_fft_size", uint32_t{4096}},
@@ -464,7 +464,7 @@ const boost::ut::suite<"WidebandDecoder block skeleton"> wbBlockTests = [] {
             {"channel_bw", 62500.f},
             {"decode_bw", 62500.f},
             {"max_channels", uint32_t{8}},
-            {"buffer_ms", 100.f},
+
             {"l1_interval", uint32_t{4}},
             {"l1_snapshots", uint32_t{4}},
             {"l1_fft_size", uint32_t{4096}},
@@ -535,7 +535,7 @@ const boost::ut::suite<"WidebandDecoder block skeleton"> wbBlockTests = [] {
             {"channel_bw", 62500.f},
             {"decode_bw", 62500.f},
             {"max_channels", uint32_t{8}},
-            {"buffer_ms", 100.f},
+
             {"l1_interval", uint32_t{4}},
             {"l1_snapshots", uint32_t{4}},
             {"l1_fft_size", uint32_t{4096}},
@@ -806,7 +806,7 @@ const boost::ut::suite<"WidebandDecoder loopback"> wbLoopbackTests = [] {
             {"channel_bw", 62500.f},
             {"decode_bw", static_cast<float>(test_bw)},
             {"max_channels", uint32_t{8}},
-            {"buffer_ms", 200.f},
+
             {"l1_interval", uint32_t{1}},
             {"l1_snapshots", uint32_t{2}},
             {"l1_fft_size", uint32_t{4096}},
@@ -958,7 +958,7 @@ const boost::ut::suite<"WidebandDecoder loopback"> wbLoopbackTests = [] {
             {"channel_bw", 62500.f},
             {"decode_bw", static_cast<float>(test_bw)},
             {"max_channels", uint32_t{8}},
-            {"buffer_ms", 200.f},
+
             {"l1_interval", uint32_t{1}},
             {"l1_snapshots", uint32_t{2}},
             {"l1_fft_size", uint32_t{4096}},

@@ -2,14 +2,19 @@
 #include "test_helpers.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <numeric>
 #include <random>
 
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
+#include <gnuradio-4.0/lora/algorithm/SfLane.hpp>
 #include <gnuradio-4.0/lora/algorithm/tables.hpp>
+#include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
 #include <gnuradio-4.0/lora/algorithm/hamming.hpp>
 #include <gnuradio-4.0/lora/algorithm/crc.hpp>
+#include <gnuradio-4.0/lora/algorithm/GrayPartition.hpp>
 #include <gnuradio-4.0/lora/algorithm/interleaving.hpp>
 
 using namespace gr::lora::test;
@@ -467,6 +472,534 @@ const boost::ut::suite<"LoRa full TX pipeline"> pipeline_tests = [] {
             gray_mapped.push_back((g + 1) % N);
         }
         expect_vectors_equal(gray_mapped, load_u32("tx_06_gray_mapped.u32"), "stage 6 gray demap");
+    };
+};
+
+// =============================================================================
+// Sync algorithm tests: CFO, Xhonneux Eq.20 STO, mod-8 correction
+// =============================================================================
+
+namespace {
+
+/// Helper: generate a preamble with known CFO applied, at os_factor=1.
+std::vector<std::complex<float>> make_preamble_with_cfo(
+        uint8_t sf, float cfo_frac, uint32_t n_syms, uint32_t sto_int = 0,
+        std::mt19937* rng = nullptr, float noise_sigma = 0.f) {
+    const uint32_t Nfft = 1u << sf;
+    std::vector<std::complex<float>> upchirp(Nfft);
+    gr::lora::build_upchirp(upchirp.data(), sto_int, sf, 1);
+
+    std::vector<std::complex<float>> out;
+    out.reserve(static_cast<std::size_t>(Nfft) * n_syms);
+    std::normal_distribution<float> dist(0.f, noise_sigma);
+
+    for (uint32_t s = 0; s < n_syms; s++) {
+        for (uint32_t n = 0; n < Nfft; n++) {
+            float phase = 2.f * static_cast<float>(std::numbers::pi) * cfo_frac
+                        / static_cast<float>(Nfft) * static_cast<float>(s * Nfft + n);
+            auto rot = std::complex<float>(std::cos(phase), std::sin(phase));
+            auto sample = upchirp[n] * rot;
+            if (rng && noise_sigma > 0.f) {
+                sample += std::complex<float>(dist(*rng), dist(*rng));
+            }
+            out.push_back(sample);
+        }
+    }
+    return out;
+}
+
+/// Helper: initialize an SfLane for testing.
+gr::lora::SfLane make_test_lane(uint8_t sf, uint32_t bw = 62500,
+                                 uint16_t sync_word = 0x12, uint16_t preamble_len = 8) {
+    gr::lora::SfLane lane;
+    lane.init(sf, bw, 1 /*os_factor=1*/, preamble_len, sync_word);
+    return lane;
+}
+
+}  // namespace
+
+const boost::ut::suite<"CFO estimation"> cfo_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "CFO estimate at clean SNR"_test = [] {
+        constexpr uint8_t sf = 8;
+        constexpr float cfo_true = 0.3f;
+        auto lane = make_test_lane(sf);
+        auto preamble = make_preamble_with_cfo(sf, cfo_true, lane.n_up_req);
+        std::copy(preamble.begin(), preamble.end(), lane.preamble_raw.begin());
+
+        float cfo_est = lane.estimate_CFO_frac(preamble.data());
+        float err = std::abs(cfo_est - cfo_true);
+        std::printf("  CFO clean: true=%.3f est=%.3f err=%.4f\n",
+                    static_cast<double>(cfo_true), static_cast<double>(cfo_est),
+                    static_cast<double>(err));
+        expect(lt(err, 0.01f)) << "CFO error should be < 0.01 at high SNR";
+    };
+
+    "CFO estimate negative value"_test = [] {
+        constexpr uint8_t sf = 8;
+        constexpr float cfo_true = -0.25f;
+        auto lane = make_test_lane(sf);
+        auto preamble = make_preamble_with_cfo(sf, cfo_true, lane.n_up_req);
+        std::copy(preamble.begin(), preamble.end(), lane.preamble_raw.begin());
+
+        float cfo_est = lane.estimate_CFO_frac(preamble.data());
+        float err = std::abs(cfo_est - cfo_true);
+        std::printf("  CFO negative: true=%.3f est=%.3f err=%.4f\n",
+                    static_cast<double>(cfo_true), static_cast<double>(cfo_est),
+                    static_cast<double>(err));
+        expect(lt(err, 0.01f)) << "negative CFO error should be < 0.01 at high SNR";
+    };
+};
+
+const boost::ut::suite<"Xhonneux Eq.20 STO estimation (W3b)"> sto_eq20_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "STO frac estimate clean (sto_int=5)"_test = [] {
+        constexpr uint8_t sf = 8;
+        constexpr uint32_t sto_int = 5;
+        auto lane = make_test_lane(sf);
+
+        auto preamble = make_preamble_with_cfo(sf, 0.f, lane.n_up_req, sto_int);
+        lane.k_hat = static_cast<int>(sto_int);
+        std::copy(preamble.begin(), preamble.end(), lane.preamble_raw.begin());
+        lane.estimate_CFO_frac(preamble.data());
+
+        float sto_f = lane.estimate_STO_frac(sto_int);
+        std::printf("  STO frac (integer STO=%u): est=%.4f (expect ~0)\n",
+                    sto_int, static_cast<double>(sto_f));
+        expect(lt(std::abs(sto_f), 0.1f)) << "fractional STO should be near 0 for integer STO";
+    };
+
+    "STO frac estimate with fractional offset"_test = [] {
+        constexpr uint8_t sf = 8;
+        constexpr uint32_t Nfft = 1u << sf;
+        constexpr uint8_t os = 4;
+        constexpr float sto_frac_true = 0.3f;
+        constexpr uint32_t sto_int = 0;
+
+        auto lane = make_test_lane(sf);
+        lane.k_hat = 0;
+
+        std::vector<std::complex<float>> upchirp_os(Nfft * os);
+        build_upchirp(upchirp_os.data(), sto_int, sf, os);
+
+        std::vector<std::complex<float>> preamble;
+        preamble.reserve(static_cast<std::size_t>(Nfft) * lane.n_up_req);
+        for (uint32_t s = 0; s < lane.n_up_req; s++) {
+            for (uint32_t n = 0; n < Nfft; n++) {
+                float pos = (static_cast<float>(n) + sto_frac_true) * static_cast<float>(os);
+                auto idx0 = static_cast<uint32_t>(std::floor(pos)) % (Nfft * os);
+                auto idx1 = (idx0 + 1) % (Nfft * os);
+                float frac = pos - std::floor(pos);
+                auto sample = upchirp_os[idx0] * (1.f - frac) + upchirp_os[idx1] * frac;
+                preamble.push_back(sample);
+            }
+        }
+
+        std::copy(preamble.begin(), preamble.end(), lane.preamble_raw.begin());
+        lane.estimate_CFO_frac(preamble.data());
+        float sto_f = lane.estimate_STO_frac(sto_int);
+        std::printf("  STO frac (true=%.3f): est=%.4f\n",
+                    static_cast<double>(sto_frac_true), static_cast<double>(sto_f));
+        expect(lt(std::abs(sto_f - sto_frac_true), 0.2f))
+            << "STO frac should be within 0.2 of true value";
+    };
+
+    "STO frac bounded output [-0.5, 0.5]"_test = [] {
+        constexpr uint8_t sf = 8;
+        auto lane = make_test_lane(sf);
+        lane.k_hat = 0;
+
+        auto preamble = make_preamble_with_cfo(sf, 0.f, lane.n_up_req);
+        std::copy(preamble.begin(), preamble.end(), lane.preamble_raw.begin());
+        lane.estimate_CFO_frac(preamble.data());
+
+        float sto_f = lane.estimate_STO_frac(0);
+        expect(ge(sto_f, -0.5f)) << "STO frac must be >= -0.5";
+        expect(le(sto_f, 0.5f))  << "STO frac must be <= 0.5";
+    };
+};
+
+const boost::ut::suite<"Mod-8 sync word STO correction (W3c)"> mod8_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "mod8 correction with residual +2"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(10, 18);
+        expect(eq(delta, 2)) << "mod-8 residual +2 should give delta=+2";
+    };
+
+    "mod8 correction with residual -1 (=7 mod 8)"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(7, 15);
+        expect(eq(delta, -1)) << "mod-8 residual 7 should give delta=-1";
+    };
+
+    "mod8 no correction when residuals match sync word"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(8, 16);
+        expect(eq(delta, 0)) << "exact match should give delta=0";
+    };
+
+    "mod8 no correction when residuals differ"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(10, 19);
+        expect(eq(delta, 0)) << "mismatched residuals should give delta=0";
+    };
+
+    "mod8 correction wraps for residual +4"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(12, 20);
+        expect(eq(delta, -4)) << "residual 4 should wrap to delta=-4";
+    };
+
+    "mod8 correction with large symbol values"_test = [] {
+        auto lane = make_test_lane(8);
+        int delta = lane.mod8_sto_correction(253, 245);
+        expect(eq(delta, -3)) << "large values: residual 5 should wrap to delta=-3";
+    };
+};
+
+// =============================================================================
+// Soft Hamming decode: GrayPartition, LLR extraction, soft deinterleave
+// =============================================================================
+
+const boost::ut::suite<"GrayPartition"> gray_partition_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "partition sizes are M/2 each"_test = [] {
+        GrayPartition gp;
+        gp.init(8);
+        expect(eq(gp.M, 256u));
+        for (uint8_t k = 0; k < 8; k++) {
+            expect(eq(gp.ones[k].size(), 128uz))
+                << "ones[" << static_cast<int>(k) << "] should have M/2 entries";
+            expect(eq(gp.zeros[k].size(), 128uz))
+                << "zeros[" << static_cast<int>(k) << "] should have M/2 entries";
+        }
+    };
+
+    "known bit values for SF8 symbol 42"_test = [] {
+        GrayPartition gp;
+        gp.init(8);
+        // Gray code of 42: 42 ^ (42 >> 1) = 42 ^ 21 = 0b00101010 ^ 0b00010101 = 0b00111111 = 63
+        // Binary: 63 = 0b00111111
+        // Bit 0 (LSB) = 1, Bit 1 = 1, Bit 2 = 1, Bit 3 = 1, Bit 4 = 1, Bit 5 = 1, Bit 6 = 0, Bit 7 = 0
+        uint32_t gray_42 = 42 ^ (42 >> 1);
+        expect(eq(gray_42, 63u)) << "Gray(42) should be 63";
+
+        // Verify symbol 42 is in the correct partition for each bit
+        for (uint8_t k = 0; k < 8; k++) {
+            bool bit_k = (gray_42 >> k) & 1u;
+            if (bit_k) {
+                bool found = false;
+                for (uint32_t s : gp.ones[k]) {
+                    if (s == 42) { found = true; break; }
+                }
+                expect(found) << "symbol 42 should be in ones[" << static_cast<int>(k) << "]";
+            } else {
+                bool found = false;
+                for (uint32_t s : gp.zeros[k]) {
+                    if (s == 42) { found = true; break; }
+                }
+                expect(found) << "symbol 42 should be in zeros[" << static_cast<int>(k) << "]";
+            }
+        }
+    };
+
+    "SF12 partition validity"_test = [] {
+        GrayPartition gp;
+        gp.init(12);
+        expect(eq(gp.M, 4096u));
+        for (uint8_t k = 0; k < 12; k++) {
+            expect(eq(gp.ones[k].size(), 2048uz));
+            expect(eq(gp.zeros[k].size(), 2048uz));
+        }
+    };
+};
+
+const boost::ut::suite<"Soft dechirp and LLR extraction"> soft_dechirp_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "LLR sign test: known symbol bin 42 at SF8"_test = [] {
+        constexpr uint8_t sf = 8;
+        constexpr uint32_t Nfft = 1u << sf;
+
+        // Build chirp at bin 42 (which maps to FFT bin (42+1)%256 = 43 after +1 offset)
+        std::vector<std::complex<float>> chirp(Nfft);
+        build_upchirp(chirp.data(), 43, sf);  // FFT bin 43 → symbol 42 after mod(bin-1, N)
+
+        std::vector<std::complex<float>> downchirp(Nfft), upchirp(Nfft);
+        build_ref_chirps(upchirp.data(), downchirp.data(), sf);
+
+        std::vector<std::complex<float>> scratch(Nfft);
+        gr::algorithm::FFT<std::complex<float>> fft;
+
+        auto result = dechirp_soft(chirp.data(), downchirp.data(),
+                                   scratch.data(), Nfft, fft);
+        expect(eq(result.bin, 43u)) << "FFT bin should be 43 for symbol 42";
+
+        // Remap from FFT bin to symbol (subtract 1 mod N)
+        std::vector<float> sym_mag_sq(Nfft);
+        for (uint32_t s = 0; s < Nfft; s++) {
+            sym_mag_sq[s] = result.mag_sq[(s + 1) % Nfft];
+        }
+
+        // Compute LLRs
+        GrayPartition gp;
+        gp.init(sf);
+        std::vector<double> llrs(sf);
+        SfLane::compute_symbol_llr(sym_mag_sq.data(), Nfft, sf, gp, llrs.data());
+
+        // Gray code of 42: bits = 00111111 (MSB to LSB: k7=0 k6=0 k5=1 k4=1 k3=1 k2=1 k1=1 k0=1)
+        uint32_t gray_42 = 42 ^ (42 >> 1);
+        expect(eq(gray_42, 63u));
+
+        for (uint8_t k = 0; k < sf; k++) {
+            bool bit_k = (gray_42 >> k) & 1u;
+            if (bit_k) {
+                expect(gt(llrs[k], 0.0))
+                    << "LLR[" << static_cast<int>(k) << "] should be > 0 for Gray bit 1";
+            } else {
+                expect(lt(llrs[k], 0.0))
+                    << "LLR[" << static_cast<int>(k) << "] should be < 0 for Gray bit 0";
+            }
+        }
+    };
+
+    "dechirp_soft PMR matches dechirp_and_quality"_test = [] {
+        constexpr uint8_t sf = 8;
+        constexpr uint32_t Nfft = 1u << sf;
+
+        std::vector<std::complex<float>> chirp(Nfft);
+        build_upchirp(chirp.data(), 10, sf);
+
+        std::vector<std::complex<float>> downchirp(Nfft), upchirp(Nfft);
+        build_ref_chirps(upchirp.data(), downchirp.data(), sf);
+
+        std::vector<std::complex<float>> scratch(Nfft);
+        gr::algorithm::FFT<std::complex<float>> fft;
+
+        auto soft_result = dechirp_soft(chirp.data(), downchirp.data(),
+                                        scratch.data(), Nfft, fft);
+        auto [bin_hard, pmr_hard] = dechirp_and_quality(
+            chirp.data(), downchirp.data(), scratch.data(), Nfft, fft);
+
+        expect(eq(soft_result.bin, bin_hard)) << "bin should match";
+        expect(lt(std::abs(soft_result.pmr - pmr_hard), 0.01f)) << "PMR should match";
+    };
+};
+
+const boost::ut::suite<"Soft decode roundtrip"> soft_decode_roundtrip_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "soft decode clean signal matches hard decode"_test = [] {
+        // For all 16 nibbles and all CRs, verify soft decode gives same result
+        // as hard decode when LLRs are strong (clean signal).
+        for (uint8_t cr = 1; cr <= 4; cr++) {
+            for (uint8_t nib = 0; nib < 16; nib++) {
+                uint8_t cw = hamming_encode(nib, cr);
+                auto bits = int2bool(cw, cr + 4);
+
+                // Create strong LLRs: +10 for bit 1, -10 for bit 0
+                std::vector<double> llrs(static_cast<std::size_t>(cr + 4));
+                for (std::size_t i = 0; i < llrs.size(); i++) {
+                    llrs[i] = bits[i] ? 10.0 : -10.0;
+                }
+
+                uint8_t soft = hamming_decode_soft(llrs.data(), cr);
+                uint8_t hard = hamming_decode_hard(cw, cr);
+                expect(eq(soft, hard))
+                    << "soft/hard mismatch cr=" << static_cast<int>(cr)
+                    << " nib=" << static_cast<int>(nib);
+            }
+        }
+    };
+
+    "soft deinterleave single codeword trace"_test = [] {
+        // Trace through hard and soft paths for a minimal block to isolate the mismatch.
+        constexpr uint8_t sf = 8;
+        constexpr uint8_t sf_app = sf;
+        constexpr uint8_t cr = 4;
+        constexpr uint8_t cw_len = cr + 4;
+        constexpr uint32_t N_fft = 1u << sf;
+
+        // Single nibble → encode → interleave → one block of cw_len symbols
+        uint8_t nib = 5;
+        std::vector<uint8_t> codewords(sf_app);
+        codewords[0] = hamming_encode(nib, cr);
+        for (std::size_t i = 1; i < sf_app; i++) codewords[i] = hamming_encode(0, cr);
+
+        auto interleaved = interleave_block(codewords, sf, cw_len, sf_app, false);
+
+        // TX gray demap + shift
+        std::vector<uint32_t> chirp_syms;
+        for (auto s : interleaved) {
+            uint32_t g = s;
+            for (int j = 1; j < sf; j++) g ^= (s >> j);
+            chirp_syms.push_back((g + 1) % N_fft);
+        }
+
+        // HARD RX: mod(cs-1, N) → gray_map → deinterleave → decode
+        std::vector<uint16_t> rx_syms;
+        for (auto cs : chirp_syms) {
+            rx_syms.push_back(static_cast<uint16_t>(
+                mod(static_cast<int64_t>(cs) - 1, static_cast<int64_t>(N_fft))));
+        }
+        std::vector<uint16_t> gray_syms;
+        for (auto s : rx_syms) gray_syms.push_back(SfLane::grayMap(s));
+        auto hard_cw = deinterleave_block(gray_syms, sf, cw_len, sf_app);
+        uint8_t hard_nib = hamming_decode_hard(hard_cw[0], cr);
+        std::printf("  hard_nib=%u expected=%u codeword=0x%02x\n",
+                    hard_nib, nib, hard_cw[0]);
+
+        // SOFT RX: create LLRs from symbol-indexed mag_sq
+        GrayPartition gp;
+        gp.init(sf);
+        std::vector<std::vector<double>> sym_llrs;
+        for (auto cs : chirp_syms) {
+            auto sym = static_cast<uint32_t>(
+                mod(static_cast<int64_t>(cs) - 1, static_cast<int64_t>(N_fft)));
+            std::vector<float> sym_mag_sq(N_fft, 0.001f);
+            sym_mag_sq[sym] = 100.f;
+            std::vector<double> llrs(sf);
+            SfLane::compute_symbol_llr(sym_mag_sq.data(), N_fft, sf, gp, llrs.data());
+            sym_llrs.push_back(std::move(llrs));
+        }
+        SfLane soft_lane;
+        soft_lane.sf = sf;
+        soft_lane.N = N_fft;
+        auto soft_nibs = soft_lane.processBlockSoft(sym_llrs, sf_app, cw_len, cr);
+        std::printf("  soft_nib=%u expected=%u\n", soft_nibs[0], nib);
+
+        expect(eq(hard_nib, nib)) << "hard decode should recover nibble";
+        expect(eq(soft_nibs[0], nib)) << "soft decode should recover nibble";
+    };
+
+    "soft deinterleave matches hard deinterleave for clean signal"_test = [] {
+        // Simulate the RX decode pipeline for both hard and soft paths.
+        // The hard path: grayMap(symbol) → shift → deinterleave_block → hamming_decode_hard
+        // The soft path: LLR from mag_sq → shift(trim) → deinterleave_block_soft → hamming_decode_soft
+        //
+        // Use a known set of nibbles, encode through the TX pipeline, then decode
+        // both ways and compare.
+        constexpr uint8_t sf = 8;
+        constexpr uint8_t sf_app = sf;  // payload block
+        constexpr uint8_t cr = 4;
+        constexpr uint8_t cw_len = cr + 4;
+
+        // Encode known nibbles
+        std::vector<uint8_t> nibbles_in;
+        for (int i = 0; i < sf_app; i++)
+            nibbles_in.push_back(static_cast<uint8_t>(i % 16));
+        std::vector<uint8_t> codewords;
+        for (auto n : nibbles_in) codewords.push_back(hamming_encode(n, cr));
+
+        // TX: interleave → gray_demap → +1 shift = chirp symbols
+        auto interleaved = interleave_block(codewords, sf, cw_len, sf_app, false);
+        std::vector<uint32_t> chirp_syms;
+        for (auto s : interleaved) {
+            uint32_t g = s;
+            for (int j = 1; j < sf; j++) g ^= (s >> j);
+            chirp_syms.push_back((g + 1) % (1u << sf));
+        }
+
+        // RX hard path: mod(sym-1, N) → grayMap → deinterleave → hamming_hard
+        uint32_t N_fft = 1u << sf;
+        std::vector<uint16_t> rx_hard_syms;
+        for (auto cs : chirp_syms) {
+            auto sym = static_cast<uint16_t>(mod(static_cast<int64_t>(cs) - 1,
+                                                  static_cast<int64_t>(N_fft)));
+            rx_hard_syms.push_back(sym);
+        }
+        // Use SfLane::processBlock hard path (via a temporary SfLane with no soft data)
+        SfLane hard_lane;
+        hard_lane.sf = sf;
+        hard_lane.N = N_fft;
+        auto hard_nibs = hard_lane.processBlock(rx_hard_syms, sf_app, cw_len, cr, false);
+
+        // RX soft path: for each chirp symbol, create mag_sq with peak at that bin
+        GrayPartition gp;
+        gp.init(sf);
+
+        std::vector<std::vector<double>> sym_llrs;
+        for (auto cs : chirp_syms) {
+            // The FFT would give a peak at bin = cs. After mod(bin-1, N) we get
+            // the symbol. But compute_symbol_llr uses the GrayPartition which
+            // indexes by symbol (not bin). The mag_sq is indexed by FFT bin.
+            // In the real pipeline: mag_sq[bin] has the peak. Symbol s maps to
+            // bin (s+1)%N. So mag_sq[(s+1)%N] is high for symbol s.
+            // compute_symbol_llr takes mag_sq indexed by symbol s directly.
+            // We need: sym_mag_sq[s] = FFT_mag_sq[(s+1)%N].
+            // Since we have FFT peak at bin cs, sym_mag_sq[s] is high when (s+1)%N == cs,
+            // i.e. s = (cs-1+N)%N = mod(cs-1, N).
+            std::vector<float> sym_mag_sq(N_fft, 0.001f);
+            auto sym = static_cast<uint32_t>(mod(static_cast<int64_t>(cs) - 1,
+                                                  static_cast<int64_t>(N_fft)));
+            sym_mag_sq[sym] = 100.f;
+
+            std::vector<double> llrs(sf);
+            SfLane::compute_symbol_llr(sym_mag_sq.data(), N_fft, sf, gp, llrs.data());
+            sym_llrs.push_back(std::move(llrs));
+        }
+
+        // Use processBlockSoft directly
+        SfLane soft_lane;
+        soft_lane.sf = sf;
+        soft_lane.N = N_fft;
+        auto soft_nibs = soft_lane.processBlockSoft(sym_llrs, sf_app, cw_len, cr);
+
+        expect(eq(soft_nibs.size(), hard_nibs.size())) << "nibble count mismatch";
+        for (std::size_t i = 0; i < std::min(soft_nibs.size(), hard_nibs.size()); i++) {
+            expect(eq(soft_nibs[i], hard_nibs[i]))
+                << "soft/hard nibble mismatch at " << i
+                << " soft=" << static_cast<int>(soft_nibs[i])
+                << " hard=" << static_cast<int>(hard_nibs[i])
+                << " expected=" << static_cast<int>(nibbles_in[i]);
+        }
+    };
+
+    "soft decode with noise still recovers nibbles"_test = [] {
+        // Generate a symbol at bin 42, add noise to mag_sq, verify LLR signs
+        // still produce correct decode.
+        constexpr uint8_t sf = 8;
+        constexpr uint32_t Nfft = 1u << sf;
+
+        GrayPartition gp;
+        gp.init(sf);
+
+        std::mt19937 gen(42);
+        std::uniform_real_distribution<float> noise_dist(0.f, 5.f);
+
+        // Repeat for several symbols
+        for (uint32_t sym = 0; sym < 16; sym++) {
+            std::vector<float> mag_sq(Nfft);
+            for (auto& m : mag_sq) m = noise_dist(gen);
+            mag_sq[sym] = 200.f;  // Strong signal peak
+
+            std::vector<double> llrs(sf);
+            SfLane::compute_symbol_llr(mag_sq.data(), Nfft, sf, gp, llrs.data());
+
+            // Verify LLR signs match the Gray code
+            uint32_t gray_sym = sym ^ (sym >> 1);
+            for (uint8_t k = 0; k < sf; k++) {
+                bool bit_k = (gray_sym >> k) & 1u;
+                if (bit_k) {
+                    expect(gt(llrs[k], 0.0))
+                        << "sym=" << sym << " k=" << static_cast<int>(k) << " should be > 0";
+                } else {
+                    expect(lt(llrs[k], 0.0))
+                        << "sym=" << sym << " k=" << static_cast<int>(k) << " should be < 0";
+                }
+            }
+        }
     };
 };
 

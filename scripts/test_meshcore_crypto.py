@@ -905,5 +905,124 @@ class TestGrpTxtChannelHash(unittest.TestCase):
         self.assertIsNone(result)
 
 
+# ---- Known-answer test for meshcore_shared_secret ----
+
+# Pre-compute deterministic vectors at module level for regression testing.
+_KA_SEED_A = bytes(range(32))  # 0x00..0x1f
+_KA_SEED_B = bytes(range(32, 64))  # 0x20..0x3f
+_KA_EXPANDED_A = meshcore_expanded_key(_KA_SEED_A)
+_KA_PUB_A = bytes(SigningKey(_KA_SEED_A).verify_key)
+_KA_EXPANDED_B = meshcore_expanded_key(_KA_SEED_B)
+_KA_PUB_B = bytes(SigningKey(_KA_SEED_B).verify_key)
+_KA_EXPECTED_HEX = "f6f92efb32945aff683324a1c984c5001f46aaea513f3453138d740b3a604b7d"
+
+
+class TestSharedSecretKnownAnswer(unittest.TestCase):
+    """Known-answer and property tests for meshcore_shared_secret.
+
+    The ECDH derivation must produce the same shared secret as the MeshCore
+    firmware's ed25519_key_exchange().  These tests guard against regressions
+    in clamping, Ed25519→Curve25519 conversion, or X25519 scalar multiply.
+    """
+
+    def test_symmetric(self):
+        """shared_secret(A_prv, B_pub) == shared_secret(B_prv, A_pub)."""
+        secret_ab = meshcore_shared_secret(_KA_EXPANDED_A, _KA_PUB_B)
+        secret_ba = meshcore_shared_secret(_KA_EXPANDED_B, _KA_PUB_A)
+        self.assertIsNotNone(secret_ab)
+        self.assertIsNotNone(secret_ba)
+        self.assertEqual(secret_ab, secret_ba)
+
+    def test_deterministic(self):
+        """Same inputs always produce the same output."""
+        s1 = meshcore_shared_secret(_KA_EXPANDED_A, _KA_PUB_B)
+        s2 = meshcore_shared_secret(_KA_EXPANDED_A, _KA_PUB_B)
+        self.assertIsNotNone(s1)
+        self.assertEqual(s1, s2)
+
+    def test_known_vector(self):
+        """Verify pre-computed shared secret matches expected hex.
+
+        Seeds: A = bytes(range(32)), B = bytes(range(32, 64)).
+        If this fails, the ECDH derivation has changed — check clamping,
+        Ed25519→Curve25519 conversion, and X25519 scalar multiply.
+        """
+        secret = meshcore_shared_secret(_KA_EXPANDED_A, _KA_PUB_B)
+        self.assertIsNotNone(secret)
+        self.assertEqual(secret.hex(), _KA_EXPECTED_HEX)
+
+    def test_invalid_pubkey(self):
+        """31-byte pubkey (too short) returns None."""
+        result = meshcore_shared_secret(_KA_EXPANDED_A, bytes(31))
+        self.assertIsNone(result)
+
+    def test_zero_pubkey(self):
+        """32 zero bytes is not a valid Ed25519 point — returns None."""
+        result = meshcore_shared_secret(_KA_EXPANDED_A, bytes(32))
+        self.assertIsNone(result)
+
+
+# ---- MAC rejection tests for tampered ciphertext ----
+
+
+class TestMacRejection(unittest.TestCase):
+    """Verify that meshcore_mac_then_decrypt rejects tampered or invalid data.
+
+    MeshCore uses AES-128-ECB with a 2-byte HMAC-SHA256 MAC.  The MAC must
+    reject any modification to the ciphertext, MAC bytes, or key.
+    """
+
+    def setUp(self):
+        self.secret = os.urandom(32)
+        self.plaintext = b"Hello MeshCore!"  # 15 bytes → padded to 16
+        self.encrypted = meshcore_encrypt_then_mac(self.secret, self.plaintext)
+
+    def test_tampered_ciphertext_rejected(self):
+        """Flip one bit in the ciphertext (not the MAC) — decrypt must fail."""
+        data = bytearray(self.encrypted)
+        # Flip bit 0 of the first ciphertext byte (after 2-byte MAC)
+        data[CIPHER_MAC_SIZE] ^= 0x01
+        result = meshcore_mac_then_decrypt(self.secret, bytes(data))
+        self.assertIsNone(result)
+
+    def test_tampered_mac_rejected(self):
+        """Flip one bit in the MAC bytes — decrypt must fail."""
+        data = bytearray(self.encrypted)
+        data[0] ^= 0x01
+        result = meshcore_mac_then_decrypt(self.secret, bytes(data))
+        self.assertIsNone(result)
+
+    def test_wrong_key_rejected(self):
+        """Encrypt with key A, decrypt with key B — must fail."""
+        other_secret = os.urandom(32)
+        # Ensure keys differ (astronomically unlikely to collide, but be explicit)
+        while other_secret[:16] == self.secret[:16]:
+            other_secret = os.urandom(32)  # pragma: no cover
+        result = meshcore_mac_then_decrypt(other_secret, self.encrypted)
+        self.assertIsNone(result)
+
+    def test_truncated_ciphertext_rejected(self):
+        """Truncate ciphertext by 1 byte — invalid block size, must fail."""
+        truncated = self.encrypted[:-1]
+        result = meshcore_mac_then_decrypt(self.secret, truncated)
+        # Either None (MAC mismatch on truncated data) or decrypt error
+        # The MAC is over the ciphertext, so truncation changes the MAC input
+        self.assertIsNone(result)
+
+    def test_multi_block_roundtrip(self):
+        """33-byte plaintext forces 3 blocks (48 bytes). Round-trip succeeds."""
+        plaintext = bytes(range(33))
+        encrypted = meshcore_encrypt_then_mac(self.secret, plaintext)
+        # 33 bytes → padded to 48 (3 × 16), plus 2-byte MAC = 50 bytes
+        self.assertEqual(len(encrypted), CIPHER_MAC_SIZE + 48)
+        decrypted = meshcore_mac_then_decrypt(self.secret, encrypted)
+        self.assertIsNotNone(decrypted)
+        # Decrypted is the full padded block (48 bytes)
+        self.assertEqual(len(decrypted), 48)
+        # First 33 bytes match plaintext, remaining 15 are zero padding
+        self.assertEqual(decrypted[:33], plaintext)
+        self.assertEqual(decrypted[33:], b"\x00" * 15)
+
+
 if __name__ == "__main__":
     unittest.main()

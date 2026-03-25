@@ -247,6 +247,33 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         auto fftOut = _fft.compute(
             std::span<const cf32>(samples.data(), l1_fft_size));
 
+        // Replace DC spur bins with noise-floor estimate.
+        // The B210 AD9361 produces a broadband DC artifact at 0 Hz baseband
+        // (~22 dB above NF at 16 MS/s) that no IIR HP filter can sufficiently
+        // suppress. Replacing (not zeroing) avoids a visible notch in the
+        // spectrum while removing the spur from energy detection.
+        {
+            // Scale null radius to ~±100 kHz regardless of FFT size / sample rate
+            const float binHz = sample_rate / static_cast<float>(l1_fft_size);
+            const auto kDcNullRadius = std::min(
+                static_cast<uint32_t>(100000.f / binHz),
+                l1_fft_size / 8);  // cap at 12.5% of FFT to preserve usable spectrum
+            const auto kRefBins = std::max(kDcNullRadius, 8u);
+            float refMagSq = 0.f;
+            for (uint32_t b = kDcNullRadius + 1; b <= kDcNullRadius + kRefBins && b < l1_fft_size / 2; ++b) {
+                const auto& s1 = fftOut[b];
+                refMagSq += s1.real() * s1.real() + s1.imag() * s1.imag();
+                const auto& s2 = fftOut[l1_fft_size - b];
+                refMagSq += s2.real() * s2.real() + s2.imag() * s2.imag();
+            }
+            // Average magnitude for replacement (preserve phase=0, set magnitude to NF)
+            float nfMag = std::sqrt(refMagSq / static_cast<float>(2 * kRefBins));
+            for (uint32_t b = 0; b <= kDcNullRadius; ++b) {
+                fftOut[b] = {nfMag, 0.f};
+                if (b > 0) fftOut[l1_fft_size - b] = {nfMag, 0.f};
+            }
+        }
+
         // Accumulate |FFT|² into channel bins (DC-centered via fftshift)
         const auto half    = l1_fft_size / 2;
         const float binBw  = sample_rate / static_cast<float>(l1_fft_size);

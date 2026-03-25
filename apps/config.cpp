@@ -416,6 +416,11 @@ std::vector<TrxConfig> load_config(const std::string& path,
         cfg.decode_bws.push_back(cfg.bw);
     }
 
+    // soft decode (experimental)
+    if (auto v = trx_tbl->at_path("soft_decode").value<bool>()) {
+        cfg.soft_decode = *v;
+    }
+
     // wideband mode
     if (auto v = trx_tbl->at_path("wideband").value<bool>()) {
         cfg.wideband = *v;

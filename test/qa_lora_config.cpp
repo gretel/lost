@@ -52,8 +52,8 @@ const boost::ut::suite configLoadConfig = [] {
 
         // Radio
         expect(c.freq == 869'618'000.0) << "freq";
-        expect(c.gain_rx == 32.0) << "gain_rx";
-        expect(c.gain_tx == 75.0) << "gain_tx";
+        expect(c.gain_rx == 35.0) << "gain_rx";
+        expect(c.gain_tx == 70.0) << "gain_tx";
         expect(c.rx_channels.size() == 2_u) << "rx_channels count";
         expect(c.rx_channels[0] == 1_u) << "rx_channels[0]";
         expect(c.rx_channels[1] == 2_u) << "rx_channels[1]";

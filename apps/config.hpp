@@ -42,17 +42,15 @@ constexpr std::array<ChannelMap, 4> kChannelMap = {{
     {1, "TX/RX", "TX/RX", "TRX_B"},   // config channel 3
 }};
 
-// Per-decode-chain configuration.  Each entry produces one FrameSync +
-// DemodDecoder pair per radio channel.  Multiple DecodeConfig entries on
-// the same radio channel are split via a Splitter block.
+// Per-decode-chain configuration.  Each entry produces one
+// MultiSfDecoder per BW per radio channel.  Multiple DecodeConfig
+// entries on the same radio channel are split via a Splitter block.
 // All three identity keys (sf, sync_word, label) are required.
-// Block-level overrides (min_snr_db, energy_thresh, ldro_mode, impl_*)
-// are collected here from [[set_*.decode]] entries.
 struct DecodeConfig {
     uint8_t          sf{8};
     uint16_t         sync_word{0x12};
     std::string      label{};
-    gr::property_map block_overrides{};  ///< per-chain FrameSync/DemodDecoder overrides
+    gr::property_map block_overrides{};  ///< per-chain MultiSfDecoder overrides
 };
 
 // Passthrough config sections for Python scripts.
@@ -135,6 +133,9 @@ struct TrxConfig {
     bool                 dc_offset_auto{true};   ///< hardware DC offset correction
     bool                 dc_blocker{true};        ///< DSP DC blocker
     float                dc_blocker_cutoff{2000.f}; ///< DC blocker cutoff (Hz)
+
+    // Decode options
+    bool                 soft_decode{false};      ///< soft-decision (LLR) Hamming decode (experimental)
 
     // Wideband decode mode (16 MS/s, digital channelization, all SFs on all channels)
     bool                 wideband{false};
@@ -244,11 +245,6 @@ gr::property_map filter_properties(const gr::property_map& src,
     }
     return out;
 }
-
-// Override keys each block accepts (beyond the PHY keys already set explicitly).
-static constexpr std::array kFrameSyncOverrides = {"energy_thresh", "min_snr_db", "max_symbols"};
-static constexpr std::array kDemodDecoderOverrides = {
-    "impl_head", "impl_cr", "impl_pay_len", "impl_has_crc", "ldro_mode"};
 
 // --- CBOR serialisation ---
 

@@ -25,8 +25,7 @@
 
 #include <gnuradio-4.0/lora/algorithm/DCBlocker.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
-#include <gnuradio-4.0/lora/FrameSync.hpp>
-#include <gnuradio-4.0/lora/DemodDecoder.hpp>
+#include <gnuradio-4.0/lora/MultiSfDecoder.hpp>
 
 using namespace boost::ut;
 using namespace boost::ut::literals;
@@ -263,7 +262,7 @@ const suite<"DCBlocker algorithm"> dcBlockerTests = [] {
 const suite<"DCBlocker loopback"> dcBlockerLoopbackTests = [] {
     using namespace gr;
 
-    "DC injection: decode succeeds with DCBlocker"_test = [] {
+    "DC injection: decode succeeds with MultiSfDecoder embedded DCBlocker"_test = [] {
         // TX: generate a LoRa frame
         constexpr uint8_t  sf   = 8;
         constexpr uint8_t  cr   = 4;
@@ -283,53 +282,43 @@ const suite<"DCBlocker loopback"> dcBlockerLoopbackTests = [] {
             s += dcOffset;
         }
 
-        // Apply DCBlocker algorithm directly to the IQ vector (no GR4 block wrapper)
-        lora::DCBlocker dc;
-        dc.init(static_cast<float>(bw * os), 10.f);
-        expect(dc.initialised()) << "DCBlocker should initialise";
-        std::vector<cf32> filtered(iq.size());
-        dc.processBlock(std::span<const cf32>(iq), std::span<cf32>(filtered));
-
-        // Graph: TagSource → FrameSync → DemodDecoder → TagSink
+        // Graph: TagSource → MultiSfDecoder (with embedded DC blocker) → TagSink
         Graph graph;
         using BulkSrc  = testing::TagSource<cf32, testing::ProcessFunction::USE_PROCESS_BULK>;
         using BulkSink = testing::TagSink<uint8_t, testing::ProcessFunction::USE_PROCESS_BULK>;
 
         auto& src = graph.emplaceBlock<BulkSrc>({
-            {"n_samples_max", static_cast<gr::Size_t>(filtered.size())},
+            {"n_samples_max", static_cast<gr::Size_t>(iq.size())},
             {"repeat_tags", false},
             {"mark_tag", false}});
-        src.values = filtered;
+        src.values = iq;
 
-        auto& fsync = graph.emplaceBlock<lora::FrameSync>();
-        fsync.center_freq  = 869618000.f;
-        fsync.bandwidth    = bw;
-        fsync.sf           = sf;
-        fsync.sync_word    = sync;
-        fsync.os_factor    = os;
-        fsync.preamble_len = preamble;
-
-        auto& demod = graph.emplaceBlock<lora::DemodDecoder>();
-        demod.sf        = sf;
-        demod.bandwidth = bw;
+        auto& decoder = graph.emplaceBlock<lora::MultiSfDecoder>();
+        decoder.bandwidth         = bw;
+        decoder.sync_word         = sync;
+        decoder.os_factor         = os;
+        decoder.preamble_len      = preamble;
+        decoder.center_freq       = 869618000.f;
+        decoder.sf_min            = sf;
+        decoder.sf_max            = sf;
+        decoder.dc_blocker_cutoff = 2000.f;  // embedded DC blocker handles DC removal
 
         auto& sink = graph.emplaceBlock<BulkSink>({
             {"log_samples", true}, {"log_tags", true}});
 
-        (void)graph.connect<"out", "in">(src, fsync);
-        (void)graph.connect<"out", "in">(fsync, demod);
-        (void)graph.connect<"out", "in">(demod, sink);
+        (void)graph.connect<"out", "in">(src, decoder);
+        (void)graph.connect<"out", "in">(decoder, sink);
 
         scheduler::Simple sched;
         expect(sched.exchange(std::move(graph)).has_value());
         sched.runAndWait();
 
         auto decoded = std::vector<uint8_t>(sink._samples.begin(), sink._samples.end());
-        std::fprintf(stderr, "DC loopback: %zu bytes decoded (expected %zu)\n",
+        std::fprintf(stderr, "DC loopback (MultiSfDecoder): %zu bytes decoded (expected %zu)\n",
                      decoded.size(), payload.size());
 
         expect(decoded.size() >= payload.size())
-            << "should decode at least payload bytes with DCBlocker";
+            << "should decode at least payload bytes with embedded DCBlocker";
 
         if (decoded.size() >= payload.size()) {
             std::string got(decoded.begin(),
@@ -345,7 +334,7 @@ const suite<"DCBlocker loopback"> dcBlockerLoopbackTests = [] {
                 crcOk = it->second.value_or<bool>(false);
             }
         }
-        expect(crcOk) << "CRC should be valid with DCBlocker removing DC offset";
+        expect(crcOk) << "CRC should be valid with MultiSfDecoder's embedded DC blocker";
     };
 };
 

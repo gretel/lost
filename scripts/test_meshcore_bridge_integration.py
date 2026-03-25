@@ -203,7 +203,7 @@ class BridgeFixture:
                 s = socket.create_connection(("127.0.0.1", self.tcp_port), timeout=0.1)
                 s.close()
                 return
-            except ConnectionRefusedError, OSError:
+            except (ConnectionRefusedError, OSError):
                 time.sleep(0.05)
         raise RuntimeError(
             f"Bridge did not start within {timeout}s on port {self.tcp_port}"

@@ -69,7 +69,14 @@ inline gr::lora::MultiSfDecoder& add_multisf_chain(
     decoder.sf_min       = 7;
     decoder.sf_max       = 12;
     decoder.debug        = cfg.debug;
-    decoder.dc_blocker_cutoff = cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f;
+    decoder.soft_decode  = cfg.soft_decode;
+    if (cfg.lo_offset > 0.0) {
+        // LO offset shifts DC spur out of passband; reduce HP cutoff to
+        // avoid attenuating low-bin sync word symbols (SF8/BW62.5k sw0 = 1953 Hz)
+        decoder.dc_blocker_cutoff = cfg.dc_blocker ? 100.f : 0.f;
+    } else {
+        decoder.dc_blocker_cutoff = cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f;
+    }
     decoder._spectrum_state = std::move(spectrum);
     if (telemetry_cb) {
         decoder._telemetry = telemetry_cb;
@@ -488,13 +495,13 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         {"channel_bw", 62500.f},
         {"decode_bw", static_cast<float>(cfg.bw)},
         {"max_channels", uint32_t{8}},
-        {"buffer_ms", 512.f},
         {"sync_word", dc.sync_word},
         {"preamble_len", cfg.preamble},
         {"debug", cfg.debug},
         {"l1_interval", uint32_t{16}},    // L1 FFT every 16 calls = 8ms
         {"l1_snapshots", uint32_t{4}},    // 4 snapshots = 33ms sweep (catches brief ADVERTs)
-        {"dc_blocker_cutoff", cfg.dc_blocker_cutoff},
+        {"dc_blocker_cutoff", cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f},
+        {"soft_decode", cfg.soft_decode},
     };
     if (!cfg.decode_sfs_str.empty()) {
         wb_props["decode_sfs_str"] = cfg.decode_sfs_str;
@@ -512,6 +519,7 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         {"label", dc.label},
     });
     sink._frame_callback = callback;
+
 
     if (!ok(graph.connect<"out", "in">(source, decoder))) {
         gr::lora::log_ts("error", "graph", "connect source -> WidebandDecoder failed");

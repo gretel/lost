@@ -966,11 +966,11 @@ static int streaming_main(ScanSetConfig& cfg) {
             auto* wrapper = dynamic_cast<gr::BlockWrapper<SoapyType>*>(soapy_source.get());
             if (wrapper) {
                 uint64_t ovf = wrapper->blockRef().totalOverflowCount();
-                if (ovf != lastOvf) {
+                if (ovf != lastOvf && (ovf == 1 || ovf % 50 == 0)) {
                     gr::lora::log_ts("warn ", "lora_scan",
                         "overflow count: %llu", static_cast<unsigned long long>(ovf));
-                    lastOvf = ovf;
                 }
+                lastOvf = ovf;
             }
         }
     }

@@ -26,14 +26,23 @@ from meshcore_crypto import (
     meshcore_encrypt_then_mac,
     GroupChannel,
     build_grp_txt,
+    decode_path_len,
     PAYLOAD_TXT,
     PAYLOAD_ANON_REQ,
     PAYLOAD_GRP_TXT,
     PAYLOAD_ACK,
     PAYLOAD_ADVERT,
+    PAYLOAD_RESP,
+    PAYLOAD_TRACE,
     PATH_HASH_SIZE,
 )
-from meshcore_tx import build_txt_msg, build_anon_req, build_wire_packet, make_header
+from meshcore_tx import (
+    build_txt_msg,
+    build_anon_req,
+    build_wire_packet,
+    make_header,
+    make_cbor_tx_request,
+)
 
 
 # ---- Helpers ----
@@ -388,16 +397,31 @@ class TestCommandHandler(unittest.TestCase):
         self.assertEqual(responses[0][0], bridge.RESP_ERROR)
 
     def test_trace_returns_msg_sent(self):
-        """CMD_TRACE stub returns RESP_MSG_SENT."""
-        cmd = bytes([bridge.CMD_TRACE]) + b"payload"
-        responses = bridge.handle_command(cmd, self.state, None, None)
+        """CMD_TRACE returns RESP_MSG_SENT with valid payload and UDP socket."""
+        sock = _FakeUDPSock()
+        # tag(4) + auth(4) + flags(1) + path_hashes(1+)
+        cmd = (
+            bytes([bridge.CMD_TRACE])
+            + b"\x01\x02\x03\x04"
+            + b"\x05\x06\x07\x08"
+            + b"\x00\xaa"
+        )
+        responses = bridge.handle_command(cmd, self.state, sock, ("127.0.0.1", 5555))
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
 
     def test_path_discovery_returns_msg_sent(self):
-        """CMD_PATH_DISCOVERY stub returns RESP_MSG_SENT."""
-        cmd = bytes([bridge.CMD_PATH_DISCOVERY]) + b"payload"
-        responses = bridge.handle_command(cmd, self.state, None, None)
+        """CMD_PATH_DISCOVERY returns RESP_MSG_SENT with valid contact."""
+        peer_prv, peer_pub, _ = make_identity()
+        from meshcore_crypto import save_pubkey
+
+        save_pubkey(self.state.keys_dir, peer_pub)
+        self.state.known_keys[peer_pub.hex()] = peer_pub
+        record = _make_contact_record(peer_pub)
+        self.state.contacts[peer_pub.hex()] = record
+        sock = _FakeUDPSock()
+        cmd = bytes([bridge.CMD_PATH_DISCOVERY, 0x00]) + peer_pub
+        responses = bridge.handle_command(cmd, self.state, sock, ("127.0.0.1", 5555))
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
 
@@ -4214,43 +4238,39 @@ setattr(
 # ---- Group W: Stub command details ----
 
 
-def _w1_test_stub_cmds_return_msg_sent_flood_routing(self):
-    """Remaining stub cmds (TRACE, PATH_DISCOVERY) have routing_type=1."""
+def _w1_test_trace_returns_msg_sent_with_correct_routing(self):
+    """CMD_TRACE returns MSG_SENT with routing_type=0 (direct)."""
     state = make_state()
-    for cmd_byte in [
-        bridge.CMD_TRACE,
-        bridge.CMD_PATH_DISCOVERY,
-    ]:
-        cmd = bytes([cmd_byte]) + b"payload"
-        responses = bridge.handle_command(cmd, state, None, None)
-        self.assertEqual(
-            responses[0][1],
-            1,
-            f"cmd 0x{cmd_byte:02x} routing_type should be 1 (flood)",
-        )
-
-
-def _w2_test_stub_cmds_increment_msg_seq(self):
-    """Remaining stub cmds increment state.msg_seq."""
-    state = make_state()
-    initial_seq = state.msg_seq
-    bridge.handle_command(bytes([bridge.CMD_TRACE]) + b"payload", state, None, None)
-    self.assertEqual(state.msg_seq, initial_seq + 1)
-    bridge.handle_command(
-        bytes([bridge.CMD_PATH_DISCOVERY]) + b"payload", state, None, None
+    sock = _FakeUDPSock()
+    # tag(4) + auth(4) + flags(1) + path(1+)
+    cmd = bytes([bridge.CMD_TRACE]) + b"\x01\x02\x03\x04\x05\x06\x07\x08\x00\xaa"
+    responses = bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+    self.assertEqual(
+        responses[0][1],
+        0,
+        "CMD_TRACE routing_type should be 0 (direct)",
     )
-    self.assertEqual(state.msg_seq, initial_seq + 2)
+
+
+def _w2_test_trace_tracks_pkt_sent(self):
+    """CMD_TRACE increments pkt_sent counter."""
+    state = make_state()
+    sock = _FakeUDPSock()
+    initial_sent = state.pkt_sent
+    cmd = bytes([bridge.CMD_TRACE]) + b"\x01\x02\x03\x04\x05\x06\x07\x08\x00\xaa"
+    bridge.handle_command(cmd, state, sock, ("127.0.0.1", 5555))
+    self.assertEqual(state.pkt_sent, initial_sent + 1)
 
 
 setattr(
     TestCommandHandler,
-    "test_stub_cmds_return_msg_sent_flood_routing",
-    _w1_test_stub_cmds_return_msg_sent_flood_routing,
+    "test_trace_returns_msg_sent_with_correct_routing",
+    _w1_test_trace_returns_msg_sent_with_correct_routing,
 )
 setattr(
     TestCommandHandler,
-    "test_stub_cmds_increment_msg_seq",
-    _w2_test_stub_cmds_increment_msg_seq,
+    "test_trace_tracks_pkt_sent",
+    _w2_test_trace_tracks_pkt_sent,
 )
 
 
@@ -4964,6 +4984,428 @@ class TestBinaryReq(unittest.TestCase):
         msgs, acks = bridge.lora_frame_to_companion_msgs(frame, state)
         push_types = [m[0] for m in msgs]
         self.assertNotIn(bridge.PUSH_BINARY_RESPONSE, push_types)
+
+
+# ---- Group: CMD_GET_ADVERT_PATH (0x2A) ----
+
+
+class TestGetAdvertPath(unittest.TestCase):
+    """Tests for CMD_GET_ADVERT_PATH (0x2A)."""
+
+    def test_get_advert_path_success(self):
+        """CMD_GET_ADVERT_PATH returns RESP_ADVERT_PATH with path info from contact."""
+        state = make_state()
+        peer_prv, peer_pub, _ = make_identity()
+        # Build a contact record with known last_advert and path_len
+        ts = int(time.time())
+        record = (
+            peer_pub  # pubkey (32)
+            + b"\x01"  # node_type=chat
+            + b"\x00"  # flags
+            + b"\xff"  # path_len=-1 (flood, encoded as 0xFF unsigned)
+            + b"\x00" * 64  # path (64)
+            + b"peer"
+            + b"\x00" * 28  # name (32)
+            + struct.pack("<I", ts)  # last_advert (4)
+            + struct.pack("<i", 0)  # lat (4)
+            + struct.pack("<i", 0)  # lon (4)
+            + struct.pack("<I", ts)  # lastmod (4)
+        )
+        assert len(record) == 147
+        state.contacts[peer_pub.hex()] = record
+
+        # Send CMD_GET_ADVERT_PATH: [0x2A][reserved(1)][pubkey(32)]
+        cmd = bytes([bridge.CMD_GET_ADVERT_PATH, 0x00]) + peer_pub
+        responses = bridge.handle_command(cmd, state, None, None)
+        self.assertEqual(len(responses), 1)
+        resp = responses[0]
+        self.assertEqual(resp[0], bridge.RESP_ADVERT_PATH)
+        # Check recv_timestamp
+        recv_ts = struct.unpack_from("<I", resp, 1)[0]
+        self.assertEqual(recv_ts, ts)
+        # Check path_len_enc byte
+        self.assertEqual(resp[5], 0xFF)  # -1 signed = 0xFF unsigned
+
+    def test_get_advert_path_not_found(self):
+        """CMD_GET_ADVERT_PATH with unknown pubkey returns RESP_ERROR + NOT_FOUND."""
+        state = make_state()
+        unknown_pub = b"\xaa" * 32
+        cmd = bytes([bridge.CMD_GET_ADVERT_PATH, 0x00]) + unknown_pub
+        responses = bridge.handle_command(cmd, state, None, None)
+        self.assertEqual(len(responses), 1)
+        resp = responses[0]
+        self.assertEqual(resp[0], bridge.RESP_ERROR)
+        self.assertEqual(resp[1], bridge.ERR_CODE_NOT_FOUND)
+
+    def test_get_advert_path_too_short(self):
+        """CMD_GET_ADVERT_PATH with < 33 bytes of data returns error."""
+        state = make_state()
+        # Only 10 bytes of data (need 33: reserved + pubkey)
+        cmd = bytes([bridge.CMD_GET_ADVERT_PATH]) + b"\x00" * 10
+        responses = bridge.handle_command(cmd, state, None, None)
+        self.assertEqual(len(responses), 1)
+        resp = responses[0]
+        self.assertEqual(resp[0], bridge.RESP_ERROR)
+        self.assertEqual(resp[1], bridge.ERR_CODE_ILLEGAL_ARG)
+
+
+# ---- Group: CMD_SEND_TRACE_PATH (0x24) ----
+
+
+class TestTrace(unittest.TestCase):
+    """Tests for CMD_SEND_TRACE_PATH (0x24)."""
+
+    def test_trace_sends_wire_packet(self):
+        """CMD_TRACE builds a PAYLOAD_TRACE wire packet and sends via UDP."""
+        state = make_state()
+        sock = _FakeUDPSock()
+        udp_addr = ("127.0.0.1", 5555)
+        tag = b"\x01\x02\x03\x04"
+        auth = b"\x05\x06\x07\x08"
+        flags = b"\x00"
+        path_hashes = b"\xaa\xbb\xcc"
+        # Frame: [0x24][tag(4)][auth(4)][flags(1)][path_hashes...]
+        cmd = bytes([bridge.CMD_TRACE]) + tag + auth + flags + path_hashes
+        responses = bridge.handle_command(cmd, state, sock, udp_addr)
+        # Should return MSG_SENT
+        self.assertEqual(len(responses), 1)
+        resp = responses[0]
+        self.assertEqual(resp[0], bridge.RESP_MSG_SENT)
+        # ack_hash in MSG_SENT should be the tag bytes
+        ack_tag = resp[2:6]
+        self.assertEqual(ack_tag, tag)
+        # Should have sent one UDP packet
+        self.assertEqual(len(sock.sent), 1)
+        # Decode the CBOR to verify the wire packet
+        import cbor2
+
+        cbor_msg = cbor2.loads(sock.sent[0])
+        wire = cbor_msg["payload"]
+        # Verify header: ROUTE_DIRECT + PAYLOAD_TRACE
+        header = wire[0]
+        route = header & 0x03
+        ptype = (header >> 2) & 0x0F
+        self.assertEqual(route, bridge.ROUTE_DIRECT)
+        self.assertEqual(ptype, PAYLOAD_TRACE)
+        # Verify payload contains tag + auth + flags + path_hashes
+        # Wire: header(1) + path_len(1) + payload
+        payload_data = wire[2:]  # skip header and path_len
+        self.assertEqual(payload_data[:4], tag)
+        self.assertEqual(payload_data[4:8], auth)
+        self.assertEqual(payload_data[8:9], flags)
+        self.assertEqual(payload_data[9:], path_hashes)
+
+    def test_trace_too_short(self):
+        """CMD_TRACE with < 10 bytes of data returns error."""
+        state = make_state()
+        sock = _FakeUDPSock()
+        udp_addr = ("127.0.0.1", 5555)
+        # Only 8 bytes: tag(4) + auth(4), missing flags and path_hashes
+        cmd = bytes([bridge.CMD_TRACE]) + b"\x01" * 8
+        responses = bridge.handle_command(cmd, state, sock, udp_addr)
+        self.assertEqual(len(responses), 1)
+        resp = responses[0]
+        self.assertEqual(resp[0], bridge.RESP_ERROR)
+
+
+# ---- Group: CMD_PATH_DISCOVERY (0x34) ----
+
+
+class TestPathDiscovery(unittest.TestCase):
+    """Tests for CMD_SEND_PATH_DISCOVERY_REQ (0x34)."""
+
+    def test_path_discovery_sends_status_msg(self):
+        """CMD_PATH_DISCOVERY sends a CLI 'status' message and sets _pending_discovery."""
+        state = make_state()
+        peer_prv, peer_pub, _ = make_identity()
+        from meshcore_crypto import save_pubkey
+
+        save_pubkey(state.keys_dir, peer_pub)
+        state.known_keys[peer_pub.hex()] = peer_pub
+        # Add contact so resolution works
+        record = _make_contact_record(peer_pub)
+        state.contacts[peer_pub.hex()] = record
+
+        sock = _FakeUDPSock()
+        udp_addr = ("127.0.0.1", 5555)
+        # Frame: [0x34][reserved=0x00][pubkey(32)]
+        cmd = bytes([bridge.CMD_PATH_DISCOVERY, 0x00]) + peer_pub
+        responses = bridge.handle_command(cmd, state, sock, udp_addr)
+        # Should return MSG_SENT
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_MSG_SENT)
+        # Should have sent via UDP
+        self.assertTrue(len(sock.sent) > 0)
+        # _pending_discovery should be set
+        self.assertEqual(state._pending_discovery, peer_pub[:4])
+
+    def test_path_discovery_not_found(self):
+        """CMD_PATH_DISCOVERY with unknown pubkey returns error."""
+        state = make_state()
+        sock = _FakeUDPSock()
+        udp_addr = ("127.0.0.1", 5555)
+        unknown_pub = b"\xbb" * 32
+        cmd = bytes([bridge.CMD_PATH_DISCOVERY, 0x00]) + unknown_pub
+        responses = bridge.handle_command(cmd, state, sock, udp_addr)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+    def test_path_discovery_too_short(self):
+        """CMD_PATH_DISCOVERY with < 34 bytes of data returns error."""
+        state = make_state()
+        sock = _FakeUDPSock()
+        udp_addr = ("127.0.0.1", 5555)
+        cmd = bytes([bridge.CMD_PATH_DISCOVERY]) + b"\x00" * 10
+        responses = bridge.handle_command(cmd, state, sock, udp_addr)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], bridge.RESP_ERROR)
+
+
+# ---- Group: PUSH events for RESP RX (login/status) ----
+
+
+def _build_resp_wire_packet(
+    sender_prv: bytes,
+    sender_pub: bytes,
+    dest_pub: bytes,
+    response_data: bytes,
+    route_type: int = bridge.ROUTE_FLOOD,
+) -> bytes:
+    """Build a PAYLOAD_RESP wire packet for testing.
+
+    RESP has the same encryption as TXT_MSG:
+      [dest_hash(1)][src_hash(1)][MAC(2)][ciphertext]
+    Plaintext: tag(4) + response_data
+    """
+    from meshcore_crypto import meshcore_shared_secret, meshcore_encrypt_then_mac
+
+    secret = meshcore_shared_secret(sender_prv, dest_pub)
+    assert secret is not None
+
+    # Build plaintext: tag(4) + response_data
+    tag = struct.pack("<I", int(time.time()))
+    plaintext = tag + response_data
+
+    # Encrypt
+    encrypted = meshcore_encrypt_then_mac(secret, plaintext)
+
+    # Build payload: dest_hash + src_hash + encrypted
+    dest_hash = dest_pub[:PATH_HASH_SIZE]
+    src_hash = sender_pub[:PATH_HASH_SIZE]
+    payload = dest_hash + src_hash + encrypted
+
+    # Build wire packet
+    header = make_header(route_type, PAYLOAD_RESP)
+    return build_wire_packet(header, payload)
+
+
+class TestRespRx(unittest.TestCase):
+    """Tests for PAYLOAD_RESP RX handling (login/status push events)."""
+
+    def setUp(self):
+        self.state = make_state()
+        self.peer_prv, self.peer_pub, _ = make_identity()
+        from meshcore_crypto import save_pubkey
+
+        save_pubkey(self.state.keys_dir, self.peer_pub)
+        self.state.known_keys[self.peer_pub.hex()] = self.peer_pub
+
+    def _make_frame(self, wire_packet: bytes) -> dict:
+        return {
+            "type": "lora_frame",
+            "payload": wire_packet,
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0, "rssi_dbm": -70},
+        }
+
+    def test_resp_login_success(self):
+        """RESP with response_data[0]==0x00 produces PUSH_LOGIN_SUCCESS."""
+        # Build RESP with login OK (response_data[0] = 0x00)
+        # response_data: [0x00][type_byte][permissions][acl_perms][...][fw_ver_level]
+        response_data = bytes([0x00, 0x01, 0x07, 0x03, 0x00, 0x00, 0x00, 0x00, 0x05])
+        pkt = _build_resp_wire_packet(
+            self.peer_prv, self.peer_pub, self.state.pub_key, response_data
+        )
+        frame = self._make_frame(pkt)
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, self.state)
+        self.assertTrue(len(msgs) > 0)
+        push = msgs[0]
+        self.assertEqual(push[0], bridge.PUSH_LOGIN_SUCCESS)
+        # permissions byte
+        self.assertEqual(push[1], 0x07)
+        # pubkey prefix (6 bytes)
+        self.assertEqual(push[2:8], self.peer_pub[:6])
+
+    def test_resp_login_fail(self):
+        """RESP with unknown response code produces PUSH_LOGIN_FAIL."""
+        # response_data with unknown code (not 0x00, not "OK", no pending status)
+        response_data = b"\xff\x01\x02\x03"
+        pkt = _build_resp_wire_packet(
+            self.peer_prv, self.peer_pub, self.state.pub_key, response_data
+        )
+        frame = self._make_frame(pkt)
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, self.state)
+        self.assertTrue(len(msgs) > 0)
+        push = msgs[0]
+        self.assertEqual(push[0], bridge.PUSH_LOGIN_FAIL)
+        self.assertEqual(push[1], 0x00)
+        self.assertEqual(push[2:8], self.peer_pub[:6])
+
+    def test_resp_legacy_ok_login_success(self):
+        """RESP with response_data starting with b'OK' produces PUSH_LOGIN_SUCCESS."""
+        response_data = b"OK logged in"
+        pkt = _build_resp_wire_packet(
+            self.peer_prv, self.peer_pub, self.state.pub_key, response_data
+        )
+        frame = self._make_frame(pkt)
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, self.state)
+        self.assertTrue(len(msgs) > 0)
+        push = msgs[0]
+        self.assertEqual(push[0], bridge.PUSH_LOGIN_SUCCESS)
+        # Legacy format: [0x85][0x00][pubkey_prefix(6)]
+        self.assertEqual(push[1], 0x00)
+        self.assertEqual(push[2:8], self.peer_pub[:6])
+
+    def test_resp_status_response(self):
+        """RESP matching _pending_status produces PUSH_STATUS_RESPONSE."""
+        # Set pending status for this peer
+        self.state._pending_status = self.peer_pub[:4]
+        # response_data: some status text (not 0x00, not "OK")
+        response_data = b"\x03status: battery 80%"
+        pkt = _build_resp_wire_packet(
+            self.peer_prv, self.peer_pub, self.state.pub_key, response_data
+        )
+        frame = self._make_frame(pkt)
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, self.state)
+        self.assertTrue(len(msgs) > 0)
+        push = msgs[0]
+        self.assertEqual(push[0], bridge.PUSH_STATUS_RESPONSE)
+        self.assertEqual(push[1], 0x00)
+        self.assertEqual(push[2:8], self.peer_pub[:6])
+        # Status data follows the prefix (strip AES zero-padding)
+        self.assertEqual(push[8:].rstrip(b"\x00"), response_data)
+        # _pending_status should be cleared
+        self.assertEqual(self.state._pending_status, b"")
+
+    def test_resp_wrong_dest_ignored(self):
+        """RESP not addressed to us (wrong dest_hash) is silently ignored."""
+        # Build RESP addressed to someone else
+        other_prv, other_pub, _ = make_identity()
+        response_data = bytes([0x00, 0x01])
+        pkt = _build_resp_wire_packet(
+            self.peer_prv, self.peer_pub, other_pub, response_data
+        )
+        frame = self._make_frame(pkt)
+        msgs, acks = bridge.lora_frame_to_companion_msgs(frame, self.state)
+        self.assertEqual(len(msgs), 0)
+
+
+# ---- W5 companion command tests ----
+
+
+class TestW5CompanionCommands(unittest.TestCase):
+    """Tests for newly added companion protocol commands (W5)."""
+
+    def setUp(self):
+        self.state = make_state()
+        self.null_sock = _FakeUDPSock()
+        self.addr = ("127.0.0.1", 5555)
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(cmd_bytes, self.state, self.null_sock, self.addr)
+
+    def test_export_private_key(self):
+        """CMD_EXPORT_PRIVATE_KEY returns OK + 32-byte seed."""
+        resp = self._handle(bytes([bridge.CMD_EXPORT_PRIVATE_KEY]))
+        self.assertEqual(len(resp), 1)
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+        seed_out = resp[0][1:]  # skip RESP_OK byte; value(4) + seed(32)?
+        # RESP_OK format: [0x00, value(4 LE)] — but export appends seed after RESP_OK
+        # Actually our build_ok() returns [0x00, value(4 LE)], but we return
+        # bytes([RESP_OK]) + state.seed[:32] directly
+        self.assertEqual(len(resp[0]), 1 + 32)
+        self.assertEqual(resp[0][1:], self.state.seed[:32])
+
+    def test_import_private_key(self):
+        """CMD_IMPORT_PRIVATE_KEY re-derives keypair from new seed."""
+        old_pub = self.state.pub_key
+        new_seed = os.urandom(32)
+        resp = self._handle(bytes([bridge.CMD_IMPORT_PRIVATE_KEY]) + new_seed)
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+        self.assertNotEqual(self.state.pub_key, old_pub)
+        self.assertEqual(self.state.seed, new_seed)
+
+    def test_import_private_key_too_short(self):
+        """CMD_IMPORT_PRIVATE_KEY with < 32 bytes returns error."""
+        resp = self._handle(bytes([bridge.CMD_IMPORT_PRIVATE_KEY]) + b"\x00" * 16)
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+
+    def test_get_tuning_params(self):
+        """CMD_GET_TUNING_PARAMS returns RESP_TUNING_PARAMS with two zeros."""
+        resp = self._handle(bytes([bridge.CMD_GET_TUNING_PARAMS]))
+        self.assertEqual(len(resp), 1)
+        self.assertEqual(resp[0][0], bridge.RESP_TUNING_PARAMS)
+        # 1 byte code + 8 bytes (two uint32 LE zeros)
+        self.assertEqual(len(resp[0]), 9)
+        self.assertEqual(struct.unpack_from("<II", resp[0], 1), (0, 0))
+
+    def test_has_connection(self):
+        """CMD_HAS_CONNECTION always returns ERR_CODE_NOT_FOUND."""
+        resp = self._handle(bytes([bridge.CMD_HAS_CONNECTION]))
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+        self.assertEqual(resp[0][1], bridge.ERR_CODE_NOT_FOUND)
+
+    def test_get_contact_by_key_found(self):
+        """CMD_GET_CONTACT_BY_KEY returns RESP_CONTACT when prefix matches."""
+        pk = os.urandom(32)
+        record = bridge._build_contact_record(pk, name="Alice")
+        self.state.contacts[pk.hex()] = record
+        resp = self._handle(bytes([bridge.CMD_GET_CONTACT_BY_KEY]) + pk[:6])
+        self.assertEqual(resp[0][0], bridge.RESP_CONTACT)
+        self.assertEqual(resp[0][1:], record)
+
+    def test_get_contact_by_key_not_found(self):
+        """CMD_GET_CONTACT_BY_KEY returns ERR_CODE_NOT_FOUND for unknown prefix."""
+        resp = self._handle(bytes([bridge.CMD_GET_CONTACT_BY_KEY]) + b"\xff" * 6)
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+        self.assertEqual(resp[0][1], bridge.ERR_CODE_NOT_FOUND)
+
+    def test_get_contact_by_key_too_short(self):
+        """CMD_GET_CONTACT_BY_KEY with < 6 bytes returns error."""
+        resp = self._handle(bytes([bridge.CMD_GET_CONTACT_BY_KEY]) + b"\x01\x02")
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+
+    def test_set_device_pin(self):
+        """CMD_SET_DEVICE_PIN stores the PIN in state."""
+        pin = struct.pack("<I", 1234)
+        resp = self._handle(bytes([bridge.CMD_SET_DEVICE_PIN]) + pin)
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+        self.assertEqual(self.state.device_pin, 1234)
+
+    def test_set_device_pin_zero(self):
+        """CMD_SET_DEVICE_PIN with 0 clears the PIN."""
+        self.state.device_pin = 9999
+        pin = struct.pack("<I", 0)
+        resp = self._handle(bytes([bridge.CMD_SET_DEVICE_PIN]) + pin)
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+        self.assertEqual(self.state.device_pin, 0)
+
+    def test_factory_reset_clears_contacts_and_keys(self):
+        """CMD_FACTORY_RESET clears in-memory contacts and keys."""
+        pk = os.urandom(32)
+        self.state.contacts[pk.hex()] = bridge._build_contact_record(pk)
+        self.state.known_keys[pk.hex()] = pk
+        self.state.pkt_recv = 42
+        resp = self._handle(bytes([bridge.CMD_FACTORY_RESET]))
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+        self.assertEqual(len(self.state.contacts), 0)
+        self.assertEqual(len(self.state.known_keys), 0)
+        self.assertEqual(self.state.pkt_recv, 0)
+
+    def test_send_telemetry_req_short_returns_error(self):
+        """CMD_SEND_TELEMETRY_REQ with < 32 bytes returns error."""
+        resp = self._handle(bytes([bridge.CMD_SEND_TELEMETRY_REQ]) + b"\x00" * 16)
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
 
 
 if __name__ == "__main__":

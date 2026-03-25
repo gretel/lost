@@ -277,21 +277,6 @@ def main() -> None:
                 flush=True,
             )
 
-        # --- FrameSync telemetry ---
-        elif msg_type == "framesync_detect":
-            sf = msg.get("sf", 0)
-            bin_val = msg.get("bin", 0)
-            print(f"SYNC_DETECT SF{sf} bin={bin_val}", flush=True)
-
-        elif msg_type == "framesync_sync":
-            sf = msg.get("sf", 0)
-            cfo = msg.get("cfo_int", 0)
-            cfo_frac = msg.get("cfo_frac", 0.0)
-            snr = msg.get("snr_db", 0.0)
-            print(
-                f"SYNC_LOCK SF{sf} cfo_int={cfo} cfo_frac={cfo_frac:.3f} SNR={snr:.1f}",
-                flush=True,
-            )
 
 
 if __name__ == "__main__":
