@@ -91,13 +91,13 @@ add_ut_test(qa_lora_dc_blocker)
 FetchContent_Declare(
     SoapyLoopback
     GIT_REPOSITORY https://github.com/gretel/SoapyLoopback.git
-    GIT_TAG        bffb12274ac657802d5f14e46996a77f023a4077  # fix/tx-loopback-qa
+    GIT_TAG        eab0395f5033da85adb5af6ccd30a5e7129a453e  # fix/tx-loopback-qa
 )
 FetchContent_MakeAvailable(SoapyLoopback)
 
 add_executable(qa_soapy_loopback qa_soapy_loopback.cpp)
 target_link_libraries(qa_soapy_loopback PRIVATE
-    gnuradio-options gnuradio-core-group gr-soapy gr-testing ut)
+    gr-lora gnuradio-options gnuradio-core-group gr-soapy gr-testing ut)
 target_compile_definitions(qa_soapy_loopback PRIVATE
     SOAPY_LOOPBACK_MODULE_PATH="$<TARGET_FILE:soapyloopback>")
 add_test(NAME qa_soapy_loopback

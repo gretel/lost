@@ -9,6 +9,7 @@
 #include <gnuradio-4.0/soapy/Soapy.hpp>
 #include <gnuradio-4.0/soapy/SoapySink.hpp>
 #include <gnuradio-4.0/testing/NullSources.hpp>
+#include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -195,6 +196,74 @@ const boost::ut::suite<"SoapyLoopback raw API"> rawApiTests = [] {
             expect(eq(std::memcmp(txBuf.data(), rxBuf.data(), nSamples * sizeof(std::complex<float>)), 0))
                 << std::format("cycle {} data mismatch", cycle);
         }
+
+        dev->deactivateStream(txStream);
+        dev->deactivateStream(rxStream);
+        dev->closeStream(txStream);
+        dev->closeStream(rxStream);
+        SoapySDR::Device::unmake(dev);
+    };
+
+    "LoRa TX IQ round-trip"_test = [] {
+        // Generate a LoRa frame: SF8, CR4, BW125k, OS=1, 8 preamble symbols
+        const std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o'};
+        auto iq = gr::lora::generate_frame_iq(
+            payload,
+            /*sf=*/8, /*cr=*/4, /*os_factor=*/1,
+            /*sync_word=*/0x12, /*preamble_len=*/8,
+            /*has_crc=*/true, /*zero_pad=*/0,
+            /*ldro_mode=*/0, /*bandwidth=*/125000,
+            /*inverted_iq=*/false);
+        expect(gt(iq.size(), 0UZ)) << "generate_frame_iq produced no samples";
+
+        auto* dev = SoapySDR::Device::make(SoapySDR::Kwargs{{"driver", "loopback"}});
+        expect(dev != nullptr);
+        if (!dev) return;
+
+        dev->setSampleRate(SOAPY_SDR_TX, 0, 125e3);
+        dev->setSampleRate(SOAPY_SDR_RX, 0, 125e3);
+
+        auto* txStream = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32);
+        auto* rxStream = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32);
+        expect(txStream != nullptr);
+        expect(rxStream != nullptr);
+
+        dev->activateStream(txStream);
+        dev->activateStream(rxStream);
+
+        // Write IQ data, possibly in chunks if larger than MTU
+        const std::size_t mtu = dev->getStreamMTU(txStream);
+        std::size_t       written = 0;
+        while (written < iq.size()) {
+            std::size_t chunk = std::min(mtu, iq.size() - written);
+            const void* txBuffs[1] = {iq.data() + written};
+            int         txFlags = 0;
+            int         txRet = dev->writeStream(txStream, txBuffs, chunk, txFlags);
+            expect(eq(txRet, static_cast<int>(chunk)))
+                << std::format("writeStream returned {} at offset {}", txRet, written);
+            if (txRet <= 0) break;
+            written += static_cast<std::size_t>(txRet);
+        }
+        expect(eq(written, iq.size())) << "did not write all IQ samples";
+
+        // Read back all IQ data (may arrive in multiple chunks)
+        std::vector<std::complex<float>> rxBuf(iq.size());
+        std::size_t                      totalRead = 0;
+        while (totalRead < iq.size()) {
+            std::size_t remaining = iq.size() - totalRead;
+            void*       rxBuffs[1] = {rxBuf.data() + totalRead};
+            int         rxFlags = 0;
+            long long   rxTimeNs = 0;
+            int         rxRet = dev->readStream(rxStream, rxBuffs, remaining, rxFlags, rxTimeNs, 1'000'000);
+            expect(gt(rxRet, 0)) << std::format("readStream returned {} at offset {}", rxRet, totalRead);
+            if (rxRet <= 0) break;
+            totalRead += static_cast<std::size_t>(rxRet);
+        }
+        expect(eq(totalRead, iq.size())) << "did not read all IQ samples";
+
+        // Verify bit-exact match
+        expect(eq(std::memcmp(iq.data(), rxBuf.data(), iq.size() * sizeof(std::complex<float>)), 0))
+            << std::format("LoRa IQ mismatch ({} cf32 samples)", iq.size());
 
         dev->deactivateStream(txStream);
         dev->deactivateStream(rxStream);
