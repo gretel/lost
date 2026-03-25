@@ -62,7 +62,7 @@ jobs:
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
       - name: Build
-        run: cmake --build build -j"$(nproc)"
+        run: cmake --build build -j4
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 120
@@ -134,7 +134,7 @@ jobs:
             -DENABLE_LORA_BENCHMARKS=OFF
 
       - name: Build lora_trx and lora_scan
-        run: cmake --build build --target lora_trx lora_scan -j"$(nproc)"
+        run: cmake --build build --target lora_trx lora_scan -j4
 
       - name: Verify version
         run: |
