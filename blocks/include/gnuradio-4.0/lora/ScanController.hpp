@@ -253,9 +253,12 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         // suppress. Replacing (not zeroing) avoids a visible notch in the
         // spectrum while removing the spur from energy detection.
         {
-            constexpr uint32_t kDcNullRadius = 24;  // ±24 bins = ±93.75 kHz at 16 MS/s/4096
-            // Estimate noise floor from bins just outside the DC region
-            constexpr uint32_t kRefBins = 32;
+            // Scale null radius to ~±100 kHz regardless of FFT size / sample rate
+            const float binHz = sample_rate / static_cast<float>(l1_fft_size);
+            const auto kDcNullRadius = std::min(
+                static_cast<uint32_t>(100000.f / binHz),
+                l1_fft_size / 8);  // cap at 12.5% of FFT to preserve usable spectrum
+            const auto kRefBins = std::max(kDcNullRadius, 8u);
             float refMagSq = 0.f;
             for (uint32_t b = kDcNullRadius + 1; b <= kDcNullRadius + kRefBins && b < l1_fft_size / 2; ++b) {
                 const auto& s1 = fftOut[b];

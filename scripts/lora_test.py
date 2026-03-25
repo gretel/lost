@@ -59,12 +59,13 @@ SCRIPT_DIR = Path(__file__).parent
 
 SETTLE_S = 2.0  # wait after radio change for PLL lock
 FLUSH_DECODE_S = 5.0  # wait after TX for decode pipeline
-FLUSH_SCAN_S = 3.0  # wait after TX for scan sweeps (2-3 sweep cycles)
+FLUSH_SCAN_S = 8.0  # wait after TX for scan sweeps (~14 cycles at 555ms)
 FLUSH_TX_S = 3.0  # wait after SDR TX for Heltec to receive
 FLUSH_BRIDGE_S = 5.0  # wait for bridge RX path (decode + companion protocol)
 BRIDGE_PORT = 7835  # serial_bridge TCP port
 MESHCORE_BRIDGE_PORT = 7834  # meshcore_bridge TCP port
 TRX_PORT = 5556  # lora_trx UDP port (accepts lora_tx messages)
+AGG_PORT = 5555  # lora_agg consumer-facing UDP port
 MIN_RATIO = 8.0  # scan detection threshold
 
 
@@ -143,6 +144,19 @@ MATRICES: dict[str, list[ConfigPoint]] = {
     "power_sweep": [
         ConfigPoint(sf=8, bw=62500, freq_mhz=869.618, tx_power=p)
         for p in [2, 0, -4, -9, -14]
+    ],
+    # Bridge-optimised: mixed BW to keep airtime under B210 TX limit (~1.5s)
+    "bridge_full": [
+        ConfigPoint(sf=7, bw=62500, freq_mhz=869.618),  # 652ms
+        ConfigPoint(sf=8, bw=62500, freq_mhz=869.618),  # 1140ms
+        ConfigPoint(sf=9, bw=125000, freq_mhz=869.618),  # 1042ms
+        ConfigPoint(sf=10, bw=250000, freq_mhz=869.618),  # 1042ms
+    ],
+    "bw125k_sweep": [
+        ConfigPoint(sf=sf, bw=125000, freq_mhz=869.618) for sf in [7, 8, 9]
+    ],
+    "bw250k_sweep": [
+        ConfigPoint(sf=sf, bw=250000, freq_mhz=869.618) for sf in [7, 8, 9, 10]
     ],
 }
 
@@ -334,9 +348,21 @@ def run_point(
     time.sleep(SETTLE_S)
     collector.drain()  # discard stale events
 
-    # TX one unique ADVERT
-    result.tx_ok = companion.send_advert()
-    _info(f"  TX {'ok' if result.tx_ok else 'FAIL'}")
+    # TX ADVERT(s) — scan mode sends 3 with gaps to increase detection
+    # probability (streaming scan has ~60% per-ADVERT detection rate due
+    # to L1 sweep timing alignment)
+    if mode == "scan":
+        ok_count = 0
+        for i in range(3):
+            if companion.send_advert():
+                ok_count += 1
+            if i < 2:
+                time.sleep(2.0)
+        result.tx_ok = ok_count > 0
+        _info(f"  TX {ok_count}/3 ok")
+    else:
+        result.tx_ok = companion.send_advert()
+        _info(f"  TX {'ok' if result.tx_ok else 'FAIL'}")
 
     time.sleep(flush_s)
     events = collector.drain()
@@ -387,6 +413,12 @@ def _collect_decode(result: PointResult, events: list[dict], tx_freq_hz: float) 
 
 def _collect_scan(result: PointResult, events: list[dict], tx_freq_hz: float) -> None:
     """Extract scan results from scan_spectrum / scan_sweep_end events."""
+    n_spectrum = sum(1 for e in events if e.get("type") == "scan_spectrum")
+    n_with_det = sum(
+        1 for e in events if e.get("type") == "scan_spectrum" and e.get("detections")
+    )
+    if n_spectrum > 0:
+        _info(f"  cbor: {n_spectrum} spectrum, {n_with_det} with det")
     sweep_durs: list[int] = []
     for ev in events:
         t = ev.get("type", "")
@@ -1196,7 +1228,10 @@ def main() -> None:
     sock, _, _ = create_udp_subscriber("127.0.0.1", udp_port)
     collector = EventCollector(sock, event_types)
     collector.start()
-    time.sleep(1.0)
+    # Scan mode needs longer startup — B210 at 16 MS/s has ~8s transient
+    # (master clock switch, overflow burst, L1 energy settling)
+    startup_delay = 10.0 if mode == "scan" else 1.0
+    time.sleep(startup_delay)
 
     _info(f"\n--- {mode}: {len(matrix)} points, matrix={args.matrix} ---")
     if args.hypothesis:
@@ -1307,7 +1342,14 @@ async def _run_bridge_experiment(
     tcp_host: str | None = None,
     tcp_port: int | None = None,
 ) -> None:
-    """Bridge experiment: full bidirectional message exchange via meshcore_bridge."""
+    """Bridge experiment: full bidirectional message exchange via meshcore_bridge.
+
+    Process stack (inner to outer):
+      lora_trx:5556 ← lora_agg:5555 ← meshcore_bridge:7834
+    lora_agg deduplicates TX echoes (fnv1a64 hash matching, TX_ECHO_WINDOW=10s)
+    so Phase D doesn't see the bridge's own Phase C packets.
+    Config socket goes direct to lora_trx:5556 (lora_agg doesn't forward lora_config).
+    """
     # 1. Start lora_trx
     _info(f"Starting {binary}")
     binary_proc = _start_process(
@@ -1320,13 +1362,31 @@ async def _run_bridge_experiment(
         sys.exit(1)
     _info(f"{binary} ready")
 
-    # 2. Start meshcore_bridge.py
+    # 2. Start lora_agg.py (dedup + TX echo suppression)
+    _info("Starting lora_agg")
+    agg_cmd = [
+        sys.executable,
+        str(SCRIPT_DIR / "lora_agg.py"),
+        "--upstream",
+        f"127.0.0.1:{TRX_PORT}",
+        "--listen",
+        f"127.0.0.1:{AGG_PORT}",
+    ]
+    agg_proc = _start_process(agg_cmd, "tmp/lora_agg.log")
+    if not _wait_udp(AGG_PORT):
+        _err("lora_agg failed (see tmp/lora_agg.log)")
+        _stop_process(agg_proc)
+        _stop_process(binary_proc)
+        sys.exit(1)
+    _info("lora_agg ready")
+
+    # 3. Start meshcore_bridge.py (connects to lora_agg, not lora_trx directly)
     _info("Starting meshcore_bridge")
     bridge_cmd = [
         sys.executable,
         str(SCRIPT_DIR / "meshcore_bridge.py"),
         "--connect",
-        f"127.0.0.1:{TRX_PORT}",
+        f"127.0.0.1:{AGG_PORT}",
         "--port",
         str(MESHCORE_BRIDGE_PORT),
     ]
@@ -1334,6 +1394,7 @@ async def _run_bridge_experiment(
     if not _wait_tcp(MESHCORE_BRIDGE_PORT):
         _err("meshcore_bridge failed (see tmp/meshcore_bridge.log)")
         _stop_process(bridge_proc)
+        _stop_process(agg_proc)
         _stop_process(binary_proc)
         sys.exit(1)
     _info("meshcore_bridge ready")
@@ -1351,31 +1412,34 @@ async def _run_bridge_experiment(
     if not connected:
         _err("meshcore_py: cannot connect to companion")
         _stop_process(bridge_proc)
+        _stop_process(agg_proc)
         _stop_process(binary_proc)
         sys.exit(1)
     heltec_pubkey = companion.pubkey
     _info(f"Heltec pubkey: {heltec_pubkey[:16]}...")
 
-    # 4. Create CompanionDriver for the bridge
+    # 5. Create CompanionDriver for the bridge
     driver = CompanionDriver(bridge_host="127.0.0.1", bridge_port=MESHCORE_BRIDGE_PORT)
 
-    # 5. Get SDR pubkey from bridge's card
+    # 6. Get SDR pubkey from bridge's card
     card_out = driver.get_card()
     sdr_pubkey = _extract_pubkey_from_card(card_out)
     if not sdr_pubkey:
         _err(f"cannot extract SDR pubkey from card output: {card_out[:80]}")
         await companion.close()
         _stop_process(bridge_proc)
+        _stop_process(agg_proc)
         _stop_process(binary_proc)
         sys.exit(1)
     _info(f"SDR pubkey: {sdr_pubkey[:16]}...")
 
-    # 6. Heltec contact name (for meshcore-cli msg <name> <text>)
+    # 7. Heltec contact name (for meshcore-cli msg <name> <text>)
     # meshcore-cli uses the node name from the ADVERT; we'll use the first
     # portion of the pubkey as fallback
     heltec_name = heltec_pubkey[:8]  # short prefix as contact name
 
-    # 7. Create UDP socket for lora_config messages.
+    # 8. Create UDP socket for lora_config messages.
+    # Config goes direct to lora_trx:5556 (lora_agg doesn't forward lora_config).
     # Pre-subscribe and drain: lora_trx floods subscribers with ~50 spectrum
     # messages/s. Without draining first, send_lora_config's ack gets buried
     # and times out.
@@ -1397,7 +1461,7 @@ async def _run_bridge_experiment(
         _info(f"H: {args.hypothesis}")
     _info("")
 
-    # 8. Run each config point
+    # 9. Run each config point
     bridge_results: list[dict] = []
     contact_exchanged = False
     try:
@@ -1427,9 +1491,10 @@ async def _run_bridge_experiment(
         await companion.set_radio(869.618, 62.5, 8, cr=8)
         await companion.close()
         _stop_process(bridge_proc)
+        _stop_process(agg_proc)
         _stop_process(binary_proc)
 
-    # 9. Write results
+    # 10. Write results
     summary = _collect_bridge(bridge_results)
     doc = {
         "experiment": label,
