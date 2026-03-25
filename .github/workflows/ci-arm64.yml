@@ -9,16 +9,12 @@ on:
 
 jobs:
   build:
-    name: "arm64 | clang-20 | ${{ matrix.build-type }}"
+    name: "arm64 | gcc-14 | Release"
     runs-on: ubuntu-24.04-arm
-    strategy:
-      fail-fast: false
-      matrix:
-        build-type: [Release, Debug]
     env:
       DEBIAN_FRONTEND: noninteractive
-      CC: clang-20
-      CXX: clang++-20
+      CC: gcc-14
+      CXX: g++-14
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
@@ -32,11 +28,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            clang-20 clang-tools-20 libc++-20-dev libc++abi-20-dev \
+            gcc-14 g++-14 \
             cmake ninja-build ccache \
             libsoapysdr-dev soapysdr-module-uhd libuhd-dev
 
@@ -45,8 +39,8 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-arm64-clang20-${{ matrix.build-type }}-${{ github.run_id }}
-          restore-keys: ccache-arm64-clang20-${{ matrix.build-type }}
+          key: ccache-arm64-gcc14-Release-${{ github.run_id }}
+          restore-keys: ccache-arm64-gcc14-Release
 
       - name: Configure ccache
         run: |
@@ -61,7 +55,8 @@ jobs:
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWARNINGS_AS_ERRORS=OFF \
             -DUSE_CCACHE=ON \
             -DENABLE_COVERAGE=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -70,7 +65,6 @@ jobs:
         run: cmake --build build -j"$(nproc)"
 
       - name: Test
-        if: matrix.build-type == 'Release'
         run: ctest --test-dir build --output-on-failure --timeout 120
 
       - name: Save ccache
@@ -78,20 +72,20 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-arm64-clang20-${{ matrix.build-type }}-${{ github.run_id }}
+          key: ccache-arm64-gcc14-Release-${{ github.run_id }}
 
       - name: Show ccache stats
         if: always()
         run: ccache --show-stats
 
   deploy:
-    name: "arm64 | clang-20 | Release | static-libc++"
+    name: "arm64 | gcc-14 | Release | deploy"
     runs-on: ubuntu-24.04-arm
     needs: build
     env:
       DEBIAN_FRONTEND: noninteractive
-      CC: clang-20
-      CXX: clang++-20
+      CC: gcc-14
+      CXX: g++-14
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
@@ -105,11 +99,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            clang-20 clang-tools-20 libc++-20-dev libc++abi-20-dev \
+            gcc-14 g++-14 \
             cmake ninja-build ccache \
             libsoapysdr-dev soapysdr-module-uhd libuhd-dev
 
@@ -118,8 +110,8 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-arm64-clang20-Release-${{ github.run_id }}
-          restore-keys: ccache-arm64-clang20-Release
+          key: ccache-arm64-gcc14-Release-${{ github.run_id }}
+          restore-keys: ccache-arm64-gcc14-Release
 
       - name: Configure ccache
         run: |
@@ -131,38 +123,34 @@ jobs:
           ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
           ccache -z
 
-      - name: Configure (static libc++)
+      - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DWARNINGS_AS_ERRORS=OFF \
             -DUSE_CCACHE=ON \
             -DENABLE_COVERAGE=OFF \
             -DENABLE_LORA_TESTING=OFF \
-            -DENABLE_LORA_BENCHMARKS=OFF \
-            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -Wl,-Bstatic -lc++ -lc++abi -Wl,-Bdynamic"
+            -DENABLE_LORA_BENCHMARKS=OFF
 
-      - name: Build lora_trx
+      - name: Build lora_trx and lora_scan
         run: cmake --build build --target lora_trx lora_scan -j"$(nproc)"
 
-      - name: Verify linkage
+      - name: Verify version
         run: |
-          echo "=== ldd lora_trx ==="
-          ldd build/apps/lora_trx
-          echo "=== file ==="
-          file build/apps/lora_trx
+          build/apps/lora_trx --version
+          build/apps/lora_scan --version
 
       - name: Bundle binaries and runtime libraries
         run: |
           mkdir -p bundle
           cp build/apps/lora_trx build/apps/lora_scan bundle/
-          # Copy runtime .so deps of each binary, excluding fundamental system libs
           for bin in bundle/lora_trx bundle/lora_scan; do
             ldd "$bin" \
               | awk '/=> \// {print $3}' \
               | grep -v 'libc\.so\|libm\.so\|libdl\.so\|libpthread\|librt\.so\|ld-linux' \
               | tr '\n' '\0' | xargs -0 -I{} cp -L {} bundle/ 2>/dev/null || true
           done
-          # Also include any .so files built by the project itself
           find build -name "*.so*" -not -name "*.so*.dbg" -print0 \
             | xargs -0 -I{} cp -L {} bundle/ 2>/dev/null || true
           echo "Bundle contents:"
@@ -187,7 +175,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-arm64-clang20-Release-${{ github.run_id }}
+          key: ccache-arm64-gcc14-Release-${{ github.run_id }}
 
       - name: Show ccache stats
         if: always()
