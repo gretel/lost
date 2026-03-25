@@ -5300,5 +5300,113 @@ class TestRespRx(unittest.TestCase):
         self.assertEqual(len(msgs), 0)
 
 
+# ---- W5 companion command tests ----
+
+
+class TestW5CompanionCommands(unittest.TestCase):
+    """Tests for newly added companion protocol commands (W5)."""
+
+    def setUp(self):
+        self.state = make_state()
+        self.null_sock = _FakeUDPSock()
+        self.addr = ("127.0.0.1", 5555)
+
+    def _handle(self, cmd_bytes: bytes) -> list[bytes]:
+        return bridge.handle_command(cmd_bytes, self.state, self.null_sock, self.addr)
+
+    def test_export_private_key(self):
+        """CMD_EXPORT_PRIVATE_KEY returns OK + 32-byte seed."""
+        resp = self._handle(bytes([bridge.CMD_EXPORT_PRIVATE_KEY]))
+        self.assertEqual(len(resp), 1)
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+        seed_out = resp[0][1:]  # skip RESP_OK byte; value(4) + seed(32)?
+        # RESP_OK format: [0x00, value(4 LE)] — but export appends seed after RESP_OK
+        # Actually our build_ok() returns [0x00, value(4 LE)], but we return
+        # bytes([RESP_OK]) + state.seed[:32] directly
+        self.assertEqual(len(resp[0]), 1 + 32)
+        self.assertEqual(resp[0][1:], self.state.seed[:32])
+
+    def test_import_private_key(self):
+        """CMD_IMPORT_PRIVATE_KEY re-derives keypair from new seed."""
+        old_pub = self.state.pub_key
+        new_seed = os.urandom(32)
+        resp = self._handle(bytes([bridge.CMD_IMPORT_PRIVATE_KEY]) + new_seed)
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+        self.assertNotEqual(self.state.pub_key, old_pub)
+        self.assertEqual(self.state.seed, new_seed)
+
+    def test_import_private_key_too_short(self):
+        """CMD_IMPORT_PRIVATE_KEY with < 32 bytes returns error."""
+        resp = self._handle(bytes([bridge.CMD_IMPORT_PRIVATE_KEY]) + b"\x00" * 16)
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+
+    def test_get_tuning_params(self):
+        """CMD_GET_TUNING_PARAMS returns RESP_TUNING_PARAMS with two zeros."""
+        resp = self._handle(bytes([bridge.CMD_GET_TUNING_PARAMS]))
+        self.assertEqual(len(resp), 1)
+        self.assertEqual(resp[0][0], bridge.RESP_TUNING_PARAMS)
+        # 1 byte code + 8 bytes (two uint32 LE zeros)
+        self.assertEqual(len(resp[0]), 9)
+        self.assertEqual(struct.unpack_from("<II", resp[0], 1), (0, 0))
+
+    def test_has_connection(self):
+        """CMD_HAS_CONNECTION always returns ERR_CODE_NOT_FOUND."""
+        resp = self._handle(bytes([bridge.CMD_HAS_CONNECTION]))
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+        self.assertEqual(resp[0][1], bridge.ERR_CODE_NOT_FOUND)
+
+    def test_get_contact_by_key_found(self):
+        """CMD_GET_CONTACT_BY_KEY returns RESP_CONTACT when prefix matches."""
+        pk = os.urandom(32)
+        record = bridge._build_contact_record(pk, name="Alice")
+        self.state.contacts[pk.hex()] = record
+        resp = self._handle(bytes([bridge.CMD_GET_CONTACT_BY_KEY]) + pk[:6])
+        self.assertEqual(resp[0][0], bridge.RESP_CONTACT)
+        self.assertEqual(resp[0][1:], record)
+
+    def test_get_contact_by_key_not_found(self):
+        """CMD_GET_CONTACT_BY_KEY returns ERR_CODE_NOT_FOUND for unknown prefix."""
+        resp = self._handle(bytes([bridge.CMD_GET_CONTACT_BY_KEY]) + b"\xff" * 6)
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+        self.assertEqual(resp[0][1], bridge.ERR_CODE_NOT_FOUND)
+
+    def test_get_contact_by_key_too_short(self):
+        """CMD_GET_CONTACT_BY_KEY with < 6 bytes returns error."""
+        resp = self._handle(bytes([bridge.CMD_GET_CONTACT_BY_KEY]) + b"\x01\x02")
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+
+    def test_set_device_pin(self):
+        """CMD_SET_DEVICE_PIN stores the PIN in state."""
+        pin = struct.pack("<I", 1234)
+        resp = self._handle(bytes([bridge.CMD_SET_DEVICE_PIN]) + pin)
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+        self.assertEqual(self.state.device_pin, 1234)
+
+    def test_set_device_pin_zero(self):
+        """CMD_SET_DEVICE_PIN with 0 clears the PIN."""
+        self.state.device_pin = 9999
+        pin = struct.pack("<I", 0)
+        resp = self._handle(bytes([bridge.CMD_SET_DEVICE_PIN]) + pin)
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+        self.assertEqual(self.state.device_pin, 0)
+
+    def test_factory_reset_clears_contacts_and_keys(self):
+        """CMD_FACTORY_RESET clears in-memory contacts and keys."""
+        pk = os.urandom(32)
+        self.state.contacts[pk.hex()] = bridge._build_contact_record(pk)
+        self.state.known_keys[pk.hex()] = pk
+        self.state.pkt_recv = 42
+        resp = self._handle(bytes([bridge.CMD_FACTORY_RESET]))
+        self.assertEqual(resp[0][0], bridge.RESP_OK)
+        self.assertEqual(len(self.state.contacts), 0)
+        self.assertEqual(len(self.state.known_keys), 0)
+        self.assertEqual(self.state.pkt_recv, 0)
+
+    def test_send_telemetry_req_short_returns_error(self):
+        """CMD_SEND_TELEMETRY_REQ with < 32 bytes returns error."""
+        resp = self._handle(bytes([bridge.CMD_SEND_TELEMETRY_REQ]) + b"\x00" * 16)
+        self.assertEqual(resp[0][0], bridge.RESP_ERROR)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,11 +6,13 @@ import socket
 import unittest
 
 from lora_test import (
+    AGG_PORT,
     ConfigPoint,
     PointResult,
     MATRICES,
     point_label,
     build_summary,
+    lora_airtime_s,
     _collect_decode,
     _collect_scan,
     _collect_bridge,
@@ -45,7 +47,17 @@ class TestPointLabel(unittest.TestCase):
 
 class TestMatrices(unittest.TestCase):
     def test_all_matrices_exist(self):
-        for name in ("basic", "full", "dc_edge", "sf_sweep", "bw_sweep", "power_sweep"):
+        for name in (
+            "basic",
+            "full",
+            "dc_edge",
+            "sf_sweep",
+            "bw_sweep",
+            "power_sweep",
+            "bridge_full",
+            "bw125k_sweep",
+            "bw250k_sweep",
+        ):
             self.assertIn(name, MATRICES)
 
     def test_no_duplicate_configs(self):
@@ -62,6 +74,27 @@ class TestMatrices(unittest.TestCase):
 
     def test_full_has_8_points(self):
         self.assertEqual(len(MATRICES["full"]), 8)
+
+    def test_bridge_full_has_4_points(self):
+        self.assertEqual(len(MATRICES["bridge_full"]), 4)
+
+    def test_bridge_full_all_under_airtime_limit(self):
+        """All bridge_full points must have airtime < 1.5s (B210 TX limit)."""
+        for p in MATRICES["bridge_full"]:
+            airtime = lora_airtime_s(p.sf, p.bw)
+            self.assertLess(
+                airtime,
+                1.5,
+                f"{point_label(p)}: airtime {airtime:.3f}s >= 1.5s limit",
+            )
+
+    def test_bw125k_sweep_all_bw125k(self):
+        for p in MATRICES["bw125k_sweep"]:
+            self.assertEqual(p.bw, 125000)
+
+    def test_bw250k_sweep_all_bw250k(self):
+        for p in MATRICES["bw250k_sweep"]:
+            self.assertEqual(p.bw, 250000)
 
 
 class TestCollectDecode(unittest.TestCase):
@@ -522,6 +555,7 @@ class TestBridgeCollection(unittest.TestCase):
                 "advert_rx": True,
                 "advert_tx": True,
                 "msg_tx": True,
+                "msg_tx_acked": True,
                 "msg_rx": True,
                 "phases_passed": 4,
                 "phases_total": 4,
@@ -531,6 +565,7 @@ class TestBridgeCollection(unittest.TestCase):
                 "advert_rx": True,
                 "advert_tx": True,
                 "msg_tx": True,
+                "msg_tx_acked": True,
                 "msg_rx": True,
                 "phases_passed": 4,
                 "phases_total": 4,
@@ -540,6 +575,7 @@ class TestBridgeCollection(unittest.TestCase):
                 "advert_rx": True,
                 "advert_tx": True,
                 "msg_tx": True,
+                "msg_tx_acked": False,
                 "msg_rx": True,
                 "phases_passed": 4,
                 "phases_total": 4,
@@ -551,6 +587,7 @@ class TestBridgeCollection(unittest.TestCase):
         self.assertEqual(s["advert_rx"], 3)
         self.assertEqual(s["advert_tx"], 3)
         self.assertEqual(s["msg_tx"], 3)
+        self.assertEqual(s["msg_tx_acked"], 2)
         self.assertEqual(s["msg_rx"], 3)
         self.assertAlmostEqual(s["pass_rate"], 1.0)
 
@@ -693,6 +730,45 @@ class TestCLIBridgeMode(unittest.TestCase):
         args = self._parse(["bridge", "--tcp", "192.168.1.42:4000"])
         self.assertEqual(args.mode, "bridge")
         self.assertEqual(args.tcp, "192.168.1.42:4000")
+
+
+class TestAggPort(unittest.TestCase):
+    """Test AGG_PORT constant."""
+
+    def test_agg_port_value(self):
+        self.assertEqual(AGG_PORT, 5555)
+
+
+class TestLoraAirtime(unittest.TestCase):
+    """Test lora_airtime_s estimator."""
+
+    def test_sf8_bw62k_under_1_5s(self):
+        """SF8/BW62.5k ADVERT should be around 1.14s."""
+        t = lora_airtime_s(8, 62500)
+        self.assertGreater(t, 1.0)
+        self.assertLess(t, 1.5)
+
+    def test_sf9_bw125k_under_1_5s(self):
+        """SF9/BW125k ADVERT should be around 1.04s."""
+        t = lora_airtime_s(9, 125000)
+        self.assertGreater(t, 0.5)
+        self.assertLess(t, 1.5)
+
+    def test_sf7_bw62k_shortest(self):
+        """SF7/BW62.5k should be the shortest common config."""
+        t = lora_airtime_s(7, 62500)
+        self.assertLess(t, 1.0)
+
+    def test_sf12_bw62k_long(self):
+        """SF12/BW62.5k should be very long (>10s)."""
+        t = lora_airtime_s(12, 62500)
+        self.assertGreater(t, 10.0)
+
+    def test_higher_bw_shorter(self):
+        """BW250k should be shorter than BW62.5k for the same SF."""
+        t_250k = lora_airtime_s(8, 250000)
+        t_62k = lora_airtime_s(8, 62500)
+        self.assertLess(t_250k, t_62k)
 
 
 if __name__ == "__main__":

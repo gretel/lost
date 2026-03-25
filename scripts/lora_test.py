@@ -861,6 +861,7 @@ async def run_bridge_point(
         "advert_tx_snr": None,
         "msg_tx": False,  # Phase C
         "msg_tx_payload": "",
+        "msg_tx_acked": None,  # Phase E (None = skipped/unknown)
         "msg_rx": False,  # Phase D
         "msg_rx_payload": "",
         "phases_passed": 0,
@@ -960,7 +961,11 @@ async def run_bridge_point(
     companion.drain_messages()  # discard stale
     payload_c = bridge_payload(point)
     result["msg_tx_payload"] = payload_c
-    driver.send_msg(heltec_name, payload_c)
+    msg_ok, msg_output = driver.send_msg(heltec_name, payload_c)
+    # Phase E: parse ACK status from meshcore-cli output
+    # meshcore-cli prints "acked" when the recipient ACKs the message.
+    msg_acked = "acked" in msg_output.lower() if msg_ok else None
+    result["msg_tx_acked"] = msg_acked
     # TXT_MSG is shorter than ADVERT but still needs airtime margin
     tx_air_c = lora_airtime_s(point.sf, point.bw, n_bytes=40)
     await asyncio.sleep(max(FLUSH_TX_S, tx_air_c + 1.0))
@@ -969,7 +974,8 @@ async def run_bridge_point(
     result["msg_tx"] = msg_tx
     if msg_tx:
         result["phases_passed"] += 1
-        _info(f"  Phase C: PASS ('{payload_c}')")
+        ack_str = f" acked={msg_acked}" if msg_acked is not None else ""
+        _info(f"  Phase C: PASS ('{payload_c}'{ack_str})")
     else:
         texts = [m.get("text", "")[:40] for m in msgs]
         _info(f"  Phase C: FAIL (sent '{payload_c}', saw {len(msgs)} msgs: {texts})")
@@ -1010,6 +1016,33 @@ async def run_bridge_point(
             f"  Phase D: FAIL (sent '{payload_d}', got {len(all_recv)} msgs: {shown})"
         )
 
+    await asyncio.sleep(1.0)
+
+    # Phase F: Bridge GRP_TXT → Heltec RX (channel message)
+    # Uses the public channel PSK (8b3387e9c5cdea6ac9e5edbaa115cd72).
+    # Bridge→Heltec direction only for v1.
+    _info("  Phase F: Bridge GRP_TXT → Heltec RX (public channel)")
+    companion.drain_messages()
+    payload_f = bridge_payload(point)
+    chan_ok = driver.chan_msg("public", payload_f)
+    result["chan_tx"] = False
+    result["chan_tx_payload"] = payload_f
+    if chan_ok:
+        tx_air_f = lora_airtime_s(point.sf, point.bw, n_bytes=40)
+        await asyncio.sleep(max(FLUSH_TX_S, tx_air_f + 1.0))
+        chan_msgs = companion.drain_messages()
+        chan_rx = any(payload_f in m.get("text", "") for m in chan_msgs)
+        result["chan_tx"] = chan_rx
+        if chan_rx:
+            _info(f"  Phase F: PASS ('{payload_f}')")
+        else:
+            texts = [m.get("text", "")[:40] for m in chan_msgs]
+            _info(
+                f"  Phase F: FAIL (sent '{payload_f}', saw {len(chan_msgs)} msgs: {texts})"
+            )
+    else:
+        _info("  Phase F: FAIL (chan_msg command failed)")
+
     return result
 
 
@@ -1019,14 +1052,18 @@ def _collect_bridge(results: list[dict]) -> dict:
     advert_rx = sum(1 for r in results if r.get("advert_rx"))
     advert_tx = sum(1 for r in results if r.get("advert_tx"))
     msg_tx = sum(1 for r in results if r.get("msg_tx"))
+    msg_tx_acked = sum(1 for r in results if r.get("msg_tx_acked"))
     msg_rx = sum(1 for r in results if r.get("msg_rx"))
+    chan_tx = sum(1 for r in results if r.get("chan_tx"))
     return {
         "mode": "bridge",
         "points": n,
         "advert_rx": advert_rx,
         "advert_tx": advert_tx,
         "msg_tx": msg_tx,
+        "msg_tx_acked": msg_tx_acked,
         "msg_rx": msg_rx,
+        "chan_tx": chan_tx,
         "pass_rate": round(
             (advert_rx + advert_tx + msg_tx + msg_rx) / max(1, 4 * n), 3
         ),
@@ -1519,6 +1556,7 @@ async def _run_bridge_experiment(
         f"advert_rx={summary['advert_rx']}/{n} "
         f"advert_tx={summary['advert_tx']}/{n} "
         f"msg_tx={summary['msg_tx']}/{n} "
+        f"msg_tx_acked={summary['msg_tx_acked']}/{n} "
         f"msg_rx={summary['msg_rx']}/{n}"
     )
     json.dump(summary, sys.stdout, indent=2)

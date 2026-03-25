@@ -119,7 +119,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except OSError, subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     return "dev"
 
@@ -171,6 +171,14 @@ CMD_GET_ADVERT_PATH = 0x2A
 CMD_PATH_DISCOVERY = 0x34
 CMD_GET_STATS = 0x38
 CMD_SEND_CONTROL_DATA = 0x37
+CMD_EXPORT_PRIVATE_KEY = 0x17
+CMD_IMPORT_PRIVATE_KEY = 0x18
+CMD_HAS_CONNECTION = 0x1C
+CMD_GET_CONTACT_BY_KEY = 0x1E
+CMD_SET_DEVICE_PIN = 0x25
+CMD_SEND_TELEMETRY_REQ = 0x27
+CMD_GET_TUNING_PARAMS = 0x2B
+CMD_FACTORY_RESET = 0x33
 CMD_SET_FLOOD_SCOPE = 0x36
 CMD_BINARY_REQ = 0x32
 CMD_SEND_ANON_REQ = 0x39
@@ -200,6 +208,7 @@ RESP_CHANNEL_INFO = 0x12
 RESP_CUSTOM_VARS = (
     0x15  # GET_CUSTOM_VARS response (empty payload = no hardware sensors)
 )
+RESP_TUNING_PARAMS = 0x14
 RESP_STATS = 0x18
 RESP_CODE_AUTOADD_CONFIG = 0x19
 RESP_ALLOWED_REPEAT_FREQ = 0x1A
@@ -436,6 +445,7 @@ class BridgeState:
         self.telemetry_mode: int = 0
         self.adv_loc_policy: int = 0
         self.multi_acks: int = 0
+        self.device_pin: int = 0  # CMD_SET_DEVICE_PIN (in-memory only)
 
     def apply_startup_config(self) -> None:
         """Re-apply startup settings to live state.
@@ -1878,6 +1888,81 @@ def handle_command(
         state.pending_acks[expected_ack] = (time.monotonic(), dst_pub[:6])
         return [resp]
 
+    if cmd == CMD_EXPORT_PRIVATE_KEY:
+        # Return the raw 32-byte seed (private key material)
+        log.info("companion: EXPORT_PRIVATE_KEY")
+        return [bytes([RESP_OK]) + state.seed[:32]]
+
+    if cmd == CMD_IMPORT_PRIVATE_KEY:
+        # Re-derive keys from new 32-byte seed
+        if len(data) < 32:
+            return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
+        new_seed = data[:32]
+        from nacl.signing import SigningKey as _SK
+
+        sk = _SK(new_seed)
+        new_pub = bytes(sk.verify_key)
+        new_expanded = meshcore_expanded_key(new_seed)
+        state.seed = new_seed
+        state.pub_key = new_pub
+        state.expanded_prv = new_expanded
+        log.info("companion: IMPORT_PRIVATE_KEY → new pubkey %s..", new_pub.hex()[:8])
+        return [state.build_ok()]
+
+    if cmd == CMD_SEND_TELEMETRY_REQ:
+        # Build a REQ wire packet (encrypted CLI "status" to a peer)
+        assert udp_sock is not None and udp_addr is not None
+        if len(data) < 32:
+            return [state.build_error()]
+        dst_pub = data[:32]
+        log.info("companion: SEND_TELEMETRY_REQ to %s..", dst_pub.hex()[:8])
+        return _send_cli_txt_msg(dst_pub, "status", state, udp_sock, udp_addr)
+
+    if cmd == CMD_GET_TUNING_PARAMS:
+        # Return defaults: rx_delay(4 LE u32)=0, airtime_factor(4 LE u32)=0
+        log.debug("companion: GET_TUNING_PARAMS → defaults")
+        return [bytes([RESP_TUNING_PARAMS]) + struct.pack("<II", 0, 0)]
+
+    if cmd == CMD_FACTORY_RESET:
+        # Wipe contacts and keys directories, reset in-memory state
+        import shutil
+
+        for d in (state.contacts_dir, state.keys_dir):
+            if d is not None and d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+        state.contacts.clear()
+        state.known_keys.clear()
+        state.msg_queue.clear()
+        state.pkt_recv = state.pkt_sent = 0
+        state.pkt_flood_tx = state.pkt_direct_tx = 0
+        state.pkt_flood_rx = state.pkt_direct_rx = 0
+        log.warning("companion: FACTORY_RESET — data wiped")
+        return [state.build_ok()]
+
+    if cmd == CMD_HAS_CONNECTION:
+        # No persistent mesh connections in the bridge
+        return [state.build_error(ERR_CODE_NOT_FOUND)]
+
+    if cmd == CMD_GET_CONTACT_BY_KEY:
+        # Lookup by 6-byte pubkey prefix
+        if len(data) < 6:
+            return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
+        prefix = data[:6]
+        resolved = _resolve_contact(state, prefix)
+        if resolved is None:
+            return [state.build_error(ERR_CODE_NOT_FOUND)]
+        _, record = resolved
+        return [bytes([RESP_CONTACT]) + record]
+
+    if cmd == CMD_SET_DEVICE_PIN:
+        # Store PIN in-memory (4 bytes LE uint32)
+        if len(data) >= 4:
+            state.device_pin = struct.unpack_from("<I", data, 0)[0]
+        else:
+            state.device_pin = 0
+        log.debug("companion: SET_DEVICE_PIN %d", state.device_pin)
+        return [state.build_ok()]
+
     # Unknown command — return OK silently
     return [state.build_ok()]
 
@@ -2529,7 +2614,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except ConnectionError, OSError:
+                    except (ConnectionError, OSError):
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2551,7 +2636,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except BlockingIOError, OSError:
+                    except (BlockingIOError, OSError):
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2703,7 +2788,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except ConnectionError, OSError:
+    except (ConnectionError, OSError):
         pass  # client disconnected, will be cleaned up on next recv
 
 

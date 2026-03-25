@@ -239,7 +239,7 @@ def get_terminal_size() -> tuple[int, int]:
     try:
         sz = os.get_terminal_size()
         return sz.columns, sz.lines
-    except AttributeError, ValueError, OSError:
+    except (AttributeError, ValueError, OSError):
         return 80, 24
 
 
@@ -775,7 +775,7 @@ def main() -> None:
 
             try:
                 data, _addr = sock.recvfrom(65536)
-            except BlockingIOError, OSError:
+            except (BlockingIOError, OSError):
                 continue
 
             try:

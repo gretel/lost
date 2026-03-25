@@ -484,7 +484,7 @@ def run(args: argparse.Namespace) -> None:
 
             try:
                 events = sel.select(timeout=RECV_TIMEOUT)
-            except InterruptedError, OSError:
+            except (InterruptedError, OSError):
                 continue
 
             for key, _ in events:

@@ -857,9 +857,19 @@ class CompanionDriver:
         ok, _ = self._run("advert")
         return ok
 
-    def send_msg(self, contact_name: str, text: str) -> bool:
-        """Send a TXT_MSG to a contact by name via meshcore-cli."""
-        ok, _ = self._run("msg", contact_name, text)
+    def send_msg(self, contact_name: str, text: str) -> tuple[bool, str]:
+        """Send a TXT_MSG to a contact by name via meshcore-cli.
+
+        Returns (ok, raw_output) so callers can inspect ACK status.
+        The raw output from meshcore-cli contains "acked" when the
+        recipient acknowledged the message.
+        """
+        ok, out = self._run("msg", contact_name, text)
+        return ok, out
+
+    def chan_msg(self, channel_name: str, text: str) -> bool:
+        """Send a GRP_TXT to a channel by name via meshcore-cli."""
+        ok, _ = self._run("chan", channel_name, text)
         return ok
 
     def get_radio(self) -> str:
