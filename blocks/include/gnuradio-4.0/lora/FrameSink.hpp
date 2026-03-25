@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <format>
 #include <functional>
 #include <mutex>
 #include <random>
@@ -115,15 +116,12 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         hi = (hi & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
         // Set variant bits in lo word (top 2 bits = 10)
         lo = (lo & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
-        char out[37];
-        std::snprintf(out, sizeof(out),
-            "%08x-%04x-%04x-%04x-%012llx",
-            static_cast<unsigned>(hi >> 32),
-            static_cast<unsigned>((hi >> 16) & 0xFFFFU),
-            static_cast<unsigned>(hi & 0xFFFFU),
-            static_cast<unsigned>(lo >> 48),
-            static_cast<unsigned long long>(lo & 0x0000FFFFFFFFFFFFULL));
-        return out;
+        return std::format("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            static_cast<uint32_t>(hi >> 32),
+            static_cast<uint32_t>((hi >> 16) & 0xFFFFU),
+            static_cast<uint32_t>(hi & 0xFFFFU),
+            static_cast<uint32_t>(lo >> 48),
+            lo & 0x0000FFFFFFFFFFFFULL);
     }
 
     void udpListenerLoop() {
@@ -256,19 +254,19 @@ struct FrameSink : gr::Block<FrameSink, gr::NoDefaultTagForwarding> {
         bool truncated = pay_actual > kMaxHexBytes;
 
         // Format BW as human-readable (e.g. "62.5k", "125k", "250k")
-        char bw_str[16];
+        std::string bw_str;
         if (phy_bw >= 1000 && (phy_bw % 1000) != 0) {
-            std::snprintf(bw_str, sizeof(bw_str), "%.1fk", static_cast<double>(phy_bw) / 1000.0);
+            bw_str = std::format("{:.1f}k", static_cast<double>(phy_bw) / 1000.0);
         } else if (phy_bw >= 1000) {
-            std::snprintf(bw_str, sizeof(bw_str), "%uk", phy_bw / 1000);
+            bw_str = std::format("{}k", phy_bw / 1000);
         } else {
-            std::snprintf(bw_str, sizeof(bw_str), "%u", phy_bw);
+            bw_str = std::format("{}", phy_bw);
         }
 
         std::fprintf(stderr,
             "[%s] seq=#%u sf=%u bw=%s bytes=%u cr=4/%u crc=%s sync=0x%02X snr=%.1fdB",
             ts.c_str(), _frame_count,
-            effectiveSf(), bw_str, _pay_len, 4u + _cr,
+            effectiveSf(), bw_str.c_str(), _pay_len, 4u + _cr,
             _crc_valid ? "OK" : "FAIL",
             sync_word, _snr_db);
         if (_noise_floor_db > -999.0)   std::fprintf(stderr, " nf=%.1fdBFS", _noise_floor_db);
