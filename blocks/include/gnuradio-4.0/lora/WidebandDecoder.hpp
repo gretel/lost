@@ -722,7 +722,7 @@ struct WidebandDecoder
             return;
         }
 
-        if (dechirp_pmr < sflane_detail::kMinPreamblePMR) {
+        if (dechirp_pmr < sflane_detail::min_preamble_pmr(lane.sf)) {
             lane.symbol_cnt = 1;
             lane.bin_idx = -1;
             return;

@@ -21,6 +21,24 @@ static constexpr uint8_t  kMaxAdditionalUpchirps = 3;
 static constexpr uint8_t  kMaxPreambleRotations  = 4;
 static constexpr float    kMinPreamblePMR        = 4.0f;
 
+/// Per-SF minimum PMR threshold for preamble detection.
+/// SF12 has 4096 FFT bins vs SF7's 128 bins — the mean magnitude is
+/// lower relative to the peak, so the PMR is naturally higher for
+/// clean signals but more susceptible to noise spreading.
+/// NOTE: Values are initial estimates. SF7-10 match the original
+/// kMinPreamblePMR=4.0 for no-regression safety.
+[[nodiscard]] inline constexpr float min_preamble_pmr(uint8_t sf) noexcept {
+    switch (sf) {
+        case 7:  return 4.0f;
+        case 8:  return 4.0f;
+        case 9:  return 4.0f;
+        case 10: return 4.0f;
+        case 11: return 3.5f;
+        case 12: return 3.0f;
+        default: return 4.0f;
+    }
+}
+
 [[nodiscard]] inline int most_frequent(const std::vector<int>& arr) {
     std::unordered_map<int, int> freq;
     for (int v : arr) freq[v]++;

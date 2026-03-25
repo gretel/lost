@@ -746,6 +746,46 @@ const boost::ut::suite<"MultiSfDecoder robustness"> robustness_tests = [] {
         expect(found_crc) << "should have crc_valid tag";
     };
 
+    "SF12 preamble PMR diagnostic"_test = [] {
+        // Generate SF12/BW62.5k frame with moderate noise (+5 dB SNR)
+        std::vector<uint8_t> payload = {'H', 'i'};
+        auto result = run_multisf_impaired(payload, 12, 4, 62500, 4,
+                                            5.f, 0.f,
+                                            0x12, 8, 12, 12);
+        std::printf("  SF12 +5dB diagnostic: %zu bytes decoded\n",
+                    result.decoded.size());
+        // This test is diagnostic — it passes regardless.
+        // Check output to verify the PMR threshold is appropriate.
+        expect(true) << "diagnostic only";
+    };
+
+    "SF12 decode at +5 dB SNR (PMR threshold test)"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'i'};
+        auto result = run_multisf_impaired(payload, 12, 4, 62500, 4,
+                                            5.f, 0.f,
+                                            0x12, 8, 12, 12);
+        expect(result.ok) << "graph ran";
+        std::printf("  SF12/BW62.5k +5dB: %zu bytes\n", result.decoded.size());
+        expect(ge(result.decoded.size(), payload.size()))
+            << "SF12 must decode at +5 dB SNR with relaxed PMR threshold";
+        if (result.decoded.size() >= payload.size()) {
+            std::string decoded(result.decoded.begin(),
+                                result.decoded.begin()
+                                + static_cast<std::ptrdiff_t>(payload.size()));
+            expect(eq(decoded, std::string("Hi")))
+                << "SF12 payload mismatch";
+        }
+        // Verify CRC valid
+        bool found_crc = false;
+        for (const auto& t : result.tags) {
+            if (auto it = t.map.find("crc_valid"); it != t.map.end()) {
+                expect(it->second.value_or<bool>(false)) << "SF12 +5dB CRC";
+                found_crc = true;
+            }
+        }
+        expect(found_crc) << "SF12 +5dB should have crc_valid tag";
+    };
+
     "noise rejection at -10 dB"_test = [] {
         using namespace gr;
         using namespace gr::lora;

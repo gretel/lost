@@ -287,7 +287,7 @@ struct MultiSfDecoder
             return;
         }
 
-        if (dechirp_pmr < multisf_detail::kMinPreamblePMR) {
+        if (dechirp_pmr < multisf_detail::min_preamble_pmr(lane.sf)) {
             lane.symbol_cnt = 1;
             lane.bin_idx = -1;
             return;
