@@ -334,7 +334,12 @@ def run_point(
     collector: EventCollector,
 ) -> PointResult:
     """Run one config point: set radio, TX one ADVERT, collect results."""
-    flush_s = FLUSH_DECODE_S if mode == "decode" else FLUSH_SCAN_S
+    if mode == "decode":
+        # SF12/BW62.5k airtime is ~4.5s; the fixed 5.0s left only 0.5s for
+        # decode pipeline processing.  Use airtime + 3s margin.
+        flush_s = max(FLUSH_DECODE_S, lora_airtime_s(point.sf, point.bw) + 3.0)
+    else:
+        flush_s = FLUSH_SCAN_S
     result = PointResult(config=asdict(point))
 
     # Configure companion
