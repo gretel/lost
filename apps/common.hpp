@@ -72,7 +72,7 @@ inline std::string log_hardware_info(const char* app_name,
 // --- SoapyBlock reliability defaults (shared by lora_trx and lora_scan) ---
 
 constexpr uint32_t kSoapyChunkSize       = 512U << 4U;   // 8192 samples per poll
-constexpr uint32_t kSoapyMaxOverflow     = 1000U;        // consecutive overflows before fatal
+constexpr uint32_t kSoapyMaxOverflow     = 0U;            // disabled — throws gr::exception that kills scheduler
 constexpr uint32_t kSoapyMaxConsecErrors = 0U;            // disabled — restart kills MIMO streams
 constexpr uint32_t kSoapyTimeoutUs       = 10'000U;      // readStream timeout
 
@@ -82,6 +82,7 @@ inline gr::property_map soapy_reliability_defaults() {
         {"max_overflow_count",     gr::Size_t{kSoapyMaxOverflow}},
         {"max_consecutive_errors", gr::Size_t{kSoapyMaxConsecErrors}},
         {"max_time_out_us",        kSoapyTimeoutUs},
+        {"max_fragment_count",     gr::Size_t{0U}},        // disabled — throws gr::exception that kills scheduler
     };
 }
 
