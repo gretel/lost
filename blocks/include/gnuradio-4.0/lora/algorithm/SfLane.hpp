@@ -460,6 +460,12 @@ struct SfLane {
     /// Compute per-Gray-bit LLR from FFT magnitude-squared vector (max-log approx).
     /// llr_out must have sf_bits elements. llr_out[k] > 0 means Gray bit k is likely 1.
     /// k=0 is the LSB of the Gray code.
+    ///
+    /// The max-log approximation computes max(mag_sq over partition where bit=1)
+    /// minus max(mag_sq over partition where bit=0). The peak bin always dominates
+    /// its partition, so the result is equivalent to peak-anchored max-log: the LLR
+    /// magnitude for each bit is the difference between the signal peak and the
+    /// strongest noise bin in the opposite partition.
     static void compute_symbol_llr(
             const float* mag_sq, uint32_t M, uint8_t sf_bits,
             const GrayPartition& gp,

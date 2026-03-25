@@ -126,7 +126,8 @@ LoopbackResult run_multisf_impaired(
         float cfo_hz = 0.f,
         uint16_t sync_word = 0x12,
         uint16_t preamble_len_val = 8,
-        uint8_t sf_min = 7, uint8_t sf_max = 12) {
+        uint8_t sf_min = 7, uint8_t sf_max = 12,
+        bool soft_decode_flag = false) {
     using namespace gr;
     using namespace gr::lora;
 
@@ -156,6 +157,7 @@ LoopbackResult run_multisf_impaired(
     decoder.center_freq  = CENTER_FREQ;
     decoder.sf_min       = sf_min;
     decoder.sf_max       = sf_max;
+    decoder.soft_decode  = soft_decode_flag;
 
     auto& sink = graph.emplaceBlock<testing::TagSink<uint8_t,
         testing::ProcessFunction::USE_PROCESS_BULK>>({
@@ -1112,6 +1114,67 @@ const boost::ut::suite<"MultiSfDecoder runtime reconfig"> reconfig_tests = [] {
         // Lanes should remain unchanged (no reconfigure triggered)
         expect(eq(decoder._lanes.size(), 1UZ)) << "lanes unchanged for non-phy setting";
         expect(eq(static_cast<uint32_t>(decoder.center_freq), uint32_t{868000000})) << "center_freq updated";
+    };
+};
+
+// ============================================================================
+// Soft decode graph-level tests
+// ============================================================================
+
+const boost::ut::suite<"MultiSfDecoder soft decode"> soft_decode_tests = [] {
+    using namespace boost::ut;
+
+    "SF8 soft decode clean loopback"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o'};
+        auto result = run_multisf_impaired(payload, 8, 4, 125000, 4,
+                                            100.f, 0.f, 0x12, 8, 8, 8, true);
+        expect(result.ok) << "graph ran";
+        std::printf("  SF8 soft clean: %zu bytes decoded (expected %zu)\n",
+                    result.decoded.size(), payload.size());
+        expect(eq(result.decoded.size(), payload.size())) << "payload size";
+        for (std::size_t i = 0; i < std::min(result.decoded.size(), payload.size()); i++) {
+            expect(eq(result.decoded[i], payload[i])) << "byte " << i;
+        }
+    };
+
+    "SF8 soft decode +10dB SNR"_test = [] {
+        std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o'};
+        auto result = run_multisf_impaired(payload, 8, 4, 125000, 4,
+                                            10.f, 0.f, 0x12, 8, 8, 8, true);
+        expect(result.ok) << "graph ran";
+        std::printf("  SF8 soft +10dB: %zu bytes decoded (expected %zu)\n",
+                    result.decoded.size(), payload.size());
+        expect(eq(result.decoded.size(), payload.size())) << "payload size";
+        for (std::size_t i = 0; i < std::min(result.decoded.size(), payload.size()); i++) {
+            expect(eq(result.decoded[i], payload[i])) << "byte " << i;
+        }
+    };
+
+    "SF8 soft decode matches hard decode for all SFs clean"_test = [] {
+        // Run both hard and soft for each SF at clean signal, verify identical output
+        std::vector<uint8_t> payload = {0x12, 0x00, 0xBB, 0x59, 0x76};
+        for (uint8_t test_sf = 7; test_sf <= 12; test_sf++) {
+            auto hard = run_multisf_impaired(payload, test_sf, 4, 125000, 4,
+                                              100.f, 0.f, 0x12, 8,
+                                              test_sf, test_sf, false);
+            auto soft = run_multisf_impaired(payload, test_sf, 4, 125000, 4,
+                                              100.f, 0.f, 0x12, 8,
+                                              test_sf, test_sf, true);
+            expect(hard.ok) << "hard graph ran SF" << static_cast<int>(test_sf);
+            expect(soft.ok) << "soft graph ran SF" << static_cast<int>(test_sf);
+            std::printf("  SF%u: hard=%zu soft=%zu bytes\n",
+                        static_cast<unsigned>(test_sf),
+                        hard.decoded.size(), soft.decoded.size());
+            expect(eq(hard.decoded.size(), soft.decoded.size()))
+                << "SF" << static_cast<int>(test_sf) << " size mismatch";
+            if (hard.decoded.size() == soft.decoded.size()) {
+                for (std::size_t i = 0; i < hard.decoded.size(); i++) {
+                    expect(eq(hard.decoded[i], soft.decoded[i]))
+                        << "SF" << static_cast<int>(test_sf)
+                        << " byte " << i << " mismatch";
+                }
+            }
+        }
     };
 };
 

@@ -1003,4 +1003,276 @@ const boost::ut::suite<"Soft decode roundtrip"> soft_decode_roundtrip_tests = []
     };
 };
 
+// =============================================================================
+// Soft decode regression: header block (sf_app = sf-2) hard vs soft comparison
+// =============================================================================
+
+const boost::ut::suite<"Soft decode header block regression"> soft_header_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "soft decode header block matches hard decode for all SFs and nibbles"_test = [] {
+        // For each SF (7-12), create a header interleaver block (sf_app = sf-2, cw_len = 8,
+        // cr = 4 always for header). Encode sf_app nibbles through the TX pipeline, then
+        // decode via both hard and soft paths. They must produce identical output.
+        for (uint8_t test_sf = 7; test_sf <= 12; test_sf++) {
+            const uint8_t sf_app = test_sf - 2;
+            const uint8_t cr     = 4;
+            const uint8_t cw_len = 8;  // header always uses cw_len=8
+            const uint32_t N_fft = 1u << test_sf;
+
+            // Test all 16 nibble values in each position
+            for (uint8_t nib_val = 0; nib_val < 16; nib_val++) {
+                // Build sf_app nibbles: [nib_val, 0, 0, ..., 0]
+                std::vector<uint8_t> nibbles_in(sf_app, 0);
+                nibbles_in[0] = nib_val;
+
+                // TX: Hamming-encode → interleave → Gray demap → +1 shift
+                std::vector<uint8_t> codewords;
+                for (auto n : nibbles_in) codewords.push_back(hamming_encode(n, cr));
+                auto interleaved = interleave_block(codewords, test_sf, cw_len, sf_app, true);
+
+                std::vector<uint32_t> chirp_syms;
+                for (auto s : interleaved) {
+                    uint32_t g = s;
+                    for (int j = 1; j < test_sf; j++) g ^= (s >> j);
+                    chirp_syms.push_back((g + 1) % N_fft);
+                }
+
+                // RX hard path: mod(cs-1, N) → grayMap → shift → deinterleave → hamming_hard
+                SfLane hard_lane;
+                hard_lane.sf = test_sf;
+                hard_lane.N  = N_fft;
+                std::vector<uint16_t> rx_syms;
+                for (auto cs : chirp_syms) {
+                    rx_syms.push_back(static_cast<uint16_t>(
+                        mod(static_cast<int64_t>(cs) - 1, static_cast<int64_t>(N_fft))));
+                }
+                auto hard_nibs = hard_lane.processBlock(rx_syms, sf_app, cw_len, cr, true);
+
+                // RX soft path: create mag_sq peak → LLR → processBlockSoft
+                GrayPartition gp;
+                gp.init(test_sf);
+
+                std::vector<std::vector<double>> sym_llrs;
+                for (auto cs : chirp_syms) {
+                    auto sym = static_cast<uint32_t>(
+                        mod(static_cast<int64_t>(cs) - 1, static_cast<int64_t>(N_fft)));
+                    std::vector<float> sym_mag_sq(N_fft, 0.001f);
+                    sym_mag_sq[sym] = 100.f;
+                    std::vector<double> llrs(test_sf);
+                    SfLane::compute_symbol_llr(sym_mag_sq.data(), N_fft, test_sf, gp, llrs.data());
+                    sym_llrs.push_back(std::move(llrs));
+                }
+
+                SfLane soft_lane;
+                soft_lane.sf = test_sf;
+                soft_lane.N  = N_fft;
+                auto soft_nibs = soft_lane.processBlockSoft(sym_llrs, sf_app, cw_len, cr);
+
+                // Compare
+                expect(eq(soft_nibs.size(), hard_nibs.size()))
+                    << "SF" << static_cast<int>(test_sf)
+                    << " nib=" << static_cast<int>(nib_val) << " count mismatch";
+                for (std::size_t i = 0; i < std::min(soft_nibs.size(), hard_nibs.size()); i++) {
+                    expect(eq(soft_nibs[i], hard_nibs[i]))
+                        << "SF" << static_cast<int>(test_sf)
+                        << " nib=" << static_cast<int>(nib_val)
+                        << " pos=" << i
+                        << " soft=" << static_cast<int>(soft_nibs[i])
+                        << " hard=" << static_cast<int>(hard_nibs[i])
+                        << " expected=" << static_cast<int>(nibbles_in[i]);
+                }
+            }
+            std::printf("  SF%u header block: all 16 nibbles passed\n",
+                        static_cast<unsigned>(test_sf));
+        }
+    };
+
+    "soft decode payload block matches hard decode for all SFs"_test = [] {
+        // Payload blocks: sf_app = sf, cw_len = cr+4
+        // This verifies soft decode for all SFs, not just SF8.
+        for (uint8_t test_sf = 7; test_sf <= 12; test_sf++) {
+            const uint8_t sf_app = test_sf;
+            const uint8_t cr     = 4;
+            const uint8_t cw_len = cr + 4;
+            const uint32_t N_fft = 1u << test_sf;
+
+            for (uint8_t nib_val = 0; nib_val < 16; nib_val++) {
+                std::vector<uint8_t> nibbles_in(sf_app, 0);
+                nibbles_in[0] = nib_val;
+
+                std::vector<uint8_t> codewords;
+                for (auto n : nibbles_in) codewords.push_back(hamming_encode(n, cr));
+                auto interleaved = interleave_block(codewords, test_sf, cw_len, sf_app, false);
+
+                std::vector<uint32_t> chirp_syms;
+                for (auto s : interleaved) {
+                    uint32_t g = s;
+                    for (int j = 1; j < test_sf; j++) g ^= (s >> j);
+                    chirp_syms.push_back((g + 1) % N_fft);
+                }
+
+                SfLane hard_lane;
+                hard_lane.sf = test_sf;
+                hard_lane.N  = N_fft;
+                std::vector<uint16_t> rx_syms;
+                for (auto cs : chirp_syms) {
+                    rx_syms.push_back(static_cast<uint16_t>(
+                        mod(static_cast<int64_t>(cs) - 1, static_cast<int64_t>(N_fft))));
+                }
+                auto hard_nibs = hard_lane.processBlock(rx_syms, sf_app, cw_len, cr, false);
+
+                GrayPartition gp;
+                gp.init(test_sf);
+                std::vector<std::vector<double>> sym_llrs;
+                for (auto cs : chirp_syms) {
+                    auto sym = static_cast<uint32_t>(
+                        mod(static_cast<int64_t>(cs) - 1, static_cast<int64_t>(N_fft)));
+                    std::vector<float> sym_mag_sq(N_fft, 0.001f);
+                    sym_mag_sq[sym] = 100.f;
+                    std::vector<double> llrs(test_sf);
+                    SfLane::compute_symbol_llr(sym_mag_sq.data(), N_fft, test_sf, gp, llrs.data());
+                    sym_llrs.push_back(std::move(llrs));
+                }
+
+                SfLane soft_lane;
+                soft_lane.sf = test_sf;
+                soft_lane.N  = N_fft;
+                auto soft_nibs = soft_lane.processBlockSoft(sym_llrs, sf_app, cw_len, cr);
+
+                expect(eq(soft_nibs.size(), hard_nibs.size()))
+                    << "SF" << static_cast<int>(test_sf)
+                    << " nib=" << static_cast<int>(nib_val) << " count mismatch";
+                for (std::size_t i = 0; i < std::min(soft_nibs.size(), hard_nibs.size()); i++) {
+                    expect(eq(soft_nibs[i], hard_nibs[i]))
+                        << "SF" << static_cast<int>(test_sf)
+                        << " nib=" << static_cast<int>(nib_val)
+                        << " pos=" << i
+                        << " soft=" << static_cast<int>(soft_nibs[i])
+                        << " hard=" << static_cast<int>(hard_nibs[i])
+                        << " expected=" << static_cast<int>(nibbles_in[i]);
+                }
+            }
+            std::printf("  SF%u payload block: all 16 nibbles passed\n",
+                        static_cast<unsigned>(test_sf));
+        }
+    };
+};
+
+// =============================================================================
+// Soft decode under noise: per-SF sensitivity comparison
+// =============================================================================
+
+const boost::ut::suite<"Soft vs hard decode noise sensitivity"> soft_noise_tests = [] {
+    using namespace boost::ut;
+    using namespace gr::lora;
+
+    "soft vs hard interleaver block under noise for all SFs"_test = [] {
+        // Fair comparison: both hard and soft decode use the SAME noisy argmax
+        // symbol (as in a real receiver). Hard decode uses the argmax bin;
+        // soft decode uses the LLRs from the same mag_sq spectrum.
+        std::mt19937 gen(12345);
+
+        for (uint8_t test_sf = 7; test_sf <= 12; test_sf++) {
+            const uint8_t cr = 4;
+            const uint32_t N_fft = 1u << test_sf;
+
+            for (int block_type = 0; block_type <= 1; block_type++) {
+                const uint8_t sf_app = (block_type == 0)
+                    ? static_cast<uint8_t>(test_sf - 2) : test_sf;
+                const uint8_t cw_len = (block_type == 0) ? uint8_t(8)
+                    : static_cast<uint8_t>(cr + 4);
+                const char* block_name = (block_type == 0) ? "header" : "payload";
+                const bool add_parity = (block_type == 0);
+
+                int total_nibs = 0, soft_errors = 0, hard_errors = 0;
+                const int N_trials = 50;
+
+                for (int trial = 0; trial < N_trials; trial++) {
+                    std::vector<uint8_t> nibbles_in(sf_app);
+                    for (auto& n : nibbles_in)
+                        n = static_cast<uint8_t>(gen() % 16);
+
+                    std::vector<uint8_t> codewords;
+                    for (auto n : nibbles_in) codewords.push_back(hamming_encode(n, cr));
+                    auto interleaved = interleave_block(
+                        codewords, test_sf, cw_len, sf_app, add_parity);
+
+                    std::vector<uint32_t> chirp_syms;
+                    for (auto s : interleaved) {
+                        uint32_t g = s;
+                        for (int j = 1; j < test_sf; j++) g ^= (s >> j);
+                        chirp_syms.push_back((g + 1) % N_fft);
+                    }
+
+                    GrayPartition gp;
+                    gp.init(test_sf);
+                    std::normal_distribution<float> noise_dist(0.f, 3.f);
+
+                    std::vector<std::vector<double>> sym_llrs;
+                    std::vector<uint16_t> rx_syms;  // from argmax of noisy mag_sq
+
+                    for (auto cs : chirp_syms) {
+                        auto true_sym = static_cast<uint32_t>(
+                            mod(static_cast<int64_t>(cs) - 1,
+                                static_cast<int64_t>(N_fft)));
+
+                        std::vector<float> sym_mag_sq(N_fft);
+                        for (auto& m : sym_mag_sq) {
+                            float n = noise_dist(gen);
+                            m = n * n;
+                        }
+                        sym_mag_sq[true_sym] += 100.f;
+
+                        // Find argmax (what the real receiver would use)
+                        uint32_t argmax = 0;
+                        float maxv = sym_mag_sq[0];
+                        for (uint32_t s = 1; s < N_fft; s++) {
+                            if (sym_mag_sq[s] > maxv) { maxv = sym_mag_sq[s]; argmax = s; }
+                        }
+                        rx_syms.push_back(static_cast<uint16_t>(argmax));
+
+                        std::vector<double> llrs(test_sf);
+                        SfLane::compute_symbol_llr(
+                            sym_mag_sq.data(), N_fft, test_sf, gp, llrs.data());
+                        sym_llrs.push_back(std::move(llrs));
+                    }
+
+                    SfLane hard_lane;
+                    hard_lane.sf = test_sf;
+                    hard_lane.N  = N_fft;
+                    auto hard_nibs = hard_lane.processBlock(
+                        rx_syms, sf_app, cw_len, cr, block_type == 0);
+
+                    SfLane soft_lane;
+                    soft_lane.sf = test_sf;
+                    soft_lane.N  = N_fft;
+                    auto soft_nibs = soft_lane.processBlockSoft(
+                        sym_llrs, sf_app, cw_len, cr);
+
+                    for (std::size_t i = 0; i < std::min(nibbles_in.size(),
+                                                          soft_nibs.size()); i++) {
+                        total_nibs++;
+                        if (soft_nibs[i] != nibbles_in[i]) soft_errors++;
+                        if (i < hard_nibs.size() && hard_nibs[i] != nibbles_in[i])
+                            hard_errors++;
+                    }
+                }
+
+                std::printf("  SF%u %s: %d nibs, hard_err=%d (%.1f%%), "
+                            "soft_err=%d (%.1f%%)\n",
+                    static_cast<unsigned>(test_sf), block_name, total_nibs,
+                    hard_errors, 100.0 * hard_errors / total_nibs,
+                    soft_errors, 100.0 * soft_errors / total_nibs);
+
+                // Soft should not be significantly worse than hard
+                expect(le(soft_errors, std::max(hard_errors * 3 + 5, 10)))
+                    << "SF" << static_cast<int>(test_sf) << " " << block_name
+                    << ": soft errors significantly worse than hard";
+            }
+        }
+    };
+};
+
 int main() { /* boost::ut auto-runs all suites */ }
