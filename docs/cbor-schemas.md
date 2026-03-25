@@ -10,11 +10,16 @@ minimal, hand-rolled single-header implementation. Encodes to / decodes from
 `std::vector<uint8_t>`. The decoder only handles the top-level map; nested
 maps are produced but never consumed on the C++ side.
 
+**Telemetry encoder:** `blocks/include/gnuradio-4.0/lora/algorithm/Telemetry.hpp`
+— generic `property_map` → CBOR encoder. Blocks emit `property_map` events;
+the app injects a lambda that serialises via `telemetry::encode()` and
+broadcasts over UDP. Auto-adds ISO 8601 `"ts"` field.
+
 **Python:** `cbor2` (`pip install cbor2`).
 
 **Wireshark:** `scripts/lora_trx.lua` — dissects all frame types on UDP 5555.
 
-## Frame types
+## Frame types — lora_trx
 
 | Type | Direction | Source | Port |
 |------|-----------|--------|------|
@@ -22,13 +27,38 @@ maps are produced but never consumed on the C++ side.
 | [`lora_tx`](#lora_tx) | client → server | any CBOR client | 5555 |
 | [`lora_tx_ack`](#lora_tx_ack) | server → requesting client | `lora_trx.cpp` | 5555 |
 | [`subscribe`](#subscribe) | client → server | any CBOR client | 5555 |
-| [`config`](#config) | server → client (on subscribe) | `lora_trx.cpp` | 5555 |
-| [`status`](#status) | server → all clients (periodic) | `lora_trx.cpp` | 5555 |
-| [`spectrum`](#spectrum) | server → all clients | `lora_trx.cpp` | 5555 |
-| [`spectrum_tx`](#spectrum_tx) | server → all clients | `lora_trx.cpp` | 5555 |
+| [`config`](#config) | server → client (on subscribe) | `config.cpp` | 5555 |
+| [`status`](#status) | server → all clients (periodic) | `config.cpp` | 5555 |
+| [`spectrum`](#spectrum) | server → all clients | `config.cpp` | 5555 |
+| [`spectrum_tx`](#spectrum_tx) | server → all clients | `config.cpp` | 5555 |
 | [`lora_config`](#lora_config) | client → server | any CBOR client | 5555 |
 | [`lora_config_ack`](#lora_config_ack) | server → requesting client | `lora_trx.cpp` | 5555 |
-| [`scan_result`](#scan_result) | lora_scan → consumers | `lora_scan.cpp` | TBD |
+
+## Frame types — lora_trx telemetry
+
+| Type | Direction | Source | Port |
+|------|-----------|--------|------|
+| [`multisf_detect`](#multisf_detect) | server → clients | `MultiSfDecoder.hpp` | 5555 |
+| [`multisf_sync`](#multisf_sync) | server → clients | `MultiSfDecoder.hpp` | 5555 |
+| [`multisf_frame`](#multisf_frame) | server → clients | `MultiSfDecoder.hpp` | 5555 |
+| [`wideband_sweep`](#wideband_sweep) | server → clients | `WidebandDecoder.hpp` | 5555 |
+| [`wideband_slot`](#wideband_slot) | server → clients | `WidebandDecoder.hpp` | 5555 |
+
+## Frame types — lora_scan
+
+| Type | Direction | Source | Mode |
+|------|-----------|--------|------|
+| [`scan_spectrum`](#scan_spectrum) | broadcast | `lora_scan.cpp` | both |
+| [`scan_sweep_start`](#scan_sweep_start) | broadcast | `lora_scan.cpp` | legacy |
+| [`scan_sweep_end`](#scan_sweep_end) | broadcast | `lora_scan.cpp` | both |
+| [`scan_l2_probe`](#scan_l2_probe) | broadcast | `lora_scan.cpp` | legacy |
+| [`scan_retune`](#scan_retune) | broadcast | `lora_scan.cpp` | legacy |
+| [`scan_overflow`](#scan_overflow) | broadcast | `lora_scan.cpp` | legacy |
+| [`scan_status`](#scan_status) | broadcast | `lora_scan.cpp` | legacy |
+
+`lora_scan` has two modes: **legacy** (hardware retune sweep) and **streaming**
+(wideband digital channelisation). In streaming mode, only `scan_spectrum` and
+`scan_sweep_end` are emitted (via `emitDataSetCbor()`).
 
 ---
 
@@ -42,7 +72,7 @@ event, delivered to clients via `lora_trx` UDP broadcast.
   "type":         "lora_frame",       // text
   "ts":           "2026-02-17T...",   // text, ISO 8601 UTC
   "seq":          1,                  // uint, 1-based frame counter (per FrameSink)
-  "phy": {                            // map
+  "phy": {                            // map (variable field count)
     "sf":             8,              // uint, spreading factor
     "bw":             62500,          // uint, bandwidth (Hz)
     "cr":             4,              // uint, coding rate (1–4)
@@ -51,7 +81,12 @@ event, delivered to clients via `lora_trx` UDP broadcast.
     "snr_db":         12.3,           // float64, FFT-domain SNR estimate (dB)
     "noise_floor_db": -42.1,          // float64, optional, EMA noise floor (dBFS)
     "peak_db":        -6.2,           // float64, optional, EMA peak amplitude (dBFS)
-    "snr_db_td":      -7.2            // float64, optional, time-domain SNR (dB)
+    "snr_db_td":      -7.2,           // float64, optional, time-domain SNR (dB)
+    "channel_freq":   869618000.0,    // float64, optional, channel center freq (Hz)
+    "decode_bw":      62500.0,        // float64, optional, decode bandwidth (Hz)
+    "cfo_int":        3.0,            // float64, optional, integer CFO (bins)
+    "cfo_frac":       0.214,          // float64, optional, fractional CFO
+    "sfo_hat":        -0.001          // float64, optional, sample freq offset estimate
   },
   "payload":      h'48656C6C6F',      // bytes, raw payload
   "payload_len":  5,                  // uint
@@ -59,18 +94,21 @@ event, delivered to clients via `lora_trx` UDP broadcast.
   "cr":           4,                  // uint (top-level duplicate)
   "is_downchirp": false,              // bool
   "rx_channel":   0,                  // uint, optional, RX channel index
-  "decode_label": "SF8-sync12",       // text, optional, decode chain label
+  "decode_label": "meshcore",         // text, optional, decode chain label
   "id":           "550e8400-...",      // text, UUIDv4, unique per decode event
   "payload_hash": 12345678901234,     // uint, FNV-1a 64-bit hash
   "device":       "31DE7F5"           // text, optional, SDR device serial
 }
 ```
 
-**Optional fields:** `noise_floor_db`, `peak_db`, `snr_db_td` are only
-present when their EMA values have been initialised (value > -999). `rx_channel`
-is only present in multi-channel configurations. `decode_label` is only present
-when the decode chain has a non-empty label (configured via TOML). `device` is
-only present when the SDR reports a serial number (UHD devices always do).
+**Optional `phy` fields:** `noise_floor_db`, `peak_db`, `snr_db_td` are only
+present when their EMA values have been initialised (value > -999).
+`channel_freq`, `decode_bw`, `cfo_int`, `cfo_frac`, `sfo_hat` are only
+present when decoded by `WidebandDecoder` (channel_freq > 0).
+
+**Optional top-level fields:** `rx_channel` requires multi-channel config.
+`decode_label` requires a non-empty label in TOML. `device` requires the SDR
+to report a serial number.
 
 **SNR fields:** `snr_db` is an FFT-domain estimate (peak-vs-rest energy ratio
 averaged over preamble symbols) and includes ~SF×3 dB of FFT processing gain.
@@ -79,7 +117,9 @@ normalises the FFT peak back to per-sample power, making it comparable to
 RSSI-based SNR values reported by companion devices.
 
 **Consumers:** `lora_mon.py`, `lora_agg.py`, `lora_waterfall.py`,
-`lora_duckdb.py`, `meshcore_bridge.py`, `lora_trx.lua`.
+`lora_duckdb.py`, `trx_perf.py`, `trx_test.py`, `trx_ab_loop.py`,
+`test_multisf_hardware.py`, `lora_decode_meshcore.py`, `meshcore_bridge.py`,
+`lora_trx.lua`.
 
 ### Aggregated frame (from lora_agg on :5555)
 
@@ -201,7 +241,7 @@ server metadata, and passthrough config for Python scripts.
   },
   "decode_chains": [                  // array of maps, one per decode chain
     {
-      "label":     "SF8-sync12",      // text, decode chain label
+      "label":     "meshcore",        // text, decode chain label
       "sf":        8,                 // uint, spreading factor
       "sync_word": 18                 // uint, sync word
     }
@@ -300,7 +340,7 @@ Bins are float32 LE magnitude values in dBFS, DC-centred (fftshift applied).
 }
 ```
 
-**Consumers:** `lora_waterfall.py`, `lora_trx.lua`.
+**Consumers:** `lora_waterfall.py`, `dc_diag.py`, `lora_trx.lua`.
 
 ---
 
@@ -364,27 +404,314 @@ Sent back to the requesting client after a `lora_config` request is processed.
 
 ---
 
-## `scan_result`
+## `multisf_detect`
 
-Channel activity report from `lora_scan`. Emitted after each L2/L3 detection
-(not for noise-only channels). Intended for consumption by a second `lora_trx`
-instance that can hop to active frequencies.
+Emitted when a preamble is detected (DETECT → SYNC state transition) on any
+SF lane in the `MultiSfDecoder` block. Encoded via `Telemetry::encode()`.
 
 ```
 {
-  "type":         "scan_result",      // text
-  "ts":           "2026-03-11T...",   // text, ISO 8601 UTC
-  "freq":         868100000.0,        // float64, channel center frequency (Hz)
-  "bw":           62500,              // uint, channel bandwidth (Hz)
-  "detected":     true,               // bool, L2 CAD detection result
-  "peak_ratio_up":  5.23,             // float64, best upchirp peak ratio
-  "peak_ratio_dn":  1.12,             // float64, best downchirp peak ratio
-  "sf_est":       8,                  // uint, optional, estimated SF from L3 sweep (0 = unknown)
-  "sweep":        1                   // uint, sweep counter (1-based)
+  "type":  "multisf_detect",          // text
+  "ts":    "2026-03-22T...",          // text, ISO 8601 UTC (auto-added)
+  "sf":    8,                         // uint, spreading factor that detected
+  "bin":   42                         // uint, dechirp bin index of last preamble upchirp
 }
 ```
 
-**Status:** not yet implemented. `lora_scan` currently writes text to stdout.
+**Consumers:** `trx_perf.py`.
+
+---
+
+## `multisf_sync`
+
+Emitted when sync word is verified and SNR passes threshold (SYNC → OUTPUT
+state transition) in `MultiSfDecoder`. Encoded via `Telemetry::encode()`.
+
+```
+{
+  "type":     "multisf_sync",         // text
+  "ts":       "2026-03-22T...",       // text, ISO 8601 UTC (auto-added)
+  "sf":       8,                      // uint, spreading factor
+  "cfo_int":  -2,                     // int, integer carrier freq offset (bins)
+  "cfo_frac": 0.214,                  // float64, fractional carrier freq offset
+  "snr_db":   12.3                    // float64, signal-to-noise ratio (dB)
+}
+```
+
+**Consumers:** `trx_perf.py`.
+
+---
+
+## `multisf_frame`
+
+Emitted when a complete frame is decoded (all symbols received and processed)
+in `MultiSfDecoder`. Encoded via `Telemetry::encode()`.
+
+```
+{
+  "type":    "multisf_frame",         // text
+  "ts":      "2026-03-22T...",        // text, ISO 8601 UTC (auto-added)
+  "sf":      8,                       // uint, spreading factor
+  "crc_ok":  true,                    // bool, CRC check result
+  "len":     118,                     // uint, payload length (bytes)
+  "cr":      4,                       // uint, coding rate (0–4)
+  "snr_db":  12.3                     // float64, signal-to-noise ratio (dB)
+}
+```
+
+**Consumers:** `trx_perf.py`.
+
+---
+
+## `wideband_sweep`
+
+Emitted every L1 sweep completion in `WidebandDecoder` (wideband mode only,
+`wideband=true` in config). Encoded via `Telemetry::encode()`.
+
+```
+{
+  "type":        "wideband_sweep",    // text
+  "ts":          "2026-03-22T...",    // text, ISO 8601 UTC (auto-added)
+  "sweep":       42,                  // uint, sweep sequence number
+  "tainted":     false,               // bool, overflows exceeded threshold
+  "overflows":   0,                   // uint, overflow events during this sweep
+  "zero_calls":  2,                   // uint, processBulk calls with 0 input
+  "total_calls": 1024,               // uint, total processBulk calls this sweep
+  "duration_ms": 524,                 // uint, sweep duration (ms)
+  "n_snapshots": 16,                  // uint, L1 FFT snapshots taken
+  "n_hot":       1,                   // uint, hot channels detected
+  "n_active":    1,                   // uint, active ChannelSlots
+  "max_slots":   24                   // uint, maximum ChannelSlots (config)
+}
+```
+
+**Consumers:** `trx_perf.py`.
+
+---
+
+## `wideband_slot`
+
+Emitted when a ChannelSlot is activated or deactivated in `WidebandDecoder`
+(wideband mode only). Encoded via `Telemetry::encode()`.
+
+```
+{
+  "type":    "wideband_slot",         // text
+  "ts":      "2026-03-22T...",        // text, ISO 8601 UTC (auto-added)
+  "action":  "activate",             // text, "activate" or "deactivate"
+  "slot":    0,                       // uint, slot index (0 to max_channels-1)
+  "channel": 42,                      // uint, L1 channel index
+  "freq":    869618000.0,             // float64, channel center frequency (Hz)
+  "bw":      62500                    // uint, decode bandwidth (Hz)
+}
+```
+
+**Consumers:** `trx_perf.py`.
+
+---
+
+## `scan_spectrum`
+
+L1 energy spectrum with L2 detection results. Emitted once per sweep.
+
+In **legacy** mode, produced by `emitSpectrumCbor()` (emitted after
+`scan_sweep_end`). In **streaming** mode, produced by `emitDataSetCbor()`
+(emitted before `scan_sweep_end`).
+
+```
+{
+  "type":       "scan_spectrum",      // text
+  "ts":         "2026-03-11T...",     // text, ISO 8601 UTC
+  "sweep":      42,                   // uint, 1-based sweep counter
+  "freq_min":   863000000,            // uint, first channel center freq (Hz)
+  "freq_step":  62500,                // uint, channel spacing (Hz)
+  "channels":   h'...',              // bytes, n_channels × float32 LE, linear power
+  "n_channels": 112,                  // uint, number of channels
+  "hot":        [5, 42, 73],          // uint array, hot channel indices (0-based)
+  "detections": [...]                 // array of detection sub-maps (see below)
+}
+```
+
+**Detection sub-map (legacy mode, 7 fields):**
+
+```
+{
+  "freq":     869618000,              // uint, detection frequency (Hz)
+  "sf":       8,                      // uint, detected spreading factor (7–12)
+  "bw":       62500,                  // uint, detection bandwidth (Hz)
+  "ratio":    35.5,                   // float64, max(ratio_up, ratio_dn)
+  "ratio_up": 35.5,                   // float64, upchirp peak ratio
+  "ratio_dn": 1.2,                    // float64, downchirp peak ratio
+  "chirp":    "up"                    // text, "up", "dn", or "both"
+}
+```
+
+**Detection sub-map (streaming mode, 4 fields):**
+
+```
+{
+  "freq":   869618000,                // uint, detection frequency (Hz)
+  "sf":     8,                        // uint, detected spreading factor
+  "bw":     62500,                    // uint, detection bandwidth (Hz)
+  "ratio":  35.5                      // float64, peak ratio
+}
+```
+
+**Consumers:** `lora_spectrum.py`, `lora_perf.py`, `scan_test.py`.
+
+---
+
+## `scan_sweep_start`
+
+Emitted at the beginning of each sweep. **Legacy mode only.**
+
+```
+{
+  "type":   "scan_sweep_start",       // text
+  "ts":     "2026-03-11T...",         // text, ISO 8601 UTC
+  "sweep":  42                        // uint, 1-based sweep number
+}
+```
+
+**Consumers:** `lora_spectrum.py`.
+
+---
+
+## `scan_sweep_end`
+
+Emitted at the end of each sweep, after all L1/L2 work completes.
+
+**Legacy mode (9 fields):**
+
+```
+{
+  "type":         "scan_sweep_end",   // text
+  "ts":           "2026-03-11T...",   // text, ISO 8601 UTC
+  "sweep":        42,                 // uint, 1-based sweep number
+  "duration_ms":  1063,               // uint, wall-clock sweep duration (ms)
+  "l1_snapshots": 678,                // uint, L1 FFT snapshots taken
+  "l2_probes":    3,                  // uint, L2 CAD probes performed
+  "hot_count":    3,                  // uint, hot channels detected
+  "detections":   2,                  // uint, positive detections
+  "overflows":    0                   // uint, overflow events this sweep
+}
+```
+
+**Streaming mode (8 fields):** same as legacy but **without `l2_probes`**.
+`overflows` is currently hardcoded to 0 (TODO: not wired in streaming mode).
+
+**Consumers:** `lora_perf.py`, `lora_spectrum.py`, `scan_test.py`.
+
+---
+
+## `scan_l2_probe`
+
+Emitted after each L2 CAD probe of a hot channel. **Legacy mode only.**
+
+```
+{
+  "type":        "scan_l2_probe",     // text
+  "ts":          "2026-03-11T...",    // text, ISO 8601 UTC
+  "sweep":       42,                  // uint, current sweep number
+  "freq":        869618000,           // uint, probed channel freq (Hz)
+  "duration_ms": 134,                 // uint, probe duration (ms)
+  "results":     [...]                // array of per-BW result sub-maps
+}
+```
+
+**Per-BW result sub-map (4 fields):**
+
+```
+{
+  "bw":     62500,                    // uint, bandwidth probed (Hz)
+  "sf":     8,                        // uint, detected spreading factor
+  "ratio":  35.5,                     // float64, peak-to-median ratio
+  "chirp":  "up"                      // text, "up", "dn", or "both"
+}
+```
+
+**Consumers:** `lora_spectrum.py`.
+
+---
+
+## `scan_retune`
+
+Emitted when the SDR retunes to a new center frequency. **Legacy mode only.**
+
+```
+{
+  "type":    "scan_retune",           // text
+  "ts":      "2026-03-11T...",        // text, ISO 8601 UTC
+  "sweep":   42,                      // uint, current sweep number
+  "freq":    869618000,               // uint, new center frequency (Hz)
+  "reason":  "l2"                     // text, retune reason (e.g. "l1", "l2")
+}
+```
+
+---
+
+## `scan_overflow`
+
+Emitted when SoapySDR overflow count increases. **Legacy mode only.**
+
+```
+{
+  "type":   "scan_overflow",          // text
+  "ts":     "2026-03-11T...",         // text, ISO 8601 UTC
+  "sweep":  42,                       // uint, current sweep number
+  "count":  5                         // uint, cumulative total overflow count
+}
+```
+
+**Consumers:** `lora_perf.py`, `lora_spectrum.py`.
+
+---
+
+## `scan_status`
+
+Periodic status summary. Emitted every 5 seconds and on first sweep
+completion. **Legacy mode only.**
+
+```
+{
+  "type":       "scan_status",        // text
+  "ts":         "2026-03-11T...",     // text, ISO 8601 UTC
+  "mode":       "streaming",         // text, scan mode identifier
+  "sweeps":     42,                   // uint, total sweeps completed
+  "detections": 15,                   // uint, total cumulative detections
+  "overflows":  0,                    // uint, total overflow events
+  "dropouts":   0,                    // uint, total sample dropouts
+  "scan_range": [863000000, 870000000] // uint array, [freq_start, freq_stop] (Hz)
+}
+```
+
+**Consumers:** `lora_spectrum.py`.
+
+---
+
+## Emission ordering
+
+### lora_trx — per decoded frame
+
+1. `multisf_detect` (preamble found)
+2. `multisf_sync` (sync word verified)
+3. `multisf_frame` (decode complete)
+4. `lora_frame` (delivered to consumers)
+
+### lora_scan — per sweep (legacy mode)
+
+1. `scan_sweep_start`
+2. `scan_retune` (0..N, per retune)
+3. `scan_l2_probe` (0..N, per hot channel)
+4. `scan_overflow` (0..N, if overflows detected)
+5. `scan_sweep_end`
+6. `scan_spectrum`
+7. `scan_status` (conditional: first sweep, or every 5s)
+
+### lora_scan — per sweep (streaming mode)
+
+1. `scan_spectrum`
+2. `scan_sweep_end`
 
 ---
 
