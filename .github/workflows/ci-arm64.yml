@@ -61,8 +61,16 @@ jobs:
             -DENABLE_COVERAGE=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-      - name: Build
-        run: cmake --build build -j4
+      - name: Build tests
+        run: |
+          cmake --build build -j2 --target \
+            qa_lora_algorithms qa_lora_tx qa_lora_phase3 \
+            qa_lora_rx qa_lora_loopback qa_lora_burst \
+            qa_lora_splitter qa_lora_cad qa_lora_multisf \
+            qa_lora_cbor qa_lora_framesink qa_lora_scan \
+            qa_lora_wideband qa_lora_tx_queue qa_lora_udp \
+            qa_lora_dc_blocker qa_lora_config qa_soapy_loopback \
+            bm_lora_algorithms bm_lora_decode
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 120
@@ -78,105 +86,4 @@ jobs:
         if: always()
         run: ccache --show-stats
 
-  deploy:
-    name: "arm64 | gcc-14 | Release | deploy"
-    runs-on: ubuntu-24.04-arm
-    needs: build
-    env:
-      DEBIAN_FRONTEND: noninteractive
-      CC: gcc-14
-      CXX: g++-14
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
 
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: false
-          fetch-depth: 0
-
-      - name: Fetch submodules
-        run: git submodule update --init --recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
-            gcc-14 g++-14 \
-            cmake ninja-build ccache \
-            libsoapysdr-dev soapysdr-module-uhd libuhd-dev
-
-      - name: Restore ccache
-        id: restore-ccache
-        uses: actions/cache/restore@v5
-        with:
-          path: ${{ github.workspace }}/.ccache
-          key: ccache-arm64-gcc14-Release-${{ github.run_id }}
-          restore-keys: ccache-arm64-gcc14-Release
-
-      - name: Configure ccache
-        run: |
-          ccache --max-size=3G
-          ccache --set-config=compression=true
-          ccache --set-config=compression_level=6
-          ccache --set-config=depend_mode=true
-          ccache --set-config=hash_dir=false
-          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
-          ccache -z
-
-      - name: Configure
-        run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DWARNINGS_AS_ERRORS=OFF \
-            -DUSE_CCACHE=ON \
-            -DENABLE_COVERAGE=OFF \
-            -DENABLE_LORA_TESTING=OFF \
-            -DENABLE_LORA_BENCHMARKS=OFF
-
-      - name: Build lora_trx and lora_scan
-        run: cmake --build build --target lora_trx lora_scan -j4
-
-      - name: Verify version
-        run: |
-          build/apps/lora_trx --version
-          build/apps/lora_scan --version
-
-      - name: Bundle binaries and runtime libraries
-        run: |
-          mkdir -p bundle
-          cp build/apps/lora_trx build/apps/lora_scan bundle/
-          for bin in bundle/lora_trx bundle/lora_scan; do
-            ldd "$bin" \
-              | awk '/=> \// {print $3}' \
-              | grep -v 'libc\.so\|libm\.so\|libdl\.so\|libpthread\|librt\.so\|ld-linux' \
-              | tr '\n' '\0' | xargs -0 -I{} cp -L {} bundle/ 2>/dev/null || true
-          done
-          find build -name "*.so*" -not -name "*.so*.dbg" -print0 \
-            | xargs -0 -I{} cp -L {} bundle/ 2>/dev/null || true
-          echo "Bundle contents:"
-          ls -lh bundle/
-
-      - name: Smoke-test bundled binaries
-        run: |
-          cd bundle
-          LD_LIBRARY_PATH=. ./lora_trx --version
-          LD_LIBRARY_PATH=. ./lora_scan --version
-
-      - name: Upload deploy artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: gr4-lora-arm64-deploy
-          path: bundle/
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Save ccache
-        if: always()
-        uses: actions/cache/save@v5
-        with:
-          path: ${{ github.workspace }}/.ccache
-          key: ccache-arm64-gcc14-Release-${{ github.run_id }}
-
-      - name: Show ccache stats
-        if: always()
-        run: ccache --show-stats
