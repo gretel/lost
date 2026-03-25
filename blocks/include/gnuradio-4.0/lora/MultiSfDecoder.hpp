@@ -100,11 +100,12 @@ struct MultiSfDecoder
 
         // Only set in.min_samples at startup. Changing it at runtime can
         // disrupt the scheduler's buffer management and cause USB transport
-        // errors (LIBUSB_ERROR_OTHER) on B210. The worst-case value (SF12)
-        // set at start() works for all SFs — smaller SFs just process more
-        // symbols per processBulk call.
+        // errors (LIBUSB_ERROR_OTHER) on B210. Use sf_max (not always SF12)
+        // to avoid starving the scheduler when only lower SFs are configured
+        // — with SF12's min_samples (16392 at os=4), the scheduler stops
+        // delivering when fewer samples remain, preventing short-frame decode.
         if (isStartup) {
-            auto worst_sps = static_cast<uint32_t>((1u << 12) * os_factor);
+            auto worst_sps = static_cast<uint32_t>((1u << sf_max) * os_factor);
             in.min_samples = worst_sps + 2u * os_factor;
         }
 
