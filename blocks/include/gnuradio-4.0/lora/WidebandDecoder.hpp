@@ -218,6 +218,7 @@ struct WidebandDecoder
     uint32_t                  _totalCalls{0};  // total processBulk calls (per sweep)
 
     // Hot channel tracking
+    std::vector<uint32_t>     _channelHotCount;   // consecutive sweeps channel was hot
     std::vector<uint32_t>     _hotChannels;
     std::vector<uint32_t>                _decodeBws;
     std::vector<uint8_t>                 _decodeSfs;   // SF range (empty = all SF7-12)
@@ -293,6 +294,7 @@ struct WidebandDecoder
             std::ranges::sort(_decodeSfs);
         }
 
+        _channelHotCount.assign(_nChannels, 0);
         _activeChannelMap.assign(_nChannels, {});
 
         // Channel slots
@@ -565,12 +567,23 @@ struct WidebandDecoder
         std::ranges::sort(sorted);
         const float median = sorted[sorted.size() / 2];
 
-        constexpr float kHotMultiplier = 6.0f;
+        constexpr float    kHotMultiplier = 6.0f;
+        constexpr uint32_t kMinHotSweeps  = 2;  // require 2 consecutive sweeps hot
         const float threshold = median * kHotMultiplier;
 
-        std::vector<uint32_t> raw;
+        // Update persistence counters
         for (uint32_t ch = 0; ch < _nChannels; ++ch) {
             if (_channelEnergy[ch] > threshold) {
+                _channelHotCount[ch]++;
+            } else {
+                _channelHotCount[ch] = 0;
+            }
+        }
+
+        // Only report channels that have been hot for kMinHotSweeps consecutive sweeps
+        std::vector<uint32_t> raw;
+        for (uint32_t ch = 0; ch < _nChannels; ++ch) {
+            if (_channelHotCount[ch] >= kMinHotSweeps) {
                 raw.push_back(ch);
             }
         }

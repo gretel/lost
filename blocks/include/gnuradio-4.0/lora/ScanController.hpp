@@ -67,6 +67,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     uint32_t                 _callCount{0};
     uint32_t                 _snapshotCount{0};
     std::vector<float>       _channelEnergy;
+    std::vector<uint32_t>    _channelHotCount;   // consecutive sweeps channel was hot
     std::vector<uint32_t>    _hotChannels;
     std::size_t              _probeIndex{0};
     std::size_t              _probeBwIndex{0};
@@ -98,6 +99,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         const float usableBw = sample_rate * 0.8f;
         _nChannels = static_cast<uint32_t>(usableBw / channel_bw);
         _channelEnergy.assign(_nChannels, 0.f);
+        _channelHotCount.assign(_nChannels, 0);
         _channelPeakBin.assign(_nChannels, 0);
         _channelPeakMag.assign(_nChannels, 0.f);
 
@@ -315,12 +317,23 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         std::ranges::sort(sorted);
         const float median = sorted[sorted.size() / 2];
 
-        constexpr float kHotMultiplier = 6.0f;
+        constexpr float    kHotMultiplier = 6.0f;
+        constexpr uint32_t kMinHotSweeps  = 2;  // require 2 consecutive sweeps hot
         const float threshold = median * kHotMultiplier;
 
-        std::vector<uint32_t> raw;
+        // Update persistence counters
         for (uint32_t ch = 0; ch < _nChannels; ++ch) {
             if (_channelEnergy[ch] > threshold) {
+                _channelHotCount[ch]++;
+            } else {
+                _channelHotCount[ch] = 0;
+            }
+        }
+
+        // Only report channels that have been hot for kMinHotSweeps consecutive sweeps
+        std::vector<uint32_t> raw;
+        for (uint32_t ch = 0; ch < _nChannels; ++ch) {
+            if (_channelHotCount[ch] >= kMinHotSweeps) {
                 raw.push_back(ch);
             }
         }
