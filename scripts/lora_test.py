@@ -11,7 +11,8 @@ packet transmission, event collection, and structured JSON output.
 Design principles:
   - One packet per config point (no repeats -- each ADVERT has a unique timestamp)
   - Machine-parseable JSON output with provenance (git SHA, hypothesis, config)
-  - Harness manages all processes; do not pre-start serial_bridge or lora_trx
+  - Harness manages serial_bridge lifecycle; SDR binary managed unless --attach is set
+  - With --attach: connect to already-running lora_trx/lora_scan; only serial_bridge is started
 
 Usage:
     # USB serial (local companion):
@@ -21,6 +22,11 @@ Usage:
     # TCP (remote companion via WiFi serial bridge):
     python3 scripts/lora_test.py decode --matrix full --tcp 192.168.1.42:4000
     python3 scripts/lora_test.py scan --matrix basic --tcp 10.0.0.5:7835
+
+    # Attach to already-running daemons (e.g. for live demo):
+    ./build/apps/lora_scan --config apps/config.toml &
+    python3 scripts/lora_spectrum.py &
+    python3 scripts/lora_test.py scan --matrix basic --serial /dev/cu.usbserial-0001 --attach
 
     python3 scripts/lora_test.py decode --matrix dc_edge --label dc-on \\
         --hypothesis "2kHz DC blocker does not degrade SF12" --serial ...
@@ -1195,6 +1201,12 @@ def main() -> None:
         )
         p.add_argument("--hypothesis", default="")
         p.add_argument("--label", default="")
+        p.add_argument(
+            "--attach",
+            action="store_true",
+            default=False,
+            help="Attach to already-running SDR binary; skip start/stop of lora_trx/lora_scan",
+        )
 
     args = parser.parse_args()
 
@@ -1289,28 +1301,33 @@ def main() -> None:
         sys.exit(1)
     _info(f"companion: {radio_info}")
 
-    _info(f"Starting {binary}")
-    binary_proc = _start_process(
-        [binary, "--config", args.config],
-        f"tmp/{mode}.log",
-    )
-    # Tuning scanner (streaming=false) needs longer startup: first sweep can
-    # take 30-60s depending on hot channel count before any CBOR is emitted.
-    udp_timeout = 90.0 if mode == "scan" else 30.0
-    if not _wait_udp(udp_port, timeout=udp_timeout):
-        _err(f"{binary} failed to start (see tmp/{mode}.log)")
-        _stop_process(binary_proc)
-        _stop_process(bridge_proc)
-        sys.exit(1)
-    _info(f"{binary} ready")
+    binary_proc = None
+    if not args.attach:
+        _info(f"Starting {binary}")
+        binary_proc = _start_process(
+            [binary, "--config", args.config],
+            f"tmp/{mode}.log",
+        )
+        # Tuning scanner (streaming=false) needs longer startup: first sweep can
+        # take 30-60s depending on hot channel count before any CBOR is emitted.
+        udp_timeout = 90.0 if mode == "scan" else 30.0
+        if not _wait_udp(udp_port, timeout=udp_timeout):
+            _err(f"{binary} failed to start (see tmp/{mode}.log)")
+            _stop_process(binary_proc)
+            _stop_process(bridge_proc)
+            sys.exit(1)
+        _info(f"{binary} ready")
+    else:
+        _info(f"Attaching to already-running {binary} on port {udp_port}")
 
     sock, _, _ = create_udp_subscriber("127.0.0.1", udp_port)
     collector = EventCollector(sock, event_types)
     collector.start()
     # Scan mode needs longer startup — B210 at 16 MS/s has ~8s transient
     # (master clock switch, overflow burst, L1 energy settling)
-    startup_delay = 10.0 if mode == "scan" else 1.0
-    time.sleep(startup_delay)
+    if not args.attach:
+        startup_delay = 10.0 if mode == "scan" else 1.0
+        time.sleep(startup_delay)
 
     # Detect tuning scanner mode (streaming=false) from config file
     is_tuning_scan = False
@@ -1369,17 +1386,20 @@ async def _run_tx_experiment(
     tcp_port: int | None = None,
 ) -> None:
     """TX experiment: meshcore_py connects via serial or TCP, no bridge."""
-    # Start lora_trx (needed for SDR TX via UDP)
-    _info(f"Starting {binary}")
-    binary_proc = _start_process(
-        [binary, "--config", args.config],
-        "tmp/tx.log",
-    )
-    if not _wait_udp(TRX_PORT):
-        _err(f"{binary} failed to start (see tmp/tx.log)")
-        _stop_process(binary_proc)
-        sys.exit(1)
-    _info(f"{binary} ready")
+    binary_proc = None
+    if not args.attach:
+        _info(f"Starting {binary}")
+        binary_proc = _start_process(
+            [binary, "--config", args.config],
+            "tmp/tx.log",
+        )
+        if not _wait_udp(TRX_PORT):
+            _err(f"{binary} failed to start (see tmp/tx.log)")
+            _stop_process(binary_proc)
+            sys.exit(1)
+        _info(f"{binary} ready")
+    else:
+        _info(f"Attaching to already-running {binary} on port {TRX_PORT}")
 
     # Connect to Heltec via meshcore_py (TCP or serial)
     companion = MeshCoreCompanion()
@@ -1445,54 +1465,64 @@ async def _run_bridge_experiment(
     so Phase D doesn't see the bridge's own Phase C packets.
     Config socket goes direct to lora_trx:5556 (lora_agg doesn't forward lora_config).
     """
-    # 1. Start lora_trx
-    _info(f"Starting {binary}")
-    binary_proc = _start_process(
-        [binary, "--config", args.config],
-        "tmp/bridge_trx.log",
-    )
-    if not _wait_udp(TRX_PORT):
-        _err(f"{binary} failed to start (see tmp/bridge_trx.log)")
-        _stop_process(binary_proc)
-        sys.exit(1)
-    _info(f"{binary} ready")
+    binary_proc = None
+    agg_proc = None
+    bridge_proc = None
 
-    # 2. Start lora_agg.py (dedup + TX echo suppression)
-    _info("Starting lora_agg")
-    agg_cmd = [
-        sys.executable,
-        str(SCRIPT_DIR / "lora_agg.py"),
-        "--upstream",
-        f"127.0.0.1:{TRX_PORT}",
-        "--listen",
-        f"127.0.0.1:{AGG_PORT}",
-    ]
-    agg_proc = _start_process(agg_cmd, "tmp/lora_agg.log")
-    if not _wait_udp(AGG_PORT):
-        _err("lora_agg failed (see tmp/lora_agg.log)")
-        _stop_process(agg_proc)
-        _stop_process(binary_proc)
-        sys.exit(1)
-    _info("lora_agg ready")
+    if not args.attach:
+        # 1. Start lora_trx
+        _info(f"Starting {binary}")
+        binary_proc = _start_process(
+            [binary, "--config", args.config],
+            "tmp/bridge_trx.log",
+        )
+        if not _wait_udp(TRX_PORT):
+            _err(f"{binary} failed to start (see tmp/bridge_trx.log)")
+            _stop_process(binary_proc)
+            sys.exit(1)
+        _info(f"{binary} ready")
 
-    # 3. Start meshcore_bridge.py (connects to lora_agg, not lora_trx directly)
-    _info("Starting meshcore_bridge")
-    bridge_cmd = [
-        sys.executable,
-        str(SCRIPT_DIR / "meshcore_bridge.py"),
-        "--connect",
-        f"127.0.0.1:{AGG_PORT}",
-        "--port",
-        str(MESHCORE_BRIDGE_PORT),
-    ]
-    bridge_proc = _start_process(bridge_cmd, "tmp/meshcore_bridge.log")
-    if not _wait_tcp(MESHCORE_BRIDGE_PORT):
-        _err("meshcore_bridge failed (see tmp/meshcore_bridge.log)")
-        _stop_process(bridge_proc)
-        _stop_process(agg_proc)
-        _stop_process(binary_proc)
-        sys.exit(1)
-    _info("meshcore_bridge ready")
+        # 2. Start lora_agg.py (dedup + TX echo suppression)
+        _info("Starting lora_agg")
+        agg_cmd = [
+            sys.executable,
+            str(SCRIPT_DIR / "lora_agg.py"),
+            "--upstream",
+            f"127.0.0.1:{TRX_PORT}",
+            "--listen",
+            f"127.0.0.1:{AGG_PORT}",
+        ]
+        agg_proc = _start_process(agg_cmd, "tmp/lora_agg.log")
+        if not _wait_udp(AGG_PORT):
+            _err("lora_agg failed (see tmp/lora_agg.log)")
+            _stop_process(agg_proc)
+            _stop_process(binary_proc)
+            sys.exit(1)
+        _info("lora_agg ready")
+
+        # 3. Start meshcore_bridge.py (connects to lora_agg, not lora_trx directly)
+        _info("Starting meshcore_bridge")
+        bridge_cmd = [
+            sys.executable,
+            str(SCRIPT_DIR / "meshcore_bridge.py"),
+            "--connect",
+            f"127.0.0.1:{AGG_PORT}",
+            "--port",
+            str(MESHCORE_BRIDGE_PORT),
+        ]
+        bridge_proc = _start_process(bridge_cmd, "tmp/meshcore_bridge.log")
+        if not _wait_tcp(MESHCORE_BRIDGE_PORT):
+            _err("meshcore_bridge failed (see tmp/meshcore_bridge.log)")
+            _stop_process(bridge_proc)
+            _stop_process(agg_proc)
+            _stop_process(binary_proc)
+            sys.exit(1)
+        _info("meshcore_bridge ready")
+    else:
+        _info(
+            f"Attaching to already-running stack "
+            f"(trx:{TRX_PORT} agg:{AGG_PORT} bridge:{MESHCORE_BRIDGE_PORT})"
+        )
 
     # 3. Connect to Heltec via meshcore_py (same as tx mode)
     companion = MeshCoreCompanion()
