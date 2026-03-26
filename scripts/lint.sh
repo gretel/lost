@@ -25,10 +25,12 @@ info() { echo "=== $* ==="; }
     "compile_commands.json not found. Reconfigure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
 
 collect_changed_files() {
-    git diff $1 --name-only --diff-filter=d -- '*.cpp' '*.hpp' '*.h' 2>/dev/null || true
+    git diff "$1" --name-only --diff-filter=d -- '*.cpp' '*.hpp' '*.h' 2>/dev/null || true
 }
 
 collect_all_files() {
+    # PROJECT_DIRS is intentionally word-split (space-separated list of dirs)
+    # shellcheck disable=SC2086
     find $PROJECT_DIRS -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) 2>/dev/null || true
 }
 
