@@ -417,7 +417,8 @@ def render(s: State) -> None:
 
     lbl_w = 8
     spec_w = max(10, term_w - lbl_w)
-    body_h = max(2, term_h - HEADER_LINES)
+    # -1 safety margin so bars never write into header or footer on resize races
+    body_h = max(2, term_h - HEADER_LINES - 1)
 
     # EMA-smoothed energy for color gradient; raw energy for bar heights
     col_e_smooth = _resample(s.energy, spec_w)
@@ -479,19 +480,6 @@ def render(s: State) -> None:
         label = f"{avg_freq:.1f}"
         det_labels[median_col] = (label, _ratio_color(best_ratio))
 
-    # Build vertical label overlay map: (row, col) → (char, color)
-    # Labels are anchored at the TOP of the bar and go downward inside it.
-    vlabel_map: dict[tuple[int, int], tuple[str, str]] = {}
-    for col, (label, lbl_color) in det_labels.items():
-        bh = bar_h[min(col, len(bar_h) - 1)]
-        if bh < 2:
-            continue  # bar too short for label
-        bar_top_row = body_h - bh
-        for i, ch in enumerate(label):
-            r = bar_top_row + i
-            if r < body_h:
-                vlabel_map[(r, col)] = (ch, lbl_color)
-
     # Peak hold: collect per-column peak rows, then cluster adjacent columns
     _peak_raw: dict[int, int] = {}  # col → peak_row (highest = smallest row)
     mono_now = time.monotonic()
@@ -507,7 +495,8 @@ def render(s: State) -> None:
             _peak_raw[col] = peak_row
 
     # Cluster adjacent peak hold columns (±2) → single marker at median
-    peak_hold_rows: dict[int, int] = {}
+    # peak_hold_rows: col → (row, freq_label, label_color)
+    peak_hold_rows: dict[int, tuple[int, str, str]] = {}
     if _peak_raw:
         sorted_peaks = sorted(_peak_raw.items())
         pk_clusters: list[list[tuple[int, int]]] = []
@@ -519,7 +508,18 @@ def render(s: State) -> None:
         for cluster in pk_clusters:
             median_col = cluster[len(cluster) // 2][0]
             best_row = min(c[1] for c in cluster)  # highest peak
-            peak_hold_rows[median_col] = best_row
+            # Attach freq label from det_labels if available for this cluster
+            label, lbl_color = det_labels.get(median_col, ("", C_MAGENTA))
+            if not label:
+                # fall back: search nearby cols within ±3
+                for dc in range(1, 4):
+                    for mc in (median_col - dc, median_col + dc):
+                        if mc in det_labels:
+                            label, lbl_color = det_labels[mc]
+                            break
+                    if label:
+                        break
+            peak_hold_rows[median_col] = (best_row, label, lbl_color)
 
     out: list[str] = ["\033[H"]
     out.append(_render_header(s, term_w))
@@ -551,24 +551,35 @@ def render(s: State) -> None:
             label = ""
         out.append(f"{C_GRAY}{label:>{lbl_w}}{C_RST}")
 
-        # RLE fast path with magenta highlight, vertical labels, and peak hold
+        # Build per-column char map for this row from peak hold markers + labels.
+        # peak_hold_rows: col → (marker_row, freq_label, color)
+        row_overlays: dict[int, tuple[str, str]] = {}  # col → (char, color)
+        for mc, (marker_row, freq_label, lbl_color) in peak_hold_rows.items():
+            if marker_row == row:
+                row_overlays[mc] = ("\u25bc", C_MAGENTA)  # ▼ at marker row
+            if freq_label and marker_row - 1 == row:
+                # Freq label one row above the ▼, left-anchored at marker col
+                for i, ch in enumerate(freq_label):
+                    c = mc + i
+                    if 0 <= c < n_cols and c not in row_overlays:
+                        row_overlays[c] = (ch, lbl_color)
+
+        # RLE fast path with magenta highlight and peak hold markers
         threshold = body_h - row
         prev_color: str = ""
         run_len = 0
         for col in range(n_cols):
             has_bar = bar_h[col] >= threshold and col_e_raw[col] > 1e-15
+            overlay = row_overlays.get(col)
 
-            # Check for vertical label overlay INSIDE the bar
-            vlabel = vlabel_map.get((row, col))
-            if vlabel and has_bar:
-                # Flush pending RLE run
+            if overlay and not has_bar:
+                # Overlay (marker or label) in empty space above the bar
                 if run_len:
-                    out.append(f"{prev_color}{_BAR * run_len}")
+                    out.append(f"{prev_color}{_BAR * run_len}{C_RST}")
                     prev_color = ""
                     run_len = 0
-                ch, _lc = vlabel
-                # Bold white character on magenta background (inside bar)
-                out.append(f"\033[48;5;53m{C_WHITE}{C_BOLD}{ch}{C_RST}")
+                ch, oc = overlay
+                out.append(f"{oc}{ch}{C_RST}")
             elif has_bar:
                 cc = C_MAGENTA if col in det_cols else col_color[col]
                 if cc == prev_color:
@@ -578,13 +589,6 @@ def render(s: State) -> None:
                         out.append(f"{prev_color}{_BAR * run_len}")
                     prev_color = cc
                     run_len = 1
-            elif peak_hold_rows.get(col) == row:
-                # Peak hold marker: thin bright line above the bar
-                if run_len:
-                    out.append(f"{prev_color}{_BAR * run_len}{C_RST}")
-                    prev_color = ""
-                    run_len = 0
-                out.append(f"{C_MAGENTA}\u25bc{C_RST}")  # ▼ magenta triangle
             else:
                 if run_len:
                     out.append(f"{prev_color}{_BAR * run_len}{C_RST}")
