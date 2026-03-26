@@ -108,7 +108,8 @@ class State:
     """Spectrum and sweep state accumulated from CBOR messages."""
 
     def __init__(self, ema_alpha: float = EMA_ALPHA) -> None:
-        self.energy: list[float] | None = None
+        self.energy: list[float] | None = None  # EMA-smoothed (for color gradient)
+        self.raw_energy: list[float] | None = None  # unsmoothed (for bar heights)
         self.freq_min: int = 0
         self.freq_step: int = 62500
         self.n_channels: int = 0
@@ -145,6 +146,9 @@ class State:
     def on_spectrum(self, msg: dict[str, Any]) -> None:
         n = msg["n_channels"]
         raw = list(struct.unpack(f"<{n}f", msg["channels"]))
+
+        # raw_energy: unsmoothed — used for bar heights (actual power level)
+        self.raw_energy = raw
 
         if self.energy is None or len(self.energy) != n:
             self.energy = raw
@@ -406,7 +410,7 @@ def render_header(s: State) -> None:
 
 def render(s: State) -> None:
     """Full redraw: status + marker row + frequency axis + bar chart + detection log."""
-    if s.energy is None:
+    if s.energy is None or s.raw_energy is None:
         return
 
     term_w, term_h = _term_size()
@@ -415,26 +419,35 @@ def render(s: State) -> None:
     spec_w = max(10, term_w - lbl_w)
     body_h = max(2, term_h - HEADER_LINES)
 
-    col_e = _resample(s.energy, spec_w)
-    n_cols = len(col_e)
+    # EMA-smoothed energy for color gradient; raw energy for bar heights
+    col_e_smooth = _resample(s.energy, spec_w)
+    col_e_raw = _resample(s.raw_energy, spec_w)
+    n_cols = len(col_e_smooth)
 
-    db = [_db(e) for e in col_e]
-    nonzero = sorted(d for d, e in zip(db, col_e) if e > 1e-15)
+    # Scale derived from raw energy so the dB axis reflects actual power
+    db_raw = [_db(e) for e in col_e_raw]
+    nonzero = sorted(d for d, e in zip(db_raw, col_e_raw) if e > 1e-15)
     if nonzero:
         db_min = nonzero[len(nonzero) // 4] - DB_FLOOR_PAD
     else:
         db_min = -100.0
-    db_max = max(db) + DB_HEADROOM
+    db_max = max(db_raw) + DB_HEADROOM
     db_range = max(db_max - db_min, 10.0)
 
-    # Bar heights (integer rows, 0..body_h); clamp to body_h
+    # Bar heights from raw (actual) power level
     bar_h = [
-        min(body_h, max(0, int((db[c] - db_min) / db_range * body_h + 0.5)))
+        min(body_h, max(0, int((db_raw[c] - db_min) / db_range * body_h + 0.5)))
         for c in range(n_cols)
     ]
 
-    # Per-column gradient color from bar height
-    col_color = [_grad_color(bar_h[c] / body_h) for c in range(n_cols)]
+    # Per-column gradient color from smoothed energy (nicer visuals)
+    db_smooth = [_db(e) for e in col_e_smooth]
+    db_min_s = min(db_smooth)
+    db_max_s = max(db_smooth)
+    db_range_s = max(db_max_s - db_min_s, 10.0)
+    col_color = [
+        _grad_color((db_smooth[c] - db_min_s) / db_range_s) for c in range(n_cols)
+    ]
 
     # Detection columns for magenta highlight
     det_cols: set[int] = set()
@@ -546,7 +559,7 @@ def render(s: State) -> None:
         prev_color: str = ""
         run_len = 0
         for col in range(n_cols):
-            has_bar = bar_h[col] >= threshold and col_e[col] > 1e-15
+            has_bar = bar_h[col] >= threshold and col_e_raw[col] > 1e-15
 
             # Check for vertical label overlay INSIDE the bar
             vlabel = vlabel_map.get((row, col))
