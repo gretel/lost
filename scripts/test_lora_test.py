@@ -38,7 +38,7 @@ class TestConfigPoint(unittest.TestCase):
 class TestPointLabel(unittest.TestCase):
     def test_default_power(self):
         p = ConfigPoint(sf=8, bw=62500, freq_mhz=869.618)
-        self.assertEqual(point_label(p), "SF8/BW62k@869.618")
+        self.assertEqual(point_label(p), "SF8/BW62k@869.618 2dBm")
 
     def test_custom_power(self):
         p = ConfigPoint(sf=12, bw=125000, freq_mhz=863.5, tx_power=-4)

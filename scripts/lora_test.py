@@ -169,11 +169,17 @@ MATRICES: dict[str, list[ConfigPoint]] = {
     # Official MeshCore regional presets
     "meshcore_presets": [
         ConfigPoint(
-            sf=8, bw=62500, freq_mhz=869.618, cr=8
+            sf=8, bw=62500, freq_mhz=869.618, cr=8, tx_power=10
         ),  # EU/UK Narrow (Recommended)
-        ConfigPoint(sf=11, bw=250000, freq_mhz=869.525, cr=5),  # EU/UK Long Range
-        ConfigPoint(sf=10, bw=250000, freq_mhz=869.525, cr=5),  # EU/UK Medium Range
-        ConfigPoint(sf=7, bw=62500, freq_mhz=869.525, cr=5),  # Czech Republic Narrow
+        ConfigPoint(
+            sf=11, bw=250000, freq_mhz=869.525, cr=5, tx_power=10
+        ),  # EU/UK Long Range
+        ConfigPoint(
+            sf=10, bw=250000, freq_mhz=869.525, cr=5, tx_power=10
+        ),  # EU/UK Medium Range
+        ConfigPoint(
+            sf=7, bw=62500, freq_mhz=869.525, cr=5, tx_power=10
+        ),  # Czech Republic Narrow
     ],
     # LoRaWAN EU868 channels (generic LoRa detection, sync-word agnostic)
     "lorawan_eu": [
@@ -334,7 +340,7 @@ FREQ_TOL = 200e3  # Hz — accept events within ±200 kHz of TX freq
 
 def point_label(p: ConfigPoint) -> str:
     bw_k = p.bw / 1000
-    pwr = f" {p.tx_power}dBm" if p.tx_power != 2 else ""
+    pwr = f" {p.tx_power}dBm"
     cr = f" CR{p.cr}" if p.cr != 8 else ""
     return f"SF{p.sf}/BW{bw_k:.0f}k@{p.freq_mhz:.3f}{pwr}{cr}"
 
