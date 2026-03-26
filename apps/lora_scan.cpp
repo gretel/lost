@@ -615,17 +615,13 @@ static void emitSpectrumCbor(
     cb::encode_text(buf, "detections");
     cb::encode_array_begin(buf, detections.size());
     for (const auto& det : detections) {
-        cb::encode_map_begin(buf, 7);
+        const double ratio = std::max(det.peak_ratio_up, det.peak_ratio_dn);
+        const double k = det.bw * det.bw / static_cast<double>(1U << det.sf_detected);
+        cb::encode_map_begin(buf, 4);
         cb::kv_uint(buf, "freq", static_cast<uint64_t>(det.freq));
-        cb::kv_uint(buf, "sf", det.sf_detected);
-        cb::kv_uint(buf, "bw", static_cast<uint64_t>(det.bw));
-        cb::kv_float64(buf, "ratio", std::max(det.peak_ratio_up, det.peak_ratio_dn));
-        cb::kv_float64(buf, "ratio_up", det.peak_ratio_up);
-        cb::kv_float64(buf, "ratio_dn", det.peak_ratio_dn);
-        const char* chirp = (det.up_detected && det.dn_detected) ? "both"
-                          : det.dn_detected                     ? "dn"
-                          :                                       "up";
-        cb::kv_text(buf, "chirp", chirp);
+        cb::kv_float64(buf, "ratio", ratio);
+        cb::kv_float64(buf, "chirp_slope", k);
+        cb::kv_uint(buf, "probe_bw", static_cast<uint64_t>(det.bw));
     }
 
     sendCbor(buf);
@@ -702,11 +698,11 @@ static void emitL2ProbeCbor(uint32_t sweep, double freq, uint32_t durationMs,
     cb::encode_text(buf, "results");
     cb::encode_array_begin(buf, results.size());
     for (const auto& r : results) {
-        cb::encode_map_begin(buf, 4);
-        cb::kv_uint(buf, "bw", static_cast<uint64_t>(r.bw));
-        cb::kv_uint(buf, "sf", r.sf);
+        const double k = r.bw * r.bw / static_cast<double>(1U << r.sf);
+        cb::encode_map_begin(buf, 3);
         cb::kv_float64(buf, "ratio", r.ratio);
-        cb::kv_text(buf, "chirp", r.chirp);
+        cb::kv_float64(buf, "chirp_slope", k);
+        cb::kv_uint(buf, "probe_bw", static_cast<uint64_t>(r.bw));
     }
     sendCbor(buf);
 }
@@ -755,7 +751,7 @@ static std::string ts_short() {
 // ─── streaming scan mode ──────────────────────────────────────────────────────
 
 // Convert a DataSet from the streaming pipeline to legacy CBOR and send via UDP/stdout.
-static void emitDataSetCbor(const gr::DataSet<float>& ds) {
+static void emitDataSetCbor(const gr::DataSet<float>& ds, uint64_t overflows = 0) {
     if (ds.meta_information.empty()) return;
     const auto& meta = ds.meta_information[0];
 
@@ -800,15 +796,15 @@ static void emitDataSetCbor(const gr::DataSet<float>& ds) {
 
     // --- Parse detections from indexed metadata fields ---
     const auto nDet = static_cast<std::size_t>(getInt("n_det"));
-    struct Det { uint64_t freq; uint64_t sf; uint64_t bw; double ratio; };
+    struct Det { uint64_t freq; double ratio; double chirp_slope; uint64_t probe_bw; };
     std::vector<Det> detections;
     for (std::size_t i = 0; i < nDet; ++i) {
         const auto prefix = std::string("det") + std::to_string(i) + "_";
         Det d;
-        d.freq  = static_cast<uint64_t>(getMetaDouble(prefix + "freq"));
-        d.sf    = static_cast<uint64_t>(getInt(prefix + "sf"));
-        d.bw    = static_cast<uint64_t>(getMetaFloat(prefix + "bw"));
-        d.ratio = static_cast<double>(getMetaFloat(prefix + "ratio"));
+        d.freq        = static_cast<uint64_t>(getMetaDouble(prefix + "freq"));
+        d.ratio       = static_cast<double>(getMetaFloat(prefix + "ratio"));
+        d.chirp_slope = static_cast<double>(getMetaFloat(prefix + "chirp_slope"));
+        d.probe_bw    = static_cast<uint64_t>(getMetaFloat(prefix + "probe_bw"));
         detections.push_back(d);
     }
 
@@ -845,9 +841,9 @@ static void emitDataSetCbor(const gr::DataSet<float>& ds) {
         for (const auto& d : detections) {
             cb::encode_map_begin(buf, 4);
             cb::kv_uint(buf, "freq", d.freq);
-            cb::kv_uint(buf, "sf", d.sf);
-            cb::kv_uint(buf, "bw", d.bw);
             cb::kv_float64(buf, "ratio", d.ratio);
+            cb::kv_float64(buf, "chirp_slope", d.chirp_slope);
+            cb::kv_uint(buf, "probe_bw", d.probe_bw);
         }
 
         sendCbor(buf);
@@ -866,7 +862,7 @@ static void emitDataSetCbor(const gr::DataSet<float>& ds) {
         cb::kv_uint(buf, "detections", static_cast<uint64_t>(nDet));
         cb::kv_uint(buf, "hot_count", static_cast<uint64_t>(hotIndices.size()));
         cb::kv_uint(buf, "l1_snapshots", static_cast<uint64_t>(getInt("n_snapshots")));
-        cb::kv_uint(buf, "overflows", static_cast<uint64_t>(0));  // TODO: wire overflow count
+        cb::kv_uint(buf, "overflows", overflows);
 
         sendCbor(buf);
     }
@@ -903,12 +899,7 @@ static int streaming_main(ScanSetConfig& cfg) {
 
     // Build streaming scan graph
     gr::Graph graph;
-    auto& scanSink = lora_graph::build_streaming_scan_graph(graph, cfg);
-
-    // Wire CBOR output callback (called from scheduler thread)
-    scanSink._onDataSet = [](const gr::DataSet<float>& ds) {
-        emitDataSetCbor(ds);
-    };
+    lora_graph::build_streaming_scan_graph(graph, cfg);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> sched;
     sched.timeout_inactivity_count = 1U;
@@ -920,8 +911,27 @@ static int streaming_main(ScanSetConfig& cfg) {
         return 1;
     }
 
-    // Find SoapySource for overflow counter
+    // Find blocks post-exchange (original graph references are dangling)
     auto soapy_source = lora_graph::find_soapy_source(sched.blocks());
+    auto* scanSink    = lora_graph::find_scan_sink(sched.blocks());
+    if (!scanSink) {
+        gr::lora::log_ts("error", "lora_scan", "ScanSink not found in graph");
+        return 1;
+    }
+
+    // Wire CBOR output callback — captures soapy_source for live overflow count.
+    // The callback runs on the scheduler thread (via ScanSink._onDataSet).
+    scanSink->_onDataSet = [&soapy_source](const gr::DataSet<float>& ds) {
+        uint64_t ovf = 0;
+        if (soapy_source) {
+            using SoapyType = gr::blocks::soapy::SoapyBlock<cf32, 1UL>;
+            auto* wrapper = dynamic_cast<gr::BlockWrapper<SoapyType>*>(soapy_source.get());
+            if (wrapper) {
+                ovf = wrapper->blockRef().totalOverflowCount();
+            }
+        }
+        emitDataSetCbor(ds, ovf);
+    };
 
     if (savedStdout >= 0) {
         dup2(savedStdout, STDOUT_FILENO);

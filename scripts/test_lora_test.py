@@ -205,7 +205,12 @@ class TestCollectScan(unittest.TestCase):
             {
                 "type": "scan_spectrum",
                 "detections": [
-                    {"freq": tx, "ratio": 42.5, "sf": 8},
+                    {
+                        "freq": tx,
+                        "ratio": 42.5,
+                        "chirp_slope": 15259,
+                        "probe_bw": 62500,
+                    },
                 ],
             },
         ]
@@ -215,7 +220,7 @@ class TestCollectScan(unittest.TestCase):
         self.assertEqual(result.overflows, 1)
         self.assertEqual(result.det_count, 1)
         self.assertEqual(result.best_ratio, 42.5)
-        self.assertEqual(result.best_sf, 8)
+        self.assertEqual(result.best_chirp_slope, 15259)
 
     def test_freq_filter_scan(self):
         result = PointResult(config={})
@@ -223,29 +228,49 @@ class TestCollectScan(unittest.TestCase):
             {
                 "type": "scan_spectrum",
                 "detections": [
-                    {"freq": 866.0e6, "ratio": 50.0, "sf": 10},
+                    {
+                        "freq": 866.0e6,
+                        "ratio": 50.0,
+                        "chirp_slope": 15259,
+                        "probe_bw": 62500,
+                    },
                 ],
             },
         ]
         _collect_scan(result, events, 869.618e6)
         self.assertEqual(result.det_count, 0)
 
-    def test_mode_sf(self):
-        """best_sf should be the most common SF, not the highest ratio."""
+    def test_best_chirp_slope(self):
+        """best_chirp_slope should be the max chirp_slope among detections."""
         result = PointResult(config={})
         tx = 869.618e6
         events = [
             {
                 "type": "scan_spectrum",
                 "detections": [
-                    {"freq": tx, "ratio": 100.0, "sf": 12},
-                    {"freq": tx, "ratio": 30.0, "sf": 8},
-                    {"freq": tx, "ratio": 35.0, "sf": 8},
+                    {
+                        "freq": tx,
+                        "ratio": 100.0,
+                        "chirp_slope": 244141,
+                        "probe_bw": 250000,
+                    },
+                    {
+                        "freq": tx,
+                        "ratio": 30.0,
+                        "chirp_slope": 15259,
+                        "probe_bw": 62500,
+                    },
+                    {
+                        "freq": tx,
+                        "ratio": 35.0,
+                        "chirp_slope": 15259,
+                        "probe_bw": 62500,
+                    },
                 ],
             },
         ]
         _collect_scan(result, events, tx)
-        self.assertEqual(result.best_sf, 8)  # mode, not max-ratio
+        self.assertEqual(result.best_chirp_slope, 244141)
 
 
 class TestBuildSummary(unittest.TestCase):

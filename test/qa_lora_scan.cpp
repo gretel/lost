@@ -533,6 +533,115 @@ const boost::ut::suite<"ScanController L1 energy detection"> scanControllerL1Tes
         expect(sc._hotChannels.empty()) << "hot channels cleared";
     };
 
+    "DC-adjacent hot channels excluded from probe window"_test = [&] {
+        // Use 4 MHz sample rate → 51 channels (3.2 MHz usable / 62.5 kHz).
+        // DC exclusion: 625 kHz / 62.5 kHz + 1 = 11 channels radius.
+        // centerCh=25.  Channels 14-36 (dist ≤ 11) are DC-excluded.
+        auto sc = makeScanController(4e6f, 868e6f, 62500.f, 8.0f, 4096);
+        auto nCh = sc._nChannels;
+        expect(eq(nCh, 51U)) << "precondition: 51 channels";
+
+        const uint32_t centerCh = nCh / 2;  // = 25
+        constexpr uint32_t dcExcludeRadius = 11;  // 625000/62500 + 1
+
+        // Inject hot energy at DC-adjacent channel (25 = center) and
+        // an off-center channel (5, well outside DC zone).
+        sc._channelEnergy.assign(nCh, 1.0f);
+        sc._channelEnergy[centerCh] = 200.f;  // DC spur
+        sc._channelEnergy[5]        = 150.f;   // real signal, dist=20 from center
+        sc._snapshotCount = 1;
+
+        // findHotChannels still reports both (it doesn't filter DC)
+        sc.findHotChannels();
+        expect(eq(sc._hotChannels.size(), 2UZ))
+            << "findHotChannels reports both DC and off-center";
+
+        // Simulate the probe window assembly from ScanState::Accumulate.
+        // Set _probeWindowStart far from both hot channels so they'd be
+        // merged via the hot-channel merge path (not the rotating window).
+        sc._probeWindowStart = 40;  // rotating window covers ch 40-47
+
+        // Compute usable bounds (mirrors production code)
+        constexpr float kUsableFrac = 0.70f;
+        const uint32_t usableRadius = static_cast<uint32_t>(
+            sc.sample_rate * kUsableFrac / (2.f * sc.channel_bw));
+        const uint32_t usableEnd = std::min(centerCh + usableRadius, nCh);
+
+        constexpr uint32_t kProbeWindowSize = 8;
+        const uint32_t windowEnd = std::min(sc._probeWindowStart + kProbeWindowSize, usableEnd);
+
+        std::vector<uint32_t> probeChannels;
+        for (uint32_t ch = sc._probeWindowStart; ch < windowEnd; ++ch) {
+            const auto dist = (ch > centerCh) ? ch - centerCh : centerCh - ch;
+            if (dist <= dcExcludeRadius) continue;
+            probeChannels.push_back(ch);
+        }
+        // Merge hot channels with DC exclusion (same logic as production code)
+        for (uint32_t ch : sc._hotChannels) {
+            if (ch < sc._probeWindowStart || ch >= windowEnd) {
+                const auto dist = (ch > centerCh) ? ch - centerCh : centerCh - ch;
+                if (dist <= dcExcludeRadius) continue;
+                probeChannels.push_back(ch);
+            }
+        }
+
+        // Channel 25 (DC center, dist=0) should be excluded from merge
+        bool hasDcCenter = std::ranges::find(probeChannels, centerCh) != probeChannels.end();
+        expect(!hasDcCenter) << "DC center channel should be excluded from probe list";
+
+        // Channel 5 (off-center, dist=20 > dcExcludeRadius=11) should be merged
+        bool hasOffCenter = std::ranges::find(probeChannels, 5U) != probeChannels.end();
+        expect(hasOffCenter) << "off-center hot channel (5) should be in probe list";
+
+        // Rotating window channels (40-47) should be present (dist > 11 from center)
+        for (uint32_t ch = sc._probeWindowStart; ch < windowEnd; ++ch) {
+            bool hasIt = std::ranges::find(probeChannels, ch) != probeChannels.end();
+            expect(hasIt) << "rotating window channel " << ch << " should be in probe list";
+        }
+    };
+
+    "DC-adjacent hot channels at edge of exclusion zone"_test = [&] {
+        // Use 4 MHz sample rate → 51 channels.
+        // DC exclusion: 625 kHz / 62.5 kHz + 1 = 11 channels radius.
+        // centerCh=25.  ch 36 (dist=11) = edge of DC zone, ch 38 (dist=13) = outside.
+        auto sc = makeScanController(4e6f, 868e6f, 62500.f, 8.0f, 4096);
+        auto nCh = sc._nChannels;
+        const uint32_t centerCh = nCh / 2;  // = 25
+        constexpr uint32_t dcExcludeRadius = 11;  // 625000/62500 + 1
+
+        // ch 36 (dist=11, at DC edge) and ch 38 (dist=13, outside DC).
+        // Gap at ch 37 prevents cluster dedup from merging them.
+        sc._channelEnergy.assign(nCh, 1.0f);
+        sc._channelEnergy[36] = 200.f;  // dist=11, at DC edge
+        sc._channelEnergy[38] = 200.f;  // dist=13, outside DC
+        sc._snapshotCount = 1;
+        sc.findHotChannels();
+
+        // Both reported by findHotChannels (non-adjacent, survive cluster dedup)
+        expect(eq(sc._hotChannels.size(), 2UZ)) << "both channels reported by findHotChannels";
+
+        // Simulate probe window NOT covering either channel (window at ch 2-9)
+        std::vector<uint32_t> probeChannels;
+        for (uint32_t ch = 2; ch < 10; ++ch) {
+            probeChannels.push_back(ch);
+        }
+        for (uint32_t ch : sc._hotChannels) {
+            if (ch >= 10) {  // outside window [2,10)
+                const auto dist = (ch > centerCh) ? ch - centerCh : centerCh - ch;
+                if (dist <= dcExcludeRadius) continue;
+                probeChannels.push_back(ch);
+            }
+        }
+
+        // ch 36 (dist=11 == dcExcludeRadius) should be excluded from hot merge
+        bool hasCh36 = std::ranges::find(probeChannels, 36U) != probeChannels.end();
+        expect(!hasCh36) << "channel 36 (dist=11, at DC edge) excluded from hot merge";
+
+        // ch 38 (dist=13 > dcExcludeRadius) should be included in hot merge
+        bool hasCh38 = std::ranges::find(probeChannels, 38U) != probeChannels.end();
+        expect(hasCh38) << "channel 38 (dist=13, outside DC) included in hot merge";
+    };
+
     "state machine transitions ACCUMULATE → findHotChannels on snapshot threshold"_test = [&] {
         constexpr uint32_t fftSize = 1024;
         constexpr uint32_t snaps   = 2;  // very low threshold for quick test

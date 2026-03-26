@@ -54,10 +54,10 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     enum class ScanState : uint8_t { Accumulate, Probe, Report };
 
     struct ProbeResult {
-        double   freq{0.0};
-        uint32_t sf{0};
-        float    bw{0.f};
-        float    ratio{0.f};
+        double   freq{0.0};          // channel center frequency (Hz)
+        float    ratio{0.f};         // CAD peak-to-median ratio
+        float    chirp_slope{0.f};   // k = probe_bw² / 2^SF (Hz/s)
+        float    probe_bw{0.f};      // probe bandwidth used (Hz, context only)
     };
 
     // --- internal state ---
@@ -69,6 +69,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     std::vector<float>       _channelEnergy;
     std::vector<uint32_t>    _channelHotCount;   // consecutive sweeps channel was hot
     std::vector<uint32_t>    _hotChannels;
+    std::vector<bool>        _probeIsHot;        // true = L1-hot (all BWs), false = rotating (widest BW only)
     std::size_t              _probeIndex{0};
     std::size_t              _probeBwIndex{0};
     uint32_t                 _sweepCount{0};
@@ -86,6 +87,9 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     std::vector<float>       _window;
 
     std::vector<ChannelActivityDetector> _cadPerBw;
+    std::vector<CascadedDecimator>       _decimatorPerBw;  // FIR channelizer per BW
+    std::vector<cf32>                    _probeNbBuf;       // pre-allocated narrowband output
+    std::vector<cf32>                    _probeWbBuf;       // pre-allocated wideband extract
 
     // DC blocker (embedded, applied before ring buffer push + L1 FFT)
     DCBlocker           _dc;
@@ -121,13 +125,36 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         if (_bws.empty()) _bws = {62500.f};
         _cadPerBw.clear();
         _cadPerBw.reserve(_bws.size());
+        _decimatorPerBw.clear();
+        _decimatorPerBw.reserve(_bws.size());
+
+        // Pre-compute the largest wideband sample count needed for L2 probing
+        // (narrowest BW = highest decimation factor = most wideband samples)
+        constexpr uint32_t kMaxSf     = 12;
+        const uint32_t     cadSamples = (1U << kMaxSf) * 2;  // 8192
+        uint32_t maxWbSamples = 0;
+
         for (float bw : _bws) {
             ChannelActivityDetector cad;
             cad.os_factor = 1U;
             cad.bandwidth = static_cast<uint32_t>(bw);
             cad.initMultiSf();
             _cadPerBw.push_back(std::move(cad));
+
+            // CascadedDecimator: nStages = log2(sample_rate / bw)
+            const auto osFactor = static_cast<uint32_t>(sample_rate / bw);
+            const auto nStages  = static_cast<std::size_t>(std::log2(osFactor));
+            CascadedDecimator dec;
+            dec.init(nStages, cadSamples * osFactor);
+            _decimatorPerBw.push_back(std::move(dec));
+
+            const uint32_t wbSamples = cadSamples * osFactor;
+            maxWbSamples = std::max(maxWbSamples, wbSamples);
         }
+
+        // Pre-allocate probe buffers (avoid per-call heap allocations)
+        _probeWbBuf.reserve(maxWbSamples);
+        _probeNbBuf.reserve(cadSamples);
 
         // L1 FFT window (Hann)
         _window.resize(l1_fft_size);
@@ -207,24 +234,64 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
                 // per sweep, cycling through the full band. L1 hot channels
                 // are merged in so energy-detected signals still get priority.
                 constexpr uint32_t kProbeWindowSize = 8;
-                const uint32_t windowEnd = std::min(_probeWindowStart + kProbeWindowSize, _nChannels);
 
-                // Build probe list: rotating window + any L1 hot channels
-                std::vector<uint32_t> probeChannels;
-                for (uint32_t ch = _probeWindowStart; ch < windowEnd; ++ch) {
-                    probeChannels.push_back(ch);
+                // Only probe channels within the usable bandwidth (80% of
+                // sample_rate).  Band-edge channels beyond this have severe
+                // anti-aliasing filter roll-off and never contain real signals.
+                // Also skip DC-adjacent channels where the ADC DC spur cluster
+                // (up to ±500 kHz skirt on AD9361) produces false hot channels.
+                const uint32_t centerCh = _nChannels / 2;
+                constexpr float kDcExcludeHz   = 625000.f;  // ±625 kHz DC spur skirt (10 ch at 62.5 kHz)
+                constexpr float kUsableFrac    = 0.70f;     // conservative usable fraction
+                const uint32_t dcExcludeRadius = static_cast<uint32_t>(
+                    kDcExcludeHz / channel_bw) + 1;
+                const uint32_t usableRadius    = static_cast<uint32_t>(
+                    sample_rate * kUsableFrac / (2.f * channel_bw));
+                const uint32_t usableStart     = (centerCh > usableRadius)
+                    ? centerCh - usableRadius : 0;
+                const uint32_t usableEnd       = std::min(centerCh + usableRadius, _nChannels);
+
+                // Advance rotating window, skipping DC-excluded and band-edge channels
+                if (_probeWindowStart < usableStart || _probeWindowStart >= usableEnd) {
+                    _probeWindowStart = usableStart;
                 }
-                // Merge L1 hot channels not already in the window
+                // Skip past DC-excluded zone
+                uint32_t wStart = _probeWindowStart;
+                if (wStart >= centerCh - dcExcludeRadius && wStart <= centerCh + dcExcludeRadius) {
+                    wStart = centerCh + dcExcludeRadius + 1;
+                }
+                const uint32_t windowEnd = std::min(wStart + kProbeWindowSize, usableEnd);
+
+                // Build probe list: rotating window + any L1 hot channels.
+                // Rotating channels get probed at widest BW only (cheapest).
+                // L1-hot channels get probed at all BWs (narrowest first).
+                std::vector<uint32_t> probeChannels;
+                std::vector<bool>     probeHot;
+                for (uint32_t ch = wStart; ch < windowEnd; ++ch) {
+                    // Skip DC-excluded channels in the window
+                    const auto dist = (ch > centerCh) ? ch - centerCh : centerCh - ch;
+                    if (dist <= dcExcludeRadius) continue;
+                    probeChannels.push_back(ch);
+                    probeHot.push_back(false);  // rotating window = widest BW only
+                }
+                // Merge L1 hot channels not already in the window,
+                // excluding DC-adjacent channels (persistent ADC DC spur)
                 for (uint32_t ch : _hotChannels) {
-                    if (ch < _probeWindowStart || ch >= windowEnd) {
+                    if (ch < wStart || ch >= windowEnd) {
+                        const auto dist = (ch > centerCh)
+                            ? ch - centerCh : centerCh - ch;
+                        if (dist <= dcExcludeRadius) continue;
+                        if (ch < usableStart || ch >= usableEnd) continue;
                         probeChannels.push_back(ch);
+                        probeHot.push_back(true);  // L1-hot = all BWs
                     }
                 }
 
-                // Advance window for next sweep (wrap around)
-                _probeWindowStart = windowEnd >= _nChannels ? 0 : windowEnd;
+                // Advance window for next sweep (wrap within usable range)
+                _probeWindowStart = (windowEnd >= usableEnd) ? usableStart : windowEnd;
 
                 _hotChannels = std::move(probeChannels);
+                _probeIsHot  = std::move(probeHot);
                 _probeIndex   = 0;
                 _probeBwIndex = 0;
                 _probeResults.clear();
@@ -386,11 +453,20 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
 
         const uint32_t ch = _hotChannels[_probeIndex];
         const double channelFreq = channelCenterFreq(ch);
+        const bool isHot = (_probeIndex < _probeIsHot.size()) && _probeIsHot[_probeIndex];
 
-        // Initialize best result for this channel on first BW
+        // Initialize best result for this channel on first BW.
+        // L1-hot channels: probe all BWs (narrowest first for correct SF ID).
+        // Rotating window channels: probe widest BW only (cheapest — os is smallest,
+        // so the FIR cascade has fewer stages and processes fewer wideband samples).
+        // BW62.5k at os=256 processes 2M samples through 8 FIR stages (~0.6ms);
+        // BW250k at os=64 processes 524k samples through 6 stages (~0.05ms).
         if (_probeBwIndex == 0) {
             _currentBest = ProbeResult{};
             _currentBest.freq = channelFreq;
+            if (!isHot && _bws.size() > 1) {
+                _probeBwIndex = _bws.size() - 1;  // widest BW only
+            }
         }
 
         if (_probeBwIndex < _bws.size() && _currentBest.ratio < min_ratio) {
@@ -399,26 +475,38 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             // chirp-slope equivalents at different SFs due to k = BW²/2^SF).
             const float probeBw = _bws[_probeBwIndex];
             auto& cad = _cadPerBw[_probeBwIndex];
+            auto& dec = _decimatorPerBw[_probeBwIndex];
 
             constexpr uint32_t kMaxSf     = 12;
-            const uint32_t     fftSize    = 1U << kMaxSf;
-            const uint32_t     cadSamples = fftSize * 2;
+            const uint32_t     cadSamples = (1U << kMaxSf) * 2;
             const auto         osFactor   = static_cast<uint32_t>(sample_rate / probeBw);
             const uint32_t     wbSamples  = cadSamples * osFactor;
 
-            auto wbIq = _ring.recent(wbSamples);
-            if (!wbIq.empty()) {
-                auto nbIq = channelize(wbIq.data(), static_cast<uint32_t>(wbIq.size()),
-                                       channelFreq, static_cast<double>(center_freq),
-                                       static_cast<double>(sample_rate),
-                                       static_cast<double>(probeBw));
+            // Extract wideband IQ from ring buffer into pre-allocated buffer
+            if (_ring.count < wbSamples) { ++_probeBwIndex; return false; }
+            auto wbView = _ring.recentView(wbSamples);
+            if (wbView.first.size() + wbView.second.size() >= wbSamples) {
+                // Linearize the two spans into _probeWbBuf (ring may wrap)
+                _probeWbBuf.resize(wbSamples);
+                std::copy_n(wbView.first.data(), wbView.first.size(), _probeWbBuf.data());
+                if (!wbView.second.empty()) {
+                    std::copy_n(wbView.second.data(), wbView.second.size(),
+                                _probeWbBuf.data() + wbView.first.size());
+                }
 
-                if (nbIq.size() >= cadSamples) {
-                    auto det = cad.detectMultiSf(nbIq.data());
+                // Channelize: fused NCO + cascaded half-band FIR (-45 dB stopband)
+                channelizeFir(_probeWbBuf.data(), wbSamples,
+                              channelFreq, static_cast<double>(center_freq),
+                              static_cast<double>(sample_rate),
+                              dec, _probeNbBuf);
+
+                if (_probeNbBuf.size() >= cadSamples) {
+                    auto det = cad.detectMultiSf(_probeNbBuf.data());
                     if (det.detected && det.best_ratio > _currentBest.ratio) {
-                        _currentBest.sf    = det.sf;
-                        _currentBest.bw    = probeBw;
-                        _currentBest.ratio = det.best_ratio;
+                        _currentBest.ratio      = det.best_ratio;
+                        _currentBest.probe_bw   = probeBw;
+                        _currentBest.chirp_slope = probeBw * probeBw
+                            / static_cast<float>(1U << det.sf);
                     }
                 }
             }
@@ -426,7 +514,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             ++_probeBwIndex;
         }
 
-        // Done if: all BWs tried, or narrowest BW already detected above threshold
+        // Done if: all BWs tried, or detection above threshold
         if (_probeBwIndex >= _bws.size() || _currentBest.ratio >= min_ratio) {
             if (_currentBest.ratio >= min_ratio) {
                 _probeResults.push_back(_currentBest);
@@ -494,10 +582,10 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         for (std::size_t i = 0; i < _probeResults.size(); ++i) {
             const auto& r = _probeResults[i];
             const auto idx = std::to_string(i);
-            ds.meta_information[0][std::pmr::string("det" + idx + "_freq")]  = r.freq;
-            ds.meta_information[0][std::pmr::string("det" + idx + "_sf")]    = static_cast<int64_t>(r.sf);
-            ds.meta_information[0][std::pmr::string("det" + idx + "_bw")]    = static_cast<float>(r.bw);
-            ds.meta_information[0][std::pmr::string("det" + idx + "_ratio")] = static_cast<float>(r.ratio);
+            ds.meta_information[0][std::pmr::string("det" + idx + "_freq")]        = r.freq;
+            ds.meta_information[0][std::pmr::string("det" + idx + "_ratio")]       = static_cast<float>(r.ratio);
+            ds.meta_information[0][std::pmr::string("det" + idx + "_chirp_slope")] = r.chirp_slope;
+            ds.meta_information[0][std::pmr::string("det" + idx + "_probe_bw")]    = r.probe_bw;
         }
 
         outSpan[0] = std::move(ds);

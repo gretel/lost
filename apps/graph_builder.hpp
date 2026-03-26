@@ -289,6 +289,18 @@ inline std::shared_ptr<gr::BlockModel> find_soapy_source(
     return nullptr;
 }
 
+/// Find ScanSink in the scheduler's block list (for wiring callbacks post-exchange).
+inline gr::lora::ScanSink* find_scan_sink(
+        std::span<std::shared_ptr<gr::BlockModel>> blocks) {
+    for (auto& blk : blocks) {
+        if (blk->typeName().find("ScanSink") != std::string_view::npos) {
+            auto* wrapper = dynamic_cast<gr::BlockWrapper<gr::lora::ScanSink>*>(blk.get());
+            if (wrapper) return &wrapper->blockRef();
+        }
+    }
+    return nullptr;
+}
+
 /// Set `_device_serial` on all FrameSink blocks in the scheduler.
 inline void set_device_serial(std::span<std::shared_ptr<gr::BlockModel>> blocks,
                               const std::string& serial) {
@@ -358,6 +370,9 @@ inline ScanGraph build_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg,
 
     auto& tap = graph.emplaceBlock<gr::lora::SpectrumTapBlock>({});
     tap._spectrum = sg.spectrum;
+    // Rate-limit ring push at wideband rates: target ~30 FFTs/s.
+    // At 16 MS/s / 8192-sample chunks = ~1950 calls/s → interval = 64.
+    tap._pushInterval = std::max(1U, static_cast<uint32_t>(cfg.l1_rate / (8192.0 * 30.0)));
 
     auto& null_sink = graph.emplaceBlock<gr::testing::NullSink<cf32>>({});
 
@@ -389,8 +404,8 @@ inline ScanGraph build_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg,
 /// Build the streaming scan graph: SoapySource → ScanController → ScanSink
 /// No hardware retune — L2 uses digital channelization from the wideband stream.
 /// ScanController handles both L1 energy (internal FFT) and L2 CAD.
-/// Returns reference to ScanSink for callback setup (must be set before exchange()).
-inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg) {
+/// Use find_scan_sink() post-exchange to wire the _onDataSet callback.
+inline void build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg) {
     auto ok = [](std::expected<void, gr::Error> r) { return r.has_value(); };
 
     const double centerFreq = cfg.center_freq();
@@ -448,8 +463,6 @@ inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const Sc
     if (!ok(graph.connect<"spectrum_out", "spectrum">(controller, sink))) {
         gr::lora::log_ts("error", "graph", "connect controller.spectrum_out -> sink.spectrum failed");
     }
-
-    return sink;
 }
 
 // ─── Wideband decode graph (lora_trx --wideband) ─────────────────────────────

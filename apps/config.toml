@@ -151,9 +151,9 @@ bws          = [62500, 125000, 250000]  # L2 probe BWs (all three for full cover
 l1_rate      = 16000000                 # L1 wideband sample rate
 master_clock = 32000000                 # FPGA master clock rate
 os_factor    = 4                        # oversampling factor
-min_ratio    = 5.0                      # CAD detection threshold (lowered for streaming box-car channelizer)
+min_ratio    = 5.0                      # CAD detection threshold
 settle_ms    = 5                        # PLL settle delay (ms)
-streaming    = true                     # streaming pipeline (no retune)
+streaming    = true                      # streaming pipeline (no retune)
 # sweeps     = 0                        # 0 = infinite (default)
 # layer1_only = false                   # set true for energy-only mode
 

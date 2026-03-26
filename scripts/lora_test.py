@@ -103,6 +103,7 @@ class ConfigPoint:
     bw: int  # Hz
     freq_mhz: float
     tx_power: int = 2  # dBm
+    cr: int = 8  # coding rate (5-8, where 5=4/5, 8=4/8)
 
 
 # -- Predefined matrices ------------------------------------------------------
@@ -158,6 +159,22 @@ MATRICES: dict[str, list[ConfigPoint]] = {
     "bw250k_sweep": [
         ConfigPoint(sf=sf, bw=250000, freq_mhz=869.618) for sf in [7, 8, 9, 10]
     ],
+    # Official MeshCore regional presets
+    "meshcore_presets": [
+        ConfigPoint(
+            sf=8, bw=62500, freq_mhz=869.618, cr=8
+        ),  # EU/UK Narrow (Recommended)
+        ConfigPoint(sf=11, bw=250000, freq_mhz=869.525, cr=5),  # EU/UK Long Range
+        ConfigPoint(sf=10, bw=250000, freq_mhz=869.525, cr=5),  # EU/UK Medium Range
+        ConfigPoint(sf=7, bw=62500, freq_mhz=869.525, cr=5),  # Czech Republic Narrow
+    ],
+    # LoRaWAN EU868 channels (generic LoRa detection, sync-word agnostic)
+    "lorawan_eu": [
+        ConfigPoint(sf=7, bw=125000, freq_mhz=868.100, cr=5),  # Join CH1
+        ConfigPoint(sf=7, bw=125000, freq_mhz=868.300, cr=5),  # Join CH2
+        ConfigPoint(sf=7, bw=125000, freq_mhz=868.500, cr=5),  # Join CH3
+        ConfigPoint(sf=12, bw=125000, freq_mhz=869.525, cr=5),  # RX2 default
+    ],
 }
 
 
@@ -180,7 +197,7 @@ class PointResult:
     detections: list[dict] = field(default_factory=list)
     det_count: int = 0
     best_ratio: float | None = None
-    best_sf: int | None = None
+    best_chirp_slope: float | None = None
     sweeps: int = 0
     avg_sweep_ms: int = 0
     overflows: int = 0
@@ -300,7 +317,8 @@ FREQ_TOL = 200e3  # Hz — accept events within ±200 kHz of TX freq
 def point_label(p: ConfigPoint) -> str:
     bw_k = p.bw / 1000
     pwr = f" {p.tx_power}dBm" if p.tx_power != 2 else ""
-    return f"SF{p.sf}/BW{bw_k:.0f}k@{p.freq_mhz:.3f}{pwr}"
+    cr = f" CR{p.cr}" if p.cr != 8 else ""
+    return f"SF{p.sf}/BW{bw_k:.0f}k@{p.freq_mhz:.3f}{pwr}{cr}"
 
 
 def _info(msg: str) -> None:
@@ -344,7 +362,7 @@ def run_point(
 
     # Configure companion
     bw_khz = point.bw / 1000.0
-    if not companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8):
+    if not companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=point.cr):
         _err(f"set_radio failed for {point_label(point)}")
         return result
     if not companion.set_tx_power(point.tx_power):
@@ -445,13 +463,8 @@ def _collect_scan(result: PointResult, events: list[dict], tx_freq_hz: float) ->
     if result.detections:
         best = max(result.detections, key=lambda d: d.get("ratio", 0))
         result.best_ratio = round(best.get("ratio", 0.0), 1)
-        sf_counts: dict[int, int] = {}
-        for d in result.detections:
-            sf = d.get("sf", 0)
-            if sf > 0:
-                sf_counts[sf] = sf_counts.get(sf, 0) + 1
-        if sf_counts:
-            result.best_sf = max(sf_counts, key=lambda s: sf_counts[s])
+        slopes = [d.get("chirp_slope", 0) for d in result.detections]
+        result.best_chirp_slope = max(slopes) if slopes else 0
 
 
 # -- SDR TX helpers ------------------------------------------------------------
@@ -727,7 +740,7 @@ async def run_tx_point(
 
     # Configure Heltec radio to receive at this config
     bw_khz = point.bw / 1000.0
-    if not await companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8):
+    if not await companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=point.cr):
         _err(f"set_radio failed for {point_label(point)}")
         return result
 
@@ -897,9 +910,9 @@ async def run_bridge_point(
     # The bridge may not receive the lora_trx config broadcast reliably,
     # so we set its state directly.
     bw_khz = point.bw / 1000.0
-    driver.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8)
+    driver.set_radio(point.freq_mhz, bw_khz, point.sf, cr=point.cr)
     # Update Heltec radio (triggers reboot + auto-reconnect)
-    if not await companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8):
+    if not await companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=point.cr):
         _err(f"  set_radio failed for {point_label(point)}")
         return result
     await asyncio.sleep(SETTLE_S)
@@ -1598,7 +1611,7 @@ def _write_results(
                 "detections": r.detections,
                 "det_count": r.det_count,
                 "best_ratio": r.best_ratio,
-                "best_sf": r.best_sf,
+                "best_chirp_slope": r.best_chirp_slope,
                 "sweeps": r.sweeps,
                 "avg_sweep_ms": r.avg_sweep_ms,
                 "overflows": r.overflows,
