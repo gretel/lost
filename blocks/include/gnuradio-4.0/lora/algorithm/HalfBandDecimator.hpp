@@ -177,8 +177,10 @@ struct HalfBandStage {
         sampleCount += input.size();
     }
 
-    /// Process with per-sample mixing fused into the input.
+    /// Process with per-sample mixing fused into the input (circular delay line).
     /// mixFn(i) returns the mixed sample for index i.
+    /// NOTE: Uses `% 23` per-sample — expensive at high sample rates.
+    /// Prefer processWithMixBatch() for stage 0 in channelizeFir().
     template<typename MixFn>
     void processWithMix(std::size_t count, MixFn&& mixFn, std::vector<cf32>& out) {
         using namespace halfband_detail;
@@ -200,6 +202,53 @@ struct HalfBandStage {
             writePos = (writePos + 1) % kFilterLen;
             ++sampleCount;
         }
+    }
+
+    /// Batch FIR with NCO mixing fused into input loading — no modulo indexing.
+    /// Replaces processWithMix() for stage 0 in channelization.
+    /// Uses the same linear-buffer approach as processBatch(): builds [tail | mixed_input]
+    /// and accesses taps via simple buf[i + k] indexing.
+    /// mixFn(i) returns the mixed sample for input index i.
+    ///
+    /// Requires initBatch() to have been called first (same as processBatch).
+    template<typename MixFn>
+    void processWithMixBatch(std::size_t count, MixFn&& mixFn, std::vector<cf32>& out) {
+        using namespace halfband_detail;
+        constexpr std::size_t kTailLen = kFilterLen - 1;  // 22
+
+        if (count == 0) return;
+
+        // Build linear work buffer: [tail | mixed_input]
+        const std::size_t totalLen = kTailLen + count;
+        _workBuf.resize(totalLen);
+        std::copy(_tail.begin(), _tail.end(), _workBuf.begin());
+
+        // Apply NCO mix while loading input into the work buffer
+        for (std::size_t i = 0; i < count; ++i) {
+            _workBuf[kTailLen + i] = mixFn(i);
+        }
+
+        const cf32* buf = _workBuf.data();
+
+        // FIR: identical to processBatch — linear indexing, no modulo
+        for (std::size_t i = 0; i < count; ++i) {
+            if (((sampleCount + i) & 1U) == 1U) {
+                cf32 acc{0.f, 0.f};
+                for (std::size_t c = 0; c < kCoeffs.size(); ++c) {
+                    const std::size_t k     = c * 2;
+                    const std::size_t kMirr = kFilterLen - 1 - k;
+                    acc += kCoeffs[c] * (buf[i + k] + buf[i + kMirr]);
+                }
+                acc += kCenterTap * buf[i + 11];
+                out.push_back(acc);
+            }
+        }
+
+        // Save tail (last kTailLen samples of workBuf)
+        std::copy(_workBuf.end() - static_cast<std::ptrdiff_t>(kTailLen),
+                  _workBuf.end(), _tail.begin());
+
+        sampleCount += count;
     }
 };
 
@@ -284,10 +333,10 @@ struct CascadedDecimator {
             return;
         }
 
-        // First stage: fused NCO + FIR via lambda
+        // First stage: fused NCO + linear-buffer batch FIR (no % 23)
         scratch0.clear();
         std::size_t idx = 0;
-        stages[0].processWithMix(input.size(),
+        stages[0].processWithMixBatch(input.size(),
             [&](std::size_t) -> cf32 {
                 cf32 s = input[idx] * rot;
                 rot *= step;
@@ -335,8 +384,7 @@ struct CascadedDecimator {
     }
 
     /// Batch-process with NCO mixing fused into stage 0.
-    /// Stage 0 uses the existing processWithMix() (circular, NCO-fused).
-    /// Stages 1+ use processBatch() (linear buffer, no modulo).
+    /// All stages use linear-buffer batch FIR (no modulo indexing).
     void processWithNcoBatch(std::span<const cf32> input, std::vector<cf32>& out,
                              cf32& rot, const cf32& step) {
         if (stages.empty()) {
@@ -348,10 +396,10 @@ struct CascadedDecimator {
             return;
         }
 
-        // Stage 0: fused NCO + FIR via lambda (scalar, same as existing)
+        // Stage 0: fused NCO + linear-buffer batch FIR (no % 23)
         scratch0.clear();
         std::size_t idx = 0;
-        stages[0].processWithMix(input.size(),
+        stages[0].processWithMixBatch(input.size(),
             [&](std::size_t) -> cf32 {
                 cf32 s = input[idx] * rot;
                 rot *= step;
