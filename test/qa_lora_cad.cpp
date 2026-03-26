@@ -26,6 +26,8 @@
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
 #include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
+#include <gnuradio-4.0/lora/algorithm/PreambleId.hpp>
+#include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 #include <gnuradio-4.0/lora/algorithm/utilities.hpp>
 
 using namespace gr::lora::test;
@@ -878,6 +880,199 @@ const boost::ut::suite<"CAD chirp-combined"> combined_tests = [] {
             << "N=4 ratio (" << r4.peak_ratio_up << ") should exceed N=2 (" << r2.peak_ratio_up << ")";
         expect(gt(r8.peak_ratio_up, r4.peak_ratio_up))
             << "N=8 ratio (" << r8.peak_ratio_up << ") should exceed N=4 (" << r4.peak_ratio_up << ")";
+    };
+};
+
+// === Preamble characterization tests =========================================
+
+const boost::ut::suite<"Preamble identification"> preamble_id_tests = [] {
+    using namespace boost::ut;
+
+    "SF8 clean signal: correct SF, sync word 0x12, zero CFO"_test = [] {
+        constexpr uint8_t  kSF   = 8;
+        constexpr uint8_t  kCR   = 4;
+        constexpr uint8_t  kOS   = 4;
+        constexpr uint16_t kSync = 0x12;
+        constexpr uint16_t kPre  = 8;
+        constexpr uint32_t kBW   = 62500;
+
+        const std::vector<uint8_t> payload = {0x12, 0x00, 0xBB, 0x59};
+        auto iq = gr::lora::generate_frame_iq(payload, kSF, kCR, kOS, kSync, kPre,
+                                               /*has_crc=*/true, /*zero_pad=*/0,
+                                               /*ldro=*/2, kBW);
+
+        auto info = gr::lora::characterize_preamble(
+            iq.data(), iq.size(), kSF, kBW, kOS, 868e6, kPre);
+
+        expect(info.valid) << "preamble should be characterized";
+        expect(eq(info.sf, kSF)) << "SF";
+        expect(eq(info.bw, kBW)) << "BW";
+        expect(eq(info.sync_word, kSync)) << "sync_word";
+        expect(std::abs(info.cfo_frac) < 0.5f) << "cfo_frac near zero: " << info.cfo_frac;
+        expect(std::abs(info.cfo_int) <= 1) << "cfo_int near zero: " << info.cfo_int;
+        expect(info.snr_db > 10.f) << "SNR should be high for clean signal: " << info.snr_db;
+        expect(info.preamble_len >= 5U) << "preamble_len: " << info.preamble_len;
+    };
+
+    "SF12 clean signal: correct identification"_test = [] {
+        constexpr uint8_t  kSF   = 12;
+        constexpr uint8_t  kCR   = 4;
+        constexpr uint8_t  kOS   = 4;
+        constexpr uint16_t kSync = 0x12;
+        constexpr uint16_t kPre  = 8;
+        constexpr uint32_t kBW   = 62500;
+
+        const std::vector<uint8_t> payload = {0xAA, 0xBB};
+        auto iq = gr::lora::generate_frame_iq(payload, kSF, kCR, kOS, kSync, kPre,
+                                               /*has_crc=*/true, /*zero_pad=*/0,
+                                               /*ldro=*/2, kBW);
+
+        auto info = gr::lora::characterize_preamble(
+            iq.data(), iq.size(), kSF, kBW, kOS, 868e6, kPre);
+
+        expect(info.valid) << "SF12 preamble should be characterized";
+        expect(eq(info.sf, kSF)) << "SF";
+        expect(eq(info.sync_word, kSync)) << "sync_word";
+        expect(info.snr_db > 10.f) << "SNR: " << info.snr_db;
+    };
+
+    "SF7 clean signal: correct identification"_test = [] {
+        constexpr uint8_t  kSF   = 7;
+        constexpr uint8_t  kCR   = 4;
+        constexpr uint8_t  kOS   = 4;
+        constexpr uint16_t kSync = 0x34;  // LoRaWAN sync word
+        constexpr uint16_t kPre  = 8;
+        constexpr uint32_t kBW   = 125000;
+
+        const std::vector<uint8_t> payload = {0x01, 0x02, 0x03};
+        auto iq = gr::lora::generate_frame_iq(payload, kSF, kCR, kOS, kSync, kPre,
+                                               /*has_crc=*/true, /*zero_pad=*/0,
+                                               /*ldro=*/2, kBW);
+
+        auto info = gr::lora::characterize_preamble(
+            iq.data(), iq.size(), kSF, kBW, kOS, 868e6, kPre);
+
+        expect(info.valid) << "SF7 preamble should be characterized";
+        expect(eq(info.sf, kSF)) << "SF";
+        expect(eq(info.sync_word, kSync)) << "sync_word should be 0x34";
+    };
+
+    "noise-only buffer: valid=false"_test = [] {
+        constexpr uint8_t  kSF = 8;
+        constexpr uint32_t kBW = 62500;
+        constexpr uint8_t  kOS = 4;
+        const uint32_t kN   = 1U << kSF;
+        const uint32_t kSps = kN * kOS;
+
+        // 15 symbols of pure noise
+        std::mt19937 rng(99);
+        std::normal_distribution<float> dist(0.f, 0.01f);
+        std::vector<cf32> noise(15 * kSps);
+        for (auto& s : noise) {
+            s = cf32(dist(rng), dist(rng));
+        }
+
+        auto info = gr::lora::characterize_preamble(
+            noise.data(), noise.size(), kSF, kBW, kOS, 868e6, 8);
+
+        expect(!info.valid) << "noise should not produce valid preamble";
+    };
+
+    "wrong SF: valid=false"_test = [] {
+        constexpr uint8_t  kOS   = 4;
+        constexpr uint16_t kSync = 0x12;
+        constexpr uint16_t kPre  = 8;
+        constexpr uint32_t kBW   = 62500;
+
+        // Generate SF7 signal
+        const std::vector<uint8_t> payload = {0x01};
+        auto iq = gr::lora::generate_frame_iq(payload, /*sf=*/7, /*cr=*/4, kOS, kSync, kPre,
+                                               true, 0, 2, kBW);
+
+        // Try to characterize as SF8 — should fail
+        auto info = gr::lora::characterize_preamble(
+            iq.data(), iq.size(), /*sf=*/8, kBW, kOS, 868e6, kPre);
+
+        expect(!info.valid) << "wrong SF should not produce valid preamble";
+    };
+
+    "SF8 with CFO +200 Hz"_test = [] {
+        constexpr uint8_t  kSF   = 8;
+        constexpr uint8_t  kOS   = 4;
+        constexpr uint16_t kSync = 0x12;
+        constexpr uint16_t kPre  = 8;
+        constexpr uint32_t kBW   = 62500;
+
+        const std::vector<uint8_t> payload = {0x12, 0x00, 0xBB, 0x59};
+        auto iq = gr::lora::generate_frame_iq(payload, kSF, 4, kOS, kSync, kPre,
+                                               true, 0, 2, kBW);
+
+        // Apply +200 Hz CFO
+        const double cfo_hz = 200.0;
+        const double sample_rate = static_cast<double>(kBW) * kOS;
+        for (std::size_t n = 0; n < iq.size(); n++) {
+            double phase = 2.0 * std::numbers::pi * cfo_hz
+                         / sample_rate * static_cast<double>(n);
+            iq[n] *= cf32(static_cast<float>(std::cos(phase)),
+                          static_cast<float>(std::sin(phase)));
+        }
+
+        auto info = gr::lora::characterize_preamble(
+            iq.data(), iq.size(), kSF, kBW, kOS, 868e6, kPre);
+
+        expect(info.valid) << "should characterize with CFO";
+        expect(eq(info.sync_word, kSync)) << "sync_word despite CFO";
+        // CFO = 200 Hz at BW=62500, bin_width=62500/256=244 Hz → ~0.82 bins
+        // Should appear as cfo_frac ≈ 0.82 or split between cfo_int and cfo_frac
+        float total_cfo_bins = static_cast<float>(cfo_hz * (1U << kSF) / kBW);
+        float measured_cfo = info.cfo_frac + static_cast<float>(info.cfo_int);
+        expect(std::abs(measured_cfo - total_cfo_bins) < 1.0f)
+            << "CFO estimate: expected ~" << total_cfo_bins << " bins, got " << measured_cfo;
+    };
+
+    "SF8 with AWGN +10 dB"_test = [] {
+        constexpr uint8_t  kSF   = 8;
+        constexpr uint8_t  kOS   = 4;
+        constexpr uint16_t kSync = 0x12;
+        constexpr uint16_t kPre  = 8;
+        constexpr uint32_t kBW   = 62500;
+
+        const std::vector<uint8_t> payload = {0x12, 0x00, 0xBB, 0x59};
+        auto iq = gr::lora::generate_frame_iq(payload, kSF, 4, kOS, kSync, kPre,
+                                               true, 0, 2, kBW);
+
+        // Add AWGN at +10 dB SNR
+        float signal_power = 0.f;
+        for (const auto& s : iq) {
+            signal_power += s.real() * s.real() + s.imag() * s.imag();
+        }
+        signal_power /= static_cast<float>(iq.size());
+        float noise_power = signal_power * 0.1f;  // 10 dB below signal
+
+        std::mt19937 rng(42);
+        std::normal_distribution<float> dist(0.f, std::sqrt(noise_power / 2.f));
+        for (auto& s : iq) {
+            s += cf32(dist(rng), dist(rng));
+        }
+
+        auto info = gr::lora::characterize_preamble(
+            iq.data(), iq.size(), kSF, kBW, kOS, 868e6, kPre);
+
+        expect(info.valid) << "should characterize at +10 dB SNR";
+        expect(eq(info.sync_word, kSync)) << "sync_word at +10 dB";
+        expect(info.snr_db > 5.f) << "SNR estimate: " << info.snr_db;
+    };
+
+    "buffer too small: valid=false"_test = [] {
+        // Only 3 symbols — way too short for preamble detection
+        constexpr uint32_t kN = 256;
+        constexpr uint32_t kSps = kN * 4;
+        std::vector<cf32> short_buf(3 * kSps, cf32(0.f, 0.f));
+
+        auto info = gr::lora::characterize_preamble(
+            short_buf.data(), short_buf.size(), 8, 62500, 4, 868e6, 8);
+
+        expect(!info.valid) << "too-short buffer should fail";
     };
 };
 

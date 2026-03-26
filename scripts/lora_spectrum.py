@@ -35,6 +35,7 @@ EMA_ALPHA = 0.3  # spectrum smoothing factor
 DB_HEADROOM = 1.0  # dB padding above peak
 DB_FLOOR_PAD = 3.0  # dB padding below noise floor (25th percentile)
 ANCHOR_TTL = 3.0  # seconds to keep detection anchors visible
+PEAK_HOLD_S = 5.0  # seconds to hold peak detection bar height
 HEADER_LINES = 2 + DET_HISTORY  # header + freq axis + footer lines
 
 # ANSI helpers — xterm-256 for reliable rendering on any background
@@ -134,6 +135,13 @@ class State:
         # kept for ANCHOR_TTL seconds so labels persist across sweeps
         self.active_dets: list[tuple[float, dict[str, Any]]] = []
 
+        # Peak hold: per-channel peak dB values that decay slowly.
+        # When a detection occurs, the peak hold is set to the current dB
+        # at the detection column and drawn as a bright horizontal line
+        # that slowly drops over PEAK_HOLD_S seconds.
+        # List of (column_index_in_channels, peak_db, monotonic_time)
+        self.peak_holds: list[tuple[int, float, float]] = []
+
     def on_spectrum(self, msg: dict[str, Any]) -> None:
         n = msg["n_channels"]
         raw = list(struct.unpack(f"<{n}f", msg["channels"]))
@@ -156,9 +164,21 @@ class State:
         for det in dets:
             self.active_dets.append((mono, det))
             self.det_history.append((wall, sweep, det))
+            # Register peak hold at the detection's channel index
+            freq = det.get("freq", 0)
+            if self.freq_step > 0 and freq > 0:
+                ch = int((freq - self.freq_min) / self.freq_step + 0.5)
+                ch = max(0, min(ch, n - 1))
+                if self.energy:
+                    db_val = _db(self.energy[ch])
+                    self.peak_holds.append((ch, db_val, mono))
         # Prune anchors older than ANCHOR_TTL
         self.active_dets = [
             (t, d) for t, d in self.active_dets if mono - t < ANCHOR_TTL
+        ]
+        # Prune peak holds older than PEAK_HOLD_S
+        self.peak_holds = [
+            (ch, db, t) for ch, db, t in self.peak_holds if mono - t < PEAK_HOLD_S
         ]
         self.det_history = self.det_history[-DET_HISTORY:]
 
@@ -232,6 +252,8 @@ def _grad_color(frac: float) -> str:
 
 def _bw_short(bw_hz: float) -> str:
     """Format BW as short string: 62.5k, 125k, 250k, 500k."""
+    if bw_hz <= 0:
+        return "?"
     k = bw_hz / 1000
     if k == int(k):
         return f"{int(k)}k"
@@ -338,37 +360,39 @@ def _render_header(s: State, term_w: int) -> str:
 def _render_footer(s: State, term_w: int) -> str:
     """Detection history: high-precision timestamps, readable labels, full width."""
     lines: list[str] = []
-    for wall, sweep, det in reversed(s.det_history):
+    mono_now = time.monotonic()
+    for i, (wall, sweep, det) in enumerate(reversed(s.det_history)):
         freq_mhz = det["freq"] / 1e6
-        bw_str = _bw_short(det["bw"])
-        ratio_up = det.get("ratio_up", 0.0)
-        ratio_dn = det.get("ratio_dn", 0.0)
         ratio = det.get("ratio", 0.0)
-        chirp = det.get("chirp", "")
-        # Streaming pipeline provides only "ratio"; legacy provides ratio_up/dn
-        if ratio_up == 0 and ratio_dn == 0:
-            best_ratio = ratio
-        else:
-            best_ratio = max(ratio_up, ratio_dn)
-        rc = _ratio_color(best_ratio)
+        rc = _ratio_color(ratio)
+
+        # Format SF and chirp slope
+        sf = det.get("sf", 0)
+        sf_str = f"SF{sf}" if sf else "?"
+        probe_bw = det.get("probe_bw", 0)
+        probe_str = _bw_short(probe_bw) if probe_bw else "?"
+        # Preamble ID: sync word if available
+        sync = det.get("sync_word")
+        sync_str = f"sync=0x{sync:02X}" if sync is not None else ""
 
         ts = _ts_hires(wall)
         line = (
             f"{C_GRAY}{ts}{C_RST}"
             f"  {C_BLUE}#{sweep:<5}{C_RST}"
             f"  {C_CYAN}{freq_mhz:>7.3f} MHz{C_RST}"
-            f"  {C_WHITE}SF{det['sf']}{C_RST} / {C_CYAN}{bw_str}{C_RST}"
-            f"  {rc}ratio {best_ratio:>5.1f}{C_RST}"
+            f"  {C_WHITE}{sf_str}{C_RST} {C_CYAN}@{probe_str}{C_RST}"
+            f"  {sync_str}"
+            f"  {rc}ratio {ratio:>5.1f}{C_RST}"
         )
-        if chirp:
-            chirp_label = {
-                "both": "bothchirps",
-                "up": "upchirp",
-                "dn": "downchirp",
-            }.get(chirp, chirp)
-            chirp_c = C_GREEN if chirp == "both" else C_YELLOW
-            line += f"  {chirp_c}{chirp_label}{C_RST}"
         line += "\033[K"
+
+        # Bold the most recent detection if it's within ANCHOR_TTL
+        is_recent = len(s.det_history) > 0 and (
+            mono_now - s.active_dets[0][0] < ANCHOR_TTL if s.active_dets else False
+        )
+        if i == 0 and is_recent:
+            line = f"{C_BOLD}{line}{C_RST}"
+
         lines.append(line)
     while len(lines) < DET_HISTORY:
         lines.append("\033[K")
@@ -380,45 +404,8 @@ def render_header(s: State) -> None:
     _write(f"\033[H{_render_header(s, tw)}")
 
 
-def _build_anchor_labels(
-    s: State,
-    spec_w: int,
-    lbl_w: int,
-    bar_h: list[int],
-    body_h: int,
-) -> list[tuple[int, int, str]]:
-    """Build (col, row, label) tuples for detection anchors on bar peaks.
-
-    Each anchor is placed at the column of the detection, on the row just
-    above the bar peak. Labels are clipped/shifted to avoid overlap and
-    stay within bounds.
-    """
-    if not s.active_dets or s.n_channels == 0:
-        return []
-
-    anchors: list[tuple[int, int, str]] = []
-    for _t, det in s.active_dets:
-        col = _det_col(det, s.freq_min, s.freq_step, s.n_channels, spec_w)
-        bw_str = _bw_short(det["bw"])
-        ratio = max(det.get("ratio_up", 0.0), det.get("ratio_dn", 0.0))
-        if ratio == 0:
-            ratio = det.get("ratio", 0.0)
-        label = f"SF{det['sf']}/{bw_str} r={ratio:.0f}"
-
-        # Row just above the bar peak
-        peak_row = body_h - bar_h[min(col, len(bar_h) - 1)]
-        anchor_row = max(0, peak_row - 1)
-
-        # Center label on column, clamp to spec area
-        half = len(label) // 2
-        start_col = max(0, min(spec_w - len(label), col - half))
-        anchors.append((start_col, anchor_row, label))
-
-    return anchors
-
-
 def render(s: State) -> None:
-    """Full redraw: status + frequency axis + bar chart with anchors + detection log."""
+    """Full redraw: status + marker row + frequency axis + bar chart + detection log."""
     if s.energy is None:
         return
 
@@ -449,12 +436,80 @@ def render(s: State) -> None:
     # Per-column gradient color from bar height
     col_color = [_grad_color(bar_h[c] / body_h) for c in range(n_cols)]
 
-    # Detection anchor labels positioned above bar peaks
-    anchors = _build_anchor_labels(s, spec_w, lbl_w, bar_h, body_h)
-    # Build row→[(start_col, label)] map for quick lookup during rendering
-    anchor_map: dict[int, list[tuple[int, str]]] = {}
-    for start_col, row, label in anchors:
-        anchor_map.setdefault(row, []).append((start_col, label))
+    # Detection columns for magenta highlight
+    det_cols: set[int] = set()
+    # Collect all detection columns with freq/ratio for clustering
+    det_label_candidates: list[tuple[int, float, float]] = []
+    for _t, det in s.active_dets:
+        col = _det_col(det, s.freq_min, s.freq_step, s.n_channels, spec_w)
+        det_cols.add(col)
+        freq_mhz = det.get("freq", 0) / 1e6
+        ratio = det.get("ratio", 0.0)
+        det_label_candidates.append((col, freq_mhz, ratio))
+
+    # Cluster adjacent detection columns (within ±2 cols) → one label per cluster
+    # at the median column, using average freq and best ratio.
+    det_label_candidates.sort()
+    clusters: list[list[tuple[int, float, float]]] = []
+    for item in det_label_candidates:
+        if clusters and item[0] - clusters[-1][-1][0] <= 2:
+            clusters[-1].append(item)
+        else:
+            clusters.append([item])
+
+    det_labels: dict[int, tuple[str, str]] = {}
+    for cluster in clusters:
+        cols = [c[0] for c in cluster]
+        median_col = cols[len(cols) // 2]
+        avg_freq = sum(c[1] for c in cluster) / len(cluster)
+        best_ratio = max(c[2] for c in cluster)
+        label = f"{avg_freq:.1f}"
+        det_labels[median_col] = (label, _ratio_color(best_ratio))
+
+    # Build vertical label overlay map: (row, col) → (char, color)
+    # Labels are anchored at the TOP of the bar and go downward inside it.
+    vlabel_map: dict[tuple[int, int], tuple[str, str]] = {}
+    for col, (label, lbl_color) in det_labels.items():
+        bh = bar_h[min(col, len(bar_h) - 1)]
+        if bh < 2:
+            continue  # bar too short for label
+        bar_top_row = body_h - bh
+        for i, ch in enumerate(label):
+            r = bar_top_row + i
+            if r < body_h:
+                vlabel_map[(r, col)] = (ch, lbl_color)
+
+    # Peak hold: collect per-column peak rows, then cluster adjacent columns
+    _peak_raw: dict[int, int] = {}  # col → peak_row (highest = smallest row)
+    mono_now = time.monotonic()
+    for ch_idx, peak_db, t in s.peak_holds:
+        age = mono_now - t
+        if age >= PEAK_HOLD_S:
+            continue
+        col = int(ch_idx * spec_w / s.n_channels) if s.n_channels > 0 else 0
+        col = max(0, min(col, spec_w - 1))
+        # Decay: peak drops linearly over PEAK_HOLD_S
+        decay_db = (age / PEAK_HOLD_S) * db_range * 0.5
+        held_db = peak_db - decay_db
+        peak_row = body_h - int((held_db - db_min) / db_range * body_h + 0.5)
+        peak_row = max(0, min(peak_row, body_h - 1))
+        if col not in _peak_raw or peak_row < _peak_raw[col]:
+            _peak_raw[col] = peak_row
+
+    # Cluster adjacent peak hold columns (±2) → single marker at median
+    peak_hold_rows: dict[int, int] = {}
+    if _peak_raw:
+        sorted_peaks = sorted(_peak_raw.items())
+        pk_clusters: list[list[tuple[int, int]]] = []
+        for item in sorted_peaks:
+            if pk_clusters and item[0] - pk_clusters[-1][-1][0] <= 2:
+                pk_clusters[-1].append(item)
+            else:
+                pk_clusters.append([item])
+        for cluster in pk_clusters:
+            median_col = cluster[len(cluster) // 2][0]
+            best_row = min(c[1] for c in cluster)  # highest peak
+            peak_hold_rows[median_col] = best_row
 
     out: list[str] = ["\033[H"]
     out.append(_render_header(s, term_w))
@@ -473,7 +528,7 @@ def render(s: State) -> None:
         + f"{' ' * pad2}{right}{C_RST}\033[K\n"
     )
 
-    # ── Body: bar chart with detection anchors ──
+    # ── Body: bar chart with detection highlights + vertical freq labels ──
     for row in range(body_h):
         # dB label on left margin
         if row == 0:
@@ -486,52 +541,49 @@ def render(s: State) -> None:
             label = ""
         out.append(f"{C_GRAY}{label:>{lbl_w}}{C_RST}")
 
-        # Check for anchor labels on this row
-        row_anchors = anchor_map.get(row)
-        if row_anchors:
-            # Build the row as a character buffer so we can overlay text
-            row_chars: list[str] = []
-            threshold = body_h - row
-            for col in range(n_cols):
-                if bar_h[col] >= threshold and col_e[col] > 1e-15:
-                    row_chars.append(f"{col_color[col]}{_BAR}")
-                else:
-                    row_chars.append(" ")
+        # RLE fast path with magenta highlight, vertical labels, and peak hold
+        threshold = body_h - row
+        prev_color: str = ""
+        run_len = 0
+        for col in range(n_cols):
+            has_bar = bar_h[col] >= threshold and col_e[col] > 1e-15
 
-            # Overlay anchor labels (white on default bg)
-            for start_col, anchor_text in row_anchors:
-                for i, ch in enumerate(anchor_text):
-                    pos = start_col + i
-                    if 0 <= pos < n_cols:
-                        row_chars[pos] = f"{C_WHITE}{C_BOLD}{ch}"
-
-            # Emit with run-length encoding where possible
-            out.append("".join(row_chars))
-            out.append(f"{C_RST}\033[K\n")
-        else:
-            # Fast path: no anchors, use run-length encoding
-            threshold = body_h - row
-            prev_color: str = ""
-            run_len = 0
-            for col in range(n_cols):
-                if bar_h[col] >= threshold and col_e[col] > 1e-15:
-                    cc = col_color[col]
-                    if cc == prev_color:
-                        run_len += 1
-                    else:
-                        if run_len:
-                            out.append(f"{prev_color}{_BAR * run_len}")
-                        prev_color = cc
-                        run_len = 1
+            # Check for vertical label overlay INSIDE the bar
+            vlabel = vlabel_map.get((row, col))
+            if vlabel and has_bar:
+                # Flush pending RLE run
+                if run_len:
+                    out.append(f"{prev_color}{_BAR * run_len}")
+                    prev_color = ""
+                    run_len = 0
+                ch, _lc = vlabel
+                # Bold white character on magenta background (inside bar)
+                out.append(f"\033[48;5;53m{C_WHITE}{C_BOLD}{ch}{C_RST}")
+            elif has_bar:
+                cc = C_MAGENTA if col in det_cols else col_color[col]
+                if cc == prev_color:
+                    run_len += 1
                 else:
                     if run_len:
-                        out.append(f"{prev_color}{_BAR * run_len}{C_RST}")
-                        prev_color = ""
-                        run_len = 0
-                    out.append(" ")
-            if run_len:
-                out.append(f"{prev_color}{_BAR * run_len}{C_RST}")
-            out.append("\033[K\n")
+                        out.append(f"{prev_color}{_BAR * run_len}")
+                    prev_color = cc
+                    run_len = 1
+            elif peak_hold_rows.get(col) == row:
+                # Peak hold marker: thin bright line above the bar
+                if run_len:
+                    out.append(f"{prev_color}{_BAR * run_len}{C_RST}")
+                    prev_color = ""
+                    run_len = 0
+                out.append(f"{C_MAGENTA}\u25bc{C_RST}")  # ▼ magenta triangle
+            else:
+                if run_len:
+                    out.append(f"{prev_color}{_BAR * run_len}{C_RST}")
+                    prev_color = ""
+                    run_len = 0
+                out.append(" ")
+        if run_len:
+            out.append(f"{prev_color}{_BAR * run_len}{C_RST}")
+        out.append("\033[K\n")
 
     # ── Footer: detection history ──
     out.append(_render_footer(s, term_w) + "\n")

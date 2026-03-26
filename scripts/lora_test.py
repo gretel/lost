@@ -60,6 +60,7 @@ SCRIPT_DIR = Path(__file__).parent
 SETTLE_S = 2.0  # wait after radio change for PLL lock
 FLUSH_DECODE_S = 5.0  # wait after TX for decode pipeline
 FLUSH_SCAN_S = 8.0  # wait after TX for scan sweeps (~14 cycles at 555ms)
+FLUSH_SCAN_TUNING_S = 120.0  # tuning scanner: 2 full sweeps at ~60s each
 FLUSH_TX_S = 3.0  # wait after SDR TX for Heltec to receive
 FLUSH_BRIDGE_S = 5.0  # wait for bridge RX path (decode + companion protocol)
 BRIDGE_PORT = 7835  # serial_bridge TCP port
@@ -103,6 +104,7 @@ class ConfigPoint:
     bw: int  # Hz
     freq_mhz: float
     tx_power: int = 2  # dBm
+    cr: int = 8  # coding rate (5-8, where 5=4/5, 8=4/8)
 
 
 # -- Predefined matrices ------------------------------------------------------
@@ -158,6 +160,22 @@ MATRICES: dict[str, list[ConfigPoint]] = {
     "bw250k_sweep": [
         ConfigPoint(sf=sf, bw=250000, freq_mhz=869.618) for sf in [7, 8, 9, 10]
     ],
+    # Official MeshCore regional presets
+    "meshcore_presets": [
+        ConfigPoint(
+            sf=8, bw=62500, freq_mhz=869.618, cr=8
+        ),  # EU/UK Narrow (Recommended)
+        ConfigPoint(sf=11, bw=250000, freq_mhz=869.525, cr=5),  # EU/UK Long Range
+        ConfigPoint(sf=10, bw=250000, freq_mhz=869.525, cr=5),  # EU/UK Medium Range
+        ConfigPoint(sf=7, bw=62500, freq_mhz=869.525, cr=5),  # Czech Republic Narrow
+    ],
+    # LoRaWAN EU868 channels (generic LoRa detection, sync-word agnostic)
+    "lorawan_eu": [
+        ConfigPoint(sf=7, bw=125000, freq_mhz=868.100, cr=5),  # Join CH1
+        ConfigPoint(sf=7, bw=125000, freq_mhz=868.300, cr=5),  # Join CH2
+        ConfigPoint(sf=7, bw=125000, freq_mhz=868.500, cr=5),  # Join CH3
+        ConfigPoint(sf=12, bw=125000, freq_mhz=869.525, cr=5),  # RX2 default
+    ],
 }
 
 
@@ -180,7 +198,10 @@ class PointResult:
     detections: list[dict] = field(default_factory=list)
     det_count: int = 0
     best_ratio: float | None = None
+    best_chirp_slope: float | None = None
     best_sf: int | None = None
+    best_sync_word: int | None = None
+    best_snr: float | None = None
     sweeps: int = 0
     avg_sweep_ms: int = 0
     overflows: int = 0
@@ -228,21 +249,29 @@ def _wait_tcp(port: int, timeout: float = 15.0) -> bool:
 
 def _wait_udp(port: int, timeout: float = 30.0) -> bool:
     sub_msg = cbor2.dumps({"type": "subscribe"})
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.0)
+    sock.bind(("", 0))
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(2.0)
-            sock.bind(("", 0))
-            sock.sendto(sub_msg, ("127.0.0.1", port))
-            sock.recvfrom(65536)
-            sock.close()
-            return True
-        except Exception:
-            if sock:
+    # Re-send subscribe every 5s (same socket = same ephemeral port)
+    next_sub = 0.0
+    try:
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_sub:
+                sock.sendto(sub_msg, ("127.0.0.1", port))
+                next_sub = now + 5.0
+            try:
+                sock.recvfrom(65536)
                 sock.close()
-            time.sleep(1.0)
+                return True
+            except socket.timeout:
+                continue
+            except Exception:
+                time.sleep(1.0)
+    except Exception:
+        pass
+    sock.close()
     return False
 
 
@@ -300,7 +329,8 @@ FREQ_TOL = 200e3  # Hz — accept events within ±200 kHz of TX freq
 def point_label(p: ConfigPoint) -> str:
     bw_k = p.bw / 1000
     pwr = f" {p.tx_power}dBm" if p.tx_power != 2 else ""
-    return f"SF{p.sf}/BW{bw_k:.0f}k@{p.freq_mhz:.3f}{pwr}"
+    cr = f" CR{p.cr}" if p.cr != 8 else ""
+    return f"SF{p.sf}/BW{bw_k:.0f}k@{p.freq_mhz:.3f}{pwr}{cr}"
 
 
 def _info(msg: str) -> None:
@@ -332,19 +362,22 @@ def run_point(
     point: ConfigPoint,
     companion: CompanionDriver,
     collector: EventCollector,
+    tuning_scan: bool = False,
 ) -> PointResult:
     """Run one config point: set radio, TX one ADVERT, collect results."""
     if mode == "decode":
         # SF12/BW62.5k airtime is ~4.5s; the fixed 5.0s left only 0.5s for
         # decode pipeline processing.  Use airtime + 3s margin.
         flush_s = max(FLUSH_DECODE_S, lora_airtime_s(point.sf, point.bw) + 3.0)
+    elif tuning_scan:
+        flush_s = FLUSH_SCAN_TUNING_S
     else:
         flush_s = FLUSH_SCAN_S
     result = PointResult(config=asdict(point))
 
     # Configure companion
     bw_khz = point.bw / 1000.0
-    if not companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8):
+    if not companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=point.cr):
         _err(f"set_radio failed for {point_label(point)}")
         return result
     if not companion.set_tx_power(point.tx_power):
@@ -445,13 +478,14 @@ def _collect_scan(result: PointResult, events: list[dict], tx_freq_hz: float) ->
     if result.detections:
         best = max(result.detections, key=lambda d: d.get("ratio", 0))
         result.best_ratio = round(best.get("ratio", 0.0), 1)
-        sf_counts: dict[int, int] = {}
-        for d in result.detections:
-            sf = d.get("sf", 0)
-            if sf > 0:
-                sf_counts[sf] = sf_counts.get(sf, 0) + 1
-        if sf_counts:
-            result.best_sf = max(sf_counts, key=lambda s: sf_counts[s])
+        slopes = [d.get("chirp_slope", 0) for d in result.detections]
+        result.best_chirp_slope = max(slopes) if slopes else 0
+        sfs = [d.get("sf", 0) for d in result.detections if d.get("sf", 0) > 0]
+        result.best_sf = max(sfs, key=sfs.count) if sfs else None  # most common SF
+        # Preamble ID fields (from tuning scanner)
+        if best.get("sync_word") is not None:
+            result.best_sync_word = best.get("sync_word")
+            result.best_snr = round(best.get("snr_db", -999), 1)
 
 
 # -- SDR TX helpers ------------------------------------------------------------
@@ -727,7 +761,7 @@ async def run_tx_point(
 
     # Configure Heltec radio to receive at this config
     bw_khz = point.bw / 1000.0
-    if not await companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8):
+    if not await companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=point.cr):
         _err(f"set_radio failed for {point_label(point)}")
         return result
 
@@ -897,9 +931,9 @@ async def run_bridge_point(
     # The bridge may not receive the lora_trx config broadcast reliably,
     # so we set its state directly.
     bw_khz = point.bw / 1000.0
-    driver.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8)
+    driver.set_radio(point.freq_mhz, bw_khz, point.sf, cr=point.cr)
     # Update Heltec radio (triggers reboot + auto-reconnect)
-    if not await companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=8):
+    if not await companion.set_radio(point.freq_mhz, bw_khz, point.sf, cr=point.cr):
         _err(f"  set_radio failed for {point_label(point)}")
         return result
     await asyncio.sleep(SETTLE_S)
@@ -1260,7 +1294,10 @@ def main() -> None:
         [binary, "--config", args.config],
         f"tmp/{mode}.log",
     )
-    if not _wait_udp(udp_port):
+    # Tuning scanner (streaming=false) needs longer startup: first sweep can
+    # take 30-60s depending on hot channel count before any CBOR is emitted.
+    udp_timeout = 90.0 if mode == "scan" else 30.0
+    if not _wait_udp(udp_port, timeout=udp_timeout):
         _err(f"{binary} failed to start (see tmp/{mode}.log)")
         _stop_process(binary_proc)
         _stop_process(bridge_proc)
@@ -1275,6 +1312,20 @@ def main() -> None:
     startup_delay = 10.0 if mode == "scan" else 1.0
     time.sleep(startup_delay)
 
+    # Detect tuning scanner mode (streaming=false) from config file
+    is_tuning_scan = False
+    if mode == "scan":
+        try:
+            import tomllib
+
+            with open(args.config, "rb") as _cf:
+                _toml = tomllib.load(_cf)
+            is_tuning_scan = not _toml.get("scan", {}).get("streaming", True)
+        except Exception:
+            pass
+    if is_tuning_scan:
+        _info("(tuning scanner mode — extended flush timeouts)")
+
     _info(f"\n--- {mode}: {len(matrix)} points, matrix={args.matrix} ---")
     if args.hypothesis:
         _info(f"H: {args.hypothesis}")
@@ -1284,7 +1335,9 @@ def main() -> None:
     try:
         for i, point in enumerate(matrix):
             _info(f"[{i + 1}/{len(matrix)}] {point_label(point)}")
-            result = run_point(mode, point, companion, collector)
+            result = run_point(
+                mode, point, companion, collector, tuning_scan=is_tuning_scan
+            )
             results.append(result)
             if mode == "decode":
                 snr = f" SNR={result.best_snr}" if result.best_snr is not None else ""
@@ -1598,7 +1651,10 @@ def _write_results(
                 "detections": r.detections,
                 "det_count": r.det_count,
                 "best_ratio": r.best_ratio,
+                "best_chirp_slope": r.best_chirp_slope,
                 "best_sf": r.best_sf,
+                "best_sync_word": r.best_sync_word,
+                "best_snr_scan": r.best_snr,
                 "sweeps": r.sweeps,
                 "avg_sweep_ms": r.avg_sweep_ms,
                 "overflows": r.overflows,
