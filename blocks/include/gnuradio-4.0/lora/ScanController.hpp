@@ -17,7 +17,7 @@
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
 #include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
 #include <gnuradio-4.0/lora/algorithm/Channelize.hpp>
-#include <gnuradio-4.0/lora/algorithm/DCBlocker.hpp>
+// DCBlocker.hpp not needed — scan path uses FFT NF interpolation instead
 #include <gnuradio-4.0/lora/algorithm/RingBuffer.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
@@ -92,9 +92,9 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     std::vector<cf32>                    _probeNbBuf;       // pre-allocated narrowband output
     std::vector<cf32>                    _probeWbBuf;       // pre-allocated wideband extract
 
-    // DC blocker (embedded, applied before ring buffer push + L1 FFT)
-    DCBlocker           _dc;
-    std::vector<cf32>   _dcBuf;
+    // DC blocker removed from the scan hot path — L1 FFT NF interpolation
+    // and DC-adjacent channel exclusion handle the spur without per-sample cost.
+    // The DCBlocker is still used by MultiSfDecoder (narrowband decode path).
 
     // --- lifecycle ---
 
@@ -171,10 +171,8 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         _snapshotCount = 0;
         _sweepCount    = 0;
 
-        // DC blocker: remove DC spur before L1 energy + ring buffer
-        if (dc_blocker_cutoff > 0.f) {
-            _dc.init(sample_rate, dc_blocker_cutoff);
-        }
+        // DC blocker not used in scan path (see processBulk comment).
+        // The dc_blocker_cutoff setting is kept for MultiSfDecoder compatibility.
 
         gr::lora::log_ts("info ", "scanctrl",
             "started: %.1f MS/s, %.3f MHz center, %u ch (%.1f kHz), buffer %u ms, L1 every %u calls, dc_hp %.0f Hz",
@@ -203,15 +201,14 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             }
         }
 
-        // 2. DC blocker + push into ring buffer
+        // 2. Push raw samples into ring buffer (no DC blocker).
+        // The DC spur is handled by two separate mechanisms:
+        //   - L1 energy: FFT NF interpolation replaces DC bins with noise floor
+        //   - L2 probes: DC-adjacent channels (±625 kHz) are excluded from probing
+        // Removing the per-sample DC blocker (IIR at 16 MS/s in double precision)
+        // saves ~12% of scheduler thread CPU — was the #2 hotspot after FIR.
         auto inSpan = std::span(inPort);
-        std::span<const cf32> cleanSpan = inSpan;
-        if (_dc.initialised()) {
-            _dcBuf.resize(inSpan.size());
-            _dc.processBlock(inSpan, std::span<cf32>(_dcBuf));
-            cleanSpan = std::span<const cf32>(_dcBuf);
-        }
-        _ring.push(cleanSpan);
+        _ring.push(inSpan);
         std::ignore = inPort.consume(inSpan.size());
 
         // 3. Periodic L1 energy snapshot (cheap: one FFT per interval)
