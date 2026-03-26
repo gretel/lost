@@ -250,6 +250,59 @@ struct HalfBandStage {
 
         sampleCount += count;
     }
+
+    /// Single-pass NCO mix + FIR: fills work buffer and computes FIR output
+    /// in one fused loop. Eliminates the second traversal of the work buffer
+    /// that the two-loop processWithMixBatch() requires, improving cache
+    /// locality at 16 MS/s (8192 samples × 8 bytes = 64 KB per call).
+    ///
+    /// The FIR can only produce output once 22 (kTailLen) new samples have
+    /// been written, because the filter taps span buf[i..i+22]. So we fill
+    /// samples one at a time and compute FIR output inline when ready.
+    ///
+    /// Requires initBatch() to have been called first.
+    void processNcoFirFused(std::span<const cf32> input,
+                            cf32& rot, const cf32& step,
+                            std::vector<cf32>& out) {
+        using namespace halfband_detail;
+        constexpr std::size_t kTailLen = kFilterLen - 1;  // 22
+
+        const std::size_t count = input.size();
+        if (count == 0) return;
+
+        // Build work buffer header from tail
+        const std::size_t totalLen = kTailLen + count;
+        _workBuf.resize(totalLen);
+        std::copy(_tail.begin(), _tail.end(), _workBuf.begin());
+
+        cf32* buf = _workBuf.data();
+
+        // Single pass: NCO mix + FIR output fused
+        for (std::size_t i = 0; i < count; ++i) {
+            // NCO mix: write mixed sample into work buffer
+            buf[kTailLen + i] = input[i] * rot;
+            rot *= step;
+            if ((i & 0x3FFU) == 0x3FFU) rot /= std::abs(rot);
+
+            // FIR output on odd samples (decimate-by-2)
+            if (((sampleCount + i) & 1U) == 1U) {
+                cf32 acc{0.f, 0.f};
+                for (std::size_t c = 0; c < kCoeffs.size(); ++c) {
+                    const std::size_t k     = c * 2;
+                    const std::size_t kMirr = kFilterLen - 1 - k;
+                    acc += kCoeffs[c] * (buf[i + k] + buf[i + kMirr]);
+                }
+                acc += kCenterTap * buf[i + 11];
+                out.push_back(acc);
+            }
+        }
+
+        // Save tail
+        std::copy(_workBuf.end() - static_cast<std::ptrdiff_t>(kTailLen),
+                  _workBuf.end(), _tail.begin());
+
+        sampleCount += count;
+    }
 };
 
 // ─── CascadedDecimator ──────────────────────────────────────────────────────
@@ -333,29 +386,20 @@ struct CascadedDecimator {
             return;
         }
 
-        // First stage: fused NCO + linear-buffer batch FIR (no % 23)
-        scratch0.clear();
-        std::size_t idx = 0;
-        stages[0].processWithMixBatch(input.size(),
-            [&](std::size_t) -> cf32 {
-                cf32 s = input[idx] * rot;
-                rot *= step;
-                if ((idx & 0x3FFU) == 0x3FFU) rot /= std::abs(rot);
-                ++idx;
-                return s;
-            },
-            scratch0);
+        // First stage: single-pass NCO mix + FIR
+        const std::size_t lastStage = stages.size() - 1;
+        auto& stage0dst = (lastStage == 0) ? out : scratch0;
+        if (&stage0dst != &out) stage0dst.clear();
+        stages[0].processNcoFirFused(input, rot, step, stage0dst);
 
-        // Remaining stages: normal ping-pong processing
-        for (std::size_t i = 1; i < stages.size(); ++i) {
+        // Remaining stages: last stage writes directly to `out`
+        for (std::size_t i = 1; i <= lastStage; ++i) {
             auto& src = (i & 1U) ? scratch0 : scratch1;
-            auto& dst = (i & 1U) ? scratch1 : scratch0;
-            dst.clear();
+            auto& dst = (i == lastStage) ? out
+                      : ((i & 1U) ? scratch1 : scratch0);
+            if (&dst != &out) dst.clear();
             stages[i].process(std::span<const cf32>(src), dst);
         }
-
-        auto& result = (stages.size() & 1U) ? scratch0 : scratch1;
-        out.insert(out.end(), result.begin(), result.end());
     }
 
     /// Batch-process input through all stages using linear-buffer FIR for stages 1+.
@@ -384,7 +428,8 @@ struct CascadedDecimator {
     }
 
     /// Batch-process with NCO mixing fused into stage 0.
-    /// All stages use linear-buffer batch FIR (no modulo indexing).
+    /// Stage 0 uses single-pass NCO+FIR fusion (processNcoFirFused).
+    /// Stages 1+ use linear-buffer batch FIR (processBatch).
     void processWithNcoBatch(std::span<const cf32> input, std::vector<cf32>& out,
                              cf32& rot, const cf32& step) {
         if (stages.empty()) {
@@ -396,29 +441,21 @@ struct CascadedDecimator {
             return;
         }
 
-        // Stage 0: fused NCO + linear-buffer batch FIR (no % 23)
-        scratch0.clear();
-        std::size_t idx = 0;
-        stages[0].processWithMixBatch(input.size(),
-            [&](std::size_t) -> cf32 {
-                cf32 s = input[idx] * rot;
-                rot *= step;
-                if ((idx & 0x3FFU) == 0x3FFU) rot /= std::abs(rot);
-                ++idx;
-                return s;
-            },
-            scratch0);
+        // Stage 0: single-pass NCO mix + FIR (no lambda, no second traversal)
+        const std::size_t lastStage = stages.size() - 1;
+        auto& stage0dst = (lastStage == 0) ? out : scratch0;
+        if (&stage0dst != &out) stage0dst.clear();
+        stages[0].processNcoFirFused(input, rot, step, stage0dst);
 
-        // Stages 1+: linear-buffer batch FIR
-        for (std::size_t i = 1; i < stages.size(); ++i) {
+        // Stages 1+: linear-buffer batch FIR.
+        // Last stage writes directly to `out`, avoiding a final memcpy.
+        for (std::size_t i = 1; i <= lastStage; ++i) {
             auto& src = (i & 1U) ? scratch0 : scratch1;
-            auto& dst = (i & 1U) ? scratch1 : scratch0;
-            dst.clear();
+            auto& dst = (i == lastStage) ? out
+                      : ((i & 1U) ? scratch1 : scratch0);
+            if (&dst != &out) dst.clear();
             stages[i].processBatch(std::span<const cf32>(src), dst);
         }
-
-        auto& result = (stages.size() & 1U) ? scratch0 : scratch1;
-        out.insert(out.end(), result.begin(), result.end());
     }
 };
 
