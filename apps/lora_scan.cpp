@@ -33,6 +33,7 @@
 
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/lora/ChannelActivityDetector.hpp>
+#include <gnuradio-4.0/lora/algorithm/PreambleId.hpp>
 
 #include "graph_builder.hpp"
 
@@ -129,10 +130,19 @@ static void update_spectrum_centre(std::shared_ptr<gr::lora::SpectrumState>& spe
 static std::span<const cf32> capture_samples(
         std::shared_ptr<gr::lora::CaptureState>& state,
         uint32_t nSamples,
-        const std::atomic<bool>& stopFlag) {
+        const std::atomic<bool>& stopFlag,
+        uint32_t timeout_ms = 2000) {
     state->request(nSamples);
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(timeout_ms);
     while (!state->done.load(std::memory_order_acquire)) {
         if (stopFlag.load(std::memory_order_relaxed)) {
+            state->reset();
+            return {};
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            auto captured = state->captured.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "capture timeout: got %u/%u samples\n", captured, nSamples);
             state->reset();
             return {};
         }
@@ -173,12 +183,18 @@ struct Layer1Result {
 
 /// Extract per-channel energy from a single SpectrumState FFT result.
 /// The spectrum must already be tuned to the tile centre and have fresh data.
-static void extractTileEnergy(
+static bool extractTileEnergy(
         std::shared_ptr<gr::lora::SpectrumState>& spectrum,
         const std::vector<double>& channels, double chBw,
-        std::vector<double>& energy) {
-    // Poll until a fresh FFT result is available
+        std::vector<double>& energy,
+        uint32_t timeout_ms = 500) {
+    // Poll until a fresh FFT result is available (with timeout)
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(timeout_ms);
     while (!spectrum->compute()) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
@@ -225,6 +241,7 @@ static void extractTileEnergy(
             energy[chIdx] = std::max(energy[chIdx], snapEnergy);
         }
     }
+    return true;
 }
 
 /// L1 scan using SpectrumState.  For single-tile configs, reads the spectrum
@@ -347,6 +364,15 @@ struct DirectCadResult {
     uint32_t sf_detected   = 0;
     bool     up_detected   = false;
     bool     dn_detected   = false;
+    // Preamble characterization (valid when preamble_valid == true)
+    bool     preamble_valid = false;
+    uint16_t sync_word      = 0;
+    float    cfo_frac       = 0.f;
+    int      cfo_int        = 0;
+    float    sto_frac       = 0.f;
+    float    sfo_hat        = 0.f;
+    uint32_t preamble_len   = 0;
+    float    snr_db         = -999.f;
 };
 
 // ─── Mode B: interleaved L1 snapshot + immediate L2 ─────────────────────────
@@ -413,7 +439,9 @@ static InterleavedResult interleavedSweep(
         // Single FFT snapshot: extract fresh per-channel energy, then
         // update running-max for CBOR spectrum output.
         std::ranges::fill(energy, 0.0);
-        extractTileEnergy(sg.spectrum, channels, chBw, energy);
+        if (!extractTileEnergy(sg.spectrum, channels, chBw, energy, 50)) {
+            continue;  // spectrum not ready (overflow), skip this snapshot
+        }
         for (std::size_t i = 0; i < nCh; ++i) {
             ir.energy[i] = std::max(ir.energy[i], energy[i]);
         }
@@ -481,12 +509,12 @@ static InterleavedResult interleavedSweep(
 
         const auto probeStart = std::chrono::steady_clock::now();
 
-        // Single capture: narrowest BW (first in sorted bwDets) needs the
-        // most L1 samples.  Wider BWs use a prefix of the same buffer.
-        const uint32_t sf12Win = (1U << 12U) * cfg.os_factor * 2U;
+        // Phase 1: Quick CAD — 2-symbol capture (original size, ~131ms at BW62.5k)
+        constexpr uint32_t kCadSymbols = 2U;
+        const uint32_t sf12CadWin = (1U << 12U) * cfg.os_factor * kCadSymbols;
         const double   maxTargetRate = bwDets.front().bw * static_cast<double>(cfg.os_factor);
         const auto     maxDecFactor  = static_cast<uint32_t>(std::round(cfg.l1_rate / maxTargetRate));
-        const uint32_t maxL1Win      = sf12Win * maxDecFactor;
+        const uint32_t maxL1Win      = sf12CadWin * maxDecFactor;
 
         const auto l2Raw = capture_samples(sg.capture, maxL1Win, stopFlag);
         if (l2Raw.empty()) {
@@ -495,6 +523,8 @@ static InterleavedResult interleavedSweep(
             continue;
         }
 
+        double bestBw = 0.0;
+
         for (auto& bd : bwDets) {
             if (stopFlag.load(std::memory_order_relaxed)) {
                 break;
@@ -502,7 +532,7 @@ static InterleavedResult interleavedSweep(
 
             const double   targetRate = bd.bw * static_cast<double>(cfg.os_factor);
             const auto     decFactor  = static_cast<uint32_t>(std::round(cfg.l1_rate / targetRate));
-            const uint32_t l1Win      = sf12Win * decFactor;
+            const uint32_t l1Win      = sf12CadWin * decFactor;
 
             // Decimate a prefix of the single capture
             const auto cadBuf = decimate(l2Raw.data(), l1Win, cfg.l1_rate, targetRate);
@@ -519,6 +549,7 @@ static InterleavedResult interleavedSweep(
                     bestResult.sf_detected   = r.sf;
                     bestResult.up_detected   = r.up_detected;
                     bestResult.dn_detected   = r.dn_detected;
+                    bestBw     = bd.bw;
                 }
             }
 
@@ -533,6 +564,37 @@ static InterleavedResult interleavedSweep(
 
             if (bestRatio > 10.0) {
                 break;
+            }
+        }
+
+        // Phase 2: Extended capture for preamble characterization (only on detection)
+        if (bestResult.sf_detected > 0 && bestRatio >= static_cast<double>(cfg.min_ratio)) {
+            // Second capture with 11-symbol window for full preamble
+            constexpr uint32_t kPreambleSymbols = 11U;
+            const uint32_t sf12PreWin = (1U << 12U) * cfg.os_factor * kPreambleSymbols;
+            const double   preTargetRate = bestBw * static_cast<double>(cfg.os_factor);
+            const auto     preDecFactor  = static_cast<uint32_t>(std::round(cfg.l1_rate / preTargetRate));
+            const uint32_t preL1Win      = sf12PreWin * preDecFactor;
+
+            const auto preRaw = capture_samples(sg.capture, preL1Win, stopFlag);
+            if (!preRaw.empty()) {
+                const auto preBuf = decimate(preRaw.data(), preL1Win, cfg.l1_rate, preTargetRate);
+                auto pinfo = gr::lora::characterize_preamble(
+                    preBuf.data(), preBuf.size(),
+                    static_cast<uint8_t>(bestResult.sf_detected),
+                    static_cast<uint32_t>(bestBw),
+                    static_cast<uint8_t>(cfg.os_factor),
+                    freq);
+                if (pinfo.valid) {
+                    bestResult.preamble_valid = true;
+                    bestResult.sync_word      = pinfo.sync_word;
+                    bestResult.cfo_frac       = pinfo.cfo_frac;
+                    bestResult.cfo_int        = pinfo.cfo_int;
+                    bestResult.sto_frac       = pinfo.sto_frac;
+                    bestResult.sfo_hat        = pinfo.sfo_hat;
+                    bestResult.preamble_len   = pinfo.preamble_len;
+                    bestResult.snr_db         = pinfo.snr_db;
+                }
             }
         }
 
@@ -617,11 +679,22 @@ static void emitSpectrumCbor(
     for (const auto& det : detections) {
         const double ratio = std::max(det.peak_ratio_up, det.peak_ratio_dn);
         const double k = det.bw * det.bw / static_cast<double>(1U << det.sf_detected);
-        cb::encode_map_begin(buf, 4);
+        const uint32_t nFields = det.preamble_valid ? 12U : 5U;
+        cb::encode_map_begin(buf, nFields);
         cb::kv_uint(buf, "freq", static_cast<uint64_t>(det.freq));
         cb::kv_float64(buf, "ratio", ratio);
         cb::kv_float64(buf, "chirp_slope", k);
         cb::kv_uint(buf, "probe_bw", static_cast<uint64_t>(det.bw));
+        cb::kv_uint(buf, "sf", det.sf_detected);
+        if (det.preamble_valid) {
+            cb::kv_uint(buf, "sync_word", det.sync_word);
+            cb::kv_float64(buf, "cfo_frac", static_cast<double>(det.cfo_frac));
+            cb::kv_sint(buf, "cfo_int", det.cfo_int);
+            cb::kv_float64(buf, "sto_frac", static_cast<double>(det.sto_frac));
+            cb::kv_float64(buf, "sfo_hat", static_cast<double>(det.sfo_hat));
+            cb::kv_uint(buf, "preamble_len", det.preamble_len);
+            cb::kv_float64(buf, "snr_db", static_cast<double>(det.snr_db));
+        }
     }
 
     sendCbor(buf);
@@ -796,7 +869,7 @@ static void emitDataSetCbor(const gr::DataSet<float>& ds, uint64_t overflows = 0
 
     // --- Parse detections from indexed metadata fields ---
     const auto nDet = static_cast<std::size_t>(getInt("n_det"));
-    struct Det { uint64_t freq; double ratio; double chirp_slope; uint64_t probe_bw; };
+    struct Det { uint64_t freq; double ratio; double chirp_slope; uint64_t probe_bw; uint64_t sf; };
     std::vector<Det> detections;
     for (std::size_t i = 0; i < nDet; ++i) {
         const auto prefix = std::string("det") + std::to_string(i) + "_";
@@ -805,6 +878,7 @@ static void emitDataSetCbor(const gr::DataSet<float>& ds, uint64_t overflows = 0
         d.ratio       = static_cast<double>(getMetaFloat(prefix + "ratio"));
         d.chirp_slope = static_cast<double>(getMetaFloat(prefix + "chirp_slope"));
         d.probe_bw    = static_cast<uint64_t>(getMetaFloat(prefix + "probe_bw"));
+        d.sf          = static_cast<uint64_t>(getInt(prefix + "sf"));
         detections.push_back(d);
     }
 
@@ -839,11 +913,12 @@ static void emitDataSetCbor(const gr::DataSet<float>& ds, uint64_t overflows = 0
         cb::encode_text(buf, "detections");
         cb::encode_array_begin(buf, detections.size());
         for (const auto& d : detections) {
-            cb::encode_map_begin(buf, 4);
+            cb::encode_map_begin(buf, 5);
             cb::kv_uint(buf, "freq", d.freq);
             cb::kv_float64(buf, "ratio", d.ratio);
             cb::kv_float64(buf, "chirp_slope", d.chirp_slope);
             cb::kv_uint(buf, "probe_bw", d.probe_bw);
+            cb::kv_uint(buf, "sf", d.sf);
         }
 
         sendCbor(buf);
@@ -1178,10 +1253,21 @@ int main(int argc, char** argv) {
             ? ("SF" + std::to_string(det.sf_detected)) : "-";
 
         auto* out = stderr;
-        std::fprintf(out, "%-13s  %10.3f  %6.1f  %6.1f  %6.1f  %6s  %4s\n",
-                    ts.c_str(), det.freq / 1.0e6, det.bw / 1.0e3,
-                    det.peak_ratio_up, det.peak_ratio_dn,
-                    "1/1", sfStr.c_str());
+        if (det.preamble_valid) {
+            std::fprintf(out, "%-13s  %10.3f  %4s  BW%gk  sync=0x%02X  "
+                        "CFO=%+.1f+%d  STO=%+.2f  SNR=%.1f  ratio=%.1f  pre=%u\n",
+                        ts.c_str(), det.freq / 1.0e6, sfStr.c_str(),
+                        det.bw / 1.0e3, det.sync_word,
+                        static_cast<double>(det.cfo_frac), det.cfo_int,
+                        static_cast<double>(det.sto_frac), static_cast<double>(det.snr_db),
+                        std::max(det.peak_ratio_up, det.peak_ratio_dn),
+                        det.preamble_len);
+        } else {
+            std::fprintf(out, "%-13s  %10.3f  %4s  BW%gk  ratio=%.1f  (CAD only)\n",
+                        ts.c_str(), det.freq / 1.0e6, sfStr.c_str(),
+                        det.bw / 1.0e3,
+                        std::max(det.peak_ratio_up, det.peak_ratio_dn));
+        }
         std::fflush(out);
 
         char freqBuf[32];
@@ -1284,6 +1370,20 @@ int main(int argc, char** argv) {
                              l2Probes, stats.l1_hot,
                              static_cast<uint32_t>(sweepDetections.size()),
                              stats.overflows);
+
+            // Poll for new UDP subscribers before emitting CBOR
+            // (subscribers may connect during a long tuning sweep)
+            {
+                struct sockaddr_storage sender{};
+                socklen_t sender_len = sizeof(sender);
+                char tmp[256];
+                while (::recvfrom(udp.fd, tmp, sizeof(tmp), 0,
+                                  reinterpret_cast<struct sockaddr*>(&sender),
+                                  &sender_len) >= 0) {
+                    udp.subscribe(sender);
+                    sender_len = sizeof(sender);
+                }
+            }
 
             emitSpectrumCbor(channels, sweepEnergy, hotIndices,
                              sweepDetections, stats.sweeps);

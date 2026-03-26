@@ -58,6 +58,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         float    ratio{0.f};         // CAD peak-to-median ratio
         float    chirp_slope{0.f};   // k = probe_bw² / 2^SF (Hz/s)
         float    probe_bw{0.f};      // probe bandwidth used (Hz, context only)
+        uint32_t sf{0};              // detected spreading factor (7-12, 0 = unknown)
     };
 
     // --- internal state ---
@@ -505,6 +506,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
                     if (det.detected && det.best_ratio > _currentBest.ratio) {
                         _currentBest.ratio      = det.best_ratio;
                         _currentBest.probe_bw   = probeBw;
+                        _currentBest.sf         = det.sf;
                         _currentBest.chirp_slope = probeBw * probeBw
                             / static_cast<float>(1U << det.sf);
                     }
@@ -586,6 +588,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
             ds.meta_information[0][std::pmr::string("det" + idx + "_ratio")]       = static_cast<float>(r.ratio);
             ds.meta_information[0][std::pmr::string("det" + idx + "_chirp_slope")] = r.chirp_slope;
             ds.meta_information[0][std::pmr::string("det" + idx + "_probe_bw")]    = r.probe_bw;
+            ds.meta_information[0][std::pmr::string("det" + idx + "_sf")]          = static_cast<int64_t>(r.sf);
         }
 
         outSpan[0] = std::move(ds);

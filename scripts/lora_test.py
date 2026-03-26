@@ -60,6 +60,7 @@ SCRIPT_DIR = Path(__file__).parent
 SETTLE_S = 2.0  # wait after radio change for PLL lock
 FLUSH_DECODE_S = 5.0  # wait after TX for decode pipeline
 FLUSH_SCAN_S = 8.0  # wait after TX for scan sweeps (~14 cycles at 555ms)
+FLUSH_SCAN_TUNING_S = 120.0  # tuning scanner: 2 full sweeps at ~60s each
 FLUSH_TX_S = 3.0  # wait after SDR TX for Heltec to receive
 FLUSH_BRIDGE_S = 5.0  # wait for bridge RX path (decode + companion protocol)
 BRIDGE_PORT = 7835  # serial_bridge TCP port
@@ -198,6 +199,9 @@ class PointResult:
     det_count: int = 0
     best_ratio: float | None = None
     best_chirp_slope: float | None = None
+    best_sf: int | None = None
+    best_sync_word: int | None = None
+    best_snr: float | None = None
     sweeps: int = 0
     avg_sweep_ms: int = 0
     overflows: int = 0
@@ -245,21 +249,29 @@ def _wait_tcp(port: int, timeout: float = 15.0) -> bool:
 
 def _wait_udp(port: int, timeout: float = 30.0) -> bool:
     sub_msg = cbor2.dumps({"type": "subscribe"})
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.0)
+    sock.bind(("", 0))
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(2.0)
-            sock.bind(("", 0))
-            sock.sendto(sub_msg, ("127.0.0.1", port))
-            sock.recvfrom(65536)
-            sock.close()
-            return True
-        except Exception:
-            if sock:
+    # Re-send subscribe every 5s (same socket = same ephemeral port)
+    next_sub = 0.0
+    try:
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_sub:
+                sock.sendto(sub_msg, ("127.0.0.1", port))
+                next_sub = now + 5.0
+            try:
+                sock.recvfrom(65536)
                 sock.close()
-            time.sleep(1.0)
+                return True
+            except socket.timeout:
+                continue
+            except Exception:
+                time.sleep(1.0)
+    except Exception:
+        pass
+    sock.close()
     return False
 
 
@@ -350,12 +362,15 @@ def run_point(
     point: ConfigPoint,
     companion: CompanionDriver,
     collector: EventCollector,
+    tuning_scan: bool = False,
 ) -> PointResult:
     """Run one config point: set radio, TX one ADVERT, collect results."""
     if mode == "decode":
         # SF12/BW62.5k airtime is ~4.5s; the fixed 5.0s left only 0.5s for
         # decode pipeline processing.  Use airtime + 3s margin.
         flush_s = max(FLUSH_DECODE_S, lora_airtime_s(point.sf, point.bw) + 3.0)
+    elif tuning_scan:
+        flush_s = FLUSH_SCAN_TUNING_S
     else:
         flush_s = FLUSH_SCAN_S
     result = PointResult(config=asdict(point))
@@ -465,6 +480,12 @@ def _collect_scan(result: PointResult, events: list[dict], tx_freq_hz: float) ->
         result.best_ratio = round(best.get("ratio", 0.0), 1)
         slopes = [d.get("chirp_slope", 0) for d in result.detections]
         result.best_chirp_slope = max(slopes) if slopes else 0
+        sfs = [d.get("sf", 0) for d in result.detections if d.get("sf", 0) > 0]
+        result.best_sf = max(sfs, key=sfs.count) if sfs else None  # most common SF
+        # Preamble ID fields (from tuning scanner)
+        if best.get("sync_word") is not None:
+            result.best_sync_word = best.get("sync_word")
+            result.best_snr = round(best.get("snr_db", -999), 1)
 
 
 # -- SDR TX helpers ------------------------------------------------------------
@@ -1273,7 +1294,10 @@ def main() -> None:
         [binary, "--config", args.config],
         f"tmp/{mode}.log",
     )
-    if not _wait_udp(udp_port):
+    # Tuning scanner (streaming=false) needs longer startup: first sweep can
+    # take 30-60s depending on hot channel count before any CBOR is emitted.
+    udp_timeout = 90.0 if mode == "scan" else 30.0
+    if not _wait_udp(udp_port, timeout=udp_timeout):
         _err(f"{binary} failed to start (see tmp/{mode}.log)")
         _stop_process(binary_proc)
         _stop_process(bridge_proc)
@@ -1288,6 +1312,20 @@ def main() -> None:
     startup_delay = 10.0 if mode == "scan" else 1.0
     time.sleep(startup_delay)
 
+    # Detect tuning scanner mode (streaming=false) from config file
+    is_tuning_scan = False
+    if mode == "scan":
+        try:
+            import tomllib
+
+            with open(args.config, "rb") as _cf:
+                _toml = tomllib.load(_cf)
+            is_tuning_scan = not _toml.get("scan", {}).get("streaming", True)
+        except Exception:
+            pass
+    if is_tuning_scan:
+        _info("(tuning scanner mode — extended flush timeouts)")
+
     _info(f"\n--- {mode}: {len(matrix)} points, matrix={args.matrix} ---")
     if args.hypothesis:
         _info(f"H: {args.hypothesis}")
@@ -1297,7 +1335,9 @@ def main() -> None:
     try:
         for i, point in enumerate(matrix):
             _info(f"[{i + 1}/{len(matrix)}] {point_label(point)}")
-            result = run_point(mode, point, companion, collector)
+            result = run_point(
+                mode, point, companion, collector, tuning_scan=is_tuning_scan
+            )
             results.append(result)
             if mode == "decode":
                 snr = f" SNR={result.best_snr}" if result.best_snr is not None else ""
@@ -1612,6 +1652,9 @@ def _write_results(
                 "det_count": r.det_count,
                 "best_ratio": r.best_ratio,
                 "best_chirp_slope": r.best_chirp_slope,
+                "best_sf": r.best_sf,
+                "best_sync_word": r.best_sync_word,
+                "best_snr_scan": r.best_snr,
                 "sweeps": r.sweeps,
                 "avg_sweep_ms": r.avg_sweep_ms,
                 "overflows": r.overflows,

@@ -366,18 +366,22 @@ def _render_footer(s: State, term_w: int) -> str:
         ratio = det.get("ratio", 0.0)
         rc = _ratio_color(ratio)
 
-        # Format chirp slope as human-readable
-        k = det.get("chirp_slope", 0)
-        k_str = f"{k / 1000:.0f}k" if k >= 1000 else f"{k:.0f}"
+        # Format SF and chirp slope
+        sf = det.get("sf", 0)
+        sf_str = f"SF{sf}" if sf else "?"
         probe_bw = det.get("probe_bw", 0)
         probe_str = _bw_short(probe_bw) if probe_bw else "?"
+        # Preamble ID: sync word if available
+        sync = det.get("sync_word")
+        sync_str = f"sync=0x{sync:02X}" if sync is not None else ""
 
         ts = _ts_hires(wall)
         line = (
             f"{C_GRAY}{ts}{C_RST}"
             f"  {C_BLUE}#{sweep:<5}{C_RST}"
             f"  {C_CYAN}{freq_mhz:>7.3f} MHz{C_RST}"
-            f"  {C_WHITE}k={k_str}{C_RST} {C_CYAN}@{probe_str}{C_RST}"
+            f"  {C_WHITE}{sf_str}{C_RST} {C_CYAN}@{probe_str}{C_RST}"
+            f"  {sync_str}"
             f"  {rc}ratio {ratio:>5.1f}{C_RST}"
         )
         line += "\033[K"

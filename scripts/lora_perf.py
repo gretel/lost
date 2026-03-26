@@ -41,6 +41,7 @@ class RunningStats:
     total_overflows: int = 0
     det_ratios: list[float] = field(default_factory=list)
     det_slopes: dict[str, int] = field(default_factory=dict)  # slope label -> count
+    det_sfs: dict[str, int] = field(default_factory=dict)  # SF label -> count
 
     def record_detections(self, dets: list[dict]) -> None:
         for d in dets:
@@ -51,6 +52,10 @@ class RunningStats:
             if k > 0:
                 k_str = f"{k / 1000:.0f}k" if k >= 1000 else f"{k:.0f}"
                 self.det_slopes[k_str] = self.det_slopes.get(k_str, 0) + 1
+            sf = d.get("sf", 0)
+            if sf > 0:
+                sf_str = f"SF{sf}"
+                self.det_sfs[sf_str] = self.det_sfs.get(sf_str, 0) + 1
 
     def record_sweep(self, dur_ms: int, hot: int, det: int, ovf: int) -> None:
         self.sweep_durations.append(dur_ms)
@@ -100,6 +105,7 @@ def emit_summary(stats: RunningStats) -> str:
     min_ratio = min(stats.det_ratios) if stats.det_ratios else 0.0
     max_ratio = max(stats.det_ratios) if stats.det_ratios else 0.0
     slope_str = ",".join(f"{k}:{c}" for k, c in sorted(stats.det_slopes.items()))
+    sf_str = ",".join(f"{k}:{c}" for k, c in sorted(stats.det_sfs.items()))
 
     return (
         f"SUMMARY sweeps={n} "
@@ -107,7 +113,7 @@ def emit_summary(stats: RunningStats) -> str:
         f"avg_hot={avg_hot:.1f} "
         f"total_det={total_det} total_ovf={stats.total_overflows}"
         f" avg_ratio={avg_ratio:.1f} min_ratio={min_ratio:.1f} max_ratio={max_ratio:.1f}"
-        f" slopes={slope_str or '-'}"
+        f" sfs={sf_str or '-'} slopes={slope_str or '-'}"
     )
 
 
@@ -223,13 +229,27 @@ def main() -> None:
                 for d in dets:
                     freq_mhz = d.get("freq", 0) / 1e6
                     ratio = d.get("ratio", 0.0)
-                    k = d.get("chirp_slope", 0)
-                    k_str = f"{k / 1000:.0f}k" if k >= 1000 else f"{k:.0f}"
+                    sf = d.get("sf", 0)
+                    sf_str = f"SF{sf}" if sf else "?"
                     probe_bw = d.get("probe_bw", 0)
                     probe_str = f"BW{probe_bw / 1000:.0f}k" if probe_bw else ""
-                    det_parts.append(
-                        f"{freq_mhz:.3f}MHz/r={ratio:.1f}/k={k_str}/@{probe_str}"
-                    )
+                    # Show preamble ID fields if present
+                    sync = d.get("sync_word")
+                    if sync is not None:
+                        cfo_f = d.get("cfo_frac", 0.0)
+                        cfo_i = d.get("cfo_int", 0)
+                        snr = d.get("snr_db", -999)
+                        det_parts.append(
+                            f"{freq_mhz:.3f}MHz {sf_str} {probe_str} "
+                            f"sync=0x{sync:02X} CFO={cfo_f:+.1f}+{cfo_i} "
+                            f"SNR={snr:.1f} r={ratio:.1f}"
+                        )
+                    else:
+                        k = d.get("chirp_slope", 0)
+                        k_str = f"{k / 1000:.0f}k" if k >= 1000 else f"{k:.0f}"
+                        det_parts.append(
+                            f"{freq_mhz:.3f}MHz {sf_str} r={ratio:.1f}/k={k_str}/@{probe_str}"
+                        )
                 print(
                     f"DET sweep={sweep_num} n={len(dets)} {' '.join(det_parts)}",
                     flush=True,

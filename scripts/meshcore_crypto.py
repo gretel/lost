@@ -465,7 +465,7 @@ def try_decrypt_anon_req(
 
 
 # Seed channels bundled with the repo (scripts/channels/*.channel)
-SEED_CHANNELS_DIR = Path(__file__).resolve().parent / "channels"
+SEED_CHANNELS_DIR = Path(__file__).resolve().parent / "data" / "meshcore" / "channels"
 
 DEFAULT_CHANNELS_DIR = DEFAULT_DATA_DIR / "channels"
 

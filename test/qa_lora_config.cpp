@@ -47,7 +47,7 @@ const boost::ut::suite configLoadConfig = [] {
 
         // Device
         expect(eq(c.device, std::string{"uhd"}));
-        expect(eq(c.device_param, std::string{"type=b200"}));
+        expect(eq(c.device_param, std::string{"type=b200,num_recv_frames=512,recv_frame_size=16384"}));
         expect(eq(c.clock, std::string{"external"}));
 
         // Radio

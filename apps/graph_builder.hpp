@@ -384,12 +384,17 @@ inline ScanGraph build_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg,
     }
 
     // Path 1: CaptureSink (L2 on-demand)
+    // Buffer sized for full preamble characterization: 11 symbols at SF12
+    // (8 upchirps + 2 sync + 0.25 quarter_down + margin) × os_factor × decFactor.
+    // The actual capture request may be smaller (2-symbol CAD) or larger (11-symbol
+    // preamble characterization) — the buffer just needs to be big enough for the max.
     sg.capture = std::make_shared<gr::lora::CaptureState>();
     const double minBw      = cfg.min_bw();
     const double targetRate  = minBw * static_cast<double>(cfg.os_factor);
     const auto   decFactor   = static_cast<uint32_t>(std::round(cfg.l1_rate / targetRate));
-    const uint32_t sf12Win   = (1U << 12U) * cfg.os_factor * 2U;
-    sg.capture->buffer.resize(sf12Win * decFactor);
+    constexpr uint32_t kPreambleSymbols = 11U;  // full preamble + sync + margin
+    const uint32_t sf12PreambleWin = (1U << 12U) * cfg.os_factor * kPreambleSymbols;
+    sg.capture->buffer.resize(sf12PreambleWin * decFactor);
 
     auto& cap_sink = graph.emplaceBlock<gr::lora::CaptureSink>({});
     cap_sink._state = sg.capture;
