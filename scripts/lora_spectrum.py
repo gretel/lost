@@ -173,8 +173,8 @@ class State:
             if self.freq_step > 0 and freq > 0:
                 ch = int((freq - self.freq_min) / self.freq_step + 0.5)
                 ch = max(0, min(ch, n - 1))
-                if self.energy:
-                    db_val = _db(self.energy[ch])
+                if self.raw_energy:
+                    db_val = _db(self.raw_energy[ch])
                     self.peak_holds.append((ch, db_val, mono))
         # Prune anchors older than ANCHOR_TTL
         self.active_dets = [
@@ -501,10 +501,7 @@ def render(s: State) -> None:
             continue
         col = int(ch_idx * spec_w / s.n_channels) if s.n_channels > 0 else 0
         col = max(0, min(col, spec_w - 1))
-        # Decay: peak drops linearly over PEAK_HOLD_S
-        decay_db = (age / PEAK_HOLD_S) * db_range * 0.5
-        held_db = peak_db - decay_db
-        peak_row = body_h - int((held_db - db_min) / db_range * body_h + 0.5)
+        peak_row = body_h - int((peak_db - db_min) / db_range * body_h + 0.5)
         peak_row = max(0, min(peak_row, body_h - 1))
         if col not in _peak_raw or peak_row < _peak_raw[col]:
             _peak_raw[col] = peak_row
