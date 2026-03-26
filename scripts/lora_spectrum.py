@@ -30,13 +30,12 @@ from lora_common import create_udp_subscriber  # noqa: reportImplicitRelativeImp
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
-DET_HISTORY = 6  # number of recent detections to show in footer
 EMA_ALPHA = 0.3  # spectrum smoothing factor
 DB_HEADROOM = 1.0  # dB padding above peak
 DB_FLOOR_PAD = 3.0  # dB padding below noise floor (25th percentile)
 ANCHOR_TTL = 3.0  # seconds to keep detection anchors visible
 PEAK_HOLD_S = 5.0  # seconds to hold peak detection bar height
-HEADER_LINES = 2 + DET_HISTORY  # header + freq axis + footer lines
+HEADER_LINES = 2 + 1  # status line + bar chart freq axis + freq legend
 
 # ANSI helpers — xterm-256 for reliable rendering on any background
 C_DIM = "\033[2m"
@@ -114,7 +113,9 @@ class State:
         self.freq_step: int = 62500
         self.n_channels: int = 0
         self.hot: set[int] = set()
-        self.det_history: list[tuple[float, int, dict[str, Any]]] = []
+        self.det_history: list[
+            tuple[float, int, dict[str, Any]]
+        ] = []  # unused, kept for future
         self.ema_alpha: float = ema_alpha
 
         # from scan_status
@@ -184,7 +185,7 @@ class State:
         self.peak_holds = [
             (ch, db, t) for ch, db, t in self.peak_holds if mono - t < PEAK_HOLD_S
         ]
-        self.det_history = self.det_history[-DET_HISTORY:]
+        self.det_history = self.det_history[-20:]
 
         self.sweeps = msg.get("sweep", self.sweeps)
         mono = time.monotonic()
@@ -254,16 +255,6 @@ def _grad_color(frac: float) -> str:
     return _GRAD[idx]
 
 
-def _bw_short(bw_hz: float) -> str:
-    """Format BW as short string: 62.5k, 125k, 250k, 500k."""
-    if bw_hz <= 0:
-        return "?"
-    k = bw_hz / 1000
-    if k == int(k):
-        return f"{int(k)}k"
-    return f"{k:g}k"
-
-
 def _det_col(
     det: dict[str, Any], freq_min: int, freq_step: int, n_ch: int, spec_w: int
 ) -> int:
@@ -291,13 +282,6 @@ def _sweep_rate_color(rate: float) -> str:
     if rate >= 0.4:
         return C_YELLOW
     return C_RED
-
-
-def _ts_hires(wall: float) -> str:
-    """Format wall time as HH:MM:SS.mmm."""
-    lt = time.localtime(wall)
-    ms = int((wall % 1) * 1000)
-    return f"{lt.tm_hour:02d}:{lt.tm_min:02d}:{lt.tm_sec:02d}.{ms:03d}"
 
 
 # ─── Rendering ─────────────────────────────────────────────────────────────────
@@ -361,46 +345,30 @@ def _render_header(s: State, term_w: int) -> str:
     return "".join(parts) + "\033[K\n"
 
 
-def _render_footer(s: State, term_w: int) -> str:
-    """Detection history: high-precision timestamps, readable labels, full width."""
-    lines: list[str] = []
-    mono_now = time.monotonic()
-    for i, (wall, sweep, det) in enumerate(reversed(s.det_history)):
-        freq_mhz = det["freq"] / 1e6
-        ratio = det.get("ratio", 0.0)
-        rc = _ratio_color(ratio)
+def _render_freq_legend(s: State, lbl_w: int, spec_w: int) -> str:
+    """One-line frequency legend spanning the full spectrum width."""
+    if s.n_channels == 0 or s.freq_step == 0:
+        return " " * (lbl_w + spec_w) + "\033[K"
 
-        # Format SF and chirp slope
-        sf = det.get("sf", 0)
-        sf_str = f"SF{sf}" if sf else "?"
-        probe_bw = det.get("probe_bw", 0)
-        probe_str = _bw_short(probe_bw) if probe_bw else "?"
-        # Preamble ID: sync word if available
-        sync = det.get("sync_word")
-        sync_str = f"sync=0x{sync:02X}" if sync is not None else ""
+    f_lo = s.freq_min / 1e6
+    f_hi = (s.freq_min + s.freq_step * s.n_channels) / 1e6
+    f_range = f_hi - f_lo
 
-        ts = _ts_hires(wall)
-        line = (
-            f"{C_GRAY}{ts}{C_RST}"
-            f"  {C_BLUE}#{sweep:<5}{C_RST}"
-            f"  {C_CYAN}{freq_mhz:>7.3f} MHz{C_RST}"
-            f"  {C_WHITE}{sf_str}{C_RST} {C_CYAN}@{probe_str}{C_RST}"
-            f"  {sync_str}"
-            f"  {rc}ratio {ratio:>5.1f}{C_RST}"
-        )
-        line += "\033[K"
+    # Place tick labels at regular intervals; aim for one every ~12 chars
+    n_ticks = max(2, spec_w // 12)
+    buf = [" "] * spec_w
+    for i in range(n_ticks + 1):
+        frac = i / n_ticks
+        freq = f_lo + frac * f_range
+        label = f"{freq:.1f}"
+        # Centre-align label at the column position, clamped to buffer edges
+        col = int(frac * (spec_w - 1))
+        start = max(0, min(col - len(label) // 2, spec_w - len(label)))
+        for j, ch in enumerate(label):
+            if start + j < spec_w:
+                buf[start + j] = ch
 
-        # Bold the most recent detection if it's within ANCHOR_TTL
-        is_recent = len(s.det_history) > 0 and (
-            mono_now - s.active_dets[0][0] < ANCHOR_TTL if s.active_dets else False
-        )
-        if i == 0 and is_recent:
-            line = f"{C_BOLD}{line}{C_RST}"
-
-        lines.append(line)
-    while len(lines) < DET_HISTORY:
-        lines.append("\033[K")
-    return "\n".join(lines)
+    return f"{' ' * lbl_w}{C_CYAN}{''.join(buf)}{C_RST}\033[K"
 
 
 def render_header(s: State) -> None:
@@ -599,8 +567,8 @@ def render(s: State) -> None:
             out.append(f"{prev_color}{_BAR * run_len}{C_RST}")
         out.append("\033[K\n")
 
-    # ── Footer: detection history ──
-    out.append(_render_footer(s, term_w) + "\n")
+    # ── Footer: frequency legend ──
+    out.append(_render_freq_legend(s, lbl_w, spec_w) + "\n")
 
     out.append("\033[J")
     _write("".join(out))
