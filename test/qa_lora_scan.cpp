@@ -329,24 +329,12 @@ const boost::ut::suite<"ScanController L1 energy detection"> scanControllerL1Tes
 
         sc._ring.push(std::span<const cf32>(tone));
 
-        // Sweep 1: accumulate energy + findHotChannels (persistence counter = 1)
+        // Accumulate energy + findHotChannels (kMinHotSweeps = 1: report immediately)
         for (uint32_t i = 0; i < snaps; ++i) {
             sc.computeEnergySnapshot();
         }
         sc.findHotChannels();
-        // Persistence filter: first sweep should NOT report (kMinHotSweeps = 2)
-        expect(sc._hotChannels.empty()) << "first sweep: persistence filter suppresses";
-
-        // Sweep 2: re-accumulate same signal + findHotChannels (persistence counter = 2)
-        sc._channelEnergy.assign(sc._nChannels, 0.f);
-        sc._channelPeakBin.assign(sc._nChannels, 0);
-        sc._channelPeakMag.assign(sc._nChannels, 0.f);
-        sc._snapshotCount = 0;
-        for (uint32_t i = 0; i < snaps; ++i) {
-            sc.computeEnergySnapshot();
-        }
-        sc.findHotChannels();
-        expect(!sc._hotChannels.empty()) << "CW tone should produce at least one hot channel after 2 sweeps";
+        expect(!sc._hotChannels.empty()) << "CW tone should produce at least one hot channel";
 
         if (!sc._hotChannels.empty()) {
             // The detected channel should be near the expected channel
@@ -409,15 +397,11 @@ const boost::ut::suite<"ScanController L1 energy detection"> scanControllerL1Tes
 
         sc._ring.push(std::span<const cf32>(sig));
 
-        // Two sweeps needed for persistence filter (kMinHotSweeps = 2)
-        for (uint32_t sweep = 0; sweep < 2; ++sweep) {
-            sc._channelEnergy.assign(sc._nChannels, 0.f);
-            sc._snapshotCount = 0;
-            for (uint32_t i = 0; i < snaps; ++i) {
-                sc.computeEnergySnapshot();
-            }
-            sc.findHotChannels();
+        // Single sweep sufficient (kMinHotSweeps = 1)
+        for (uint32_t i = 0; i < snaps; ++i) {
+            sc.computeEnergySnapshot();
         }
+        sc.findHotChannels();
 
         expect(sc._hotChannels.size() >= 2U)
             << "two tones should produce at least 2 hot channels, got " << sc._hotChannels.size();
@@ -440,18 +424,15 @@ const boost::ut::suite<"ScanController L1 energy detection"> scanControllerL1Tes
 
         // Direct-inject channel energy to test findHotChannels cluster dedup in isolation.
         // Uniform noise floor at 1.0, with channels 5-7 elevated (6 is peak).
-        // Two sweeps needed for persistence filter (kMinHotSweeps = 2).
-        for (uint32_t sweep = 0; sweep < 2; ++sweep) {
-            sc._channelEnergy.assign(sc._nChannels, 1.0f);
-            sc._snapshotCount = 4;  // non-zero so findHotChannels proceeds
+        sc._channelEnergy.assign(sc._nChannels, 1.0f);
+        sc._snapshotCount = 4;  // non-zero so findHotChannels proceeds
 
-            // Make channels 5, 6, 7 hot (6 is peak)
-            sc._channelEnergy[5] = 100.f;
-            sc._channelEnergy[6] = 200.f;
-            sc._channelEnergy[7] = 150.f;
+        // Make channels 5, 6, 7 hot (6 is peak)
+        sc._channelEnergy[5] = 100.f;
+        sc._channelEnergy[6] = 200.f;
+        sc._channelEnergy[7] = 150.f;
 
-            sc.findHotChannels();
-        }
+        sc.findHotChannels();
         // Cluster dedup should merge channels 5-7 into a single detection at channel 6 (peak)
         expect(eq(sc._hotChannels.size(), 1UZ))
             << "adjacent hot channels should be merged into 1 cluster";
@@ -468,76 +449,61 @@ const boost::ut::suite<"ScanController L1 energy detection"> scanControllerL1Tes
         expect(sc._hotChannels.empty()) << "no snapshots → no hot channels";
     };
 
-    "findHotChannels requires persistence"_test = [&] {
+    "findHotChannels reports on first sweep and tracks persistence"_test = [&] {
         auto sc = makeScanController();
         auto nCh = sc._nChannels;
         expect(gt(nCh, 0U)) << "should have channels";
 
-        // Sweep 1: one channel hot (first time) — persistence counter goes to 1
-        sc._channelEnergy.assign(nCh, 1.0f);
-        if (nCh > 5) sc._channelEnergy[5] = 100.0f;
-        sc._snapshotCount = 1;
-        sc.findHotChannels();
-        expect(sc._hotChannels.empty())
-            << "should NOT report after only 1 sweep";
-
-        // Sweep 2: same channel still hot → counter = 2, should now report
+        // Sweep 1: one channel hot → reported immediately (kMinHotSweeps = 1)
         sc._channelEnergy.assign(nCh, 1.0f);
         if (nCh > 5) sc._channelEnergy[5] = 100.0f;
         sc._snapshotCount = 1;
         sc.findHotChannels();
         expect(eq(sc._hotChannels.size(), 1UZ))
-            << "should report after 2 consecutive sweeps";
+            << "should report on first sweep";
         if (!sc._hotChannels.empty()) {
             expect(eq(sc._hotChannels[0], 5U)) << "should report channel 5";
         }
 
-        // Sweep 3: channel goes cold → counter resets to 0
+        // Sweep 2: channel goes cold → counter resets, not reported
         sc._channelEnergy.assign(nCh, 1.0f);
         sc._snapshotCount = 1;
         sc.findHotChannels();
         expect(sc._hotChannels.empty())
             << "should NOT report after channel goes cold";
 
-        // Sweep 4: channel hot again (counter = 1)
-        sc._channelEnergy.assign(nCh, 1.0f);
-        if (nCh > 5) sc._channelEnergy[5] = 100.0f;
-        sc._snapshotCount = 1;
-        sc.findHotChannels();
-        expect(sc._hotChannels.empty()) << "first sweep after cold: not yet";
-
-        // Sweep 5: channel still hot (counter = 2) → should report
+        // Sweep 3: channel hot again → reported immediately
         sc._channelEnergy.assign(nCh, 1.0f);
         if (nCh > 5) sc._channelEnergy[5] = 100.0f;
         sc._snapshotCount = 1;
         sc.findHotChannels();
         expect(eq(sc._hotChannels.size(), 1UZ))
-            << "second consecutive sweep: should report";
+            << "should report immediately when hot again";
     };
 
     "resetAccumulation does not clear persistence counters"_test = [&] {
         auto sc = makeScanController();
         auto nCh = sc._nChannels;
 
-        // Sweep 1: make channel 5 hot (counter = 1)
+        // Sweep 1: make channel 5 hot (counter = 1, reported immediately)
         sc._channelEnergy.assign(nCh, 1.0f);
         if (nCh > 5) sc._channelEnergy[5] = 100.0f;
         sc._snapshotCount = 1;
         sc.findHotChannels();
-        expect(sc._hotChannels.empty()) << "first sweep: suppressed by persistence";
+        expect(eq(sc._hotChannels.size(), 1UZ)) << "reported on first sweep";
 
         // Call resetAccumulation (as processBulk does between sweeps)
         sc.resetAccumulation();
         expect(eq(sc._channelHotCount[5], 1U))
             << "persistence counter survives resetAccumulation";
 
-        // Sweep 2: same channel hot again → counter = 2, should report
+        // Sweep 2: same channel still hot → counter = 2, still reported
         sc._channelEnergy.assign(nCh, 1.0f);
         if (nCh > 5) sc._channelEnergy[5] = 100.0f;
         sc._snapshotCount = 1;
         sc.findHotChannels();
         expect(eq(sc._hotChannels.size(), 1UZ))
-            << "channel reported after persistence survives reset";
+            << "channel still reported after persistence survives reset";
     };
 
     "computeEnergySnapshot requires sufficient ring buffer data"_test = [&] {

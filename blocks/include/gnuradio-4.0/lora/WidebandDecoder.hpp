@@ -568,7 +568,7 @@ struct WidebandDecoder
         const float median = sorted[sorted.size() / 2];
 
         constexpr float    kHotMultiplier = 6.0f;
-        constexpr uint32_t kMinHotSweeps  = 2;  // require 2 consecutive sweeps hot
+        constexpr uint32_t kMinHotSweeps  = 1;  // report on first sweep (transient signals span ~1 sweep)
         const float threshold = median * kHotMultiplier;
 
         // Update persistence counters

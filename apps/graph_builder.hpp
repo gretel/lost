@@ -431,8 +431,8 @@ inline gr::lora::ScanSink& build_streaming_scan_graph(gr::Graph& graph, const Sc
         {"min_ratio",         cfg.min_ratio},
         {"buffer_ms",         cfg.buffer_ms},
         {"channel_bw",        cfg.channel_bw},
-        {"l1_interval",       cfg.l1_reports},
-        {"l1_snapshots",      uint32_t{16}},
+        {"l1_interval",       uint32_t{16}},    // L1 FFT every 16 calls = ~8ms
+        {"l1_snapshots",      uint32_t{4}},     // 4 snapshots = ~33ms sweep
         {"l1_fft_size",       cfg.l1_fft_size},
         {"probe_bws",         probeBwsStr},
         {"dc_blocker_cutoff", cfg.dc_blocker ? cfg.dc_blocker_cutoff : 0.f},

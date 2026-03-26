@@ -233,7 +233,7 @@ const boost::ut::suite configLoadScan = [] {
         expect(std::ranges::find(s.bws, uint32_t{62500}) != s.bws.end())
             << "bws contains 62500";
         expect(s.os_factor == 4_u) << "os_factor";
-        expect(std::abs(s.min_ratio - 8.0F) < 0.01F) << "min_ratio";
+        expect(std::abs(s.min_ratio - 5.0F) < 0.01F) << "min_ratio";
         expect(s.l1_rate == 16'000'000.0) << "l1_rate";
         expect(s.master_clock == 32'000'000.0) << "master_clock";
         expect(s.udp_port == 5557_u) << "udp_port";

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import signal
+import struct
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -109,6 +110,64 @@ def emit_summary(stats: RunningStats) -> str:
     )
 
 
+def _emit_l1_diag(msg: dict, watch_freq: float = 0.0) -> None:
+    """Print L1 energy diagnostics from a scan_spectrum CBOR event."""
+    channels_raw = msg.get("channels", b"")
+    n_ch = msg.get("n_channels", 0)
+    freq_min = msg.get("freq_min", 0)
+    freq_step = msg.get("freq_step", 62500)
+    hot = msg.get("hot", [])
+    sweep = msg.get("sweep", 0)
+
+    if not channels_raw or n_ch == 0:
+        return
+
+    # Decode binary float array
+    energies = list(struct.unpack(f"<{n_ch}f", channels_raw[: n_ch * 4]))
+
+    # Compute threshold (same as ScanController: median × 6)
+    sorted_e = sorted(energies)
+    median = sorted_e[len(sorted_e) // 2]
+    threshold = median * 6.0
+
+    # Top-5 channels by energy
+    indexed = [(e, i) for i, e in enumerate(energies)]
+    indexed.sort(reverse=True)
+    top5 = indexed[:5]
+
+    # Hot channel info
+    hot_parts = []
+    for h in hot:
+        if h < n_ch:
+            freq_mhz = (freq_min + (h + 0.5) * freq_step) / 1e6
+            ratio_to_median = energies[h] / median if median > 0 else 0
+            hot_parts.append(f"ch{h}={freq_mhz:.3f}MHz({ratio_to_median:.1f}x)")
+
+    # Top-5 info
+    top_parts = []
+    for e, i in top5:
+        freq_mhz = (freq_min + (i + 0.5) * freq_step) / 1e6
+        ratio_to_median = e / median if median > 0 else 0
+        marker = "*" if i in hot else ""
+        top_parts.append(f"ch{i}{marker}={freq_mhz:.3f}MHz({ratio_to_median:.1f}x)")
+
+    # Watch frequency: show energy at a specific channel
+    watch_str = ""
+    if watch_freq > 0 and freq_step > 0:
+        watch_ch = int((watch_freq - freq_min) / freq_step)
+        if 0 <= watch_ch < n_ch:
+            w_ratio = energies[watch_ch] / median if median > 0 else 0
+            w_freq = (freq_min + (watch_ch + 0.5) * freq_step) / 1e6
+            watch_str = f" WATCH ch{watch_ch}={w_freq:.3f}MHz({w_ratio:.1f}x)"
+
+    print(
+        f"  L1 sweep={sweep} median={median:.2e} thresh={threshold:.2e} "
+        f"hot=[{','.join(hot_parts)}] "
+        f"top5=[{', '.join(top_parts)}]{watch_str}",
+        flush=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="lora_scan sweep performance analyzer. Subscribes via UDP.",
@@ -118,6 +177,15 @@ def main() -> None:
     )
     _ = parser.add_argument(
         "--port", type=int, default=5557, help="lora_scan UDP port (default: 5557)"
+    )
+    _ = parser.add_argument(
+        "--diag", action="store_true", help="print L1 energy diagnostics per sweep"
+    )
+    _ = parser.add_argument(
+        "--watch-freq",
+        type=float,
+        default=0.0,
+        help="frequency (Hz) to monitor in L1 diag (e.g. 869618000)",
     )
     args = parser.parse_args()
 
@@ -163,6 +231,10 @@ def main() -> None:
                     f"DET sweep={sweep_num} n={len(dets)} {' '.join(det_parts)}",
                     flush=True,
                 )
+
+            # L1 energy diagnostics
+            if args.diag:
+                _emit_l1_diag(msg, watch_freq=args.watch_freq)
 
         elif msg_type == "scan_sweep_end":
             line = emit_sweep(msg)

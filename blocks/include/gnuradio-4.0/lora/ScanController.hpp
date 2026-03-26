@@ -79,6 +79,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
     std::vector<uint32_t>    _channelPeakBin;  // DC-centered FFT bin with max |Y|² per channel
     std::vector<float>       _channelPeakMag;  // max |Y|² per channel
     std::chrono::steady_clock::time_point _sweepStart{std::chrono::steady_clock::now()};
+    uint32_t                 _probeWindowStart{0};  // rotating probe window position
 
     // L1 FFT state
     gr::algorithm::FFT<cf32> _fft;
@@ -198,17 +199,36 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         switch (_state) {
         case ScanState::Accumulate:
             if (_snapshotCount >= l1_snapshots) {
-                findHotChannels();
-                if (_hotChannels.empty()) {
-                    spectrumPublished = emitSpectrum(spectrumOutPort);
-                    _sweepCount++;
-                    resetAccumulation();
-                } else {
-                    _probeIndex   = 0;
-                    _probeBwIndex = 0;
-                    _probeResults.clear();
-                    _state = ScanState::Probe;
+                findHotChannels();  // still run for spectrum metadata
+
+                // L1 FFT energy gating cannot detect BW62.5k chirp signals at
+                // 16 MS/s (energy dilutes to ~1× median across FFT bins).
+                // Use a rotating probe window: probe kProbeWindowSize channels
+                // per sweep, cycling through the full band. L1 hot channels
+                // are merged in so energy-detected signals still get priority.
+                constexpr uint32_t kProbeWindowSize = 8;
+                const uint32_t windowEnd = std::min(_probeWindowStart + kProbeWindowSize, _nChannels);
+
+                // Build probe list: rotating window + any L1 hot channels
+                std::vector<uint32_t> probeChannels;
+                for (uint32_t ch = _probeWindowStart; ch < windowEnd; ++ch) {
+                    probeChannels.push_back(ch);
                 }
+                // Merge L1 hot channels not already in the window
+                for (uint32_t ch : _hotChannels) {
+                    if (ch < _probeWindowStart || ch >= windowEnd) {
+                        probeChannels.push_back(ch);
+                    }
+                }
+
+                // Advance window for next sweep (wrap around)
+                _probeWindowStart = windowEnd >= _nChannels ? 0 : windowEnd;
+
+                _hotChannels = std::move(probeChannels);
+                _probeIndex   = 0;
+                _probeBwIndex = 0;
+                _probeResults.clear();
+                _state = ScanState::Probe;
             }
             break;
 
@@ -222,9 +242,12 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
 
         case ScanState::Report:
             spectrumPublished = emitSpectrum(spectrumOutPort);
-            _sweepCount++;
-            resetAccumulation();
-            _state = ScanState::Accumulate;
+            if (spectrumPublished > 0) {
+                _sweepCount++;
+                resetAccumulation();
+                _state = ScanState::Accumulate;
+            }
+            // else: output full, retry next processBulk call
             break;
         }
 
@@ -318,7 +341,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
         const float median = sorted[sorted.size() / 2];
 
         constexpr float    kHotMultiplier = 6.0f;
-        constexpr uint32_t kMinHotSweeps  = 2;  // require 2 consecutive sweeps hot
+        constexpr uint32_t kMinHotSweeps  = 1;  // report on first sweep (transient signals span ~1 sweep)
         const float threshold = median * kHotMultiplier;
 
         // Update persistence counters
