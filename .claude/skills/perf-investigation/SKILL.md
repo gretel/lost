@@ -280,47 +280,6 @@ account for the majority of cases.
 | Large FFT in SfLane SYNC/OUTPUT | CPU spike on detection | SF12: 4096-point FFT per symbol in decode state |
 | channelize() blocking | Multi-channel probe stall | 8 channels × 3 BWs × 5ms = 120ms block |
 
-## Validated profiling results (lora_scan, 2026-03-27)
-
-**Config:** streaming mode, 16 MS/s, B210, external clock, branch `fix/scan-cbor-overflow`
-
-### Thread distribution (15s trace, ~30K samples)
-
-| Role | % of trace | Notes |
-|---|---|---|
-| GR4 scheduler (ScanController) | 33% | The single hot thread — 100% utilized |
-| GR4 idle workers | 60% | 8 threads blocked in `__semwait_signal` |
-| libusb I/O | 1.5% | USB transport |
-| Main thread | 0.9% | Startup + UDP recv |
-
-### Hot thread: baseline → fix #1 → fix #1+#2 → all 3 (fused)
-
-| Function | Baseline | Fix #1 | Fix #1+#2 | All 3 (fused) |
-|---|---|---|---|---|
-| `processWithMix` (% 23) | 3,788 / 39.2% | 0 | 0 | 0 |
-| `processWithNcoBatch` (NCO) | — | 3,576 / 36.5% | 4,386 / 44.8% | 0 / 0% |
-| `processWithMixBatch` (2-loop) | — | 2,006 / 20.5% | 2,375 / 24.3% | 0 / 0% |
-| **`processNcoFirFused`** | — | — | — | **6,712 / 67.8%** |
-| `computeFilter` (DC IIR) | 1,119 / 11.6% | 1,245 / 12.7% | 3 / 0.03% | 2 / 0.0% |
-| `processBatch` (FIR stgs 1+) | 842 / 8.7% | 928 / 9.5% | 1,105 / 11.3% | 1,194 / 12.1% |
-| `_platform_memmove` | 519 / 5.4% | 440 / 4.5% | 481 / 4.9% | 545 / 5.5% |
-| CAD (peakRatio+FFT) | ~175 / 1.8% | ~175 / 1.8% | 253 / 2.6% | 271 / 2.7% |
-| Hot thread total | 9,663 | 9,803 | 9,784 | 9,900 |
-
-### Overflow telemetry: 4-way comparison (30s, 61 sweeps each)
-
-| Metric | Baseline | Fix #1 | Fix #1+#2 | All 3 | Change |
-|---|---|---|---|---|---|
-| total_ovf | 9 | 7 | 5 | **4** | **-56%** |
-| p50_dur | 81ms | 66ms | 51ms | **48ms** | **-41%** |
-| avg_dur | 137ms | 102ms | 87ms | **79ms** | **-42%** |
-| min_dur | 40ms | 39ms | 32ms | **31ms** | **-23%** |
-
-After all three fixes, 80% of the hot thread is `processNcoFirFused`
-(67.8%) + `processBatch` (12.1%) — the irreducible cost of digital
-channelization at 16 MS/s. Overflows at 0.13/s are sporadic USB transport
-stalls. Further gains require NEON SIMD vectorization of the FIR inner loop.
-
 ## Telemetry integration
 
 The codebase has a telemetry system (`algorithm/Telemetry.hpp`) that emits
