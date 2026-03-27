@@ -604,6 +604,20 @@ struct WidebandDecoder
             _hotChannels.push_back(bestCh);
             i = j;
         }
+
+        // Exclude DC-adjacent channels — the B210 ADC DC offset produces
+        // persistent hot channels near center_freq that waste decode slots.
+        const uint32_t centerCh = _nChannels / 2;
+        const float binHz       = sample_rate / static_cast<float>(l1_fft_size);
+        const auto  binsPerCh   = static_cast<uint32_t>(channel_bw / binHz);
+        const uint32_t dcExcludeRadius = (binsPerCh > 0)
+            ? std::min(static_cast<uint32_t>(100000.f / binHz),
+                       l1_fft_size / 8) / binsPerCh + 1
+            : 0;
+        std::erase_if(_hotChannels, [centerCh, dcExcludeRadius](uint32_t ch) {
+            const auto dist = (ch > centerCh) ? ch - centerCh : centerCh - ch;
+            return dist <= dcExcludeRadius;
+        });
     }
 
     // --- Channel pool management ---
