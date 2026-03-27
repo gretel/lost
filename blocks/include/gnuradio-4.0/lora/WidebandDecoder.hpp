@@ -27,7 +27,7 @@
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/Message.hpp>
 #include <gnuradio-4.0/algorithm/fourier/fft.hpp>
-#include <gnuradio-4.0/lora/algorithm/DCBlocker.hpp>
+// DCBlocker.hpp not needed — wideband path uses FFT NF interpolation + DC channel exclusion
 #include <gnuradio-4.0/lora/algorithm/HalfBandDecimator.hpp>
 #include <gnuradio-4.0/lora/algorithm/SfLane.hpp>
 #include <gnuradio-4.0/lora/algorithm/Telemetry.hpp>
@@ -225,8 +225,7 @@ struct WidebandDecoder
     std::vector<std::vector<uint32_t>>   _activeChannelMap;  // channelIdx → list of slotIdx
 
     // DC removal (2nd-order Butterworth high-pass, double-precision coefficients)
-    DCBlocker                 _dc;
-    std::vector<cf32>         _dcBuf;   // persistent buffer (avoids per-call heap alloc)
+    // DC blocker removed — FFT NF interpolation + DC channel exclusion handle the spur
     std::vector<cf32>         _fftBuf;  // persistent L1 FFT buffer (avoids ~30/s heap allocs)
 
     // Telemetry callback (set by app, fires on sweep completion and slot changes)
@@ -309,8 +308,7 @@ struct WidebandDecoder
         }
         _fft = gr::algorithm::FFT<cf32>{};
 
-        _dc.init(sample_rate, dc_blocker_cutoff);
-        _dcBuf.reserve(8192);           // typical chunk size
+        // DC blocker not used — see processBulk comment for DC spur handling
         _fftBuf.reserve(l1_fft_size);   // persistent L1 FFT buffer
         _callCount      = 0;
         _snapshotCount  = 0;
@@ -360,26 +358,27 @@ struct WidebandDecoder
             }
         }
 
-        // 2. DC removal (2nd-order Butterworth high-pass) — removes B210 DC spur
-        _dcBuf.resize(in_span.size());
-        _dc.processBlock(in_span, std::span<cf32>(_dcBuf));
-        auto clean_span = std::span<const cf32>(_dcBuf);
-
-        // 3. Push DC-removed input through all active ChannelSlots.
-        //    On overflow (0 input samples), insert zeros to preserve timing.
+        // 2. Push raw samples through all active ChannelSlots (no DC blocker).
+        // The DC spur is handled by:
+        //   - L1 energy: FFT NF interpolation replaces DC bins with noise floor
+        //   - Hot channels: DC-adjacent channels (±100 kHz) excluded from detection
+        //   - Decode: ChannelSlot NCO shifts off-center signals to baseband;
+        //     center-freq slots see the DC spur but dechirp peak detection is robust
+        // Removing the per-sample DC blocker (IIR at 16 MS/s, double precision)
+        // saves ~12% of scheduler thread CPU — same fix as ScanController.
         constexpr std::size_t kExpectedChunk = 8192;
         const std::size_t gapSize = in_span.empty() ? kExpectedChunk : 0;
         for (auto& slot : _slots) {
             if (slot.state == ChannelSlot::State::Active) {
-                slot.pushWideband(clean_span, gapSize);
+                slot.pushWideband(in_span, gapSize);
             }
         }
 
-        // 4. Periodic L1 energy snapshot (from DC-removed span)
+        // 3. Periodic L1 energy snapshot (raw span — NF interpolation handles DC)
         ++_callCount;
         if (_callCount >= l1_interval) {
             _callCount = 0;
-            computeEnergySnapshotFromSpan(clean_span);
+            computeEnergySnapshotFromSpan(in_span);
         }
 
         // 5. After accumulating enough snapshots, update active channels
@@ -530,6 +529,30 @@ struct WidebandDecoder
 
         auto fftOut = _fft.compute(
             std::span<const cf32>(_fftBuf.data(), l1_fft_size));
+
+        // Replace DC spur bins with noise-floor estimate (same as ScanController).
+        // The B210 AD9361 DC offset at 16 MS/s is ~22 dB above NF — no IIR HP
+        // filter can suppress it, so we interpolate the NF into the DC region.
+        {
+            const float binHz = sample_rate / static_cast<float>(l1_fft_size);
+            const auto kDcNullRadius = std::min(
+                static_cast<uint32_t>(100000.f / binHz),
+                l1_fft_size / 8);
+            const auto kRefBins = std::max(kDcNullRadius, 8u);
+            float refMagSq = 0.f;
+            for (uint32_t b = kDcNullRadius + 1;
+                 b <= kDcNullRadius + kRefBins && b < l1_fft_size / 2; ++b) {
+                const auto& s1 = fftOut[b];
+                refMagSq += s1.real() * s1.real() + s1.imag() * s1.imag();
+                const auto& s2 = fftOut[l1_fft_size - b];
+                refMagSq += s2.real() * s2.real() + s2.imag() * s2.imag();
+            }
+            float nfMag = std::sqrt(refMagSq / static_cast<float>(2 * kRefBins));
+            for (uint32_t b = 0; b <= kDcNullRadius; ++b) {
+                fftOut[b] = {nfMag, 0.f};
+                if (b > 0) fftOut[l1_fft_size - b] = {nfMag, 0.f};
+            }
+        }
 
         // Accumulate |FFT|^2 into channel bins.
         // Bins are in fftshift domain: bin 0 = most negative freq.
@@ -740,7 +763,7 @@ struct WidebandDecoder
     void processDetect(SfLane& lane, ChannelSlot& /*slot*/) {
         auto [dechirp_bin, dechirp_pmr] = dechirp_and_quality(
             lane.in_down.data(), lane.downchirp.data(),
-            lane.scratch_N.data(), lane.N, lane.fft, /*remove_dc=*/!_dc.initialised());
+            lane.scratch_N.data(), lane.N, lane.fft, /*remove_dc=*/true);
         lane.bin_idx_new = static_cast<int32_t>(dechirp_bin);
 
         if (!lane.has_energy(lane.in_down.data(), lane.N, energy_thresh)) {
