@@ -47,8 +47,6 @@ from lora_common import (
     KEEPALIVE_INTERVAL,
     add_logging_args,
     create_udp_subscriber,
-    format_ascii,
-    format_frame,
     parse_host_port,
     setup_logging,
 )
@@ -180,8 +178,8 @@ def _estimate_noise_floor(bins: list[float]) -> float:
     return sorted(bins)[n // 4]
 
 
-# Header occupies 3 fixed lines at the top
-HEADER_LINES: int = 3
+# Header occupies 2 fixed lines at the top (reduced from 3)
+HEADER_LINES: int = 2
 
 # Maximum number of rendered rows to keep for scroll-back history
 HISTORY_SIZE: int = 2000
@@ -309,14 +307,13 @@ def format_header(
     fft_size: int,
     total_width: int,
     rx_gain: float | None,
-    last_decode: dict[str, Any] | None,
     last_status: dict[str, Any] | None,
     *,
     paused: bool = False,
     scroll_offset: int = 0,
     history_len: int = 0,
 ) -> str:
-    """Build the fixed 3-line header string (no I/O, no flush)."""
+    """Build the fixed 2-line header string (no I/O, no flush)."""
     buf: list[str] = []
 
     # Line 1: frequency axis
@@ -324,69 +321,37 @@ def format_header(
     axis = format_freq_axis(center_freq_mhz, visible_bw_hz, total_width)
     buf.append(f"\033[1m{axis}\033[0m")
 
-    # Line 2: dB legend + FFT/SR + gain + status counters + pause indicator
+    # Line 2: Compact info: dB scale + FFT/SR/Gain + Frames + Pause status
     buf.append("\033[2;1H\033[2K")
-    legend = format_db_legend(db_min, db_max)
-    info = f"  FFT={fft_size}  SR={sample_rate / 1000:.0f}kHz  VBW={visible_bw_hz / 1000:.0f}kHz"
+
+    # Compact dB legend (just min/max)
+    db_info = f"{db_min:.0f}\u2192{db_max:.0f}dB"
+
+    # Compact tech specs
+    tech = f"{fft_size}pt {sample_rate / 1000:.0f}kHz"
     if rx_gain is not None:
-        info += f"  G={rx_gain:.0f}dB"
+        tech += f" G{rx_gain:.0f}"
+
+    # Compact frame counters: ok/total(fail) [OVF]
+    frames_info = ""
     if last_status is not None:
         frames = last_status.get("frames", {})
         total = frames.get("total", 0)
         ok = frames.get("crc_ok", 0)
         fail = frames.get("crc_fail", 0)
-        info += f"  \033[2m{ok}\033[0m/\033[2m{total}\033[0m"
+        frames_info = f" {ok}/{total}"
         if fail:
-            info += f" \033[31m{fail}!\033[0m"
+            frames_info += f"\033[31m({fail})\033[0m"
         ovf = last_status.get("rx_overflows", 0)
         if ovf:
-            info += f" \033[33mOVF={ovf}\033[0m"
-    if paused:
-        info += f"  \033[2m-{scroll_offset}/{history_len}\033[0m"
-    buf.append(f"{legend}{info}")
+            frames_info += f"\033[33m[ovf{ovf}]\033[0m"
 
-    # Line 3: last decode metadata + payload preview (or blank)
-    buf.append("\033[3;1H\033[2K")
-    if last_decode is not None:
-        decode_str = _format_decode_line(last_decode, total_width)
-        buf.append(decode_str)
+    # Pause status
+    pause_info = f" \033[2m-{scroll_offset}/{history_len}\033[0m" if paused else ""
+
+    buf.append(f"{db_info} {tech}{frames_info}{pause_info}")
 
     return "".join(buf)
-
-
-def _format_decode_line(decode: dict[str, Any], width: int) -> str:
-    """Format last-decode metadata + ASCII payload preview for header line 3.
-
-    Uses format_frame() from lora_common for consistent display with lora_mon.
-    Shows only the first line of format_frame output, with ASCII payload
-    preview appended to fill the remaining terminal width.
-    """
-    # Local timezone timestamp from wall-clock time captured at decode
-    ts_wall = decode.get("_wall_time")
-    ts_str = (
-        time.strftime("%H:%M:%S", time.localtime(ts_wall))
-        if ts_wall is not None
-        else ""
-    )
-
-    # Get first line of format_frame output (the header line)
-    full = format_frame(decode)
-    first_line = full.split("\n")[0]
-
-    meta = first_line
-    if ts_str:
-        meta += f" {ts_str}"
-
-    # Append ASCII payload preview to fill remaining width
-    payload = decode.get("payload", b"")
-    if payload:
-        meta_vis = _ansi_visible_len(meta)
-        remaining = width - meta_vis - 2  # 2 for " |" separator
-        if remaining > 4:
-            ascii_preview = format_ascii(payload, max_bytes=remaining)
-            meta += f" \033[2m{ascii_preview}\033[0m"
-
-    return meta
 
 
 def decode_bins(bins_raw: bytes) -> list[float]:
@@ -761,7 +726,6 @@ def main() -> None:
                                     fft_size,
                                     tw,
                                     rx_gain,
-                                    last_decode,
                                     last_status,
                                     paused=True,
                                     scroll_offset=scroll_offset,
@@ -799,7 +763,6 @@ def main() -> None:
                         fft_size,
                         tw,
                         rx_gain,
-                        last_decode,
                         last_status,
                         paused=True,
                         scroll_offset=scroll_offset,
@@ -992,7 +955,6 @@ def main() -> None:
                                 fft_size,
                                 tw,
                                 rx_gain,
-                                last_decode,
                                 last_status,
                             )
                         )
@@ -1016,7 +978,6 @@ def main() -> None:
                                 fft_size,
                                 tw,
                                 rx_gain,
-                                last_decode,
                                 last_status,
                                 paused=True,
                                 scroll_offset=scroll_offset,
@@ -1050,7 +1011,6 @@ def main() -> None:
                         fft_size,
                         tw,
                         rx_gain,
-                        last_decode,
                         last_status,
                     )
                 )
