@@ -16,6 +16,7 @@
 // Run `lora_scan --help` for usage.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <thread>
@@ -823,6 +825,15 @@ static std::string ts_short() {
 
 // ─── streaming scan mode ──────────────────────────────────────────────────────
 
+// Lock-free handoff: scheduler thread stores DataSet + overflow count,
+// main thread polls and emits CBOR (keeping blocking I/O off the scheduler).
+struct CborHandoff {
+    std::mutex              mtx;
+    gr::DataSet<float>      ds;
+    uint64_t                overflows{0};
+    bool                    ready{false};
+};
+
 // Convert a DataSet from the streaming pipeline to legacy CBOR and send via UDP/stdout.
 static void emitDataSetCbor(const gr::DataSet<float>& ds, uint64_t overflows = 0) {
     if (ds.meta_information.empty()) return;
@@ -994,9 +1005,12 @@ static int streaming_main(ScanSetConfig& cfg) {
         return 1;
     }
 
-    // Wire CBOR output callback — captures soapy_source for live overflow count.
-    // The callback runs on the scheduler thread (via ScanSink._onDataSet).
-    scanSink->_onDataSet = [&soapy_source](const gr::DataSet<float>& ds) {
+    // CBOR handoff: scheduler thread stores DataSet, main thread emits.
+    // This keeps blocking I/O (UDP sendto, stdout fwrite+fflush) off the
+    // scheduler thread, preventing overflow cascades from CBOR emission.
+    CborHandoff handoff;
+
+    scanSink->_onDataSet = [&handoff, &soapy_source](const gr::DataSet<float>& ds) {
         uint64_t ovf = 0;
         if (soapy_source) {
             using SoapyType = gr::blocks::soapy::SoapyBlock<cf32, 1UL>;
@@ -1005,7 +1019,12 @@ static int streaming_main(ScanSetConfig& cfg) {
                 ovf = wrapper->blockRef().totalOverflowCount();
             }
         }
-        emitDataSetCbor(ds, ovf);
+        {
+            std::lock_guard<std::mutex> lock(handoff.mtx);
+            handoff.ds        = ds;
+            handoff.overflows = ovf;
+            handoff.ready     = true;
+        }
     };
 
     if (savedStdout >= 0) {
@@ -1028,10 +1047,29 @@ static int streaming_main(ScanSetConfig& cfg) {
     gr::lora::log_ts("info ", "lora_scan", "streaming — Ctrl+C to stop (UDP %s:%u)",
         cfg.udp_listen.c_str(), cfg.udp_port);
 
-    // Main thread: accept UDP subscriptions, poll overflow counter
+    // Main thread: emit CBOR from handoff, accept UDP subscriptions, poll overflow
     uint64_t lastOvf = 0;
     while (!g_stop.load(std::memory_order_relaxed)
            && !sched_done.load(std::memory_order_relaxed)) {
+        // Drain CBOR handoff — emit on main thread (blocking I/O is safe here)
+        {
+            gr::DataSet<float> pending_ds;
+            uint64_t pending_ovf = 0;
+            bool have = false;
+            {
+                std::lock_guard<std::mutex> lock(handoff.mtx);
+                if (handoff.ready) {
+                    pending_ds  = std::move(handoff.ds);
+                    pending_ovf = handoff.overflows;
+                    handoff.ready = false;
+                    have = true;
+                }
+            }
+            if (have) {
+                emitDataSetCbor(pending_ds, pending_ovf);
+            }
+        }
+
         // Accept UDP subscriptions (non-blocking)
         {
             struct sockaddr_storage sender{};
@@ -1044,7 +1082,7 @@ static int streaming_main(ScanSetConfig& cfg) {
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         if (soapy_source) {
             using SoapyType = gr::blocks::soapy::SoapyBlock<cf32, 1UL>;
