@@ -10,7 +10,6 @@ Keyboard Controls:
     Space  - Pause/resume
     +/-    - Adjust EMA alpha (sensitivity)
     q      - Quit
-    r      - Reset state
     0-9    - Set EMA to 0.0-0.9
 """
 
@@ -343,9 +342,7 @@ def _render_header(s: State, term_w: int) -> str:
     import time
 
     parts.append(f"  {C_GRAY}{time.strftime('%H:%M:%S')}{C_RST}")
-    parts.append(
-        f"  {C_GRAY}a={s.ema_alpha:.1f}{' [PAUSED]' if s.paused else ''}{C_RST}"
-    )
+    parts.append(f"  {C_GRAY}a={s.ema_alpha:.1f}{C_RST}")
 
     return "".join(parts) + "\033[K\n"
 
@@ -494,8 +491,6 @@ def handle_key(key: str, state: State) -> bool:
         return True
     elif key == " ":
         state.paused = not state.paused
-    elif key == "r":
-        state.reset()
     elif key == "+" or key == "=":
         state.ema_alpha = min(0.9, state.ema_alpha + 0.1)
     elif key == "-":
