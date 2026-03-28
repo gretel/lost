@@ -31,7 +31,7 @@
 
 [device]
 driver = "uhd"                # SoapySDR driver name (required)
-param  = "type=b200,num_recv_frames=512,recv_frame_size=16384"  # larger USB FIFO: 65ms at 16 MS/s
+param  = "type=b200,num_recv_frames=512,recv_frame_size=16360"  # larger USB FIFO: 65ms at 16 MS/s
 clock  = "external"           # internal, external, gpsdo
 
 [logging]
