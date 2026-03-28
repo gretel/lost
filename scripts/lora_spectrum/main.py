@@ -35,15 +35,13 @@ import time
 from pathlib import Path
 from typing import NoReturn
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from lora_common import create_udp_subscriber, setup_logging, add_logging_args  # noqa: E402
-from lora_spectrum.config import SpectrumConfig, load_config  # noqa: E402
-from lora_spectrum.state import SpectrumState  # noqa: E402
-from lora_spectrum.protocol import ProtocolHandler, create_default_handler  # noqa: E402
-from lora_spectrum.renderer import TerminalRenderer, create_renderer  # noqa: E402
-from lora_spectrum.input_handler import InputHandler  # noqa: E402
+# All imports are absolute - entry points must add scripts/ to sys.path first
+from lora_common import create_udp_subscriber, setup_logging, add_logging_args
+from lora_spectrum.config import SpectrumConfig, load_config
+from lora_spectrum.state import SpectrumState
+from lora_spectrum.protocol import ProtocolHandler, create_default_handler
+from lora_spectrum.renderer import TerminalRenderer, create_renderer
+from lora_spectrum.input_handler import InputHandler
 
 logger = logging.getLogger("lora_spectrum")
 
