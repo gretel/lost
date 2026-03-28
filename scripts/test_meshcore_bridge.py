@@ -173,7 +173,7 @@ class TestBridgeState(unittest.TestCase):
         # pubkey starts at offset 4 (code + adv_type + tx_power + max_tx_power)
         pubkey = resp[4:36]
         self.assertEqual(pubkey, state.pub_key)
-        # Name is at the end
+        # Name is at the end (variable length due to utf8_truncate not padding)
         name_bytes = state.name.encode("utf-8")
         self.assertTrue(resp.endswith(name_bytes))
 
@@ -1246,6 +1246,291 @@ class TestContactPersistence(unittest.TestCase):
 
         bridge._delete_persisted_contact(cdir, pk.hex())
         self.assertFalse((cdir / f"{pk.hex()}.contact").exists())
+
+
+# ---- EEPROM (config.json) persistence tests ----
+
+
+class TestEepromEmulation(unittest.TestCase):
+    """Tests for EEPROM emulation via config.json persistence."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.config_file = self.tmpdir / "config.json"
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_load_persisted_config_missing(self):
+        """Loading missing config returns empty dict."""
+        config = bridge._load_persisted_config(self.config_file)
+        self.assertEqual(config, {})
+
+    def test_load_persisted_config_corrupt(self):
+        """Loading corrupt config returns empty dict."""
+        self.config_file.write_text("not valid json")
+        config = bridge._load_persisted_config(self.config_file)
+        self.assertEqual(config, {})
+
+    def test_load_persisted_config_wrong_version(self):
+        """Loading config with wrong version returns empty dict."""
+        self.config_file.write_text('{"version": 2, "name": "test"}')
+        config = bridge._load_persisted_config(self.config_file)
+        self.assertEqual(config, {})
+
+    def test_persist_and_load_config(self):
+        """Config persisted to disk can be loaded back."""
+        state = make_state()
+        state.name = "EEPROM-Test"
+        state.lat_e6 = 53545130
+        state.lon_e6 = 9948960
+        state.region_scope = "de-hh"
+        # Note: send_scope is NOT persisted - CLI controls scope per-session
+        state.client_repeat = 1
+        state.path_hash_mode = 2
+        state.autoadd_config = 0x05
+        state.autoadd_max_hops = 16
+        state.manual_add_contacts = 1
+        state.telemetry_mode = 0x12
+        state.adv_loc_policy = 3
+        state.multi_acks = 1
+        state.device_pin = 1234
+
+        bridge._persist_config(state, self.config_file)
+
+        # Verify file was created
+        self.assertTrue(self.config_file.exists())
+
+        # Load back
+        loaded = bridge._load_persisted_config(self.config_file)
+        self.assertEqual(loaded["version"], 1)
+        self.assertEqual(loaded["identity"]["name"], "EEPROM-Test")
+        self.assertEqual(loaded["identity"]["lat_e6"], 53545130)
+        self.assertEqual(loaded["identity"]["lon_e6"], 9948960)
+        self.assertEqual(loaded["routing"]["region_scope"], "de-hh")
+        # Note: send_scope is NOT persisted - CLI controls scope per-session
+        self.assertEqual(loaded["routing"]["client_repeat"], 1)
+        self.assertEqual(loaded["routing"]["path_hash_mode"], 2)
+        self.assertEqual(loaded["contacts"]["autoadd_config"], 0x05)
+        self.assertEqual(loaded["contacts"]["autoadd_max_hops"], 16)
+        self.assertEqual(loaded["contacts"]["manual_add_contacts"], 1)
+        self.assertEqual(loaded["telemetry"]["telemetry_mode"], 0x12)
+        self.assertEqual(loaded["telemetry"]["adv_loc_policy"], 3)
+        self.assertEqual(loaded["telemetry"]["multi_acks"], 1)
+        self.assertEqual(loaded["security"]["device_pin"], 1234)
+
+    def test_persist_updates_startup_mirrors(self):
+        """Persisting config updates startup mirrors for apply_startup_config().
+
+        This is the critical fix: when settings are persisted to EEPROM, we must
+        also update the _startup_* mirrors so that on the next APP_START,
+        apply_startup_config() restores the correct persisted values.
+        Note: send_scope is NOT persisted - CLI controls scope per-session.
+        """
+        state = make_state()
+
+        # Record initial startup values
+        initial_name = state._startup_name
+
+        # Change values (as if user ran commands)
+        state.name = "New-Name"
+        state.client_repeat = 1
+        state.path_hash_mode = 2
+        state.lat_e6 = 53545130
+        state.lon_e6 = 9948960
+        state.autoadd_config = 0x05
+        state.autoadd_max_hops = 16
+        state.manual_add_contacts = 1
+        state.telemetry_mode = 0x12
+        state.adv_loc_policy = 3
+        state.multi_acks = 1
+        state.device_pin = 1234
+
+        # Persist - this should update startup mirrors
+        bridge._persist_config(state, self.config_file)
+
+        # Verify startup mirrors were updated (except send_scope - CLI controlled)
+        self.assertEqual(state._startup_name, "New-Name")
+        # send_scope is NOT updated in mirrors - CLI controls it per-session
+        self.assertEqual(state._startup_client_repeat, 1)
+        self.assertEqual(state._startup_path_hash_mode, 2)
+        self.assertEqual(state._startup_lat_e6, 53545130)
+        self.assertEqual(state._startup_lon_e6, 9948960)
+        self.assertEqual(state._startup_autoadd_config, 0x05)
+        self.assertEqual(state._startup_autoadd_max_hops, 16)
+
+        # Simulate user exiting and reconnecting (APP_START calls apply_startup_config)
+        # First, corrupt the current state to prove it's being restored
+        state.name = "Corrupted"
+
+        # Call apply_startup_config (as happens on APP_START)
+        state.apply_startup_config()
+
+        # Values should be restored to the persisted values, not initial defaults
+        # Note: send_scope is NOT restored - it comes from CLI on APP_START
+        self.assertEqual(state.name, "New-Name")
+        self.assertEqual(state.client_repeat, 1)
+
+    def test_persist_atomic_write(self):
+        """Config is written atomically (temp file + rename)."""
+        state = make_state()
+        state.name = "Atomic"
+
+        bridge._persist_config(state, self.config_file)
+
+        # Should not leave temp file
+        temp_file = self.config_file.with_suffix(".tmp")
+        self.assertFalse(temp_file.exists())
+
+    def test_reset_config(self):
+        """Factory reset deletes config file."""
+        self.config_file.write_text('{"version": 1, "name": "test"}')
+        self.assertTrue(self.config_file.exists())
+
+        bridge._reset_config(self.config_file)
+        self.assertFalse(self.config_file.exists())
+
+    def test_initialize_from_toml(self):
+        """First boot initializes EEPROM from config.toml values."""
+        toml_settings = {
+            "name": "TOML-Node",
+            "lat": 53.5,
+            "lon": 9.9,
+            "flood_scope": "de-hh",
+            "client_repeat": 1,
+            "path_hash_mode": 2,
+            "autoadd_config": 0x02,
+            "autoadd_max_hops": 8,
+        }
+
+        config = bridge._initialize_config_from_toml(toml_settings, self.config_file)
+
+        self.assertEqual(config["identity"]["name"], "TOML-Node")
+        self.assertEqual(config["identity"]["lat_e6"], 53500000)
+        self.assertEqual(config["identity"]["lon_e6"], 9900000)
+        self.assertEqual(config["routing"]["region_scope"], "de-hh")
+        self.assertEqual(config["routing"]["client_repeat"], 1)
+        self.assertEqual(config["routing"]["path_hash_mode"], 2)
+        self.assertEqual(config["contacts"]["autoadd_config"], 0x02)
+        self.assertEqual(config["contacts"]["autoadd_max_hops"], 8)
+
+        # File should be created
+        self.assertTrue(self.config_file.exists())
+
+    def test_set_advert_name_persists(self):
+        """SET_ADVERT_NAME saves to EEPROM."""
+        import socket
+
+        state = make_state()
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_sock.bind(("127.0.0.1", 0))
+        udp_addr = ("127.0.0.1", udp_sock.getsockname()[1])
+
+        try:
+            # Change name
+            responses = bridge.handle_command(
+                bytes([bridge.CMD_SET_ADVERT_NAME]) + b"NewName",
+                state,
+                udp_sock,
+                udp_addr,
+                config_file=self.config_file,
+            )
+            self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+            # Verify persisted
+            loaded = bridge._load_persisted_config(self.config_file)
+            self.assertEqual(loaded["identity"]["name"], "NewName")
+        finally:
+            udp_sock.close()
+
+    def test_set_flood_scope_updates_state(self):
+        """SET_FLOOD_SCOPE updates state (not persisted - CLI controls scope per-session)."""
+        import socket
+
+        state = make_state()
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_sock.bind(("127.0.0.1", 0))
+        udp_addr = ("127.0.0.1", udp_sock.getsockname()[1])
+
+        try:
+            # Set scope: [0x36][0x00][16 bytes]
+            scope_key = b"\x01" * 16
+            cmd = bytes([bridge.CMD_SET_FLOOD_SCOPE, 0]) + scope_key
+            responses = bridge.handle_command(
+                cmd, state, udp_sock, udp_addr, config_file=self.config_file
+            )
+            self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+            # Verify state was updated (scope is NOT persisted to EEPROM)
+            self.assertTrue(all(b == 0x01 for b in state.send_scope))
+
+            # Verify EEPROM was NOT written (config.json shouldn't exist or be unchanged)
+            # Since we passed config_file, check that file wasn't created
+            self.assertFalse(self.config_file.exists())
+        finally:
+            udp_sock.close()
+
+    def test_set_autoadd_config_persists(self):
+        """SET_AUTOADD_CONFIG saves to EEPROM."""
+        import socket
+
+        state = make_state()
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_sock.bind(("127.0.0.1", 0))
+        udp_addr = ("127.0.0.1", udp_sock.getsockname()[1])
+
+        try:
+            # Set autoadd: [0x3A][config][max_hops]
+            cmd = bytes([bridge.CMD_SET_AUTOADD_CONFIG, 0x05, 16])
+            responses = bridge.handle_command(
+                cmd, state, udp_sock, udp_addr, config_file=self.config_file
+            )
+            self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+            # Verify persisted
+            loaded = bridge._load_persisted_config(self.config_file)
+            self.assertEqual(loaded["contacts"]["autoadd_config"], 0x05)
+            self.assertEqual(loaded["contacts"]["autoadd_max_hops"], 16)
+        finally:
+            udp_sock.close()
+
+    def test_factory_reset_clears_eeprom(self):
+        """FACTORY_RESET deletes EEPROM config."""
+        import socket
+        import shutil
+
+        # Create initial config
+        self.config_file.write_text('{"version": 1, "name": "test"}')
+
+        state = make_state()
+        state.contacts_dir = self.tmpdir / "contacts"
+        state.keys_dir = self.tmpdir / "keys"
+        state.contacts_dir.mkdir(parents=True)
+        state.keys_dir.mkdir(parents=True)
+
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_sock.bind(("127.0.0.1", 0))
+        udp_addr = ("127.0.0.1", udp_sock.getsockname()[1])
+
+        try:
+            responses = bridge.handle_command(
+                bytes([bridge.CMD_FACTORY_RESET]),
+                state,
+                udp_sock,
+                udp_addr,
+                config_file=self.config_file,
+            )
+            self.assertEqual(responses[0][0], bridge.RESP_OK)
+
+            # Verify config deleted
+            self.assertFalse(self.config_file.exists())
+        finally:
+            udp_sock.close()
+            shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
 # ---- ACK handling tests ----

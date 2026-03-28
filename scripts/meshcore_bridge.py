@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import collections
 import hashlib
+import json
 import logging
 import selectors
 import socket
@@ -119,7 +120,7 @@ def _get_git_rev() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         pass
     return "dev"
 
@@ -454,6 +455,13 @@ class BridgeState:
         flood scope, repeat mode, etc.) is restored to startup values
         after a companion session may have overwritten them.
         """
+        log.info(
+            "apply_startup_config: restoring name=%s send_scope=%s...",
+            self._startup_name,
+            self._startup_send_scope.hex()[:16]
+            if self._startup_send_scope
+            else "empty",
+        )
         self.name = self._startup_name
         self.lat_e6 = self._startup_lat_e6
         self.lon_e6 = self._startup_lon_e6
@@ -1134,16 +1142,26 @@ def _build_contact_msg_recv_v3(
     return bytes(buf)
 
 
-def _build_ack_wire_packet(ack_hash: bytes) -> bytes:
-    """Build a MeshCore ACK wire packet with direct routing (no path).
+def _build_ack_wire_packet(ack_hash: bytes, state: BridgeState) -> bytes:
+    """Build a MeshCore ACK wire packet.
 
-    Wire format: header(1) + path_len(1) + ack_hash(4) = 6 bytes.
-    Uses ROUTE_DIRECT with empty path (path_len=0) for point-to-point testing.
+    Wire format: header(1) + [transport_codes(4)] + path_len(1) + path(N) + ack_hash(4).
+    Uses ROUTE_DIRECT (or ROUTE_T_DIRECT when scope is active).
     """
     from meshcore_tx import build_wire_packet, make_header
 
-    header = make_header(ROUTE_DIRECT, PAYLOAD_ACK)
-    return build_wire_packet(header, ack_hash)
+    # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
+    active_key = state.send_scope if any(state.send_scope) else state.region_key
+
+    if active_key:
+        # Use ROUTE_T_DIRECT with transport codes for scoped networks
+        tc1 = _compute_transport_code(active_key, PAYLOAD_ACK, ack_hash)
+        header = make_header(ROUTE_T_DIRECT, PAYLOAD_ACK)
+        return build_wire_packet(header, ack_hash, transport_codes=(tc1, 0))
+    else:
+        # No scope active - use plain ROUTE_DIRECT
+        header = make_header(ROUTE_DIRECT, PAYLOAD_ACK)
+        return build_wire_packet(header, ack_hash)
 
 
 def _handle_txt_msg_rx(
@@ -1202,7 +1220,7 @@ def _handle_txt_msg_rx(
         ack_packets: list[bytes] = []
         if plaintext is not None and len(plaintext) >= 5:
             ack_hash = compute_ack_hash(plaintext, sender_pub)
-            ack_packets.append(_build_ack_wire_packet(ack_hash))
+            ack_packets.append(_build_ack_wire_packet(ack_hash, state))
             log.info("ACK hash: %s for %s..", ack_hash.hex(), sender_pub.hex()[:8])
 
         companion_msgs: list[bytes] = [msg]
@@ -1281,9 +1299,22 @@ def _handle_anon_req_rx(
         resp_enc = meshcore_encrypt_then_mac(shared, resp_plaintext)
         # RESP payload: dest_hash(1) + src_hash(1) + MAC(2) + ciphertext
         resp_payload = bytes([sender_pub[0], state.pub_key[0]]) + resp_enc
-        resp_pkt = build_wire_packet(
-            make_header(ROUTE_DIRECT, PAYLOAD_RESP), resp_payload, path=b""
-        )
+
+        # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
+        active_key = state.send_scope if any(state.send_scope) else state.region_key
+        if active_key:
+            # Use ROUTE_T_DIRECT with transport codes for scoped networks
+            tc1 = _compute_transport_code(active_key, PAYLOAD_RESP, resp_payload)
+            header = make_header(ROUTE_T_DIRECT, PAYLOAD_RESP)
+            resp_pkt = build_wire_packet(
+                header, resp_payload, path=b"", transport_codes=(tc1, 0)
+            )
+        else:
+            # No scope active - use plain ROUTE_DIRECT
+            resp_pkt = build_wire_packet(
+                make_header(ROUTE_DIRECT, PAYLOAD_RESP), resp_payload, path=b""
+            )
+
         log.debug("ANON_REQ: sending RESPONSE to %s..", pk_hex[:8])
         return ([msg], [resp_pkt])
 
@@ -1395,6 +1426,174 @@ def _delete_persisted_contact(contacts_dir: Path | None, pk_hex: str) -> None:
         log.warning("could not delete contact file %s: %s", path, exc)
 
 
+# ---- EEPROM emulation (config.json persistence) ----
+
+DEFAULT_CONFIG_FILE = (
+    Path(__file__).resolve().parent / "data" / "meshcore" / "config.json"
+)
+
+
+def _load_persisted_config(config_file: Path | None = None) -> dict[str, Any]:
+    """Load EEPROM config from disk, or return empty dict if missing/corrupt.
+
+    This emulates MeshCore firmware's EEPROM - stores runtime-modifiable settings
+    that survive meshcore-cli reconnects.
+    """
+    if config_file is None:
+        config_file = DEFAULT_CONFIG_FILE
+    try:
+        if config_file.is_file():
+            data = json.loads(config_file.read_text())
+            if isinstance(data, dict) and data.get("version") == 1:
+                return data
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("could not load EEPROM config from %s: %s", config_file, exc)
+    return {}
+
+
+def _persist_config(
+    state: BridgeState,
+    config_file: Path | None = None,
+) -> None:
+    """Save runtime settings to EEPROM (config.json) atomically.
+
+    Persists user-modified settings that should survive meshcore-cli reconnects.
+    This matches MeshCore firmware's EEPROM behavior.
+
+    Also updates the startup config mirrors so that apply_startup_config()
+    restores the correct persisted values on the next APP_START.
+    """
+    if config_file is None:
+        config_file = DEFAULT_CONFIG_FILE
+
+    # Build config structure
+    # Note: we don't persist send_scope because meshcore-cli sends its own scope
+    # on every APP_START. For compatibility, we accept whatever CLI sends.
+    config = {
+        "version": 1,
+        "identity": {
+            "name": state.name,
+            "lat_e6": state.lat_e6,
+            "lon_e6": state.lon_e6,
+        },
+        "routing": {
+            "region_scope": state.region_scope,
+            "client_repeat": state.client_repeat,
+            "path_hash_mode": state.path_hash_mode,
+        },
+        "contacts": {
+            "autoadd_config": state.autoadd_config,
+            "autoadd_max_hops": state.autoadd_max_hops,
+            "manual_add_contacts": state.manual_add_contacts,
+        },
+        "telemetry": {
+            "telemetry_mode": state.telemetry_mode,
+            "adv_loc_policy": state.adv_loc_policy,
+            "multi_acks": state.multi_acks,
+        },
+        "security": {
+            "device_pin": state.device_pin,
+        },
+    }
+
+    try:
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write: temp file then rename
+        temp_file = config_file.with_suffix(".tmp")
+        temp_file.write_text(json.dumps(config, indent=2))
+        temp_file.rename(config_file)
+        log.debug("EEPROM config saved to %s", config_file)
+    except OSError as exc:
+        log.warning("could not persist EEPROM config to %s: %s", config_file, exc)
+        return
+
+    # Update startup mirrors so apply_startup_config() restores correct values
+    # This is critical: on next APP_START, apply_startup_config() uses these
+    # mirrors to restore state. If we don't update them, persisted values are lost.
+    # Note: we don't update _startup_send_scope - CLI controls scope per-session
+    state._startup_name = state.name
+    state._startup_lat_e6 = state.lat_e6
+    state._startup_lon_e6 = state.lon_e6
+    state._startup_client_repeat = state.client_repeat
+    state._startup_path_hash_mode = state.path_hash_mode
+    state._startup_autoadd_config = state.autoadd_config
+    state._startup_autoadd_max_hops = state.autoadd_max_hops
+    log.debug("EEPROM: startup mirrors updated")
+    state._startup_autoadd_max_hops = state.autoadd_max_hops
+    log.debug("EEPROM: startup mirrors updated")
+
+
+def _reset_config(config_file: Path | None = None) -> None:
+    """Delete EEPROM config (factory reset behavior).
+
+    Called by CMD_FACTORY_RESET to clear all runtime settings back to defaults.
+    """
+    if config_file is None:
+        config_file = DEFAULT_CONFIG_FILE
+    try:
+        if config_file.exists():
+            config_file.unlink()
+            log.info("EEPROM config deleted (factory reset)")
+    except OSError as exc:
+        log.warning("could not delete EEPROM config %s: %s", config_file, exc)
+
+
+def _initialize_config_from_toml(
+    toml_settings: dict[str, Any],
+    config_file: Path | None = None,
+) -> dict[str, Any]:
+    """Initialize EEPROM from config.toml on first boot.
+
+    This populates the initial EEPROM values from the [meshcore] section
+    of config.toml. Subsequent boots read from EEPROM directly.
+    """
+    config = {
+        "version": 1,
+        "identity": {
+            "name": toml_settings.get("name", "lora_trx"),
+            "lat_e6": int(float(toml_settings.get("lat", 0.0)) * 1e6),
+            "lon_e6": int(float(toml_settings.get("lon", 0.0)) * 1e6),
+        },
+        "routing": {
+            "region_scope": str(toml_settings.get("region_scope", "")),
+            "client_repeat": int(toml_settings.get("client_repeat", 0)),
+            "path_hash_mode": int(toml_settings.get("path_hash_mode", 0)),
+        },
+        "contacts": {
+            "autoadd_config": int(toml_settings.get("autoadd_config", 0)),
+            "autoadd_max_hops": min(int(toml_settings.get("autoadd_max_hops", 0)), 64),
+            "manual_add_contacts": 0,
+        },
+        "telemetry": {
+            "telemetry_mode": 0,
+            "adv_loc_policy": 0,
+            "multi_acks": 0,
+        },
+        "security": {
+            "device_pin": 0,
+        },
+    }
+
+    # Handle flood_scope (may be hex or string)
+    flood_scope_raw = str(toml_settings.get("flood_scope", ""))
+    if flood_scope_raw:
+        parsed = _parse_flood_scope(flood_scope_raw)
+        if any(parsed):
+            config["routing"]["region_scope"] = flood_scope_raw
+
+    # Save initial EEPROM
+    if config_file is None:
+        config_file = DEFAULT_CONFIG_FILE
+    try:
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps(config, indent=2))
+        log.info("EEPROM initialized from config.toml: %s", config_file)
+    except OSError as exc:
+        log.warning("could not initialize EEPROM config: %s", exc)
+
+    return config
+
+
 # ---- Command handlers ----
 
 
@@ -1461,6 +1660,7 @@ def handle_command(
     state: BridgeState,
     udp_sock: socket.socket | None,
     udp_addr: tuple[str, int] | None,
+    config_file: Path | None = None,
 ) -> list[bytes]:
     """Handle a companion protocol command, return list of response payloads."""
     if not cmd_payload:
@@ -1532,7 +1732,8 @@ def handle_command(
     if cmd == CMD_SET_ADVERT_NAME:
         name = data.decode("utf-8", errors="replace").rstrip("\x00")
         state.name = name
-        log.info("companion: SET_ADVERT_NAME '%s'", sanitize_text(name))
+        _persist_config(state, config_file)
+        log.info("companion: SET_ADVERT_NAME '%s' (EEPROM saved)", sanitize_text(name))
         return [state.build_ok()]
 
     if cmd == CMD_SET_RADIO_PARAMS:
@@ -1614,8 +1815,9 @@ def handle_command(
         if len(data) >= 8:
             state.lat_e6 = struct.unpack_from("<i", data, 0)[0]
             state.lon_e6 = struct.unpack_from("<i", data, 4)[0]
+            _persist_config(state, config_file)
             log.info(
-                "companion: SET_ADVERT_LATLON lat=%.6f lon=%.6f",
+                "companion: SET_ADVERT_LATLON lat=%.6f lon=%.6f (EEPROM saved)",
                 state.lat_e6 / 1e6,
                 state.lon_e6 / 1e6,
             )
@@ -1623,24 +1825,15 @@ def handle_command(
 
     if cmd == CMD_SET_FLOOD_SCOPE:
         # Frame: [0x36][0x00][key?:16]  (second byte is discriminator, must be 0)
+        # Note: send_scope is NOT persisted to EEPROM - CLI controls it per-session
         if not data or data[0] != 0:
             return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
         if len(data) >= 17:  # discriminator(1) + key(16)
-            incoming_key = bytes(data[1:17])
-            _null_key = b"\x00" * 16
-            # If startup config specifies a scope and the companion sends all-zeros,
-            # treat it as the client's stale default (not an intentional clear) and
-            # ignore it so the config value survives the companion init sequence.
-            if incoming_key == _null_key and any(state._startup_send_scope):
-                log.debug(
-                    "companion: SET_FLOOD_SCOPE all-zero ignored (config scope active)"
-                )
-            else:
-                state.send_scope = incoming_key
-                log.info("companion: SET_FLOOD_SCOPE key=%s", state.send_scope.hex())
+            state.send_scope = bytes(data[1:17])
+            log.info("SET_FLOOD_SCOPE set: %s...", state.send_scope.hex()[:16])
         else:
             state.send_scope = b"\x00" * 16  # clear scope
-            log.info("companion: SET_FLOOD_SCOPE cleared")
+            log.info("SET_FLOOD_SCOPE cleared")
         return [state.build_ok()]
 
     if cmd == CMD_GET_ALLOWED_REPEAT_FREQ:
@@ -1653,8 +1846,9 @@ def handle_command(
         state.autoadd_config = data[0] if data else 0
         if len(data) >= 2:
             state.autoadd_max_hops = min(data[1], 64)
+        _persist_config(state, config_file)
         log.debug(
-            "companion: SET_AUTOADD_CONFIG config=0x%02x max_hops=%d",
+            "companion: SET_AUTOADD_CONFIG config=0x%02x max_hops=%d (EEPROM saved)",
             state.autoadd_config,
             state.autoadd_max_hops,
         )
@@ -1674,7 +1868,10 @@ def handle_command(
         if data[1] >= 3:
             return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
         state.path_hash_mode = data[1]
-        log.debug("companion: SET_PATH_HASH_MODE mode=%d", state.path_hash_mode)
+        _persist_config(state, config_file)
+        log.debug(
+            "companion: SET_PATH_HASH_MODE mode=%d (EEPROM saved)", state.path_hash_mode
+        )
         return [state.build_ok()]
 
     if cmd == CMD_SET_OTHER_PARAMS:
@@ -1685,8 +1882,9 @@ def handle_command(
             state.telemetry_mode = data[1]
             state.adv_loc_policy = data[2]
             state.multi_acks = data[3] if len(data) >= 4 else 0
+            _persist_config(state, config_file)
             log.debug(
-                "companion: SET_OTHER_PARAMS manual_add=%d telemetry=0x%02x adv_loc=%d multi_acks=%d",
+                "companion: SET_OTHER_PARAMS manual_add=%d telemetry=0x%02x adv_loc=%d multi_acks=%d (EEPROM saved)",
                 state.manual_add_contacts,
                 state.telemetry_mode,
                 state.adv_loc_policy,
@@ -1707,7 +1905,26 @@ def handle_command(
         log.debug("companion: SET_CUSTOM_VAR → ILLEGAL_ARG (no hardware sensors)")
         return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
 
-    if cmd in (CMD_RESET_PATH, CMD_SET_TUNING_PARAMS, CMD_REBOOT):
+    if cmd == CMD_RESET_PATH:
+        # Reset all contact paths to flood-only (out_path_len = -1)
+        # This forces flood routing instead of direct routing for all contacts
+        reset_count = 0
+        for pk_hex, record in state.contacts.items():
+            # Check if path is currently set (out_path_len >= 0)
+            current_path_len = struct.unpack_from("<b", record, 34)[0]
+            if current_path_len >= 0:
+                # Reset to -1 (flood)
+                buf = bytearray(record)
+                struct.pack_into("<b", buf, 34, -1)  # out_path_len = -1
+                buf[35:99] = b"\x00" * 64  # clear path bytes
+                state.contacts[pk_hex] = bytes(buf)
+                reset_count += 1
+        if reset_count > 0:
+            _persist_contacts(state)
+            log.info("companion: RESET_PATH cleared paths for %d contacts", reset_count)
+        return [state.build_ok()]
+
+    if cmd in (CMD_SET_TUNING_PARAMS, CMD_REBOOT):
         return [state.build_ok()]
 
     if cmd == CMD_LOGIN:
@@ -1782,8 +1999,18 @@ def handle_command(
         trace_payload = tag_bytes + auth_bytes + flags_byte + path_hashes
         from meshcore_tx import build_wire_packet, make_header, make_cbor_tx_request
 
-        header = make_header(ROUTE_DIRECT, PAYLOAD_TRACE)
-        packet = build_wire_packet(header, trace_payload)
+        # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
+        active_key = state.send_scope if any(state.send_scope) else state.region_key
+        if active_key:
+            # Use ROUTE_T_DIRECT with transport codes for scoped networks
+            tc1 = _compute_transport_code(active_key, PAYLOAD_TRACE, trace_payload)
+            header = make_header(ROUTE_T_DIRECT, PAYLOAD_TRACE)
+            packet = build_wire_packet(header, trace_payload, transport_codes=(tc1, 0))
+        else:
+            # No scope active - use plain ROUTE_DIRECT
+            header = make_header(ROUTE_DIRECT, PAYLOAD_TRACE)
+            packet = build_wire_packet(header, trace_payload)
+
         # Track TX hash and send via UDP
         h = _hash_payload(packet)
         state.recent_tx[h] = time.monotonic()
@@ -1865,26 +2092,45 @@ def handle_command(
             req_type,
             dst_pub.hex()[:8],
         )
-        from meshcore_tx import build_anon_req, make_cbor_tx_request
+        from meshcore_tx import (
+            build_anon_req,
+            build_wire_packet,
+            make_cbor_tx_request,
+            make_header,
+        )
 
         ts = int(time.time())
-        pkt = build_anon_req(
+        tmp = build_anon_req(
             state.expanded_prv,
             state.pub_key,
             dst_pub,
             bytes([req_type]),
             timestamp=ts,
+            route_type=ROUTE_DIRECT,
         )
+
+        # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
+        active_key = state.send_scope if any(state.send_scope) else state.region_key
+        if active_key:
+            # Repackage with ROUTE_T_DIRECT + transport codes
+            # tmp structure: header(1) + path_len(1) + payload
+            anon_payload = tmp[2:]  # skip header(1) + path_len(1)
+            tc1 = _compute_transport_code(active_key, PAYLOAD_ANON_REQ, anon_payload)
+            header = make_header(ROUTE_T_DIRECT, PAYLOAD_ANON_REQ)
+            pkt = build_wire_packet(header, anon_payload, transport_codes=(tc1, 0))
+        else:
+            pkt = tmp
+
         h = _hash_payload(pkt)
         state.recent_tx[h] = time.monotonic()
         state.pkt_sent += 1
-        state.pkt_flood_tx += 1
+        state.pkt_direct_tx += 1
         cbor_msg = make_cbor_tx_request(pkt)
         udp_sock.sendto(cbor_msg, udp_addr)
         expected_ack = compute_ack_hash(
             struct.pack("<I", ts) + bytes([req_type]), state.pub_key
         )
-        resp = state.build_msg_sent(flood=True, ack_hash=expected_ack)
+        resp = state.build_msg_sent(flood=False, ack_hash=expected_ack)
         state.pending_acks[expected_ack] = (time.monotonic(), dst_pub[:6])
         return [resp]
 
@@ -1924,8 +2170,11 @@ def handle_command(
         return [bytes([RESP_TUNING_PARAMS]) + struct.pack("<II", 0, 0)]
 
     if cmd == CMD_FACTORY_RESET:
-        # Wipe contacts and keys directories, reset in-memory state
+        # Wipe contacts, keys, EEPROM config, and reset in-memory state
         import shutil
+
+        # Delete EEPROM config (factory reset)
+        _reset_config(config_file)
 
         for d in (state.contacts_dir, state.keys_dir):
             if d is not None and d.is_dir():
@@ -1936,7 +2185,7 @@ def handle_command(
         state.pkt_recv = state.pkt_sent = 0
         state.pkt_flood_tx = state.pkt_direct_tx = 0
         state.pkt_flood_rx = state.pkt_direct_rx = 0
-        log.warning("companion: FACTORY_RESET — data wiped")
+        log.warning("companion: FACTORY_RESET — data and EEPROM wiped")
         return [state.build_ok()]
 
     if cmd == CMD_HAS_CONNECTION:
@@ -1955,12 +2204,13 @@ def handle_command(
         return [bytes([RESP_CONTACT]) + record]
 
     if cmd == CMD_SET_DEVICE_PIN:
-        # Store PIN in-memory (4 bytes LE uint32)
+        # Store PIN (4 bytes LE uint32)
         if len(data) >= 4:
             state.device_pin = struct.unpack_from("<I", data, 0)[0]
         else:
             state.device_pin = 0
-        log.debug("companion: SET_DEVICE_PIN %d", state.device_pin)
+        _persist_config(state, config_file)
+        log.debug("companion: SET_DEVICE_PIN %d (EEPROM saved)", state.device_pin)
         return [state.build_ok()]
 
     # Unknown command — return OK silently
@@ -2073,10 +2323,14 @@ def _handle_send_txt_msg(
         log.info("TX: %dB TXT_MSG (flood) to %s", len(packet), dst_prefix.hex())
     else:
         # Zero-hop direct (out_path_len == 0) or known multi-hop path (out_path_len > 0).
-        # Multi-hop path routing (ROUTE_T_DIRECT with stored_path) is not yet implemented;
-        # for now fall through to zero-hop ROUTE_DIRECT which works for both cases.
-        # Pass raw bytes directly so binary payloads (txt_type=1) are not corrupted.
-        packet = build_txt_msg(
+        # Extract stored path if present for multi-hop routing.
+        stored_path = b""
+        if out_path_len > 0:
+            # Path is stored at offset 35 in the contact record, length = out_path_len
+            stored_path = contact_record[35 : 35 + out_path_len]
+
+        # Build the base packet with ROUTE_DIRECT (no transport codes yet)
+        tmp = build_txt_msg(
             state.expanded_prv,
             state.pub_key,
             dest_pub,
@@ -2086,6 +2340,27 @@ def _handle_send_txt_msg(
             txt_type=txt_type,
             route_type=ROUTE_DIRECT,
         )
+
+        if active_key:
+            # Repackage with ROUTE_T_DIRECT + transport codes + stored path
+            # tmp structure: header(1) + path_len(1) + payload
+            # For T_DIRECT: we need header + transport_codes(4) + path_len(1) + path(N) + payload
+            txt_payload = tmp[2:]  # skip header(1) + path_len(1)
+            tc1 = _compute_transport_code(active_key, PAYLOAD_TXT, txt_payload)
+            header = make_header(ROUTE_T_DIRECT, PAYLOAD_TXT)
+            packet = build_wire_packet(
+                header, txt_payload, path=stored_path, transport_codes=(tc1, 0)
+            )
+        else:
+            # No scope active - use plain ROUTE_DIRECT with stored path if any
+            if stored_path:
+                # Rebuild with the stored path included
+                txt_payload = tmp[2:]  # skip header(1) + path_len(1)
+                header = make_header(ROUTE_DIRECT, PAYLOAD_TXT)
+                packet = build_wire_packet(header, txt_payload, path=stored_path)
+            else:
+                packet = tmp
+
         log.info(
             "TX: %dB TXT_MSG (direct, path_len=%d) to %s",
             len(packet),
@@ -2614,7 +2889,7 @@ def run_bridge(
                 elif key.data == "tcp_rx":
                     try:
                         raw = client_sock.recv(4096)  # type: ignore[union-attr]
-                    except (ConnectionError, OSError):
+                    except ConnectionError, OSError:
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
@@ -2636,7 +2911,7 @@ def run_bridge(
                 elif key.data == "udp_rx":
                     try:
                         dgram, _from = udp_sock.recvfrom(65536)
-                    except (BlockingIOError, OSError):
+                    except BlockingIOError, OSError:
                         continue
                     try:
                         msg = cbor2.loads(dgram)
@@ -2788,7 +3063,7 @@ def _tcp_send(sock: socket.socket, payload: bytes) -> None:
     """Send a framed companion protocol response."""
     try:
         sock.sendall(frame_encode(payload))
-    except (ConnectionError, OSError):
+    except ConnectionError, OSError:
         pass  # client disconnected, will be cleaned up on next recv
 
 
@@ -2954,6 +3229,56 @@ def main() -> None:
     startup_autoadd_max_hops = min(int(meshcore_cfg.get("autoadd_max_hops", 0)), 64)
     flood_scope_raw = str(meshcore_cfg.get("flood_scope", ""))
     startup_send_scope = _parse_flood_scope(flood_scope_raw)
+
+    # ---- EEPROM emulation: Load persisted runtime settings ----
+    # This emulates MeshCore firmware's EEPROM - stores user-modified settings
+    # that survive meshcore-cli reconnects. First boot initializes from config.toml,
+    # subsequent boots read from EEPROM directly.
+    eeprom_config = _load_persisted_config()
+    if eeprom_config:
+        # EEPROM exists - use persisted values (override CBOR config)
+        log.info("EEPROM config loaded")
+        identity_cfg = eeprom_config.get("identity", {})
+        routing_cfg = eeprom_config.get("routing", {})
+        contacts_cfg = eeprom_config.get("contacts", {})
+        telemetry_cfg = eeprom_config.get("telemetry", {})
+        security_cfg = eeprom_config.get("security", {})
+
+        # Override with EEPROM values (CLI flags still take precedence via args)
+        if args.name is None:
+            node_name = identity_cfg.get("name", node_name)
+        lat_e6 = identity_cfg.get("lat_e6", lat_e6)
+        lon_e6 = identity_cfg.get("lon_e6", lon_e6)
+
+        region_scope = routing_cfg.get("region_scope", region_scope)
+        # Note: we don't restore send_scope from EEPROM - CLI controls it per-session
+
+        startup_client_repeat = routing_cfg.get("client_repeat", startup_client_repeat)
+        startup_path_hash_mode = routing_cfg.get(
+            "path_hash_mode", startup_path_hash_mode
+        )
+
+        startup_autoadd_config = contacts_cfg.get(
+            "autoadd_config", startup_autoadd_config
+        )
+        startup_autoadd_max_hops = contacts_cfg.get(
+            "autoadd_max_hops", startup_autoadd_max_hops
+        )
+    else:
+        # First boot - initialize EEPROM from current settings (CBOR/toml)
+        log.info("EEPROM not found - initializing from config")
+        toml_settings = {
+            "name": node_name,
+            "lat": lat_e6 / 1e6,
+            "lon": lon_e6 / 1e6,
+            "region_scope": region_scope,
+            "flood_scope": flood_scope_raw,
+            "client_repeat": startup_client_repeat,
+            "path_hash_mode": startup_path_hash_mode,
+            "autoadd_config": startup_autoadd_config,
+            "autoadd_max_hops": startup_autoadd_max_hops,
+        }
+        _initialize_config_from_toml(toml_settings)
 
     # Load identity (now that identity_file is resolved)
     expanded_prv, pub_key, seed = load_or_create_identity(identity_file)
