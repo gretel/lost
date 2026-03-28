@@ -8,6 +8,11 @@ Connects to lora_trx via UDP, receives spectrum CBOR messages, and renders
 a scrolling waterfall in the terminal using xterm-256color escape codes.
 Rows are tinted green (CRC_OK) or red (CRC_FAIL) during frame decodes.
 
+Header (2 lines):
+    Line 1: Frequency axis with band edges and center
+    Line 2: Spectrum info (left) - dB scale, FFT, SR, Gain, frames, OVF
+            Decode info (right) - HH:MM:SS SF8/62.5k CRC:OK SNR:12.3 118B
+
 Keyboard Controls:
     Space  - Pause/resume live view
     +/-    - Adjust EMA smoothing alpha
@@ -178,8 +183,8 @@ def _estimate_noise_floor(bins: list[float]) -> float:
     return sorted(bins)[n // 4]
 
 
-# Header occupies 3 fixed lines at the top
-HEADER_LINES: int = 3
+# Header occupies 2 fixed lines at the top
+HEADER_LINES: int = 2
 
 # Maximum number of rendered rows to keep for scroll-back history
 HISTORY_SIZE: int = 2000
@@ -314,7 +319,7 @@ def format_header(
     scroll_offset: int = 0,
     history_len: int = 0,
 ) -> str:
-    """Build the fixed 3-line header string (no I/O, no flush)."""
+    """Build the fixed 2-line header string (no I/O, no flush)."""
     buf: list[str] = []
 
     # Line 1: frequency axis
@@ -322,16 +327,16 @@ def format_header(
     axis = format_freq_axis(center_freq_mhz, visible_bw_hz, total_width)
     buf.append(f"\033[1m{axis}\033[0m")
 
-    # Line 2: Compact spectrum info
+    # Line 2: Spectrum info (left) + Decode info (right)
     buf.append("\033[2;1H\033[2K")
 
-    # dB scale, FFT, sample rate, gain, frame counters
-    parts: list[str] = []
-    parts.append(f"{db_min:.0f}\u2192{db_max:.0f}dB")
-    parts.append(f"{fft_size}pt")
-    parts.append(f"{sample_rate / 1000:.0f}kHz")
+    # Build left side: dB scale, FFT, sample rate, gain, frame counters
+    left_parts: list[str] = []
+    left_parts.append(f"{db_min:.0f}\u2192{db_max:.0f}dB")
+    left_parts.append(f"{fft_size}pt")
+    left_parts.append(f"{sample_rate / 1000:.0f}kHz")
     if rx_gain is not None:
-        parts.append(f"G{rx_gain:.0f}")
+        left_parts.append(f"G{rx_gain:.0f}")
 
     if last_status is not None:
         frames = last_status.get("frames", {})
@@ -343,17 +348,17 @@ def format_header(
         frame_str = f"F:{ok}/{total}"
         if fail:
             frame_str += f"\033[31m!{fail}\033[0m"
-        parts.append(frame_str)
+        left_parts.append(frame_str)
         if ovf:
-            parts.append(f"\033[33mOVF:{ovf}\033[0m")
+            left_parts.append(f"\033[33mOVF:{ovf}\033[0m")
 
     if paused:
-        parts.append(f"\033[2m-{scroll_offset}/{history_len}\033[0m")
+        left_parts.append(f"\033[2m-{scroll_offset}/{history_len}\033[0m")
 
-    buf.append(" ".join(parts))
+    left_str = " ".join(left_parts)
 
-    # Line 3: Last decode info (compact)
-    buf.append("\033[3;1H\033[2K")
+    # Build right side: decode info
+    right_str = ""
     if last_decode is not None:
         phy = last_decode.get("phy", {})
         crc_ok = last_decode.get("crc_valid", False)
@@ -375,7 +380,19 @@ def format_header(
             ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
             decode_info = f"{ts_str} {decode_info}"
 
-        buf.append(decode_info)
+        right_str = decode_info
+
+    # Combine: left_str + padding + right_str (right-aligned)
+    if right_str:
+        left_visible = _ansi_visible_len(left_str)
+        right_visible = _ansi_visible_len(right_str)
+        # Pad to align right_str to right edge, leaving 1 char margin
+        padding = total_width - left_visible - right_visible - 1
+        if padding < 1:
+            padding = 1  # Minimum 1 space separation
+        buf.append(f"{left_str}{' ' * padding}{right_str}")
+    else:
+        buf.append(left_str)
 
     return "".join(buf)
 
