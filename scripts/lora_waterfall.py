@@ -178,8 +178,8 @@ def _estimate_noise_floor(bins: list[float]) -> float:
     return sorted(bins)[n // 4]
 
 
-# Header occupies 2 fixed lines at the top (reduced from 3)
-HEADER_LINES: int = 2
+# Header occupies 3 fixed lines at the top
+HEADER_LINES: int = 3
 
 # Maximum number of rendered rows to keep for scroll-back history
 HISTORY_SIZE: int = 2000
@@ -307,13 +307,14 @@ def format_header(
     fft_size: int,
     total_width: int,
     rx_gain: float | None,
+    last_decode: dict[str, Any] | None,
     last_status: dict[str, Any] | None,
     *,
     paused: bool = False,
     scroll_offset: int = 0,
     history_len: int = 0,
 ) -> str:
-    """Build the fixed 2-line header string (no I/O, no flush)."""
+    """Build the fixed 3-line header string (no I/O, no flush)."""
     buf: list[str] = []
 
     # Line 1: frequency axis
@@ -321,35 +322,60 @@ def format_header(
     axis = format_freq_axis(center_freq_mhz, visible_bw_hz, total_width)
     buf.append(f"\033[1m{axis}\033[0m")
 
-    # Line 2: Compact info: dB scale + FFT/SR/Gain + Frames + Pause status
+    # Line 2: Compact spectrum info
     buf.append("\033[2;1H\033[2K")
 
-    # Compact dB legend (just min/max)
-    db_info = f"{db_min:.0f}\u2192{db_max:.0f}dB"
-
-    # Compact tech specs
-    tech = f"{fft_size}pt {sample_rate / 1000:.0f}kHz"
+    # dB scale, FFT, sample rate, gain, frame counters
+    parts: list[str] = []
+    parts.append(f"{db_min:.0f}\u2192{db_max:.0f}dB")
+    parts.append(f"{fft_size}pt")
+    parts.append(f"{sample_rate / 1000:.0f}kHz")
     if rx_gain is not None:
-        tech += f" G{rx_gain:.0f}"
+        parts.append(f"G{rx_gain:.0f}")
 
-    # Compact frame counters: ok/total(fail) [OVF]
-    frames_info = ""
     if last_status is not None:
         frames = last_status.get("frames", {})
         total = frames.get("total", 0)
         ok = frames.get("crc_ok", 0)
         fail = frames.get("crc_fail", 0)
-        frames_info = f" {ok}/{total}"
-        if fail:
-            frames_info += f"\033[31m({fail})\033[0m"
         ovf = last_status.get("rx_overflows", 0)
+
+        frame_str = f"F:{ok}/{total}"
+        if fail:
+            frame_str += f"\033[31m!{fail}\033[0m"
+        parts.append(frame_str)
         if ovf:
-            frames_info += f"\033[33m[ovf{ovf}]\033[0m"
+            parts.append(f"\033[33mOVF:{ovf}\033[0m")
 
-    # Pause status
-    pause_info = f" \033[2m-{scroll_offset}/{history_len}\033[0m" if paused else ""
+    if paused:
+        parts.append(f"\033[2m-{scroll_offset}/{history_len}\033[0m")
 
-    buf.append(f"{db_info} {tech}{frames_info}{pause_info}")
+    buf.append(" ".join(parts))
+
+    # Line 3: Last decode info (compact)
+    buf.append("\033[3;1H\033[2K")
+    if last_decode is not None:
+        phy = last_decode.get("phy", {})
+        crc_ok = last_decode.get("crc_valid", False)
+        crc_str = "\033[32mOK\033[0m" if crc_ok else "\033[31mFAIL\033[0m"
+        sf = phy.get("sf", "?")
+        bw = phy.get("bw", 0)
+        bw_str = f"{bw / 1000:.1f}k" if bw else "?k"
+        snr = phy.get("snr_db", None)
+        snr_str = f" SNR:{snr:.1f}" if snr is not None else ""
+        payload_len = last_decode.get("payload_len", 0)
+
+        decode_info = f"SF{sf}/{bw_str} CRC:{crc_str}{snr_str} {payload_len}B"
+
+        # Add timestamp if available
+        ts = last_decode.get("_wall_time")
+        if ts:
+            import time
+
+            ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            decode_info = f"{ts_str} {decode_info}"
+
+        buf.append(decode_info)
 
     return "".join(buf)
 
@@ -726,6 +752,7 @@ def main() -> None:
                                     fft_size,
                                     tw,
                                     rx_gain,
+                                    last_decode,
                                     last_status,
                                     paused=True,
                                     scroll_offset=scroll_offset,
@@ -763,6 +790,7 @@ def main() -> None:
                         fft_size,
                         tw,
                         rx_gain,
+                        last_decode,
                         last_status,
                         paused=True,
                         scroll_offset=scroll_offset,
@@ -955,6 +983,7 @@ def main() -> None:
                                 fft_size,
                                 tw,
                                 rx_gain,
+                                last_decode,
                                 last_status,
                             )
                         )
@@ -978,6 +1007,7 @@ def main() -> None:
                                 fft_size,
                                 tw,
                                 rx_gain,
+                                last_decode,
                                 last_status,
                                 paused=True,
                                 scroll_offset=scroll_offset,
@@ -1011,6 +1041,7 @@ def main() -> None:
                         fft_size,
                         tw,
                         rx_gain,
+                        last_decode,
                         last_status,
                     )
                 )
