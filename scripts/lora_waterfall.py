@@ -7,18 +7,23 @@ lora_waterfall.py -- Console waterfall display for lora_trx.
 Connects to lora_trx via UDP, receives spectrum CBOR messages, and renders
 a scrolling waterfall in the terminal using xterm-256color escape codes.
 Rows are tinted green (CRC_OK) or red (CRC_FAIL) during frame decodes.
-The dB color scale auto-adjusts based on RX gain from status messages and
-tracks the actual noise floor from spectrum data.
 
-Mouse scroll support: scroll up to pause and browse history, scroll down
-(or past the end) to resume live mode.  Requires a terminal that supports
-SGR mouse mode (wezterm, iTerm2, kitty, xterm, etc.).
+Keyboard Controls:
+    Space  - Pause/resume live view
+    +/-    - Adjust EMA smoothing alpha
+    0-9    - Set EMA alpha to 0.0-0.9
+    q      - Quit
+
+Mouse:
+    Scroll up    - Pause and browse history
+    Scroll down  - Resume live mode
+    Click        - Resume live mode
 
 Usage:
     lora_waterfall.py                          # default: 127.0.0.1:5555
     lora_waterfall.py --connect 192.168.1.10:5555
-    lora_waterfall.py --bw-hz 150000           # zoom to 150 kHz (62.5 kHz BW signal)
-    lora_waterfall.py --delay 2.0              # longer delay for SF12 frames
+    lora_waterfall.py --bw-hz 150000           # zoom to 150 kHz
+    lora_waterfall.py --delay 2.0              # longer delay for SF12
 """
 
 from __future__ import annotations
@@ -239,7 +244,7 @@ def get_terminal_size() -> tuple[int, int]:
     try:
         sz = os.get_terminal_size()
         return sz.columns, sz.lines
-    except (AttributeError, ValueError, OSError):
+    except AttributeError, ValueError, OSError:
         return 80, 24
 
 
@@ -337,9 +342,7 @@ def format_header(
         if ovf:
             info += f" \033[33mOVF={ovf}\033[0m"
     if paused:
-        info += (
-            f"  \033[1;33mPAUSED\033[0m \033[2m-{scroll_offset}/{history_len}\033[0m"
-        )
+        info += f"  \033[2m-{scroll_offset}/{history_len}\033[0m"
     buf.append(f"{legend}{info}")
 
     # Line 3: last decode metadata + payload preview (or blank)
@@ -635,11 +638,11 @@ def main() -> None:
     # Using only the most recent decode keeps tints clean — LoRa is half-duplex,
     # so only one frame is on-air at a time.
     display_delay: float = max(0.0, args.delay)
-    last_decode: dict | None = None  # most recent decode (for header line 3)
+    last_decode: dict[str, Any] | None = None  # most recent decode (for header line 3)
     # active_frame: (dec_time, duration_s, crc_ok) | None
     active_frame: tuple[float, float, bool] | None = None
     last_tx_time: float = 0.0
-    last_status: dict | None = None  # most recent status heartbeat
+    last_status: dict[str, Any] | None = None  # most recent status heartbeat
     # pending_rows: (capture_time, ema_snapshot, db_min, db_max) awaiting flush
     pending_rows: deque[tuple[float, list[float], float, float]] = deque()
 
@@ -687,6 +690,40 @@ def main() -> None:
                     # Check for 'q' or 'Q' to quit
                     if b"q" in raw or b"Q" in raw:
                         raise KeyboardInterrupt
+                    # Space = pause/resume
+                    if b" " in raw:
+                        if scroll_offset > 0:
+                            # Resume
+                            scroll_offset = 0
+                            was_paused = False
+                            header_printed = False
+                            scroll_region_set = False
+                        else:
+                            # Pause
+                            tw, th = get_terminal_size()
+                            waterfall_rows = th - HEADER_LINES
+                            max_offset = max(0, len(history) - waterfall_rows)
+                            scroll_offset = max_offset
+                            if not was_paused:
+                                sys.stdout.write("\033[r")
+                                was_paused = True
+                            # Trigger redraw
+                            delta = 0
+                    # +/- adjust EMA
+                    if b"+" in raw or b"=" in raw:
+                        ema_alpha = min(1.0, ema_alpha + 0.1)
+                        header_printed = False
+                    if b"-" in raw:
+                        ema_alpha = max(0.01, ema_alpha - 0.1)
+                        header_printed = False
+                    # 0-9 set EMA directly
+                    for digit in b"0123456789":
+                        if digit in raw:
+                            ema_alpha = (digit - ord("0")) / 10.0
+                            if ema_alpha < 0.01:
+                                ema_alpha = 0.01
+                            header_printed = False
+                            break
 
                     mouse_buf += raw
                     delta, click_live, mouse_buf = parse_mouse_events(mouse_buf)
@@ -775,7 +812,7 @@ def main() -> None:
 
             try:
                 data, _addr = sock.recvfrom(65536)
-            except (BlockingIOError, OSError):
+            except BlockingIOError, OSError:
                 continue
 
             try:
