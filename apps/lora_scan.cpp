@@ -988,10 +988,7 @@ static int streaming_main(ScanSetConfig& cfg) {
     lora_graph::build_streaming_scan_graph(graph, cfg);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> sched;
-    sched.timeout_inactivity_count = 1U;
-    // TODO: upstream removed watchdog_min_stall_count / watchdog_max_warnings — re-add if ported
-    // sched.watchdog_min_stall_count = 10U;
-    // sched.watchdog_max_warnings    = 30U;
+    sched.timeout_inactivity_count = 10U;  // SoapySource IO thread drives progress; log after 10s stall
 
     if (auto ret = sched.exchange(std::move(graph)); !ret) {
         gr::lora::log_ts("error", "lora_scan", "scheduler init failed");
@@ -1183,10 +1180,7 @@ int main(int argc, char** argv) {
     auto sg = lora_graph::build_scan_graph(graph, cfg, channels);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> sched;
-    sched.timeout_inactivity_count = 1U;
-    // TODO: upstream removed watchdog_min_stall_count / watchdog_max_warnings — re-add if ported
-    // sched.watchdog_min_stall_count = 10U;
-    // sched.watchdog_max_warnings    = 30U;
+    sched.timeout_inactivity_count = 10U;  // SoapySource IO thread drives progress; log after 10s stall
 
     if (auto ret = sched.exchange(std::move(graph)); !ret) {
         gr::lora::log_ts("error", "lora_scan", "scheduler init failed");

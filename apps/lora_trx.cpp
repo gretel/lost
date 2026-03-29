@@ -167,10 +167,7 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
 
     auto sched = std::make_unique<
         gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>>();
-    sched->timeout_inactivity_count  = 1U;
-    // TODO: upstream removed watchdog_min_stall_count / watchdog_max_warnings — re-add if ported
-    // sched->watchdog_min_stall_count  = 10U;
-    // sched->watchdog_max_warnings     = 0U;
+    sched->timeout_inactivity_count  = 1000U;  // TX idles waiting for requests — suppress watchdog
     if (auto ret = sched->exchange(std::move(graph)); !ret) {
         gr::lora::log_ts("error", "lora_trx", "TX scheduler init failed");
         return nullptr;
@@ -651,10 +648,7 @@ int main(int argc, char* argv[]) {
     }
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> rx_sched;
-    rx_sched.timeout_inactivity_count  = 1U;   // sleep after 1 idle cycle; SoapySource notifies progress on data
-    // TODO: upstream removed watchdog_min_stall_count / watchdog_max_warnings — re-add if ported
-    // rx_sched.watchdog_min_stall_count  = 10U;
-    // rx_sched.watchdog_max_warnings     = 30U;
+    rx_sched.timeout_inactivity_count  = 10U;  // log after 10s of no progress (SoapySource IO thread drives progress)
     if (auto ret = rx_sched.exchange(std::move(rx_graph)); !ret) {
         gr::lora::log_ts("error", "lora_trx", "RX scheduler init failed");
         if (tx_sched) {
