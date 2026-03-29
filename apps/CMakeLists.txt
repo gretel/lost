@@ -3,16 +3,16 @@
 # lora_trx — full-duplex LoRa transceiver (RX + TX) with CBOR/UDP interface.
 # All I/O is CBOR over UDP. See docs/cbor-schemas.md.
 
-if(NOT TARGET gr-soapy)
-    message(STATUS "gr-soapy not available (SoapySDR not found) -- skipping hardware apps")
+if(NOT TARGET gr-sdr)
+    message(STATUS "gr-sdr not available (SoapySDR not found) -- skipping hardware apps")
     return()
 endif()
 
 add_executable(lora_trx lora_trx.cpp config.cpp)
-target_link_libraries(lora_trx PRIVATE gnuradio-core-group gr-lora gr-soapy gr-testing tomlplusplus::tomlplusplus)
+target_link_libraries(lora_trx PRIVATE gnuradio-core-group gr-lora gr-sdr gr-testing tomlplusplus::tomlplusplus)
 
 add_executable(lora_scan lora_scan.cpp config.cpp)
-target_link_libraries(lora_scan PRIVATE gnuradio-core-group gr-lora gr-soapy gr-testing tomlplusplus::tomlplusplus)
+target_link_libraries(lora_scan PRIVATE gnuradio-core-group gr-lora gr-sdr gr-testing tomlplusplus::tomlplusplus)
 
 # Version: pass -DGIT_REV=<hash> at configure time, or auto-detect from git.
 if(NOT DEFINED GIT_REV)

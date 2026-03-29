@@ -6,8 +6,8 @@
 
 #include <gnuradio-4.0/meta/formatter.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
-#include <gnuradio-4.0/soapy/Soapy.hpp>
-#include <gnuradio-4.0/soapy/SoapySink.hpp>
+#include <gnuradio-4.0/sdr/SoapySource.hpp>
+#include <gnuradio-4.0/sdr/SoapySink.hpp>
 #include <gnuradio-4.0/testing/NullSources.hpp>
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
 
@@ -306,7 +306,7 @@ const boost::ut::suite<"SoapyLoopback GR4 graph"> gr4GraphTests = [] {
         expect(loadErr.empty()) << std::format("loadModule failed: {}", loadErr);
 
         using namespace gr;
-        using namespace gr::blocks::soapy;
+        using namespace gr::blocks::sdr;
         using namespace gr::testing;
         using scheduler = gr::scheduler::Simple<>;
         using ValueType = std::complex<float>;
@@ -318,7 +318,7 @@ const boost::ut::suite<"SoapyLoopback GR4 graph"> gr4GraphTests = [] {
         auto&     sink   = flow.emplaceBlock<SoapySinkBlock<ValueType, 1UZ>>({
             {"device", "loopback"},
             {"sample_rate", float(1e6)},
-            {"tx_center_frequency", gr::Tensor<double>{434e6}},
+            {"frequency", std::vector<double>{434e6}},
             {"timed_tx", false},
             {"wait_burst_ack", false},
         });
@@ -353,16 +353,16 @@ const boost::ut::suite<"SoapyLoopback GR4 graph"> gr4GraphTests = [] {
         expect(loadErr.empty()) << std::format("loadModule failed: {}", loadErr);
 
         using namespace gr;
-        using namespace gr::blocks::soapy;
+        using namespace gr::blocks::sdr;
         using namespace gr::testing;
         using ValueType = std::complex<float>;
 
-        // verify SoapyBlock can be emplaced into a graph with the loopback driver
+        // verify SoapySource can be emplaced into a graph with the loopback driver
         gr::Graph flow;
-        auto&     source = flow.emplaceBlock<SoapyBlock<ValueType, 1UZ>>({
+        auto&     source = flow.emplaceBlock<SoapySource<ValueType, 1UZ>>({
             {"device", "loopback"},
             {"sample_rate", float(1e6)},
-            {"rx_center_frequency", std::vector{107e6}},
+            {"frequency", std::vector<double>{107e6}},
             {"verbose_overflow", false},
         });
         auto& sink = flow.emplaceBlock<CountingSink<ValueType>>({{"n_samples_max", gr::Size_t(1000)}});
