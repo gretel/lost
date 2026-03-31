@@ -1014,7 +1014,7 @@ static int streaming_main(ScanSetConfig& cfg) {
             using SoapyType = gr::blocks::sdr::SoapySource<cf32, 1UZ>;
             auto* wrapper = dynamic_cast<gr::BlockWrapper<SoapyType>*>(soapy_source.get());
             if (wrapper) {
-                ovf = wrapper->blockRef()._overFlowCount.load(std::memory_order_relaxed);
+                ovf = wrapper->blockRef()._overflowCount.load(std::memory_order_relaxed);
             }
         }
         {
@@ -1086,7 +1086,7 @@ static int streaming_main(ScanSetConfig& cfg) {
             using SoapyType = gr::blocks::sdr::SoapySource<cf32, 1UZ>;
             auto* wrapper = dynamic_cast<gr::BlockWrapper<SoapyType>*>(soapy_source.get());
             if (wrapper) {
-                uint64_t ovf = wrapper->blockRef()._overFlowCount.load(std::memory_order_relaxed);
+                uint64_t ovf = wrapper->blockRef()._overflowCount.load(std::memory_order_relaxed);
                 if (ovf != lastOvf && (ovf == 1 || ovf % 50 == 0)) {
                     gr::lora::log_ts("warn ", "lora_scan",
                         "overflow count: %llu", static_cast<unsigned long long>(ovf));
@@ -1318,11 +1318,11 @@ int main(int argc, char** argv) {
     uint64_t lastOverflowCount = 0;
     auto checkOverflows = [&](uint32_t sweep) {
         // Access overflow count via the typed block inside the wrapper.
-        // SoapySource<cf32, 1>::_overFlowCount is atomic and cross-thread safe.
+        // SoapySource<cf32, 1>::_overflowCount is atomic and cross-thread safe.
         using SoapyType = gr::blocks::sdr::SoapySource<std::complex<float>, 1UZ>;
         auto* wrapper = dynamic_cast<gr::BlockWrapper<SoapyType>*>(soapy_source.get());
         if (!wrapper) return;
-        const uint64_t current = wrapper->blockRef()._overFlowCount.load(std::memory_order_relaxed);
+        const uint64_t current = wrapper->blockRef()._overflowCount.load(std::memory_order_relaxed);
         if (current > lastOverflowCount) {
             stats.overflows = static_cast<uint32_t>(current);
             emitOverflowCbor(sweep, current);

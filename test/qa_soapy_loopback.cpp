@@ -315,7 +315,7 @@ const boost::ut::suite<"SoapyLoopback GR4 graph"> gr4GraphTests = [] {
 
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<ConstantSource<ValueType>>({{"n_samples_max", nSamples}});
-        auto&     sink   = flow.emplaceBlock<SoapySinkBlock<ValueType, 1UZ>>({
+        auto&     sink   = flow.emplaceBlock<SoapySink<ValueType, 1UZ>>({
             {"device", "loopback"},
             {"sample_rate", float(1e6)},
             {"frequency", std::vector<double>{434e6}},

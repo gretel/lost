@@ -214,7 +214,7 @@ inline std::atomic<gr::Size_t>* build_rx_graph(
         });
         auto& source = graph.emplaceBlock<gr::blocks::sdr::SoapySimpleSource<std::complex<float>>>(
             std::move(props));
-        overflow_ptr = &source._overFlowCount;
+        overflow_ptr = &source._overflowCount;
         wireDecodeChains([&graph, &source](std::size_t /*r*/, auto& downstream) {
             return graph.connect<"out", "in">(source, downstream).has_value();
         });
@@ -234,7 +234,7 @@ inline std::atomic<gr::Size_t>* build_rx_graph(
         });
         auto& source = graph.emplaceBlock<gr::blocks::sdr::SoapyDualSource<std::complex<float>>>(
             std::move(props));
-        overflow_ptr = &source._overFlowCount;
+        overflow_ptr = &source._overflowCount;
         wireDecodeChains([&graph, &source](std::size_t r, auto& downstream) {
             auto portName = "out#"s + std::to_string(r);
             return graph.connect(source, portName, downstream, "in"s).has_value();
@@ -552,7 +552,7 @@ inline std::atomic<gr::Size_t>* build_wideband_graph(
         "wideband graph: %.1f MS/s, %.3f MHz center, BW%u, %s",
         cfg.wideband_rate / 1e6, cfg.freq / 1e6, cfg.bw, sf_desc.c_str());
 
-    return &source._overFlowCount;
+    return &source._overflowCount;
 }
 
 }  // namespace lora_graph

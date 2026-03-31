@@ -123,7 +123,7 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
 
     graph.emplaceBlock<gr::lora::TxQueueSource>();
 
-    auto& sink = graph.emplaceBlock<gr::blocks::sdr::SoapySinkBlock<cf32, 2UZ>>({
+    auto& sink = graph.emplaceBlock<gr::blocks::sdr::SoapySink<cf32, 2UZ>>({
         {"device",              cfg.device},
         {"device_parameter",    cfg.device_param},
         {"sample_rate",         cfg.rate},
