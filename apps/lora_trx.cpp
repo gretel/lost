@@ -132,6 +132,7 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
         {"num_channels",        gr::Size_t{2}},
         {"tx_antennae",         std::vector<std::string>{tx_map.tx_antenna, "TX/RX"}},
         {"clock_source",        cfg.clock},
+        {"master_clock_rate",   cfg.wideband ? cfg.wideband_master_clock : 0.0},
         {"timed_tx",            true},
         {"wait_burst_ack",      true},
         {"max_underflow_count", gr::Size_t{0}},
