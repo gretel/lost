@@ -80,10 +80,6 @@ from meshcore_crypto import (
     build_grp_txt,
     compute_ack_hash,
     # Protocol constants (canonical source)
-    PUB_KEY_SIZE,
-    CIPHER_MAC_SIZE,
-    CIPHER_BLOCK_SIZE,
-    PATH_HASH_SIZE,
     ROUTE_MASK,
     PTYPE_SHIFT,
     PTYPE_MASK,
@@ -92,13 +88,13 @@ from meshcore_crypto import (
     PAYLOAD_ADVERT,
     PAYLOAD_RESP,
     PAYLOAD_GRP_TXT,
+    PAYLOAD_GRP_DATA,
     PAYLOAD_ANON_REQ,
     PAYLOAD_PATH,
     PAYLOAD_CTRL,
     PAYLOAD_TRACE,
     ROUTE_DIRECT,
     ROUTE_FLOOD,
-    ROUTE_T_DIRECT,
     ROUTE_T_FLOOD,
     ADVERT_HAS_LOCATION,
     ADVERT_HAS_NAME,
@@ -247,14 +243,21 @@ def _is_valid_repeat_freq(freq_khz: int) -> bool:
 def _parse_flood_scope(value: str) -> bytes:
     """Parse a flood_scope config value into a 16-byte transport key.
 
-    Accepts two formats (matching the companion library's set_flood_scope()):
+    Accepts three formats:
       - 32 hex characters (64 nibbles) → decoded as raw 16-byte key
-      - Any other non-empty string → sha256(name)[:16] (human-readable scope name)
+      - Any other non-empty string → sha256("#" + name)[:16] (human-readable)
       - Empty string or "*" or "0" or "None" → all-zero key (disabled)
 
-    The hash formula for human-readable names is sha256(name) without a "#" prefix,
-    matching meshcore_py's set_flood_scope() implementation.  This differs from
-    region_scope which uses sha256("#" + name).
+    Human-readable names are hashed WITH a "#" prefix, matching the MeshCore
+    firmware's RegionMap::findMatch() auto-key derivation (TransportKeyStore
+    ``getAutoKeyFor`` always receives "#" + name).  This ensures that the
+    transport codes computed by the bridge match what repeaters expect.
+
+    NOTE: meshcore_py's ``set_flood_scope()`` hashes WITHOUT "#".  When a
+    companion CLI sends CMD_SET_FLOOD_SCOPE, the raw 16-byte key arrives
+    pre-computed — no re-hashing is possible.  For repeater-compatible
+    scoping, use config.toml ``flood_scope`` (which goes through this
+    function) rather than the companion CLI ``/scope`` command.
     """
     if not value or value in ("0", "None", "*"):
         return b"\x00" * 16
@@ -265,8 +268,9 @@ def _parse_flood_scope(value: str) -> bytes:
             return key  # exactly 16 bytes
         except ValueError:
             pass  # fall through to name hashing
-    # Human-readable scope name: sha256(name)[:16]
-    return hashlib.sha256(value.encode("utf-8")).digest()[:16]
+    # Human-readable scope name: sha256("#" + name)[:16]
+    # The "#" prefix matches firmware RegionMap auto-hashtag derivation.
+    return hashlib.sha256(("#" + value).encode("utf-8")).digest()[:16]
 
 
 # ---- Companion frame codec ----
@@ -473,9 +477,7 @@ class BridgeState:
 
     def build_self_info(self) -> bytes:
         """Build SELF_INFO (0x05) response payload."""
-        # Convert freq/bw to milli-Hz (uint32 LE)
-        freq_mhz_int = int(self.freq_mhz * 1e3)  # MHz -> milli-Hz
-        bw_mhz_int = int(self.bw_khz)  # kHz -> milli-Hz (field is mHz of MHz)
+        # Convert freq/bw to companion protocol units (uint32 LE).
         # Actually: radio_freq and radio_bw in the companion protocol are in
         # milli-Hz units where the frequency is in MHz*1000 and BW in kHz*1000
         # meshcore_py divides by 1000 to get MHz/kHz:
@@ -836,12 +838,22 @@ def lora_frame_to_companion_msgs(
         return _handle_ack_rx(payload, advert_start, state), []
 
     # For TXT_MSG: decrypt and produce CONTACT_MSG_RECV_V3 + ACK TX
+    # Pass route + path so _handle_txt_msg_rx can build PATH+ACK for flood
     if ptype == PAYLOAD_TXT:
-        return _handle_txt_msg_rx(payload, snr_byte, path_len, state)
+        path_start = off + 1  # after path_len byte
+        return _handle_txt_msg_rx(
+            payload,
+            snr_byte,
+            path_len,
+            state,
+            route=route,
+            path_len_byte=payload[off] if off < len(payload) else 0,
+            path_bytes=payload[path_start : path_start + path_byte_len],
+        )
 
     # For ANON_REQ: decrypt and produce CONTACT_MSG_RECV_V3 + ACK TX
     if ptype == PAYLOAD_ANON_REQ:
-        return _handle_anon_req_rx(payload, snr_byte, path_len, state)
+        return _handle_anon_req_rx(payload, snr_byte, path_len, state, route=route)
 
     # For GRP_TXT: decrypt and produce CHANNEL_MSG_RECV_V3 (no ACK for group)
     if ptype == PAYLOAD_GRP_TXT:
@@ -1142,26 +1154,99 @@ def _build_contact_msg_recv_v3(
     return bytes(buf)
 
 
-def _build_ack_wire_packet(ack_hash: bytes, state: BridgeState) -> bytes:
-    """Build a MeshCore ACK wire packet.
+def _build_ack_wire_packet(
+    ack_hash: bytes,
+    state: BridgeState,
+    sender_pub: bytes = b"",
+) -> bytes:
+    """Build a bare MeshCore ACK wire packet matching firmware sendAckTo().
 
-    Wire format: header(1) + [transport_codes(4)] + path_len(1) + path(N) + ack_hash(4).
-    Uses ROUTE_DIRECT (or ROUTE_T_DIRECT when scope is active).
+    Firmware behaviour (BaseChatMesh::sendAckTo):
+      - out_path_len >= 0  → sendDirect(pkt, out_path, out_path_len)
+      - out_path_len == -1 → sendFloodScoped(pkt)
+
+    The bridge mirrors this: look up the contact's stored path and route
+    the ACK accordingly.  Without a known direct path the ACK is sent as
+    a plain flood so repeaters forward it.
     """
     from meshcore_tx import build_wire_packet, make_header
 
-    # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
-    active_key = state.send_scope if any(state.send_scope) else state.region_key
+    # Look up the contact's stored direct path
+    stored_path = b""
+    stored_path_len = -1  # default: unknown → flood
+    contact_hex = sender_pub.hex() if sender_pub else ""
+    if contact_hex and contact_hex in state.contacts:
+        stored_path_len = struct.unpack_from("<b", state.contacts[contact_hex], 34)[0]
+        if stored_path_len > 0:
+            stored_path = state.contacts[contact_hex][35 : 35 + stored_path_len]
 
-    if active_key:
-        # Use ROUTE_T_DIRECT with transport codes for scoped networks
-        tc1 = _compute_transport_code(active_key, PAYLOAD_ACK, ack_hash)
-        header = make_header(ROUTE_T_DIRECT, PAYLOAD_ACK)
-        return build_wire_packet(header, ack_hash, transport_codes=(tc1, 0))
-    else:
-        # No scope active - use plain ROUTE_DIRECT
+    if stored_path_len >= 0:
+        # Known direct path (or zero-hop direct): send DIRECT ACK with path
         header = make_header(ROUTE_DIRECT, PAYLOAD_ACK)
-        return build_wire_packet(header, ack_hash)
+        return build_wire_packet(header, ack_hash, path=stored_path)
+
+    # No known path: send via flood, matching firmware sendFloodScoped()
+    active_key = state.send_scope if any(state.send_scope) else state.region_key
+    if active_key:
+        payload = ack_hash
+        tc1 = _compute_transport_code(active_key, PAYLOAD_ACK, payload)
+        header = make_header(ROUTE_T_FLOOD, PAYLOAD_ACK)
+        return build_wire_packet(header, payload, transport_codes=(tc1, 0))
+    header = make_header(ROUTE_FLOOD, PAYLOAD_ACK)
+    return build_wire_packet(header, ack_hash)
+
+
+def _build_path_ack_wire_packet(
+    ack_hash: bytes,
+    sender_pub: bytes,
+    incoming_path_len_byte: int,
+    incoming_path_bytes: bytes,
+    state: BridgeState,
+) -> bytes:
+    """Build a PATH+ACK wire packet (for flood-routed TXT_MSG).
+
+    Firmware equivalent: createPathReturn(from.id, secret, packet->path,
+    packet->path_len, PAYLOAD_TYPE_ACK, &ack_hash, 4) → sendFloodScoped().
+
+    PATH plaintext (encrypted with ECDH shared secret):
+        [path_len_byte(1)] [path_hashes(N)] [extra_type=ACK(1)] [ack_hash(4)]
+
+    Wire format: ROUTE_FLOOD (or T_FLOOD with scope):
+        header(1) [+ transport_codes(4)] + path_len(1) + path(0) +
+        dest_hash(1) + src_hash(1) + MAC(2) + ciphertext
+    """
+    from meshcore_tx import build_wire_packet, make_header
+
+    # Build plaintext: path_len_byte + path hashes + extra_type + ack_hash
+    plaintext = (
+        bytes([incoming_path_len_byte])
+        + incoming_path_bytes
+        + bytes([PAYLOAD_ACK])
+        + ack_hash
+    )
+
+    # Encrypt with ECDH shared secret
+    secret = meshcore_shared_secret(state.expanded_prv, sender_pub)
+    if secret is None:
+        log.warning(
+            "PATH+ACK: cannot compute shared secret for %s..", sender_pub.hex()[:8]
+        )
+        # Fall back to bare ACK
+        return _build_ack_wire_packet(ack_hash, state)
+
+    enc = meshcore_encrypt_then_mac(secret, plaintext)
+    # PATH payload: dest_hash(1) + src_hash(1) + MAC(2) + ciphertext
+    path_payload = bytes([sender_pub[0], state.pub_key[0]]) + enc
+
+    # Routing: flood (or T_FLOOD with scope), matching firmware sendFloodScoped()
+    active_key = state.send_scope if any(state.send_scope) else state.region_key
+    if active_key:
+        tc1 = _compute_transport_code(active_key, PAYLOAD_PATH, path_payload)
+        header = make_header(ROUTE_T_FLOOD, PAYLOAD_PATH)
+        return build_wire_packet(header, path_payload, transport_codes=(tc1, 0))
+    else:
+        header = make_header(ROUTE_FLOOD, PAYLOAD_PATH)
+        return build_wire_packet(header, path_payload)
 
 
 def _handle_txt_msg_rx(
@@ -1169,8 +1254,20 @@ def _handle_txt_msg_rx(
     snr_byte: int,
     path_len: int,
     state: BridgeState,
+    *,
+    route: int = ROUTE_DIRECT,
+    path_len_byte: int = 0,
+    path_bytes: bytes = b"",
 ) -> tuple[list[bytes], list[bytes]]:
-    """Decrypt TXT_MSG and produce CONTACT_MSG_RECV_V3 + RF ACK packet."""
+    """Decrypt TXT_MSG and produce CONTACT_MSG_RECV_V3 + RF ACK packet.
+
+    For flood-routed messages: builds PATH+ACK (ptype 0x08) carrying the
+    return path + bundled ACK hash, sent via flood — matching firmware
+    BaseChatMesh::handleTextMessage() line 224-228.
+
+    For direct-routed messages: builds bare ACK (ptype 0x03) sent via
+    direct routing — matching firmware sendAckTo().
+    """
     empty: tuple[list[bytes], list[bytes]] = ([], [])
     result = try_decrypt_txt_msg(
         payload, state.expanded_prv, state.pub_key, state.known_keys
@@ -1216,12 +1313,31 @@ def _handle_txt_msg_rx(
             text.encode("utf-8"),
         )
 
-        # Build RF ACK packet (direct routing, no path)
+        # Build RF ACK packet — PATH+ACK for flood, bare ACK for direct
         ack_packets: list[bytes] = []
         if plaintext is not None and len(plaintext) >= 5:
             ack_hash = compute_ack_hash(plaintext, sender_pub)
-            ack_packets.append(_build_ack_wire_packet(ack_hash, state))
-            log.info("ACK hash: %s for %s..", ack_hash.hex(), sender_pub.hex()[:8])
+            is_flood = route in (ROUTE_FLOOD, ROUTE_T_FLOOD)
+            if is_flood:
+                ack_pkt = _build_path_ack_wire_packet(
+                    ack_hash, sender_pub, path_len_byte, path_bytes, state
+                )
+                log.info(
+                    "PATH+ACK hash: %s for %s.. (flood return path %d hops)",
+                    ack_hash.hex(),
+                    sender_pub.hex()[:8],
+                    path_len_byte & 0x3F,
+                )
+            else:
+                ack_pkt = _build_ack_wire_packet(ack_hash, state, sender_pub)
+                route_label = "direct" if ack_pkt[0] & 0x03 == ROUTE_DIRECT else "flood"
+                log.info(
+                    "ACK hash: %s for %s.. (%s)",
+                    ack_hash.hex(),
+                    sender_pub.hex()[:8],
+                    route_label,
+                )
+            ack_packets.append(ack_pkt)
 
         companion_msgs: list[bytes] = [msg]
 
@@ -1254,6 +1370,8 @@ def _handle_anon_req_rx(
     snr_byte: int,
     path_len: int,
     state: BridgeState,
+    *,
+    route: int = ROUTE_DIRECT,
 ) -> tuple[list[bytes], list[bytes]]:
     """Decrypt ANON_REQ, deliver to companion, and send encrypted RESPONSE to sender.
 
@@ -1262,6 +1380,9 @@ def _handle_anon_req_rx(
     sender's full public key (embedded in the ANON_REQ payload).  We match
     this behaviour: the RESPONSE is returned in ack_packets so run_bridge()
     transmits it as an RF packet.
+
+    For flood-routed ANON_REQ: RESPONSE sent via flood (no return path available).
+    For direct-routed ANON_REQ: RESPONSE sent via direct (zero-hop, sender in range).
     """
     from meshcore_tx import build_wire_packet, make_header
 
@@ -1300,19 +1421,25 @@ def _handle_anon_req_rx(
         # RESP payload: dest_hash(1) + src_hash(1) + MAC(2) + ciphertext
         resp_payload = bytes([sender_pub[0], state.pub_key[0]]) + resp_enc
 
-        # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
-        active_key = state.send_scope if any(state.send_scope) else state.region_key
-        if active_key:
-            # Use ROUTE_T_DIRECT with transport codes for scoped networks
-            tc1 = _compute_transport_code(active_key, PAYLOAD_RESP, resp_payload)
-            header = make_header(ROUTE_T_DIRECT, PAYLOAD_RESP)
-            resp_pkt = build_wire_packet(
-                header, resp_payload, path=b"", transport_codes=(tc1, 0)
-            )
+        # Route RESPONSE matching firmware behaviour:
+        # - flood-routed ANON_REQ → flood RESPONSE (sender unreachable via direct)
+        # - direct-routed ANON_REQ → direct RESPONSE (sender in range)
+        is_flood = route in (ROUTE_FLOOD, ROUTE_T_FLOOD)
+        if is_flood:
+            active_key = state.send_scope if any(state.send_scope) else state.region_key
+            if active_key:
+                tc1 = _compute_transport_code(active_key, PAYLOAD_RESP, resp_payload)
+                hdr = make_header(ROUTE_T_FLOOD, PAYLOAD_RESP)
+                resp_pkt = build_wire_packet(
+                    hdr, resp_payload, transport_codes=(tc1, 0)
+                )
+            else:
+                resp_pkt = build_wire_packet(
+                    make_header(ROUTE_FLOOD, PAYLOAD_RESP), resp_payload
+                )
         else:
-            # No scope active - use plain ROUTE_DIRECT
             resp_pkt = build_wire_packet(
-                make_header(ROUTE_DIRECT, PAYLOAD_RESP), resp_payload, path=b""
+                make_header(ROUTE_DIRECT, PAYLOAD_RESP), resp_payload
             )
 
         log.debug("ANON_REQ: sending RESPONSE to %s..", pk_hex[:8])
@@ -1547,7 +1674,7 @@ def _initialize_config_from_toml(
     This populates the initial EEPROM values from the [meshcore] section
     of config.toml. Subsequent boots read from EEPROM directly.
     """
-    config = {
+    config: dict[str, Any] = {
         "version": 1,
         "identity": {
             "name": toml_settings.get("name", "lora_trx"),
@@ -1784,11 +1911,16 @@ def handle_command(
         return _handle_add_contact(data, state)
 
     if cmd == CMD_REMOVE_CONTACT:
-        if len(data) >= 32:
-            pk_hex = data[:32].hex()
-            state.contacts.pop(pk_hex, None)
-            _delete_persisted_contact(state.contacts_dir, pk_hex)
-            log.info("companion: REMOVE_CONTACT %s..", pk_hex[:8])
+        # Companion sends a 6-byte pubkey prefix (not the full 32-byte key).
+        if len(data) >= 6:
+            prefix_hex = data[:6].hex()
+            matched = [k for k in state.contacts if k.startswith(prefix_hex)]
+            for pk_hex in matched:
+                state.contacts.pop(pk_hex, None)
+                _delete_persisted_contact(state.contacts_dir, pk_hex)
+                log.info("companion: REMOVE_CONTACT %s..", pk_hex[:8])
+            if not matched:
+                log.warning("REMOVE_CONTACT: no match for prefix %s", prefix_hex)
         return [state.build_ok()]
 
     if cmd == CMD_EXPORT_CONTACT:
@@ -1829,11 +1961,27 @@ def handle_command(
         if not data or data[0] != 0:
             return [state.build_error(ERR_CODE_ILLEGAL_ARG)]
         if len(data) >= 17:  # discriminator(1) + key(16)
-            state.send_scope = bytes(data[1:17])
-            log.info("SET_FLOOD_SCOPE set: %s...", state.send_scope.hex()[:16])
+            new_key = bytes(data[1:17])
+            if not any(new_key) and any(state._startup_send_scope):
+                # meshcore-cli sends all-zero scope on every connect (its
+                # stale "*" default).  Protect the config.toml startup scope
+                # from being silently cleared — return OK without modifying.
+                log.info(
+                    "SET_FLOOD_SCOPE: ignoring all-zero (config scope active: %s..)",
+                    state._startup_send_scope.hex()[:16],
+                )
+            else:
+                state.send_scope = new_key
+                log.info("SET_FLOOD_SCOPE set: %s...", state.send_scope.hex()[:16])
         else:
-            state.send_scope = b"\x00" * 16  # clear scope
-            log.info("SET_FLOOD_SCOPE cleared")
+            if any(state._startup_send_scope):
+                log.info(
+                    "SET_FLOOD_SCOPE: ignoring clear (config scope active: %s..)",
+                    state._startup_send_scope.hex()[:16],
+                )
+            else:
+                state.send_scope = b"\x00" * 16  # clear scope
+                log.info("SET_FLOOD_SCOPE cleared")
         return [state.build_ok()]
 
     if cmd == CMD_GET_ALLOWED_REPEAT_FREQ:
@@ -1924,7 +2072,12 @@ def handle_command(
             log.info("companion: RESET_PATH cleared paths for %d contacts", reset_count)
         return [state.build_ok()]
 
-    if cmd in (CMD_SET_TUNING_PARAMS, CMD_REBOOT):
+    if cmd == CMD_SET_TUNING_PARAMS:
+        return [state.build_ok()]
+
+    if cmd == CMD_REBOOT:
+        # Simulate device reboot: restore startup configuration (scope, name, etc.)
+        state.apply_startup_config()
         return [state.build_ok()]
 
     if cmd == CMD_LOGIN:
@@ -1999,17 +2152,9 @@ def handle_command(
         trace_payload = tag_bytes + auth_bytes + flags_byte + path_hashes
         from meshcore_tx import build_wire_packet, make_header, make_cbor_tx_request
 
-        # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
-        active_key = state.send_scope if any(state.send_scope) else state.region_key
-        if active_key:
-            # Use ROUTE_T_DIRECT with transport codes for scoped networks
-            tc1 = _compute_transport_code(active_key, PAYLOAD_TRACE, trace_payload)
-            header = make_header(ROUTE_T_DIRECT, PAYLOAD_TRACE)
-            packet = build_wire_packet(header, trace_payload, transport_codes=(tc1, 0))
-        else:
-            # No scope active - use plain ROUTE_DIRECT
-            header = make_header(ROUTE_DIRECT, PAYLOAD_TRACE)
-            packet = build_wire_packet(header, trace_payload)
+        # Firmware always uses ROUTE_DIRECT for TRACE (no transport codes).
+        header = make_header(ROUTE_DIRECT, PAYLOAD_TRACE)
+        packet = build_wire_packet(header, trace_payload)
 
         # Track TX hash and send via UDP
         h = _hash_payload(packet)
@@ -2109,17 +2254,8 @@ def handle_command(
             route_type=ROUTE_DIRECT,
         )
 
-        # Priority: send_scope (CMD_SET_FLOOD_SCOPE raw key) > region_key (hashtag-derived)
-        active_key = state.send_scope if any(state.send_scope) else state.region_key
-        if active_key:
-            # Repackage with ROUTE_T_DIRECT + transport codes
-            # tmp structure: header(1) + path_len(1) + payload
-            anon_payload = tmp[2:]  # skip header(1) + path_len(1)
-            tc1 = _compute_transport_code(active_key, PAYLOAD_ANON_REQ, anon_payload)
-            header = make_header(ROUTE_T_DIRECT, PAYLOAD_ANON_REQ)
-            pkt = build_wire_packet(header, anon_payload, transport_codes=(tc1, 0))
-        else:
-            pkt = tmp
+        # Firmware always uses ROUTE_DIRECT for ANON_REQ (no transport codes).
+        pkt = tmp
 
         h = _hash_payload(pkt)
         state.recent_tx[h] = time.monotonic()
@@ -2185,6 +2321,12 @@ def handle_command(
         state.pkt_recv = state.pkt_sent = 0
         state.pkt_flood_tx = state.pkt_direct_tx = 0
         state.pkt_flood_rx = state.pkt_direct_rx = 0
+        # Reset runtime-only state to defaults (scope, repeat mode, etc.)
+        state.send_scope = b"\x00" * 16
+        state.client_repeat = 0
+        state.autoadd_config = 0
+        state.autoadd_max_hops = 0
+        state.path_hash_mode = 0
         log.warning("companion: FACTORY_RESET — data and EEPROM wiped")
         return [state.build_ok()]
 
@@ -2220,6 +2362,98 @@ def handle_command(
 def _hash_payload(payload: bytes) -> bytes:
     """Hash a payload for TX echo filtering."""
     return hashlib.sha256(payload).digest()[:8]
+
+
+MAX_PATH_SIZE = 64  # firmware Packet.h
+
+# Payload types that are DENIED flood-forwarding when denyf * is set.
+# Per MeshCore PR #1810: GRP_TXT, GRP_DATA, and ADVERT are channel/broadcast
+# traffic that clogs the network.  All other types (REQ, RESP, TXT_MSG, ACK,
+# ANON_REQ, PATH, TRACE, MULTI, CTRL) are forwarded because they are needed
+# to establish and maintain direct message paths.
+# TODO(meshcore): revisit when PR #1810 lands — upstream may adopt bitwise
+# flags per payload class (skyepn proposal) instead of the current hardcoded
+# deny set.  Also add a config.toml knob to toggle deny_flood_broadcast and
+# potentially per-type overrides.
+_DENYF_PAYLOAD_TYPES = frozenset({PAYLOAD_GRP_TXT, PAYLOAD_GRP_DATA, PAYLOAD_ADVERT})
+
+
+def _prepare_repeat_packet(
+    rx_payload: bytes,
+    frame_msg: dict[str, Any],
+    our_pub: bytes,
+    *,
+    deny_flood_broadcast: bool = True,
+) -> bytes | None:
+    """Prepare a packet for repeater forwarding, or return None to skip.
+
+    Replicates firmware Mesh::routeRecvPacket() + filterRecvFloodPacket():
+    - Only flood packets (ROUTE_FLOOD=1 or ROUTE_T_FLOOD=0)
+    - CRC must be valid
+    - Payload type filter (PR #1810): deny GRP_TXT/GRP_DATA/ADVERT
+    - Path has room for one more hash
+    - Loop detection: our hash must not already be in the path
+    - Appends our 1-byte path hash before retransmit
+    """
+    # CRC check
+    if not frame_msg.get("crc_valid", False):
+        log.debug("repeat: skip CRC-invalid packet")
+        return None
+
+    if len(rx_payload) < 2:
+        return None
+
+    hdr_byte = rx_payload[0]
+    route = hdr_byte & ROUTE_MASK
+    ptype = (hdr_byte >> 2) & 0x0F
+
+    # Only forward flood packets (ROUTE_T_FLOOD=0, ROUTE_FLOOD=1)
+    if route > ROUTE_FLOOD:  # ROUTE_DIRECT=2 or ROUTE_T_DIRECT=3
+        log.debug("repeat: skip non-flood route=%d", route)
+        return None
+
+    # Payload type filter (MeshCore PR #1810): when deny_flood_broadcast is
+    # set, block GRP_TXT, GRP_DATA, and ADVERT (network-clogging broadcast
+    # traffic).  Allow all other types needed for direct message path
+    # establishment (TXT_MSG, ACK, PATH, REQ, RESP, ANON_REQ, TRACE, etc.).
+    if deny_flood_broadcast and ptype in _DENYF_PAYLOAD_TYPES:
+        log.debug("repeat: skip denied payload type 0x%02x", ptype)
+        return None
+
+    # Parse path location in the wire packet
+    has_transport = route == ROUTE_T_FLOOD
+    path_len_offset = 1 + (4 if has_transport else 0)
+    if path_len_offset >= len(rx_payload):
+        return None
+    path_len_byte = rx_payload[path_len_offset]
+    hash_count, hash_size, path_byte_len = decode_path_len(path_len_byte)
+
+    # Path room check: firmware checks (n+1)*hash_size <= MAX_PATH_SIZE
+    if (hash_count + 1) * hash_size > MAX_PATH_SIZE:
+        log.debug("repeat: skip — path full (%d hops)", hash_count)
+        return None
+
+    # Loop detection: check if our hash is already in the path
+    our_hash = our_pub[:hash_size]
+    path_start = path_len_offset + 1
+    path_end = path_start + path_byte_len
+    if path_end > len(rx_payload):
+        return None
+    path_bytes = rx_payload[path_start:path_end]
+    for i in range(hash_count):
+        hop = path_bytes[i * hash_size : (i + 1) * hash_size]
+        if hop == our_hash:
+            log.debug("repeat: skip — loop detected (our hash at hop %d)", i)
+            return None
+
+    # Build forwarded packet: append our hash to path, increment hash_count
+    new_count = hash_count + 1
+    new_path_len_byte = (path_len_byte & 0xC0) | (new_count & 0x3F)
+    pkt = bytearray(rx_payload)
+    pkt[path_len_offset] = new_path_len_byte
+    # Insert our hash at the end of the path
+    pkt[path_end:path_end] = our_hash
+    return bytes(pkt)
 
 
 def _compute_transport_code(
@@ -2341,25 +2575,16 @@ def _handle_send_txt_msg(
             route_type=ROUTE_DIRECT,
         )
 
-        if active_key:
-            # Repackage with ROUTE_T_DIRECT + transport codes + stored path
-            # tmp structure: header(1) + path_len(1) + payload
-            # For T_DIRECT: we need header + transport_codes(4) + path_len(1) + path(N) + payload
+        # Firmware always uses plain ROUTE_DIRECT for direct-path contacts
+        # (BaseChatMesh::sendMessage → sendDirect) — no transport codes.
+        # Transport codes are only for flood routing (repeater verification).
+        if stored_path:
+            # Rebuild with the stored path included
             txt_payload = tmp[2:]  # skip header(1) + path_len(1)
-            tc1 = _compute_transport_code(active_key, PAYLOAD_TXT, txt_payload)
-            header = make_header(ROUTE_T_DIRECT, PAYLOAD_TXT)
-            packet = build_wire_packet(
-                header, txt_payload, path=stored_path, transport_codes=(tc1, 0)
-            )
+            header = make_header(ROUTE_DIRECT, PAYLOAD_TXT)
+            packet = build_wire_packet(header, txt_payload, path=stored_path)
         else:
-            # No scope active - use plain ROUTE_DIRECT with stored path if any
-            if stored_path:
-                # Rebuild with the stored path included
-                txt_payload = tmp[2:]  # skip header(1) + path_len(1)
-                header = make_header(ROUTE_DIRECT, PAYLOAD_TXT)
-                packet = build_wire_packet(header, txt_payload, path=stored_path)
-            else:
-                packet = tmp
+            packet = tmp
 
         log.info(
             "TX: %dB TXT_MSG (direct, path_len=%d) to %s",
@@ -2408,7 +2633,7 @@ def _handle_send_advert(
     """Handle CMD_SEND_SELF_ADVERT: broadcast ADVERT via UDP."""
     from meshcore_tx import build_advert, build_wire_packet, make_cbor_tx_request
 
-    flood = len(data) > 0 and data[0] == 0x01
+    # data[0] is the flood flag; currently unused — ADVERTs always flood.
 
     # Include location in ADVERT when set (CMD_SET_ADVERT_LATLON or lora_trx config)
     lat = state.lat_e6 / 1e6 if state.lat_e6 != 0 else None
@@ -2534,8 +2759,15 @@ def _handle_send_control_data(
 
     from meshcore_tx import build_wire_packet, make_header
 
-    header = make_header(ROUTE_FLOOD, PAYLOAD_CTRL)
-    packet = build_wire_packet(header, data)
+    # Priority: send_scope > region_key (same as other flood TX paths)
+    active_key = state.send_scope if any(state.send_scope) else state.region_key
+    if active_key:
+        tc1 = _compute_transport_code(active_key, PAYLOAD_CTRL, data)
+        header = make_header(ROUTE_T_FLOOD, PAYLOAD_CTRL)
+        packet = build_wire_packet(header, data, transport_codes=(tc1, 0))
+    else:
+        header = make_header(ROUTE_FLOOD, PAYLOAD_CTRL)
+        packet = build_wire_packet(header, data)
 
     # Track TX hash to filter echo
     h = _hash_payload(packet)
@@ -2887,19 +3119,21 @@ def run_bridge(
 
                 # --- TCP receive ---
                 elif key.data == "tcp_rx":
+                    assert client_sock is not None
+                    assert client_decoder is not None
                     try:
-                        raw = client_sock.recv(4096)  # type: ignore[union-attr]
+                        raw = client_sock.recv(4096)
                     except ConnectionError, OSError:
                         raw = b""
                     if not raw:
                         log.info("companion disconnected")
-                        sel.unregister(client_sock)  # type: ignore[arg-type]
-                        client_sock.close()  # type: ignore[union-attr]
+                        sel.unregister(client_sock)
+                        client_sock.close()
                         client_sock = None
                         client_decoder = None
                         continue
 
-                    frames = client_decoder.feed(raw)  # type: ignore[union-attr]
+                    frames = client_decoder.feed(raw)
                     for cmd_payload in frames:
                         responses = handle_command(
                             cmd_payload, state, udp_sock, udp_addr
@@ -3004,7 +3238,7 @@ def run_bridge(
                         msg, state
                     )
 
-                    # TX RF ACK packets (direct routing, no path)
+                    # TX RF ACK packets (flood or direct, per sendAckTo logic)
                     if ack_packets:
                         from meshcore_tx import make_cbor_tx_request
 
@@ -3013,16 +3247,24 @@ def run_bridge(
                             udp_sock.sendto(cbor_msg, udp_addr)
                             log.info("TX ACK: %s (%dB)", ack_pkt.hex(), len(ack_pkt))
 
-                    # Packet forwarding: when client_repeat is enabled, re-transmit
-                    # the raw received wire packet back to the RF medium (repeater mode).
-                    # Excluded: packets we sent ourselves (already filtered by recent_tx
-                    # echo check above) and zero-length payloads.
+                    # Packet forwarding (repeater mode): re-transmit received
+                    # flood packets when client_repeat is enabled.
+                    # Matches firmware Mesh::routeRecvPacket() + companion_radio
+                    # MyMesh::allowPacketForward():
+                    #  - Only flood packets (ROUTE_FLOOD or ROUTE_T_FLOOD)
+                    #  - CRC must be valid
+                    #  - Not our own TX echo (already filtered above)
+                    #  - Append our path hash before retransmit
+                    #  - Loop detection: don't forward if our hash is in path
+                    #  - Path room: don't exceed MAX_PATH_SIZE (64)
                     if state.client_repeat and rx_payload:
-                        from meshcore_tx import make_cbor_tx_request
+                        fwd_pkt = _prepare_repeat_packet(rx_payload, msg, state.pub_key)
+                        if fwd_pkt is not None:
+                            from meshcore_tx import make_cbor_tx_request
 
-                        fwd_cbor = make_cbor_tx_request(rx_payload)
-                        udp_sock.sendto(fwd_cbor, udp_addr)
-                        log.info("repeat: forwarded %dB", len(rx_payload))
+                            fwd_cbor = make_cbor_tx_request(fwd_pkt)
+                            udp_sock.sendto(fwd_cbor, udp_addr)
+                            log.info("repeat: forwarded %dB", len(fwd_pkt))
 
                     for companion_msg in companion_msgs:
                         # ACK pushes (PUSH_ACK) are sent immediately, not queued
@@ -3264,7 +3506,17 @@ def main() -> None:
         startup_autoadd_max_hops = contacts_cfg.get(
             "autoadd_max_hops", startup_autoadd_max_hops
         )
+        startup_manual_add = int(contacts_cfg.get("manual_add_contacts", 0))
+        startup_telemetry_mode = int(telemetry_cfg.get("telemetry_mode", 0))
+        startup_adv_loc_policy = int(telemetry_cfg.get("adv_loc_policy", 0))
+        startup_multi_acks = int(telemetry_cfg.get("multi_acks", 0))
+        startup_device_pin = int(security_cfg.get("device_pin", 0))
     else:
+        startup_manual_add = 0
+        startup_telemetry_mode = 0
+        startup_adv_loc_policy = 0
+        startup_multi_acks = 0
+        startup_device_pin = 0
         # First boot - initialize EEPROM from current settings (CBOR/toml)
         log.info("EEPROM not found - initializing from config")
         toml_settings = {
@@ -3320,6 +3572,13 @@ def main() -> None:
         autoadd_max_hops=startup_autoadd_max_hops,
         model=node_model,
     )
+
+    # Apply EEPROM-persisted fields not covered by BridgeState constructor args
+    state.manual_add_contacts = startup_manual_add
+    state.telemetry_mode = startup_telemetry_mode
+    state.adv_loc_policy = startup_adv_loc_policy
+    state.multi_acks = startup_multi_acks
+    state.device_pin = startup_device_pin
 
     # Load persisted contacts from disk
     persisted = _load_persisted_contacts(contacts_dir)

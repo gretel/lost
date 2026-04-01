@@ -1700,11 +1700,16 @@ class TestSendChannelMsg(unittest.TestCase):
 
 
 class TestRfAckTx(unittest.TestCase):
-    def test_txt_msg_produces_ack_packet(self):
-        """Decrypted TXT_MSG produces an RF ACK wire packet."""
+    def test_txt_msg_no_contact_produces_flood_ack(self):
+        """DIRECT TXT_MSG with no contact record falls back to flood ACK.
+
+        Matches firmware sendAckTo() behaviour: when out_path_len == -1
+        (no known return path), the ACK is sent via sendFloodScoped().
+        """
         (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
         state = make_state(pub_key=pub_b, expanded_prv=prv_b, seed=seed_b)
         state.known_keys[pub_a.hex()] = pub_a
+        # No contact record for pub_a → out_path_len unknown → flood fallback
 
         packet = build_txt_msg(prv_a, pub_a, pub_b, "ack me")
         frame = {
@@ -1717,18 +1722,133 @@ class TestRfAckTx(unittest.TestCase):
         self.assertEqual(len(companion_msgs), 1)
         self.assertEqual(len(ack_packets), 1)
 
-        # Verify ACK packet structure: header(1) + path_len(1) + ack_hash(4) = 6B
         ack_pkt = ack_packets[0]
+        # Should be FLOOD, not DIRECT (no stored path → flood fallback)
+        from meshcore_crypto import ROUTE_FLOOD
+
+        expected_hdr = make_header(ROUTE_FLOOD, PAYLOAD_ACK)
+        self.assertEqual(ack_pkt[0], expected_hdr)
+        # header(1) + path_len(1) + ack_hash(4) = 6 bytes
         self.assertEqual(len(ack_pkt), 6)
-        # Header: ROUTE_DIRECT (2) | PAYLOAD_ACK (3) << 2 = 0x0E
+        self.assertEqual(ack_pkt[1], 0)  # path_len = 0
+
+    def test_txt_msg_with_direct_contact_produces_direct_ack(self):
+        """DIRECT TXT_MSG with stored zero-hop contact → DIRECT ACK."""
+        (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
+        state = make_state(pub_key=pub_b, expanded_prv=prv_b, seed=seed_b)
+        state.known_keys[pub_a.hex()] = pub_a
+
+        # Build a 147-byte contact record with out_path_len = 0 (zero-hop direct)
+        record = bytearray(147)
+        record[0:32] = pub_a  # pubkey
+        record[32] = 1  # node_type = chat
+        record[33] = 0  # flags
+        record[34] = 0  # out_path_len = 0 (signed: zero-hop direct)
+        state.contacts[pub_a.hex()] = bytes(record)
+
+        packet = build_txt_msg(prv_a, pub_a, pub_b, "direct ack")
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0},
+            "payload": packet,
+        }
+        companion_msgs, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(len(ack_packets), 1)
+
+        ack_pkt = ack_packets[0]
         from meshcore_crypto import ROUTE_DIRECT
 
         expected_hdr = make_header(ROUTE_DIRECT, PAYLOAD_ACK)
         self.assertEqual(ack_pkt[0], expected_hdr)
-        # path_len = 0 (direct, no path)
-        self.assertEqual(ack_pkt[1], 0)
-        # ack_hash is 4 bytes
-        self.assertEqual(len(ack_pkt[2:]), 4)
+        self.assertEqual(ack_pkt[1], 0)  # path_len = 0 (zero-hop)
+        self.assertEqual(len(ack_pkt), 6)
+
+    def test_txt_msg_with_repeater_contact_produces_direct_ack_with_path(self):
+        """DIRECT TXT_MSG with stored 1-hop contact → DIRECT ACK with path."""
+        (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
+        state = make_state(pub_key=pub_b, expanded_prv=prv_b, seed=seed_b)
+        state.known_keys[pub_a.hex()] = pub_a
+
+        # Contact record with out_path_len = 1 (via repeater)
+        record = bytearray(147)
+        record[0:32] = pub_a
+        record[32] = 1  # node_type = chat
+        record[34] = 1  # out_path_len = 1 (signed byte)
+        record[35] = 0xAB  # repeater hash
+        state.contacts[pub_a.hex()] = bytes(record)
+
+        packet = build_txt_msg(prv_a, pub_a, pub_b, "via repeater")
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0},
+            "payload": packet,
+        }
+        _, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(len(ack_packets), 1)
+
+        ack_pkt = ack_packets[0]
+        from meshcore_crypto import ROUTE_DIRECT
+
+        expected_hdr = make_header(ROUTE_DIRECT, PAYLOAD_ACK)
+        self.assertEqual(ack_pkt[0], expected_hdr)
+        self.assertEqual(ack_pkt[1], 1)  # path_len = 1
+        self.assertEqual(ack_pkt[2], 0xAB)  # repeater hash
+        # header(1) + path_len(1) + path(1) + ack_hash(4) = 7 bytes
+        self.assertEqual(len(ack_pkt), 7)
+
+    def test_flood_txt_msg_produces_path_ack(self):
+        """FLOOD TXT_MSG produces PATH+ACK (encrypted, via flood)."""
+        from meshcore_crypto import (
+            ROUTE_FLOOD,
+            PAYLOAD_PATH,
+            meshcore_shared_secret,
+            meshcore_mac_then_decrypt,
+        )
+
+        (prv_a, pub_a, seed_a), (prv_b, pub_b, seed_b) = _make_two_identities()
+        state = make_state(pub_key=pub_b, expanded_prv=prv_b, seed=seed_b)
+        state.known_keys[pub_a.hex()] = pub_a
+
+        # Build a FLOOD TXT_MSG with 1-hop path (simulating repeater)
+        packet = build_txt_msg(prv_a, pub_a, pub_b, "flood me", route_type=ROUTE_FLOOD)
+        # Manually inject a repeater hash into the path
+        # Wire format: header(1) + path_len(1) + path(0) + payload(N)
+        # Add repeater hash: increment path_len, insert hash byte after it
+        pkt = bytearray(packet)
+        pkt[1] = 1  # path_len = 1 hash
+        pkt = bytes([pkt[0], pkt[1], 0xCC]) + bytes(pkt[2:])  # insert hash byte
+
+        frame = {
+            "type": "lora_frame",
+            "crc_valid": True,
+            "phy": {"sync_word": 0x12, "snr_db": 5.0},
+            "payload": bytes(pkt),
+        }
+        _, ack_packets = bridge.lora_frame_to_companion_msgs(frame, state)
+        self.assertEqual(len(ack_packets), 1)
+
+        ack_pkt = ack_packets[0]
+        # PATH+ACK should be ROUTE_FLOOD with PAYLOAD_PATH
+        ack_route = ack_pkt[0] & 0x03
+        ack_ptype = (ack_pkt[0] >> 2) & 0x0F
+        self.assertEqual(ack_route, ROUTE_FLOOD)
+        self.assertEqual(ack_ptype, PAYLOAD_PATH)
+
+        # Decrypt the PATH+ACK to verify it contains the return path + ACK hash
+        # Wire: header(1) + path_len(1) + dest_hash(1) + src_hash(1) + MAC(2) + ct
+        self.assertEqual(ack_pkt[1], 0)  # fresh flood, no hop path yet
+        encrypted = ack_pkt[4:]  # skip header, path_len, dest_hash, src_hash
+        secret = meshcore_shared_secret(prv_a, pub_b)
+        assert secret is not None
+        plaintext = meshcore_mac_then_decrypt(secret, encrypted)
+        self.assertIsNotNone(plaintext)
+        # Plaintext: path_len_byte(1) + path(N) + extra_type(1) + ack_hash(4)
+        self.assertEqual(plaintext[0], 1)  # path_len_byte = 1 (repeater hop)
+        self.assertEqual(plaintext[1], 0xCC)  # repeater hash
+        self.assertEqual(plaintext[2], PAYLOAD_ACK)  # extra_type = ACK
+        self.assertEqual(len(plaintext[3:].rstrip(b"\x00")), 4)  # ack_hash
 
     def test_anon_req_produces_no_ack(self):
         """ANON_REQ does NOT produce an RF ACK (firmware sends RESPONSE instead)."""
@@ -3675,16 +3795,16 @@ class TestRemoveContact(unittest.TestCase):
         return bridge.handle_command(cmd_bytes, self.state, self.sock, self.addr)
 
     def test_remove_contact_too_short_returns_ok(self):
-        """G1: data < 32 bytes still returns RESP_OK (silently ignored)."""
-        cmd = bytes([bridge.CMD_REMOVE_CONTACT]) + b"\x01" * 10
+        """G1: data < 6 bytes still returns RESP_OK (silently ignored)."""
+        cmd = bytes([bridge.CMD_REMOVE_CONTACT]) + b"\x01" * 3
         responses = self._handle(cmd)
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0][0], bridge.RESP_OK)
 
     def test_remove_contact_not_present_returns_ok(self):
         """G2: removing a contact not in state returns RESP_OK."""
-        unknown_pk = b"\xff" * 32
-        cmd = bytes([bridge.CMD_REMOVE_CONTACT]) + unknown_pk
+        unknown_prefix = b"\xff" * 6  # 6-byte prefix (companion protocol)
+        cmd = bytes([bridge.CMD_REMOVE_CONTACT]) + unknown_prefix
         responses = self._handle(cmd)
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0][0], bridge.RESP_OK)
@@ -3722,8 +3842,8 @@ class TestRemoveContact(unittest.TestCase):
         contact_file = cdir / f"{pk_hex}.contact"
         self.assertTrue(contact_file.exists(), "contact file should exist after add")
 
-        # Remove via CMD_REMOVE_CONTACT
-        responses = handle(bytes([bridge.CMD_REMOVE_CONTACT]) + pub_key)
+        # Remove via CMD_REMOVE_CONTACT using 6-byte prefix (companion protocol)
+        responses = handle(bytes([bridge.CMD_REMOVE_CONTACT]) + pub_key[:6])
         self.assertEqual(responses[0][0], bridge.RESP_OK)
 
         # Contact should be gone from in-memory state
@@ -4677,23 +4797,23 @@ class TestParseFloodScope(unittest.TestCase):
         self.assertEqual(bridge._parse_flood_scope("*"), b"\x00" * 16)
 
     def test_human_readable_name_hashed(self):
-        """Human-readable name → sha256(name)[:16] (no '#' prefix)."""
+        """Human-readable name → sha256('#' + name)[:16] (firmware RegionMap convention)."""
         import hashlib
 
         name = "de-hh"
-        expected = hashlib.sha256(name.encode("utf-8")).digest()[:16]
+        expected = hashlib.sha256(("#" + name).encode("utf-8")).digest()[:16]
         result = bridge._parse_flood_scope(name)
         self.assertEqual(result, expected)
         self.assertEqual(len(result), 16)
 
-    def test_human_readable_differs_from_region_scope(self):
-        """flood_scope('de-hh') != region_scope('de-hh') — different hash prefixes."""
+    def test_human_readable_matches_region_scope(self):
+        """flood_scope('de-hh') == region_scope('de-hh') — same '#' prefix derivation."""
         import hashlib
 
         name = "de-hh"
         flood_key = bridge._parse_flood_scope(name)
         region_key = hashlib.sha256(("#" + name).encode("utf-8")).digest()[:16]
-        self.assertNotEqual(flood_key, region_key)
+        self.assertEqual(flood_key, region_key)
 
     def test_32_hex_chars_decoded_as_raw_key(self):
         """32-char hex string → decoded as raw 16-byte key."""
@@ -4702,20 +4822,20 @@ class TestParseFloodScope(unittest.TestCase):
         self.assertEqual(result, raw)
 
     def test_short_hex_string_treated_as_name(self):
-        """12-char hex string (< 32) → treated as a name and hashed."""
+        """12-char hex string (< 32) → treated as a name and hashed with '#' prefix."""
         import hashlib
 
         name = "abcdef012345"  # 12 hex chars, not 32
-        expected = hashlib.sha256(name.encode("utf-8")).digest()[:16]
+        expected = hashlib.sha256(("#" + name).encode("utf-8")).digest()[:16]
         result = bridge._parse_flood_scope(name)
         self.assertEqual(result, expected)
 
     def test_invalid_32_char_non_hex_treated_as_name(self):
-        """32-char string with non-hex characters → hashed as name (not decoded as hex)."""
+        """32-char string with non-hex characters → hashed as name with '#' prefix."""
         import hashlib
 
         name = "this-is-exactly-32-chars-xx-yyyy"  # 32 chars, not valid hex
-        expected = hashlib.sha256(name.encode("utf-8")).digest()[:16]
+        expected = hashlib.sha256(("#" + name).encode("utf-8")).digest()[:16]
         result = bridge._parse_flood_scope(name)
         self.assertEqual(result, expected)
 
