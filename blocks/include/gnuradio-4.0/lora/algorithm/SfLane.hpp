@@ -2,7 +2,7 @@
 #ifndef GNURADIO_LORA_ALGORITHM_SFLANE_HPP
 #define GNURADIO_LORA_ALGORITHM_SFLANE_HPP
 
-// Per-SF processing lane: fused FrameSync + DemodDecoder state machine.
+// Per-SF processing lane: fused detect/sync/decode state machine.
 // Extracted from MultiSfDecoder.hpp to enable reuse by WidebandDecoder
 // without GR_REGISTER_BLOCK include conflicts.
 //
@@ -30,7 +30,7 @@ namespace gr::lora {
 // Alias for backward compatibility with call sites using multisf_detail::
 namespace multisf_detail = sflane_detail;
 
-/// Per-SF processing lane — holds the complete fused FrameSync + DemodDecoder
+/// Per-SF processing lane — holds the complete fused detect/sync/decode
 /// state machine for one spreading factor.
 struct SfLane {
     // === Configuration (set once in init) ===
@@ -61,7 +61,7 @@ struct SfLane {
     std::vector<std::complex<float>> corr_vec;     // preamble correction vector
     std::vector<std::complex<float>> fft_val_buf;  // CFO estimation FFT values
 
-    // === FrameSync state ===
+    // === detect/sync state ===
     enum State : uint8_t { DETECT, SYNC, OUTPUT };
     enum SyncPhase : int32_t {
         NET_ID1 = 0, NET_ID2 = 1, DOWNCHIRP1 = 2,
@@ -126,7 +126,7 @@ struct SfLane {
     std::vector<std::complex<float>> header_symbols; // first 8 symbols, 8*N samples
     int        down_val{0};
 
-    // === DemodDecoder state ===
+    // === decode state ===
     std::vector<std::complex<float>> dechirped;     // length N
     std::vector<uint16_t> symbol_buffer;
     uint32_t total_symbols_rx{0};
@@ -218,7 +218,7 @@ struct SfLane {
         soft_symbol_pmrs.clear();
     }
 
-    // === DSP helper methods (ported from FrameSync) ===
+    // === DSP helper methods ===
 
     [[nodiscard]] uint32_t get_symbol_val(const std::complex<float>* samples,
                                            const std::complex<float>* ref_chirp) {
@@ -393,7 +393,7 @@ struct SfLane {
         return { snr_sum * inv_n, sig_db };
     }
 
-    // === Decode helpers (ported from DemodDecoder) ===
+    // === Decode helpers ===
 
     void buildDownchirpWithCFO() {
         std::vector<std::complex<float>> uc(N);

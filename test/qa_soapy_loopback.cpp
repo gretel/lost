@@ -301,7 +301,7 @@ const boost::ut::suite<"SoapyLoopback GR4 graph"> gr4GraphTests = [] {
         return std::make_pair(std::move(watchdogThread), externalInterventionNeeded);
     };
 
-    "SoapySinkBlock TX via loopback"_test = [&createWatchdog] {
+    "SoapySink TX via loopback"_test = [&createWatchdog] {
         std::string loadErr = SoapySDR::loadModule(SOAPY_LOOPBACK_MODULE_PATH);
         expect(loadErr.empty()) << std::format("loadModule failed: {}", loadErr);
 
@@ -339,7 +339,7 @@ const boost::ut::suite<"SoapyLoopback GR4 graph"> gr4GraphTests = [] {
         }
         expect(!externalInterventionNeeded->load(std::memory_order_relaxed)) << "watchdog kicked in — scheduler hung";
 
-        std::println("'SoapySinkBlock TX via loopback' test finished");
+        std::println("'SoapySink TX via loopback' test finished");
         SoapySDR::unloadModule(SOAPY_LOOPBACK_MODULE_PATH);
     };
 

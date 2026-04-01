@@ -2,7 +2,7 @@
 #ifndef GNURADIO_LORA_ALGORITHM_SFLANE_DETAIL_HPP
 #define GNURADIO_LORA_ALGORITHM_SFLANE_DETAIL_HPP
 
-// Shared constants and helper functions for FrameSync / MultiSfDecoder / WidebandDecoder.
+// Shared constants and helper functions for MultiSfDecoder / WidebandDecoder.
 // Extracted from MultiSfDecoder.hpp's multisf_detail namespace to enable reuse
 // without GR_REGISTER_BLOCK include conflicts.
 
@@ -14,7 +14,7 @@
 
 namespace gr::lora::sflane_detail {
 
-// Detection thresholds (shared with FrameSync, MultiSfDecoder, WidebandDecoder)
+// Detection thresholds (shared with MultiSfDecoder, WidebandDecoder)
 static constexpr int      kPreambleBinTolerance  = 1;
 static constexpr int      kSyncWordBinTolerance  = 2;
 static constexpr uint8_t  kMaxAdditionalUpchirps = 3;

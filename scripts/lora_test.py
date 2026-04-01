@@ -224,7 +224,7 @@ class PointResult:
 
 def _start_process(cmd: list[str], log_path: str) -> subprocess.Popen:
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    log_fd = open(log_path, "w")
+    log_fd = open(log_path, "w", encoding="utf-8")
     return subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -1640,7 +1640,7 @@ async def _run_bridge_experiment(
         "summary": summary,
     }
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2)
     _info(f"\nResults: {output_path}")
 
@@ -1699,7 +1699,7 @@ def _write_results(
         ],
         "summary": build_summary(mode, results),
     }
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2)
     _info(f"\nResults: {output_path}")
     json.dump(doc["summary"], sys.stdout, indent=2)

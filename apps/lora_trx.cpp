@@ -89,12 +89,12 @@ std::vector<cf32> generate_iq(
 // Persistent TX graph: stays alive for the process lifetime.
 //
 // Architecture (MIMO / 2-ch RX mode):
-//   TxQueueSource(port0=IQ, port1=zeros) -> SoapySinkBlock<cf32,2>
+//   TxQueueSource(port0=IQ, port1=zeros) -> SoapySink<cf32,2>
 //
 // Architecture (single-ch RX mode):
-//   TxQueueSource(port0=IQ, port1=zeros) -> SoapySinkBlock<cf32,2>
+//   TxQueueSource(port0=IQ, port1=zeros) -> SoapySink<cf32,2>
 //
-// The same SoapySinkBlock<cf32,2> is used in both modes.  In single-ch mode
+// The same SoapySink<cf32,2> is used in both modes.  In single-ch mode
 // the second TX channel (ch1) is driven with zeros; in MIMO mode ch0 or ch1
 // is selected based on cfg.tx_channel and the other receives zeros.
 // The key property: the scheduler and device handle are created ONCE at
@@ -582,7 +582,7 @@ int main(int argc, char* argv[]) {
     };
 
     // --- Build persistent TX graph (created before RX to avoid device handle races) ---
-    // SoapySinkBlock<cf32,2> stays open for the process lifetime; TxQueueSource
+    // SoapySink<cf32,2> stays open for the process lifetime; TxQueueSource
     // receives bursts from the UDP loop thread via push() + notifyProgress().
     //
     // Wideband mode skips the TX graph: the B210 AD9361 limits master clock to

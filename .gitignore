@@ -11,11 +11,12 @@
 __pycache__/
 build/
 build_*/
+build-prof/
 cmake-build-*/
 compile_commands.json
 docs/plans
 Makefile
 out/
+data/
 scripts/data
-data/testing/
 tmp/

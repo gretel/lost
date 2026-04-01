@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: ISC
 """DC spur diagnostic: measures center-bin power from lora_trx spectrum UDP stream.
 
 Usage:

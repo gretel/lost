@@ -187,7 +187,7 @@ struct ScanController : gr::Block<ScanController, gr::NoDefaultTagForwarding> {
 
     gr::work::Status processBulk(
         gr::InputSpanLike auto&   inPort,
-        gr::OutputSpanLike auto&  detectOutPort,
+        [[maybe_unused]] gr::OutputSpanLike auto&  detectOutPort,
         gr::OutputSpanLike auto&  spectrumOutPort) noexcept
     {
         // 1. Check overflow tags

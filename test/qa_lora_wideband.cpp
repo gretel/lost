@@ -381,10 +381,10 @@ const boost::ut::suite<"ChannelSlot streaming channelizer"> channelSlotTests = [
         slotOob.pushWideband(oobTone);
 
         // Measure output power (skip warmup transient)
-        auto measurePower = [](const std::vector<cf32>& samples, std::size_t skip) {
+        auto measurePower = [](const std::vector<cf32>& samples, std::size_t skip_samples) {
             double power = 0.0;
             std::size_t count = 0;
-            for (std::size_t i = skip; i < samples.size(); ++i) {
+            for (std::size_t i = skip_samples; i < samples.size(); ++i) {
                 power += static_cast<double>(std::norm(samples[i]));
                 ++count;
             }
@@ -844,15 +844,15 @@ const boost::ut::suite<"WidebandDecoder loopback"> wbLoopbackTests = [] {
 
             // Check tags
             bool found_sf_tag = false;
-            for (const auto& tag : sink._tags) {
-                if (tag.map.contains("sf")) {
-                    auto sf_val = tag.map.at("sf").template value_or<int64_t>(0);
+            for (const auto& frame_tag : sink._tags) {
+                if (frame_tag.map.contains("sf")) {
+                    auto sf_val = frame_tag.map.at("sf").template value_or<int64_t>(0);
                     expect(eq(sf_val, static_cast<int64_t>(test_sf)))
                         << "decoded SF tag matches";
                     found_sf_tag = true;
                 }
-                if (tag.map.contains("crc_valid")) {
-                    auto crc_ok = tag.map.at("crc_valid").template value_or<bool>(false);
+                if (frame_tag.map.contains("crc_valid")) {
+                    auto crc_ok = frame_tag.map.at("crc_valid").template value_or<bool>(false);
                     expect(crc_ok) << "CRC valid";
                 }
             }
@@ -995,15 +995,15 @@ const boost::ut::suite<"WidebandDecoder loopback"> wbLoopbackTests = [] {
             expect(match) << "decoded payload matches TX payload (noisy)";
 
             bool found_sf_tag = false;
-            for (const auto& tag : sink._tags) {
-                if (tag.map.contains("sf")) {
-                    auto sf_val = tag.map.at("sf").template value_or<int64_t>(0);
+            for (const auto& frame_tag : sink._tags) {
+                if (frame_tag.map.contains("sf")) {
+                    auto sf_val = frame_tag.map.at("sf").template value_or<int64_t>(0);
                     expect(eq(sf_val, static_cast<int64_t>(test_sf)))
                         << "decoded SF tag matches (noisy)";
                     found_sf_tag = true;
                 }
-                if (tag.map.contains("crc_valid")) {
-                    auto crc_ok = tag.map.at("crc_valid").template value_or<bool>(false);
+                if (frame_tag.map.contains("crc_valid")) {
+                    auto crc_ok = frame_tag.map.at("crc_valid").template value_or<bool>(false);
                     expect(crc_ok) << "CRC valid (noisy)";
                 }
             }

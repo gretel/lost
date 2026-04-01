@@ -830,7 +830,7 @@ struct WidebandDecoder
     // Adapted from MultiSfDecoder for os_factor=1
     // =========================================================================
     void processSync(SfLane& lane, ChannelSlot& slot,
-                     std::span<const cf32> accum, std::size_t pos) {
+                     [[maybe_unused]] std::span<const cf32> accum, [[maybe_unused]] std::size_t pos) {
         if (!lane.cfo_frac_sto_frac_est) {
             auto cfo_offset = static_cast<std::size_t>(lane.N)
                 + static_cast<std::size_t>(std::max(static_cast<int>(lane.N) - lane.k_hat, 0));
