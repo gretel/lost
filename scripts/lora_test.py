@@ -34,6 +34,8 @@ Usage:
 
 from __future__ import annotations
 
+# pyright: reportImplicitRelativeImport=false
+
 import argparse
 import asyncio
 import json
@@ -49,6 +51,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import cbor2
 
@@ -198,16 +201,16 @@ MATRICES: dict[str, list[ConfigPoint]] = {
 class PointResult:
     """Result for one config point."""
 
-    config: dict
+    config: dict[str, Any]
     tx_ok: bool = False
     # decode mode
-    frames: list[dict] = field(default_factory=list)
+    frames: list[dict[str, Any]] = field(default_factory=list)
     crc_ok: int = 0
     crc_fail: int = 0
     best_snr: float | None = None
     detected_sfs: dict[int, int] = field(default_factory=dict)
     # scan mode
-    detections: list[dict] = field(default_factory=list)
+    detections: list[dict[str, Any]] = field(default_factory=list)
     det_count: int = 0
     best_ratio: float | None = None
     best_chirp_slope: float | None = None
@@ -222,7 +225,7 @@ class PointResult:
 # -- Process lifecycle ---------------------------------------------------------
 
 
-def _start_process(cmd: list[str], log_path: str) -> subprocess.Popen:
+def _start_process(cmd: list[str], log_path: str) -> subprocess.Popen[bytes]:
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     log_fd = open(log_path, "w", encoding="utf-8")
     return subprocess.Popen(
@@ -233,7 +236,7 @@ def _start_process(cmd: list[str], log_path: str) -> subprocess.Popen:
     )
 
 
-def _stop_process(proc: subprocess.Popen | None) -> None:
+def _stop_process(proc: subprocess.Popen[bytes] | None) -> None:
     if proc is None:
         return
     try:
@@ -296,7 +299,7 @@ class EventCollector:
     def __init__(self, sock: socket.socket, event_types: set[str] | None = None):
         self._sock = sock
         self._types = event_types
-        self._events: list[dict] = []
+        self._events: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -309,7 +312,7 @@ class EventCollector:
         self._stop.set()
         self._thread.join(timeout=2.0)
 
-    def drain(self) -> list[dict]:
+    def drain(self) -> list[dict[str, Any]]:
         with self._lock:
             out = self._events
             self._events = []
@@ -426,7 +429,9 @@ def run_point(
     return result
 
 
-def _collect_decode(result: PointResult, events: list[dict], tx_freq_hz: float) -> None:
+def _collect_decode(
+    result: PointResult, events: list[dict[str, Any]], tx_freq_hz: float
+) -> None:
     """Extract decode results from lora_frame events."""
     for ev in events:
         if ev.get("type") != "lora_frame":
@@ -461,7 +466,9 @@ def _collect_decode(result: PointResult, events: list[dict], tx_freq_hz: float) 
         )
 
 
-def _collect_scan(result: PointResult, events: list[dict], tx_freq_hz: float) -> None:
+def _collect_scan(
+    result: PointResult, events: list[dict[str, Any]], tx_freq_hz: float
+) -> None:
     """Extract scan results from scan_spectrum / scan_sweep_end events."""
     n_spectrum = sum(1 for e in events if e.get("type") == "scan_spectrum")
     n_with_det = sum(
@@ -591,8 +598,8 @@ class MeshCoreCompanion:
         self._serial_port = ""
         self._tcp_host = ""
         self._tcp_port = 0
-        self._adverts: list[dict] = []
-        self._messages: list[dict] = []
+        self._adverts: list[dict[str, Any]] = []
+        self._messages: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._pubkey = ""
 
@@ -632,7 +639,7 @@ class MeshCoreCompanion:
 
         return True
 
-    def _on_rf_packet(self, event) -> None:
+    async def _on_rf_packet(self, event: Any) -> None:
         d = event.payload
         if not isinstance(d, dict):
             return
@@ -648,7 +655,7 @@ class MeshCoreCompanion:
                     }
                 )
 
-    def _on_advert_push(self, event) -> None:
+    async def _on_advert_push(self, event: Any) -> None:
         d = event.payload
         if not isinstance(d, dict):
             return
@@ -663,7 +670,7 @@ class MeshCoreCompanion:
                 }
             )
 
-    def _on_message(self, event) -> None:
+    async def _on_message(self, event: Any) -> None:
         d = event.payload
         if not isinstance(d, dict):
             return
@@ -685,6 +692,7 @@ class MeshCoreCompanion:
     ) -> bool:
         from meshcore.events import EventType
 
+        assert self._mc is not None
         try:
             result = await self._mc.commands.set_radio(
                 freq=freq_mhz,  # meshcore_py takes MHz (multiplies by 1000 internally)
@@ -706,7 +714,8 @@ class MeshCoreCompanion:
         from meshcore.events import EventType
 
         try:
-            await self._mc.disconnect()
+            if self._mc is not None:
+                await self._mc.disconnect()
         except Exception:
             pass
         await asyncio.sleep(3.0)  # wait for Heltec reboot
@@ -726,6 +735,7 @@ class MeshCoreCompanion:
 
     async def send_advert(self) -> bool:
         """Send an ADVERT from the Heltec via meshcore_py."""
+        assert self._mc is not None
         try:
             result = await self._mc.commands.send_advert()
             from meshcore.events import EventType
@@ -737,6 +747,7 @@ class MeshCoreCompanion:
 
     async def send_message(self, dest_pubkey: bytes, text: str) -> bool:
         """Send a TXT_MSG to a destination by pubkey bytes."""
+        assert self._mc is not None
         try:
             result = await self._mc.commands.send_msg(dest_pubkey, text)
             from meshcore.events import EventType
@@ -746,13 +757,13 @@ class MeshCoreCompanion:
             _info(f"  send_message failed: {e}")
             return False
 
-    def drain_adverts(self) -> list[dict]:
+    def drain_adverts(self) -> list[dict[str, Any]]:
         with self._lock:
             out = self._adverts
             self._adverts = []
             return out
 
-    def drain_messages(self) -> list[dict]:
+    def drain_messages(self) -> list[dict[str, Any]]:
         with self._lock:
             out = self._messages
             self._messages = []
@@ -903,9 +914,9 @@ async def run_bridge_point(
     sdr_pubkey: str,
     heltec_name: str,
     contact_exchanged: bool,
-) -> dict:
+) -> dict[str, Any]:
     """Run one bridge test point with phases A-D."""
-    result: dict = {
+    result: dict[str, Any] = {
         "config": asdict(point),
         "advert_rx": None,  # Phase A (None = skipped)
         "advert_tx": False,  # Phase B
@@ -1097,7 +1108,7 @@ async def run_bridge_point(
     return result
 
 
-def _collect_bridge(results: list[dict]) -> dict:
+def _collect_bridge(results: list[dict[str, Any]]) -> dict[str, Any]:
     """Build bridge mode summary."""
     n = len(results)
     advert_rx = sum(1 for r in results if r.get("advert_rx"))
@@ -1124,7 +1135,7 @@ def _collect_bridge(results: list[dict]) -> dict:
 # -- Summary builder -----------------------------------------------------------
 
 
-def build_summary(mode: str, results: list[PointResult]) -> dict:
+def build_summary(mode: str, results: list[PointResult]) -> dict[str, Any]:
     n = len(results)
     tx_ok = sum(1 for r in results if r.tx_ok)
 
@@ -1276,7 +1287,7 @@ def main() -> None:
 
     # -- decode/scan: companion via serial_bridge (USB) or direct TCP ---
     bridge_proc = None
-    if tcp_host is not None:
+    if tcp_host is not None and tcp_port is not None:
         # Remote companion: connect directly via TCP (no local serial_bridge)
         _info(f"Connecting to companion via TCP {tcp_host}:{tcp_port}")
         companion = CompanionDriver(bridge_host=tcp_host, bridge_port=tcp_port)
@@ -1382,7 +1393,7 @@ def main() -> None:
 
 
 async def _run_tx_experiment(
-    args,
+    args: argparse.Namespace,
     matrix: list[ConfigPoint],
     binary: str,
     label: str,
@@ -1454,7 +1465,7 @@ async def _run_tx_experiment(
 
 
 async def _run_bridge_experiment(
-    args,
+    args: argparse.Namespace,
     matrix: list[ConfigPoint],
     binary: str,
     label: str,
@@ -1593,7 +1604,7 @@ async def _run_bridge_experiment(
     _info("")
 
     # 9. Run each config point
-    bridge_results: list[dict] = []
+    bridge_results: list[dict[str, Any]] = []
     contact_exchanged = False
     try:
         for i, point in enumerate(matrix):
@@ -1660,7 +1671,7 @@ async def _run_bridge_experiment(
 def _write_results(
     output_path: str,
     label: str,
-    args,
+    args: argparse.Namespace,
     mode: str,
     binary: str,
     results: list[PointResult],
