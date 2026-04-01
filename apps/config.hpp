@@ -105,8 +105,8 @@ struct TrxConfig {
     std::string          device{};
     std::string          device_param{};
     double               freq{869'618'000.0};
-    double               gain_rx{30.0};
-    double               gain_tx{75.0};
+    double               gain_rx{35.0};
+    double               gain_tx{70.0};
     float                rate{250'000.f};
     uint32_t             bw{62'500};
     uint8_t              sf{8};          ///< default SF (also used for TX)
@@ -122,7 +122,7 @@ struct TrxConfig {
     bool                 debug{false};
     bool                 lbt{true};             ///< enable LBT (CAD-based)
     uint32_t             lbt_timeout_ms{2000};  ///< max wait for channel clear before rejecting TX
-    uint32_t             tx_queue_depth{4};     ///< max queued TX requests (rejects when full)
+    uint32_t             tx_queue_depth{8};     ///< max queued TX requests (rejects when full)
 
     std::vector<DecodeConfig> decode_configs{};  ///< per-chain decode configs (at least one required)
     std::vector<uint32_t>     decode_bws{};      ///< BWs to decode (empty = {bw} only)
@@ -162,7 +162,7 @@ struct ScanSetConfig {
     // From [scan]
     std::vector<uint32_t> bws{62500, 125000, 250000};  ///< BWs to probe
     uint32_t     os_factor{4};              ///< oversampling factor
-    float        min_ratio{8.0F};           ///< CAD detection threshold
+    float        min_ratio{5.0F};           ///< CAD detection threshold
     int          settle_ms{5};              ///< PLL settle delay after retune (ms)
     uint32_t     sweeps{0};                 ///< 0 = infinite
     bool         layer1_only{false};
@@ -171,9 +171,7 @@ struct ScanSetConfig {
 
     // Streaming-mode parameters
     float        buffer_ms{512.f};          ///< IQ ring buffer duration (ms)
-    uint32_t     l1_fft_size{1024};         ///< FFT bins for L1 energy
-    uint32_t     l1_accumulate{64};         ///< FFTs to average per energy report
-    uint32_t     l1_reports{64};            ///< energy reports before probing
+    uint32_t     l1_fft_size{4096};         ///< FFT bins for L1 energy
     float        channel_bw{62500.f};       ///< L1 channel grid spacing (Hz)
 
     // DC spur mitigation (from [radio_*])

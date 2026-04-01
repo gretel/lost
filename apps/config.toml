@@ -8,7 +8,7 @@
 #
 # [device]        SDR hardware: driver, parameters, clock source
 # [logging]       Log level
-# [radio_*]       RF frontend: frequency, channels, gains
+# [radio_*]       RF frontend: frequency, channels, gains, DC mitigation
 # [codec_*]       LoRa PHY / TX parameters: sf, bw, cr, sync_word, preamble
 # [trx]           Transceiver mode (lora_trx)
 # [trx.network]   UDP I/O: listen, port, LBT, TX queue
@@ -16,6 +16,10 @@
 # [scan]          Scanner mode (lora_scan)
 # [meshcore]      MeshCore protocol (Python scripts only)
 # [aggregator]    lora_agg.py diversity combiner
+#
+# Values shown are the compiled-in defaults.  Uncomment and change to
+# override.  Commented-out lines document available settings and their
+# defaults.
 #
 # Example uses a USRP B210 via UHD.  Adapt [device] for your hardware:
 #   LimeSDR:  driver = "lime"    param = ""
@@ -31,24 +35,26 @@
 
 [device]
 driver = "uhd"                # SoapySDR driver name (required)
-param  = "type=b200,num_recv_frames=512,recv_frame_size=16360"  # larger USB FIFO: 65ms at 16 MS/s
-clock  = "external"           # internal, external, gpsdo
+param  = "type=b200,num_recv_frames=512,recv_frame_size=16360"
+clock  = "external"           # internal | external | gpsdo
 
 [logging]
-level = "INFO"
+level = "INFO"                # DEBUG | INFO | WARN | ERROR
 
 # ── Radio frontends ──────────────────────────────────────────────────────────
 
 [radio_868]
-freq       = 869618000
-rx_channel = [1, 2]
-tx_channel = 0
-rx_gain    = 35
-tx_gain    = 70
-lo_offset         = 62500  # Hz — shifts DC spur out of BW62.5k passband
-dc_offset_auto   = true     # hardware DC offset correction (AD9361)
-dc_blocker       = true     # DSP DC blocker (2nd-order Butterworth HP)
-dc_blocker_cutoff = 2000   # DC blocker cutoff frequency (Hz)
+freq       = 869618000        # center frequency (Hz)
+rx_channel = [1, 2]           # SoapySDR RX channel indices (default: [0])
+tx_channel = 0                # SoapySDR TX channel index (default: 0)
+# rx_gain    = 35             # RX gain (dB, default: 35)
+# tx_gain    = 70             # TX gain (dB, default: 70)
+lo_offset         = 62500     # LO offset (Hz, default: 0) — shifts DC spur out of passband
+# dc_offset_auto    = true    # hardware DC offset correction (default: true)
+# dc_blocker        = true    # DSP DC blocker (default: true)
+# dc_blocker_cutoff = 2000    # DC blocker cutoff (Hz, default: 2000)
+# frequency_correction_ppm = 0.0  # oscillator PPM correction (default: 0)
+# rx_iq_balance_auto = true   # hardware IQ balance correction (default: true)
 
 # [radio_433]
 # freq       = 433650000
@@ -62,11 +68,11 @@ dc_blocker_cutoff = 2000   # DC blocker cutoff frequency (Hz)
 # only BW and sync_word matter for RX matching.
 
 [codec_meshcore_868]
-sf           = 8               # TX spreading factor
-bw           = 62500           # TX bandwidth
-cr           = 8               # TX coding rate 4/N
-sync_word    = 0x12
-preamble_len = 8
+sf           = 8               # TX spreading factor (default: 8)
+bw           = 62500           # TX bandwidth (default: 62500)
+cr           = 8               # TX coding rate 4/N (default: 8, meaning CR4/8)
+sync_word    = 0x12            # default: 0x12
+preamble_len = 8               # default: 8
 
 # [codec_meshcore_433]
 # sf           = 11
@@ -89,38 +95,38 @@ preamble_len = 8
 name       = "MeshCore 868 MHz"
 radio      = "radio_868"
 codec      = "codec_meshcore_868"
-rate       = 250000                     # RX/TX sample rate (Hz)
+# rate       = 250000                   # sample rate (Hz, default: 250000)
 decode_bws = [62500, 125000, 250000]    # RX BWs (one MultiSfDecoder per BW)
-# soft_decode = false                   # experimental: soft-decision (LLR) Hamming decode
+# soft_decode = false                   # experimental: soft-decision Hamming (default: false)
 
-# Wideband mode: 16 MS/s capture, digital channelization, all SFs on all channels
-# When enabled, decode_bws and rate are ignored (uses wideband_rate instead)
-wideband             = false
-# wideband_rate         = 16000000     # wideband sample rate (Hz)
-# wideband_master_clock = 32000000    # FPGA master clock (Hz)
-# decode_sfs         = [7, 8, 9]   # limit SFs for wideband mode (default: all 7-12)
+# Wideband mode: 16 MS/s capture, digital channelization, all SFs
+# wideband             = false          # default: false
+# wideband_rate        = 16000000       # wideband sample rate (Hz, default: 16e6)
+# wideband_master_clock = 32000000      # FPGA master clock (Hz, default: 32e6)
+# decode_sfs           = [7, 8, 9]      # limit SFs for wideband (default: all 7-12)
 
 [trx.network]
-udp_listen      = "127.0.0.1"
-udp_port        = 5556
-status_interval = 10
-lbt             = true                  # listen-before-talk
-lbt_timeout_ms  = 2000
-tx_queue_depth  = 8
+# udp_listen      = "127.0.0.1"        # default: 127.0.0.1
+# udp_port        = 5556               # default: 5556
+# status_interval = 10                 # heartbeat interval (s, default: 10, 0 = off)
+# lbt             = true               # listen-before-talk (default: true)
+# lbt_timeout_ms  = 2000               # max LBT wait (ms, default: 2000)
+# tx_queue_depth  = 8                  # max queued TX requests (default: 8)
 
 # Each [[trx.decode]] entry creates one decode chain (SF7-12, all CRs) per BW.
-# Required keys: label, sync_word.  Optional: min_snr_db, energy_thresh, max_symbols.
+# Required: label, sync_word.  Optional: min_snr_db, energy_thresh, max_symbols.
 
 [[trx.decode]]
 label      = "meshcore"
 sync_word  = 0x12
-min_snr_db = -19.0
+# min_snr_db = -19.0                   # minimum SNR for decode (dB, default: -19)
+# energy_thresh = 1e-6                 # per-symbol energy threshold (default: 1e-6)
+# max_symbols = 600                    # max symbols per frame (default: 600)
 
 # Example: also decode Meshtastic (different sync word) on the same radio
 # [[trx.decode]]
 # label      = "meshtastic"
 # sync_word  = 0x2B
-# min_snr_db = -15.0
 
 # ── MeshCore protocol (Python scripts) ──────────────────────────────────────
 
@@ -129,13 +135,17 @@ name        = "DO2THX 📡"
 lat         = 53.54513
 lon         = 9.94896
 flood_scope = "de-hh"
+# model = ""                           # device model string
+# identity_file = ""                   # Ed25519 identity key path
+# port = 7834                          # companion protocol TCP port (default: 7834)
+# region_scope = ""                    # regional scoped flood scope
 
 # ── Aggregator (lora_agg.py) ────────────────────────────────────────────────
 
 [aggregator]
-upstream  = "127.0.0.1:5556"
-listen    = "127.0.0.1:5555"
-window_ms = 200
+# upstream  = "127.0.0.1:5556"         # default: 127.0.0.1:5556
+# listen    = "127.0.0.1:5555"         # default: 127.0.0.1:5555
+# window_ms = 200                      # dedup window (ms, default: 200)
 
 # ── Scanner mode (lora_scan) ────────────────────────────────────────────────
 #
@@ -143,27 +153,22 @@ window_ms = 200
 # Layer 2: per-channel CAD dwell with multi-SF detection
 
 [scan]
-name         = "EU868 scan"
 radio        = "radio_868"
-freq_start   = 863000000
-freq_stop    = 870000000
-bws          = [62500, 125000, 250000]  # L2 probe BWs (all three for full coverage)
-l1_rate      = 16000000                 # L1 wideband sample rate
-master_clock = 32000000                 # FPGA master clock rate
-os_factor    = 4                        # oversampling factor
-min_ratio    = 5.0                      # CAD detection threshold
-settle_ms    = 5                        # PLL settle delay (ms)
-streaming    = true                      # streaming pipeline (no retune)
-# sweeps     = 0                        # 0 = infinite (default)
-# layer1_only = false                   # set true for energy-only mode
-
-# Streaming-mode parameters (ignored when streaming = false)
-buffer_ms     = 512                     # IQ ring buffer duration (ms)
-l1_fft_size   = 4096                    # FFT bins for L1 energy
-l1_accumulate = 64                      # FFTs to average per energy report
-l1_reports    = 64                      # energy reports before probing
-channel_bw    = 62500                   # L1 channel grid spacing (Hz)
+freq_start   = 863000000               # scan band start (Hz)
+freq_stop    = 870000000               # scan band stop (Hz)
+# bws          = [62500, 125000, 250000]  # L2 probe BWs (default: all three)
+# l1_rate      = 16000000              # L1 wideband sample rate (Hz, default: 16e6)
+# master_clock = 32000000              # FPGA master clock (Hz, default: 32e6)
+# os_factor    = 4                     # oversampling factor (default: 4)
+# min_ratio    = 5.0                   # CAD detection threshold (default: 5.0)
+# settle_ms    = 5                     # PLL settle delay (ms, default: 5)
+# streaming    = true                  # streaming pipeline, no retune (default: true)
+# sweeps       = 0                     # 0 = infinite (default: 0)
+# layer1_only  = false                 # energy-only mode (default: false)
+# buffer_ms    = 512                   # IQ ring buffer (ms, default: 512)
+# l1_fft_size  = 4096                  # FFT bins for L1 energy (default: 4096)
+# channel_bw   = 62500                 # L1 channel grid spacing (Hz, default: 62500)
 
 [scan.network]
-udp_listen = "127.0.0.1"
-udp_port   = 5557                       # separate from lora_trx (5556)
+# udp_listen = "127.0.0.1"             # default: 127.0.0.1
+# udp_port   = 5557                    # default: 5557

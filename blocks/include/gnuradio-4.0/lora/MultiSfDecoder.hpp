@@ -38,7 +38,7 @@ struct MultiSfDecoder
     uint8_t  os_factor    = 4;
     uint16_t preamble_len = 8;
     float    energy_thresh = 1e-6f;
-    float    min_snr_db   = -10.0f;
+    float    min_snr_db   = -19.0f;
     uint32_t max_symbols  = 600;
     uint32_t center_freq  = 869618000;
     int32_t  rx_channel   = -1;
