@@ -6,16 +6,15 @@
 ._*
 .cache/
 .DS_Store
+.local/
 .venv/
 __pycache__/
 build/
 build_*/
-CLAUDE.md
 cmake-build-*/
 compile_commands.json
 docs/plans
 Makefile
-opencode.json
 out/
 scripts/data
 data/testing/
