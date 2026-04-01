@@ -186,7 +186,7 @@ struct WidebandDecoder
     uint16_t    sync_word{0x12};           // LoRa sync word
     uint16_t    preamble_len{8};           // preamble length
     float       energy_thresh{1e-6f};      // per-symbol energy threshold
-    float       min_snr_db{-10.0f};        // minimum SNR for decode
+    float       min_snr_db{-19.0f};        // minimum SNR for decode
     uint32_t    max_symbols{600};          // max symbols per frame
     uint32_t    overflow_max_per_sweep{5}; // overflows tolerated per sweep before tainting
     float       dc_blocker_cutoff{2000.f};  // DC blocker cutoff (Hz)
@@ -830,7 +830,7 @@ struct WidebandDecoder
     // Adapted from MultiSfDecoder for os_factor=1
     // =========================================================================
     void processSync(SfLane& lane, ChannelSlot& slot,
-                     std::span<const cf32> accum, std::size_t pos) {
+                     [[maybe_unused]] std::span<const cf32> accum, [[maybe_unused]] std::size_t pos) {
         if (!lane.cfo_frac_sto_frac_est) {
             auto cfo_offset = static_cast<std::size_t>(lane.N)
                 + static_cast<std::size_t>(std::max(static_cast<int>(lane.N) - lane.k_hat, 0));

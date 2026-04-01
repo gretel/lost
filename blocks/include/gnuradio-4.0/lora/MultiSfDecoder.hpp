@@ -38,7 +38,7 @@ struct MultiSfDecoder
     uint8_t  os_factor    = 4;
     uint16_t preamble_len = 8;
     float    energy_thresh = 1e-6f;
-    float    min_snr_db   = -10.0f;
+    float    min_snr_db   = -19.0f;
     uint32_t max_symbols  = 600;
     uint32_t center_freq  = 869618000;
     int32_t  rx_channel   = -1;
@@ -360,7 +360,7 @@ struct MultiSfDecoder
                 lane.net_id_samp[i] = in_span[static_cast<std::size_t>(src_idx)];
             }
 
-            // Align input to symbol boundary (match FrameSync line 694)
+            // Align input to symbol boundary
             lane.items_to_consume = os_i * static_cast<int>(lane.N - static_cast<uint32_t>(lane.k_hat));
         }
     }
@@ -617,7 +617,7 @@ struct MultiSfDecoder
                 return;
             }
 
-            // Apply sync word timing offset (FrameSync line 953)
+            // Apply sync word timing offset
             lane.items_to_consume = -static_cast<int>(os_factor) * net_id_off;
 
             auto [snr, sig] = lane.determine_snr();
@@ -658,7 +658,6 @@ struct MultiSfDecoder
                           / static_cast<float>(os_factor);
 
             // Adjust items_to_consume for quarter-down skip + CFO alignment
-            // (FrameSync line 1006-1007)
             lane.items_to_consume += static_cast<int>(lane.sps / 4)
                                    + static_cast<int>(os_factor) * lane.cfo_int;
 
@@ -674,7 +673,7 @@ struct MultiSfDecoder
     }
 
     // =========================================================================
-    // OUTPUT state: demodulate symbols + decode (fused FrameSync OUTPUT + DemodDecoder)
+    // OUTPUT state: demodulate symbols + decode
     // =========================================================================
     void processOutput(SfLane& lane, std::span<const cf32> /*in_span*/,
                        std::size_t /*in_offset*/,
@@ -691,7 +690,7 @@ struct MultiSfDecoder
             return;
         }
 
-        // Buffer first 8 symbols for early header decode (FrameSync-style)
+        // Buffer first 8 symbols for early header decode
         if (lane.output_symb_cnt < 8 && !lane.header_decoded) {
             std::copy_n(lane.in_down.data(), lane.N,
                         &lane.header_symbols[static_cast<std::size_t>(lane.output_symb_cnt) * lane.N]);
@@ -708,7 +707,7 @@ struct MultiSfDecoder
         lane.total_symbols_rx++;
         lane.output_symb_cnt++;
 
-        // SFO tracking (same as FrameSync lines 1064-1069)
+        // SFO tracking
         if (std::abs(lane.sfo_cum) > 1.0f / (2.0f * static_cast<float>(os_factor))) {
             int sign_val = (lane.sfo_cum > 0) ? 1 : -1;
             lane.items_to_consume -= sign_val;
@@ -716,12 +715,12 @@ struct MultiSfDecoder
         }
         lane.sfo_cum += lane.sfo_hat;
 
-        // After 8th symbol: decode header (FrameSync-style early termination)
+        // After 8th symbol: decode header (early termination)
         if (lane.output_symb_cnt == 8 && !lane.header_decoded) {
             lane.decodeHeader();
         }
 
-        // Decode pipeline (DemodDecoder logic)
+        // Decode pipeline
         if (lane.total_symbols_rx <= 8) {
             // HEADER block: accumulate 8 symbols, then decode header
             if (lane.symbol_buffer.size() == 8) {

@@ -3,8 +3,8 @@
 // lora_trx: full-duplex LoRa transceiver using native GR4 SoapySDR blocks.
 //
 // 1-ch RX: SoapySimpleSource -> [Splitter] -> MultiSfDecoder (per BW) -> FrameSink
-// 2-ch RX: SoapyDualSimpleSource -+-> [Splitter] -> MultiSfDecoder (per BW) -> FrameSink
-//                                 +-> [Splitter] -> MultiSfDecoder (per BW) -> FrameSink
+// 2-ch RX: SoapyDualSource -+-> [Splitter] -> MultiSfDecoder (per BW) -> FrameSink
+//                            +-> [Splitter] -> MultiSfDecoder (per BW) -> FrameSink
 // TX: bounded request queue with dedicated worker thread; LBT defers TX until channel clear
 //
 // MultiSfDecoder decodes all SFs (7-12) simultaneously on each channel.
@@ -47,9 +47,11 @@
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
-#include <gnuradio-4.0/soapy/SoapySink.hpp>
 
+// graph_builder.hpp includes SoapySource.hpp which defines detail::equalWithinOnePercent
+// — must come before SoapySink.hpp which uses it
 #include "graph_builder.hpp"
+#include <gnuradio-4.0/sdr/SoapySink.hpp>
 #include "udp_state.hpp"
 
 #include <gnuradio-4.0/lora/FrameSink.hpp>
@@ -87,12 +89,12 @@ std::vector<cf32> generate_iq(
 // Persistent TX graph: stays alive for the process lifetime.
 //
 // Architecture (MIMO / 2-ch RX mode):
-//   TxQueueSource(port0=IQ, port1=zeros) -> SoapySinkBlock<cf32,2>
+//   TxQueueSource(port0=IQ, port1=zeros) -> SoapySink<cf32,2>
 //
 // Architecture (single-ch RX mode):
-//   TxQueueSource(port0=IQ, port1=zeros) -> SoapySinkBlock<cf32,2>
+//   TxQueueSource(port0=IQ, port1=zeros) -> SoapySink<cf32,2>
 //
-// The same SoapySinkBlock<cf32,2> is used in both modes.  In single-ch mode
+// The same SoapySink<cf32,2> is used in both modes.  In single-ch mode
 // the second TX channel (ch1) is driven with zeros; in MIMO mode ch0 or ch1
 // is selected based on cfg.tx_channel and the other receives zeros.
 // The key property: the scheduler and device handle are created ONCE at
@@ -121,15 +123,16 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
 
     graph.emplaceBlock<gr::lora::TxQueueSource>();
 
-    auto& sink = graph.emplaceBlock<gr::blocks::soapy::SoapySinkBlock<cf32, 2UZ>>({
+    auto& sink = graph.emplaceBlock<gr::blocks::sdr::SoapySink<cf32, 2UZ>>({
         {"device",              cfg.device},
         {"device_parameter",    cfg.device_param},
         {"sample_rate",         cfg.rate},
-        {"tx_center_frequency", gr::Tensor<double>(gr::data_from, {cfg.freq, cfg.freq})},
-        {"tx_gains",            gr::Tensor<double>(gr::data_from, {cfg.gain_tx, 0.0})},
-        {"tx_channels",         gr::Tensor<gr::Size_t>(gr::data_from, {gr::Size_t{0}, gr::Size_t{1}})},
+        {"frequency",           std::vector<double>{cfg.freq, cfg.freq}},
+        {"tx_gains",            std::vector<double>{cfg.gain_tx, 0.0}},
+        {"num_channels",        gr::Size_t{2}},
         {"tx_antennae",         std::vector<std::string>{tx_map.tx_antenna, "TX/RX"}},
         {"clock_source",        cfg.clock},
+        {"master_clock_rate",   cfg.wideband ? cfg.wideband_master_clock : 0.0},
         {"timed_tx",            true},
         {"wait_burst_ack",      true},
         {"max_underflow_count", gr::Size_t{0}},
@@ -165,9 +168,7 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
 
     auto sched = std::make_unique<
         gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>>();
-    sched->timeout_inactivity_count  = 1U;
-    sched->watchdog_min_stall_count  = 10U;  // safety margin if max_warnings becomes non-zero
-    sched->watchdog_max_warnings     = 0U;   // disable all watchdog logging and escalation (TX idle is normal)
+    sched->timeout_inactivity_count  = std::numeric_limits<gr::Size_t>::max();  // TX idles — suppress watchdog entirely
     if (auto ret = sched->exchange(std::move(graph)); !ret) {
         gr::lora::log_ts("error", "lora_trx", "TX scheduler init failed");
         return nullptr;
@@ -383,7 +384,7 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
     // Retune SoapySource center frequency
     if (freq_changed && rx_blocks.soapy_source) {
         gr::property_map freq_props;
-        freq_props["rx_center_frequency"] = gr::Tensor<double>{new_freq};
+        freq_props["frequency"] = std::vector<double>{new_freq};
         auto rejected = rx_blocks.soapy_source->settings().set(freq_props);
         if (!rejected.empty()) {
             gr::lora::log_ts("warn ", "lora_trx",
@@ -397,7 +398,7 @@ bool handle_lora_config(const gr::lora::cbor::Map& msg,
     // Apply RX gain change to SoapySource
     if (new_rx_gain > 0.0 && rx_blocks.soapy_source) {
         gr::property_map gain_props;
-        gain_props["rx_gains"] = gr::Tensor<double>{new_rx_gain};
+        gain_props["rx_gains"] = std::vector<double>{new_rx_gain};
         std::ignore = rx_blocks.soapy_source->settings().set(gain_props);
     }
 
@@ -581,7 +582,7 @@ int main(int argc, char* argv[]) {
     };
 
     // --- Build persistent TX graph (created before RX to avoid device handle races) ---
-    // SoapySinkBlock<cf32,2> stays open for the process lifetime; TxQueueSource
+    // SoapySink<cf32,2> stays open for the process lifetime; TxQueueSource
     // receives bursts from the UDP loop thread via push() + notifyProgress().
     //
     // Wideband mode skips the TX graph: the B210 AD9361 limits master clock to
@@ -630,7 +631,7 @@ int main(int argc, char* argv[]) {
 
     // --- Build and start RX graph in a background thread ---
     gr::Graph rx_graph;
-    std::atomic<uint64_t>* overflow_ptr = nullptr;
+    std::atomic<gr::Size_t>* overflow_ptr = nullptr;
     if (cfg.wideband) {
         gr::lora::log_ts("info ", "lora_trx", "wideband mode: %.1f MS/s, digital channelization",
                          cfg.wideband_rate / 1e6);
@@ -648,9 +649,7 @@ int main(int argc, char* argv[]) {
     }
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> rx_sched;
-    rx_sched.timeout_inactivity_count  = 1U;   // sleep after 1 idle cycle; SoapySource notifies progress on data
-    rx_sched.watchdog_min_stall_count  = 10U;  // suppress watchdog for ≤10s gaps (normal inter-frame silence)
-    rx_sched.watchdog_max_warnings     = 30U;  // 30s of continuous stall → ERROR
+    rx_sched.timeout_inactivity_count  = 10U;  // log after 10s of no progress (SoapySource IO thread drives progress)
     if (auto ret = rx_sched.exchange(std::move(rx_graph)); !ret) {
         gr::lora::log_ts("error", "lora_trx", "RX scheduler init failed");
         if (tx_sched) {

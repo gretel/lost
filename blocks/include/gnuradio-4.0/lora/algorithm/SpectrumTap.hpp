@@ -2,7 +2,7 @@
 //
 // SpectrumTap — shared state for periodic spectrum output.
 //
-// FrameSync writes raw IQ into a ring buffer during DETECT state.
+// MultiSfDecoder writes raw IQ into a ring buffer during DETECT state.
 // The main loop polls for new FFT results and broadcasts as CBOR.
 
 #ifndef GNURADIO_LORA_ALGORITHM_SPECTRUM_TAP_HPP
@@ -29,7 +29,7 @@ struct SpectrumState {
     float    sample_rate = 250000.f;
     double   center_freq = 869618000.0;
 
-    /// Ring buffer for raw IQ samples (written by FrameSync, lock-free).
+    /// Ring buffer for raw IQ samples (written by MultiSfDecoder, lock-free).
     std::vector<std::complex<float>> ring;
     std::atomic<uint64_t> write_pos{0};
 
@@ -62,7 +62,7 @@ struct SpectrumState {
         }
     }
 
-    /// Write IQ samples into ring buffer (called from FrameSync graph thread).
+    /// Write IQ samples into ring buffer (called from MultiSfDecoder graph thread).
     void push(const std::complex<float>* data, std::size_t count) {
         auto ring_size = ring.size();
         auto pos = write_pos.load(std::memory_order_relaxed);

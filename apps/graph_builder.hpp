@@ -25,8 +25,8 @@
 #include <gnuradio-4.0/lora/ScanSink.hpp>
 #include <gnuradio-4.0/lora/log.hpp>
 
-// Soapy.hpp MUST come before common.hpp (common.hpp uses soapy types)
-#include <gnuradio-4.0/soapy/Soapy.hpp>
+// SoapySource.hpp MUST come before common.hpp (common.hpp uses sdr::soapy types)
+#include <gnuradio-4.0/sdr/SoapySource.hpp>
 #include <gnuradio-4.0/testing/NullSources.hpp>
 
 #include "common.hpp"
@@ -118,7 +118,7 @@ inline gr::lora::MultiSfDecoder& add_multisf_chain(
 ///                        → MultiSfDecoder (BW2, SF7-12) → FrameSink
 ///
 /// Returns pointer to source block's cumulative overflow counter.
-inline std::atomic<uint64_t>* build_rx_graph(
+inline std::atomic<gr::Size_t>* build_rx_graph(
         gr::Graph& graph, const TrxConfig& cfg,
         std::function<void(const std::vector<uint8_t>&, bool)> callback,
         std::shared_ptr<gr::lora::SpectrumState> spectrum = nullptr,
@@ -195,8 +195,8 @@ inline std::atomic<uint64_t>* build_rx_graph(
         }
     };
 
-    // Create source and wire: 1 radio = SoapySimple, 2 radios = SoapyDual
-    std::atomic<uint64_t>* overflow_ptr = nullptr;
+    // Create source and wire: 1 radio = SoapySimpleSource, 2 radios = SoapyDualSource
+    std::atomic<gr::Size_t>* overflow_ptr = nullptr;
 
     if (nRadio == 1) {
         auto props = lora_apps::soapy_reliability_defaults();
@@ -204,17 +204,17 @@ inline std::atomic<uint64_t>* build_rx_graph(
             {"device", cfg.device},
             {"device_parameter", cfg.device_param},
             {"sample_rate", cfg.rate},
-            {"rx_center_frequency", gr::Tensor<double>{cfg.freq}},
-            {"rx_gains", gr::Tensor<double>{cfg.gain_rx}},
-            {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
+            {"frequency", std::vector<double>{cfg.freq}},
+            {"rx_gains", std::vector<double>{cfg.gain_rx}},
+            {"num_channels", gr::Size_t{1}},
             {"rx_antennae", antennae},
             {"clock_source", cfg.clock},
             {"lo_offset", cfg.lo_offset},
             {"rx_dc_offset_auto", cfg.dc_offset_auto},
         });
-        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapySimpleSource<std::complex<float>>>(
+        auto& source = graph.emplaceBlock<gr::blocks::sdr::SoapySimpleSource<std::complex<float>>>(
             std::move(props));
-        overflow_ptr = &source._totalOverFlowCount;
+        overflow_ptr = &source._overflowCount;
         wireDecodeChains([&graph, &source](std::size_t /*r*/, auto& downstream) {
             return graph.connect<"out", "in">(source, downstream).has_value();
         });
@@ -224,17 +224,17 @@ inline std::atomic<uint64_t>* build_rx_graph(
             {"device", cfg.device},
             {"device_parameter", cfg.device_param},
             {"sample_rate", cfg.rate},
-            {"rx_center_frequency", gr::Tensor<double>(gr::data_from, {cfg.freq, cfg.freq})},
-            {"rx_gains", gr::Tensor<double>(gr::data_from, {cfg.gain_rx, cfg.gain_rx})},
-            {"rx_channels", gr::Tensor<gr::Size_t>(gr::data_from, soapy_channels)},
+            {"frequency", std::vector<double>{cfg.freq, cfg.freq}},
+            {"rx_gains", std::vector<double>{cfg.gain_rx, cfg.gain_rx}},
+            {"num_channels", gr::Size_t{2}},
             {"rx_antennae", antennae},
             {"clock_source", cfg.clock},
             {"lo_offset", cfg.lo_offset},
             {"rx_dc_offset_auto", cfg.dc_offset_auto},
         });
-        auto& source = graph.emplaceBlock<gr::blocks::soapy::SoapyDualSimpleSource<std::complex<float>>>(
+        auto& source = graph.emplaceBlock<gr::blocks::sdr::SoapyDualSource<std::complex<float>>>(
             std::move(props));
-        overflow_ptr = &source._totalOverFlowCount;
+        overflow_ptr = &source._overflowCount;
         wireDecodeChains([&graph, &source](std::size_t r, auto& downstream) {
             auto portName = "out#"s + std::to_string(r);
             return graph.connect(source, portName, downstream, "in"s).has_value();
@@ -339,8 +339,8 @@ inline ScanGraph build_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg,
         {"device_parameter",    cfg.device_param},
         {"sample_rate",         cfg.l1_rate},
         {"master_clock_rate",   cfg.master_clock},
-        {"rx_center_frequency", gr::Tensor<double>{tileCentre}},
-        {"rx_gains",            gr::Tensor<double>{cfg.gain}},
+        {"frequency",           std::vector<double>{tileCentre}},
+        {"rx_gains",            std::vector<double>{cfg.gain}},
         {"verbose_overflow",    false},
     });
     if (!cfg.clock.empty()) {
@@ -351,7 +351,7 @@ inline ScanGraph build_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg,
     }
     source_props["rx_dc_offset_auto"] = cfg.dc_offset_auto;
     auto& source = graph.emplaceBlock<
-        gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
+        gr::blocks::sdr::SoapySimpleSource<cf32>>(std::move(source_props));
 
     // Splitter -> 2 outputs
     auto& splitter = graph.emplaceBlock<gr::lora::Splitter>({
@@ -422,8 +422,8 @@ inline void build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cf
         {"device_parameter",    cfg.device_param},
         {"sample_rate",         cfg.l1_rate},
         {"master_clock_rate",   cfg.master_clock},
-        {"rx_center_frequency", gr::Tensor<double>{centerFreq}},
-        {"rx_gains",            gr::Tensor<double>{cfg.gain}},
+        {"frequency",           std::vector<double>{centerFreq}},
+        {"rx_gains",            std::vector<double>{cfg.gain}},
         {"verbose_overflow",    false},
     });
     if (!cfg.clock.empty()) {
@@ -434,7 +434,7 @@ inline void build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cf
     }
     source_props["rx_dc_offset_auto"] = cfg.dc_offset_auto;
     auto& source = graph.emplaceBlock<
-        gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
+        gr::blocks::sdr::SoapySimpleSource<cf32>>(std::move(source_props));
 
     // ScanController: sole downstream block (IQ sink with ring buffer + L1/L2)
     // Build probe_bws string from config bws vector
@@ -477,7 +477,7 @@ inline void build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cf
 ///
 /// WidebandDecoder handles L1 energy gating + digital channelization + multi-SF
 /// decode internally. No Splitter or per-BW chains needed.
-inline std::atomic<uint64_t>* build_wideband_graph(
+inline std::atomic<gr::Size_t>* build_wideband_graph(
         gr::Graph& graph, const TrxConfig& cfg,
         std::function<void(const std::vector<uint8_t>&, bool)> callback,
         std::function<void(const gr::property_map&)> telemetry_cb = {}) {
@@ -492,8 +492,8 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         {"device_parameter", cfg.device_param},
         {"sample_rate", static_cast<double>(cfg.wideband_rate)},
         {"master_clock_rate", cfg.wideband_master_clock},
-        {"rx_center_frequency", gr::Tensor<double>{cfg.freq}},
-        {"rx_gains", gr::Tensor<double>{cfg.gain_rx}},
+        {"frequency", std::vector<double>{cfg.freq}},
+        {"rx_gains", std::vector<double>{cfg.gain_rx}},
         {"verbose_overflow", false},
     });
     if (!cfg.clock.empty()) {
@@ -504,7 +504,7 @@ inline std::atomic<uint64_t>* build_wideband_graph(
     }
     source_props["rx_dc_offset_auto"] = cfg.dc_offset_auto;
     auto& source = graph.emplaceBlock<
-        gr::blocks::soapy::SoapySimpleSource<cf32>>(std::move(source_props));
+        gr::blocks::sdr::SoapySimpleSource<cf32>>(std::move(source_props));
 
     // WidebandDecoder
     gr::property_map wb_props{
@@ -552,7 +552,7 @@ inline std::atomic<uint64_t>* build_wideband_graph(
         "wideband graph: %.1f MS/s, %.3f MHz center, BW%u, %s",
         cfg.wideband_rate / 1e6, cfg.freq / 1e6, cfg.bw, sf_desc.c_str());
 
-    return &source._totalOverFlowCount;
+    return &source._overflowCount;
 }
 
 }  // namespace lora_graph

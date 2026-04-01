@@ -2,7 +2,7 @@
 //
 // FrameSink: LoRa frame output sink.
 //
-// Consumes uint8_t payload bytes from DemodDecoder, accumulates
+// Consumes uint8_t payload bytes from MultiSfDecoder, accumulates
 // frames delimited by {pay_len, cr, crc_valid} tags, then outputs them
 // as text (default), CBOR stdout (--cbor), or CBOR UDP (--udp).
 

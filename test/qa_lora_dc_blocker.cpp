@@ -40,7 +40,7 @@ constexpr float kCutoffHz   = 10.f;
 // settling time for 2nd-order Butterworth HP
 // τ = 1/(2π·fc), need ~5τ samples at sample rate fs
 constexpr std::size_t settlingsamples(float fs, float fc) {
-    return static_cast<std::size_t>(5.0 * fs / (2.0 * std::numbers::pi * static_cast<double>(fc)));
+    return static_cast<std::size_t>(5.0 * static_cast<double>(fs) / (2.0 * std::numbers::pi * static_cast<double>(fc)));
 }
 
 std::vector<cf32> generateTone(float fHz, float sampleRate, std::size_t nSamples, float amplitude = 1.f) {
@@ -82,7 +82,7 @@ const suite<"DCBlocker algorithm"> dcBlockerTests = [] {
         float inRms  = rms(std::span(input).subspan(settle));
 
         float attenDb = 20.f * std::log10(outRms / inRms);
-        std::fprintf(stderr, "DC rejection: %.1f dB (settle=%zu, N=%zu)\n", attenDb, settle, N);
+        std::fprintf(stderr, "DC rejection: %.1f dB (settle=%zu, N=%zu)\n", static_cast<double>(attenDb), settle, N);
         expect(attenDb < -40.f) << "DC should be rejected by >40 dB, got" << attenDb << "dB";
     };
 
@@ -99,7 +99,7 @@ const suite<"DCBlocker algorithm"> dcBlockerTests = [] {
         auto outSteady = std::span(output).subspan(settle);
 
         float lossDb = 20.f * std::log10(rms(outSteady) / rms(inSteady));
-        std::fprintf(stderr, "100 Hz passthrough loss: %.2f dB\n", lossDb);
+        std::fprintf(stderr, "100 Hz passthrough loss: %.2f dB\n", static_cast<double>(lossDb));
         expect(lossDb > -1.f) << "100 Hz should pass with <1 dB loss, got" << lossDb << "dB";
     };
 
@@ -113,7 +113,7 @@ const suite<"DCBlocker algorithm"> dcBlockerTests = [] {
         dc.processBlock(input, output);
 
         float lossDb = 20.f * std::log10(rms(std::span(output).subspan(settle)) / rms(std::span(input).subspan(settle)));
-        std::fprintf(stderr, "1 kHz passthrough loss: %.3f dB\n", lossDb);
+        std::fprintf(stderr, "1 kHz passthrough loss: %.3f dB\n", static_cast<double>(lossDb));
         expect(lossDb > -0.1f) << "1 kHz should be essentially unaffected, got" << lossDb << "dB";
     };
 
@@ -204,7 +204,7 @@ const suite<"DCBlocker algorithm"> dcBlockerTests = [] {
         dc.processBlock(input, output);
 
         float attenDb = 20.f * std::log10(rms(std::span(output).subspan(settle)) / rms(std::span(input).subspan(settle)));
-        std::fprintf(stderr, "attenuation at cutoff (%.0f Hz): %.2f dB\n", cutoff, attenDb);
+        std::fprintf(stderr, "attenuation at cutoff (%.0f Hz): %.2f dB\n", static_cast<double>(cutoff), static_cast<double>(attenDb));
         expect(attenDb > -4.5f && attenDb < -1.5f)
             << "expected ~-3 dB at cutoff, got" << attenDb << "dB";
     };
@@ -232,7 +232,7 @@ const suite<"DCBlocker algorithm"> dcBlockerTests = [] {
         }
         mean /= static_cast<float>(outSteady.size());
 
-        std::fprintf(stderr, "residual DC: I=%.6f Q=%.6f\n", mean.real(), mean.imag());
+        std::fprintf(stderr, "residual DC: I=%.6f Q=%.6f\n", static_cast<double>(mean.real()), static_cast<double>(mean.imag()));
         expect(std::abs(mean.real()) < 0.001f) << "residual DC I should be near zero";
         expect(std::abs(mean.imag()) < 0.001f) << "residual DC Q should be near zero";
 
@@ -254,7 +254,7 @@ const suite<"DCBlocker algorithm"> dcBlockerTests = [] {
         dc.processBlock(input, output);
 
         float lossDb = 20.f * std::log10(rms(std::span(output).subspan(settle)) / rms(std::span(input).subspan(settle)));
-        std::fprintf(stderr, "16 MS/s, 1 kHz loss: %.3f dB (settle=%zu, N=%zu)\n", lossDb, settle, N);
+        std::fprintf(stderr, "16 MS/s, 1 kHz loss: %.3f dB (settle=%zu, N=%zu)\n", static_cast<double>(lossDb), settle, N);
         expect(lossDb > -0.1f) << "1 kHz at 16 MS/s should pass clean";
     };
 };

@@ -9,12 +9,14 @@
 #include <complex>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
+#include <sstream>
 #include <string>
 
 #include <gnuradio-4.0/lora/log.hpp>
 
-// log_hardware_info() and soapy_reliability_defaults() use gr::blocks::soapy
-// types — include Soapy.hpp before this header.
+// log_hardware_info() uses gr::blocks::sdr::soapy types — include
+// SoapySource.hpp and/or SoapyRaiiWrapper.hpp before this header.
 
 namespace lora_apps {
 
@@ -47,12 +49,30 @@ inline void apply_fpga_workaround(const std::string& device, std::string& device
 inline std::string log_hardware_info(const char* app_name,
                                      const std::string& device,
                                      const std::string& device_param) {
-    auto args = gr::blocks::soapy::detail::buildDeviceArgs(device, device_param);
-    gr::blocks::soapy::Device dev(args);
-    if (dev.get() == nullptr) {
+    auto devKwargs = gr::blocks::sdr::soapy::Kwargs{{"driver", device}};
+    if (!device_param.empty()) {
+        std::stringstream ss(device_param);
+        std::string keyVal;
+        while (std::getline(ss, keyVal, ',')) {
+            auto pos = keyVal.find('=');
+            if (pos != std::string::npos) {
+                devKwargs[keyVal.substr(0, pos)] = keyVal.substr(pos + 1);
+            }
+        }
+    }
+    auto devResult = gr::blocks::sdr::soapy::Device::make(devKwargs);
+    if (!devResult) {
+        std::fprintf(stderr, "  Cannot open device: %s\n", devResult.error().message.c_str());
         return {};
     }
-    auto info = dev.getHardwareInfo();
+    auto& dev = *devResult;
+    // Use C API for hardware info (not wrapped in the RAII Device class)
+    SoapySDRKwargs hwInfo = SoapySDRDevice_getHardwareInfo(dev.get());
+    gr::blocks::sdr::soapy::Kwargs info;
+    for (std::size_t i = 0; i < hwInfo.size; ++i) {
+        info[hwInfo.keys[i]] = hwInfo.vals[i];
+    }
+    SoapySDRKwargs_clear(&hwInfo);
     std::string fpga_ver, serial;
     if (auto it = info.find("fpga_version"); it != info.end()) {
         fpga_ver = it->second;
@@ -71,18 +91,17 @@ inline std::string log_hardware_info(const char* app_name,
 
 // --- SoapyBlock reliability defaults (shared by lora_trx and lora_scan) ---
 
-constexpr uint32_t kSoapyChunkSize       = 512U << 4U;   // 8192 samples per poll
-constexpr uint32_t kSoapyMaxOverflow     = 0U;            // disabled — throws gr::exception that kills scheduler
-constexpr uint32_t kSoapyMaxConsecErrors = 0U;            // disabled — restart kills MIMO streams
-constexpr uint32_t kSoapyTimeoutUs       = 10'000U;      // readStream timeout
+constexpr uint32_t kSoapyChunkSize   = 512U << 4U;   // 8192 samples per poll
+constexpr uint32_t kSoapyMaxOverflow = 0U;            // disabled — upstream logs but no longer throws
+constexpr uint32_t kSoapyTimeoutUs   = 10'000U;       // readStream timeout
 
 inline gr::property_map soapy_reliability_defaults() {
     return {
-        {"max_chunck_size",        kSoapyChunkSize},
-        {"max_overflow_count",     gr::Size_t{kSoapyMaxOverflow}},
-        {"max_consecutive_errors", gr::Size_t{kSoapyMaxConsecErrors}},
-        {"max_time_out_us",        kSoapyTimeoutUs},
-        {"max_fragment_count",     gr::Size_t{0U}},        // disabled — throws gr::exception that kills scheduler
+        {"max_chunk_size",     kSoapyChunkSize},
+        {"max_overflow_count", gr::Size_t{kSoapyMaxOverflow}},
+        {"max_time_out_us",    kSoapyTimeoutUs},
+        {"max_fragment_count", gr::Size_t{0U}},        // disabled
+        {"verbose_overflow",   false},
     };
 }
 

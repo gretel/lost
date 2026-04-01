@@ -7,8 +7,8 @@
 //   Layer 1: wideband FFT energy scan → candidate channels
 //   Layer 2: per-channel CAD dwell with shared-buffer-per-BW detection
 //
-// Graph topology:
-//   SoapySource(L1 rate) → Splitter(2)
+// Graph topology (tuning mode):
+//   SoapySimpleSource(L1 rate) → Splitter(2)
 //       → [0] SpectrumTapBlock → NullSink    (L1 energy via SpectrumState)
 //       → [1] CaptureSink                     (L2 CAD on-demand capture)
 //
@@ -116,7 +116,7 @@ static std::vector<double> makeChannelList(double freqStart, double freqStop, do
 static void retune_source(std::shared_ptr<gr::BlockModel>& source,
                           double freq, int settleMs) {
     gr::property_map props;
-    props["rx_center_frequency"] = gr::Tensor<double>{freq};
+    props["frequency"] = std::vector<double>{freq};
     std::ignore = source->settings().set(props);
     std::this_thread::sleep_for(std::chrono::milliseconds(settleMs));
 }
@@ -988,9 +988,7 @@ static int streaming_main(ScanSetConfig& cfg) {
     lora_graph::build_streaming_scan_graph(graph, cfg);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> sched;
-    sched.timeout_inactivity_count = 1U;
-    sched.watchdog_min_stall_count = 10U;
-    sched.watchdog_max_warnings    = 30U;
+    sched.timeout_inactivity_count = 10U;  // SoapySource IO thread drives progress; log after 10s stall
 
     if (auto ret = sched.exchange(std::move(graph)); !ret) {
         gr::lora::log_ts("error", "lora_scan", "scheduler init failed");
@@ -1013,10 +1011,10 @@ static int streaming_main(ScanSetConfig& cfg) {
     scanSink->_onDataSet = [&handoff, &soapy_source](const gr::DataSet<float>& ds) {
         uint64_t ovf = 0;
         if (soapy_source) {
-            using SoapyType = gr::blocks::soapy::SoapyBlock<cf32, 1UL>;
+            using SoapyType = gr::blocks::sdr::SoapySource<cf32, 1UZ>;
             auto* wrapper = dynamic_cast<gr::BlockWrapper<SoapyType>*>(soapy_source.get());
             if (wrapper) {
-                ovf = wrapper->blockRef().totalOverflowCount();
+                ovf = wrapper->blockRef()._overflowCount.load(std::memory_order_relaxed);
             }
         }
         {
@@ -1085,10 +1083,10 @@ static int streaming_main(ScanSetConfig& cfg) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         if (soapy_source) {
-            using SoapyType = gr::blocks::soapy::SoapyBlock<cf32, 1UL>;
+            using SoapyType = gr::blocks::sdr::SoapySource<cf32, 1UZ>;
             auto* wrapper = dynamic_cast<gr::BlockWrapper<SoapyType>*>(soapy_source.get());
             if (wrapper) {
-                uint64_t ovf = wrapper->blockRef().totalOverflowCount();
+                uint64_t ovf = wrapper->blockRef()._overflowCount.load(std::memory_order_relaxed);
                 if (ovf != lastOvf && (ovf == 1 || ovf % 50 == 0)) {
                     gr::lora::log_ts("warn ", "lora_scan",
                         "overflow count: %llu", static_cast<unsigned long long>(ovf));
@@ -1182,9 +1180,7 @@ int main(int argc, char** argv) {
     auto sg = lora_graph::build_scan_graph(graph, cfg, channels);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking> sched;
-    sched.timeout_inactivity_count = 1U;
-    sched.watchdog_min_stall_count = 10U;
-    sched.watchdog_max_warnings    = 30U;
+    sched.timeout_inactivity_count = 10U;  // SoapySource IO thread drives progress; log after 10s stall
 
     if (auto ret = sched.exchange(std::move(graph)); !ret) {
         gr::lora::log_ts("error", "lora_scan", "scheduler init failed");
@@ -1322,11 +1318,11 @@ int main(int argc, char** argv) {
     uint64_t lastOverflowCount = 0;
     auto checkOverflows = [&](uint32_t sweep) {
         // Access overflow count via the typed block inside the wrapper.
-        // SoapyBlock<cf32, 1>::totalOverflowCount() is atomic and cross-thread safe.
-        using SoapyType = gr::blocks::soapy::SoapyBlock<std::complex<float>, 1UL>;
+        // SoapySource<cf32, 1>::_overflowCount is atomic and cross-thread safe.
+        using SoapyType = gr::blocks::sdr::SoapySource<std::complex<float>, 1UZ>;
         auto* wrapper = dynamic_cast<gr::BlockWrapper<SoapyType>*>(soapy_source.get());
         if (!wrapper) return;
-        const uint64_t current = wrapper->blockRef().totalOverflowCount();
+        const uint64_t current = wrapper->blockRef()._overflowCount.load(std::memory_order_relaxed);
         if (current > lastOverflowCount) {
             stats.overflows = static_cast<uint32_t>(current);
             emitOverflowCbor(sweep, current);

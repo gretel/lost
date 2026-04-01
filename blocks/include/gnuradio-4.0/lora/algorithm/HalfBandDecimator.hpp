@@ -177,33 +177,6 @@ struct HalfBandStage {
         sampleCount += input.size();
     }
 
-    /// Process with per-sample mixing fused into the input (circular delay line).
-    /// mixFn(i) returns the mixed sample for index i.
-    /// NOTE: Uses `% 23` per-sample — expensive at high sample rates.
-    /// Prefer processWithMixBatch() for stage 0 in channelizeFir().
-    template<typename MixFn>
-    void processWithMix(std::size_t count, MixFn&& mixFn, std::vector<cf32>& out) {
-        using namespace halfband_detail;
-        for (std::size_t i = 0; i < count; ++i) {
-            delay[writePos] = mixFn(i);
-            if ((sampleCount & 1U) == 1U) {
-                cf32 acc{0.f, 0.f};
-                for (std::size_t c = 0; c < kCoeffs.size(); ++c) {
-                    const std::size_t k = c * 2;
-                    const std::size_t kMirror = kFilterLen - 1 - k;
-                    const std::size_t idx1 = (writePos + k + 1) % kFilterLen;
-                    const std::size_t idx2 = (writePos + kMirror + 1) % kFilterLen;
-                    acc += kCoeffs[c] * (delay[idx1] + delay[idx2]);
-                }
-                const std::size_t centerIdx = (writePos + 11 + 1) % kFilterLen;
-                acc += kCenterTap * delay[centerIdx];
-                out.push_back(acc);
-            }
-            writePos = (writePos + 1) % kFilterLen;
-            ++sampleCount;
-        }
-    }
-
     /// Batch FIR with NCO mixing fused into input loading — no modulo indexing.
     /// Replaces processWithMix() for stage 0 in channelization.
     /// Uses the same linear-buffer approach as processBatch(): builds [tail | mixed_input]

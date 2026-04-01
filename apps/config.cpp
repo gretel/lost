@@ -198,8 +198,8 @@ static std::map<std::string, RadioCfg> parse_radios(const toml::table& tbl) {
         auto& section = *val.as_table();
         RadioCfg r;
         r.freq    = section["freq"].value_or(869'618'000.0);
-        r.rx_gain = section["rx_gain"].value_or(30.0);
-        r.tx_gain = section["tx_gain"].value_or(75.0);
+        r.rx_gain = section["rx_gain"].value_or(35.0);
+        r.tx_gain = section["tx_gain"].value_or(70.0);
         if (auto* arr = section["rx_channel"].as_array()) {
             r.rx_channels.clear();
             for (auto& elem : *arr) {
@@ -306,7 +306,7 @@ std::vector<TrxConfig> load_config(const std::string& path,
         cfg.status_interval = static_cast<uint32_t>(net_tbl->at_path("status_interval").value_or(int64_t{10}));
         cfg.lbt             = net_tbl->at_path("lbt").value_or(true);
         cfg.lbt_timeout_ms  = static_cast<uint32_t>(net_tbl->at_path("lbt_timeout_ms").value_or(int64_t{2000}));
-        cfg.tx_queue_depth  = static_cast<uint32_t>(net_tbl->at_path("tx_queue_depth").value_or(int64_t{4}));
+        cfg.tx_queue_depth  = static_cast<uint32_t>(net_tbl->at_path("tx_queue_depth").value_or(int64_t{8}));
     }
 
     // Raw config passthrough for Python scripts
@@ -540,7 +540,7 @@ std::vector<ScanSetConfig> load_scan_config(const std::string& path,
     }
 
     cfg.os_factor   = static_cast<uint32_t>(scan_tbl->at_path("os_factor").value_or(int64_t{4}));
-    cfg.min_ratio   = static_cast<float>(scan_tbl->at_path("min_ratio").value_or(8.0));
+    cfg.min_ratio   = static_cast<float>(scan_tbl->at_path("min_ratio").value_or(5.0));
     cfg.settle_ms   = static_cast<int>(scan_tbl->at_path("settle_ms").value_or(int64_t{5}));
     cfg.sweeps      = static_cast<uint32_t>(scan_tbl->at_path("sweeps").value_or(int64_t{0}));
     cfg.layer1_only = scan_tbl->at_path("layer1_only").value_or(false);
@@ -548,9 +548,7 @@ std::vector<ScanSetConfig> load_scan_config(const std::string& path,
 
     // Streaming-mode parameters
     cfg.buffer_ms     = static_cast<float>(scan_tbl->at_path("buffer_ms").value_or(512.0));
-    cfg.l1_fft_size   = static_cast<uint32_t>(scan_tbl->at_path("l1_fft_size").value_or(int64_t{1024}));
-    cfg.l1_accumulate = static_cast<uint32_t>(scan_tbl->at_path("l1_accumulate").value_or(int64_t{64}));
-    cfg.l1_reports    = static_cast<uint32_t>(scan_tbl->at_path("l1_reports").value_or(int64_t{64}));
+    cfg.l1_fft_size   = static_cast<uint32_t>(scan_tbl->at_path("l1_fft_size").value_or(int64_t{4096}));
     cfg.channel_bw    = static_cast<float>(scan_tbl->at_path("channel_bw").value_or(62500.0));
 
     // [scan.network]

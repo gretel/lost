@@ -97,7 +97,7 @@ FetchContent_MakeAvailable(SoapyLoopback)
 
 add_executable(qa_soapy_loopback qa_soapy_loopback.cpp)
 target_link_libraries(qa_soapy_loopback PRIVATE
-    gr-lora gnuradio-options gnuradio-core-group gr-soapy gr-testing ut)
+    gr-lora gnuradio-options gnuradio-core-group gr-sdr gr-testing ut)
 target_compile_definitions(qa_soapy_loopback PRIVATE
     SOAPY_LOOPBACK_MODULE_PATH="$<TARGET_FILE:soapyloopback>")
 add_test(NAME qa_soapy_loopback
