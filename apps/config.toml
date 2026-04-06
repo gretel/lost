@@ -53,8 +53,8 @@ lo_offset         = 62500     # LO offset (Hz, default: 0) — shifts DC spur ou
 # dc_offset_auto    = true    # hardware DC offset correction (default: true)
 # dc_blocker        = true    # DSP DC blocker (default: true)
 # dc_blocker_cutoff = 2000    # DC blocker cutoff (Hz, default: 2000)
-# frequency_correction_ppm = 0.0  # oscillator PPM correction (default: 0)
-# rx_iq_balance_auto = true   # hardware IQ balance correction (default: true)
+# frequency_correction = 0.0  # oscillator PPM correction (default: 0, upstream key)
+# iq_balance         = []     # manual IQ balance per-channel [I0,Q0,I1,Q1,...] (upstream key)
 
 # [radio_433]
 # freq       = 433650000

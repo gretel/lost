@@ -210,7 +210,7 @@ inline std::atomic<gr::Size_t>* build_rx_graph(
             {"rx_antennae", antennae},
             {"clock_source", cfg.clock},
             {"lo_offset", cfg.lo_offset},
-            {"rx_dc_offset_auto", cfg.dc_offset_auto},
+            {"dc_offset_mode", cfg.dc_offset_auto},
         });
         auto& source = graph.emplaceBlock<gr::blocks::sdr::SoapySimpleSource<std::complex<float>>>(
             std::move(props));
@@ -230,7 +230,7 @@ inline std::atomic<gr::Size_t>* build_rx_graph(
             {"rx_antennae", antennae},
             {"clock_source", cfg.clock},
             {"lo_offset", cfg.lo_offset},
-            {"rx_dc_offset_auto", cfg.dc_offset_auto},
+            {"dc_offset_mode", cfg.dc_offset_auto},
         });
         auto& source = graph.emplaceBlock<gr::blocks::sdr::SoapyDualSource<std::complex<float>>>(
             std::move(props));
@@ -349,7 +349,7 @@ inline ScanGraph build_scan_graph(gr::Graph& graph, const ScanSetConfig& cfg,
     if (cfg.lo_offset != 0.0) {
         source_props["lo_offset"] = cfg.lo_offset;
     }
-    source_props["rx_dc_offset_auto"] = cfg.dc_offset_auto;
+    source_props["dc_offset_mode"] = cfg.dc_offset_auto;
     auto& source = graph.emplaceBlock<
         gr::blocks::sdr::SoapySimpleSource<cf32>>(std::move(source_props));
 
@@ -432,7 +432,7 @@ inline void build_streaming_scan_graph(gr::Graph& graph, const ScanSetConfig& cf
     if (cfg.lo_offset != 0.0) {
         source_props["lo_offset"] = cfg.lo_offset;
     }
-    source_props["rx_dc_offset_auto"] = cfg.dc_offset_auto;
+    source_props["dc_offset_mode"] = cfg.dc_offset_auto;
     auto& source = graph.emplaceBlock<
         gr::blocks::sdr::SoapySimpleSource<cf32>>(std::move(source_props));
 
@@ -502,7 +502,7 @@ inline std::atomic<gr::Size_t>* build_wideband_graph(
     if (cfg.lo_offset != 0.0) {
         source_props["lo_offset"] = cfg.lo_offset;
     }
-    source_props["rx_dc_offset_auto"] = cfg.dc_offset_auto;
+    source_props["dc_offset_mode"] = cfg.dc_offset_auto;
     auto& source = graph.emplaceBlock<
         gr::blocks::sdr::SoapySimpleSource<cf32>>(std::move(source_props));
 
