@@ -97,7 +97,10 @@ jobs:
             -DENABLE_LORA_BENCHMARKS=OFF \
             -DWARNINGS_AS_ERRORS=OFF \
             -DUSE_CCACHE=ON \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DGR_ENABLE_BLOCK_REGISTRY=OFF \
+            -DINTERNAL_ENABLE_BLOCK_PLUGINS=OFF \
+            -DGR_ENABLE_HTTP=OFF
 
       - name: Build gr-lora shared block library
         run: |
