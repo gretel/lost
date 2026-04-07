@@ -8,8 +8,11 @@ on:
 # Not triggered on push:main to avoid polluting main-branch status until the
 # job has been observed green a few times. Enable main later once stable.
 
+# Cancel any in-progress run of THIS workflow on the SAME ref when a new run
+# starts. Small project: only the most recent commit matters. ARM64 CI runs
+# in a separate group so both workflows can run concurrently on the same PR.
 concurrency:
-  group: ci-armv7-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
