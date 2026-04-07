@@ -19,10 +19,9 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      TOOLCHAIN_URL: "https://toolchains.bootlin.com/downloads/releases/toolchains/armv7-eabihf/tarballs/armv7-eabihf--glibc--stable-2024.05-1.tar.bz2"
-      # Update this sha256 after the first CI run by copying from the failure log.
-      # Use 'sha256sum armv7-eabihf--glibc--stable-2024.05-1.tar.bz2' locally to verify.
-      TOOLCHAIN_SHA256: "0000000000000000000000000000000000000000000000000000000000000000"
+      TOOLCHAIN_URL: "https://toolchains.bootlin.com/downloads/releases/toolchains/armv7-eabihf/tarballs/armv7-eabihf--glibc--stable-2024.05-1.tar.xz"
+      # Official sha256 from bootlin: armv7-eabihf--glibc--stable-2024.05-1.sha256
+      TOOLCHAIN_SHA256: "608263bc9dc3eadf0962ddb1165f1c2291001190f9927dee47d464e26374462c"
       TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/armv7-bootlin/armv7-eabihf--glibc--stable-2024.05-1
       ARMV7_TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/armv7-bootlin/armv7-eabihf--glibc--stable-2024.05-1
 
@@ -40,14 +39,14 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build ccache \
-            ca-certificates curl bzip2
+            ca-certificates curl xz-utils
 
       - name: Cache Bootlin toolchain
         id: cache-toolchain
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/toolchains/armv7-bootlin
-          key: bootlin-armv7-eabihf-glibc-stable-2024.05-1
+          key: bootlin-armv7-eabihf-glibc-stable-2024.05-1-xz
 
       - name: Download Bootlin toolchain
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
@@ -55,18 +54,14 @@ jobs:
           set -euo pipefail
           mkdir -p "${{ github.workspace }}/toolchains/armv7-bootlin"
           cd "${{ github.workspace }}/toolchains/armv7-bootlin"
-          curl -sSL -o toolchain.tar.bz2 "$TOOLCHAIN_URL"
+          curl -fsSL -o toolchain.tar.xz "$TOOLCHAIN_URL"
           echo "Downloaded toolchain:"
-          ls -lh toolchain.tar.bz2
+          ls -lh toolchain.tar.xz
           echo "Computed sha256:"
-          sha256sum toolchain.tar.bz2
-          if [ "$TOOLCHAIN_SHA256" != "0000000000000000000000000000000000000000000000000000000000000000" ]; then
-            echo "$TOOLCHAIN_SHA256  toolchain.tar.bz2" | sha256sum -c -
-          else
-            echo "WARNING: TOOLCHAIN_SHA256 placeholder detected. First CI run will print actual hash — copy it into the workflow env."
-          fi
-          tar xf toolchain.tar.bz2
-          rm toolchain.tar.bz2
+          sha256sum toolchain.tar.xz
+          echo "$TOOLCHAIN_SHA256  toolchain.tar.xz" | sha256sum -c -
+          tar xf toolchain.tar.xz
+          rm toolchain.tar.xz
           ls -la
 
       - name: Verify toolchain is executable
