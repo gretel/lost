@@ -139,7 +139,7 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-armv7-bootlin.cmake \
             -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_LORA_APPS=OFF \
+            -DENABLE_LORA_APPS=ON \
             -DENABLE_LORA_BENCHMARKS=OFF \
             -DWARNINGS_AS_ERRORS=OFF \
             -DUSE_CCACHE=ON \
@@ -167,25 +167,60 @@ jobs:
             qa_lora_wideband qa_lora_tx_queue qa_lora_udp \
             qa_lora_dc_blocker qa_lora_config
 
-      # Note: qa_soapy_loopback excluded — SoapySDR is a host-arch dependency
-      # not present in the Bootlin sysroot. Would require cross-building
-      # SoapySDR to include it, which is out of scope for this CI.
+      - name: Build hardware applications (lora_trx, lora_scan)
+        run: |
+          set -euo pipefail
+          cmake --build build -j2 --target lora_trx lora_scan
+          ls -la build/apps/lora_trx build/apps/lora_scan
+          file build/apps/lora_trx build/apps/lora_scan
 
       # Note: test execution deferred — build-only validation is the goal of this
       # workflow. Running qa_lora_* under qemu-user would be a follow-up task.
+
+      - name: Install patchelf (host tool)
+        run: sudo apt-get install -y --no-install-recommends patchelf
+
+      - name: Normalize RPATH on staged binaries
+        run: |
+          set -euo pipefail
+          binaries=$(find build -type f \
+            \( -name 'qa_lora_*' -o -name 'lora_trx' -o -name 'lora_scan' \) \
+            -executable 2>/dev/null | sort -u || true)
+          for f in $binaries; do
+            [ -f "$f" ] || continue
+            old=$(patchelf --print-rpath "$f" 2>/dev/null || echo '<none>')
+            patchelf --remove-rpath "$f" || true
+            patchelf --set-rpath '$ORIGIN/../lib' "$f"
+            new=$(patchelf --print-rpath "$f")
+            printf 'rpath: %-30s %s -> %s\n' "$(basename "$f")" "$old" "$new"
+          done
 
       - name: Stage hardware-testable artifact
         if: always()
         run: |
           set -euo pipefail
           STAGE="${{ github.workspace }}/artifact-stage"
-          mkdir -p "$STAGE/bin" "$STAGE/lib"
+          mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/etc"
           # Collect every qa_lora_* test binary that successfully built.
           find build -type f -name 'qa_lora_*' -not -name '*.o' -not -name '*.cmake' \
             -executable -print0 2>/dev/null | xargs -0 -I{} cp -v {} "$STAGE/bin/" || true
-          # Collect the gr-lora shared block library if it exists.
+          # Collect hardware apps (lora_trx, lora_scan).
+          for app in lora_trx lora_scan; do
+            if [ -x "build/apps/$app" ]; then
+              cp -v "build/apps/$app" "$STAGE/bin/"
+            fi
+          done
+          # Collect the gr-lora shared block library + any gnuradio-*.so alongside.
           find build -type f \( -name 'libGrLoraBlocksShared.so*' -o -name 'libgnuradio-*.so*' \) \
             -print0 2>/dev/null | xargs -0 -I{} cp -v {} "$STAGE/lib/" || true
+          # Config template for Pluto target.
+          if [ -f apps/config-pluto.toml ]; then
+            cp -v apps/config-pluto.toml "$STAGE/etc/"
+          fi
+          # Deploy README.
+          if [ -f docs/deploy-tezuka.md ]; then
+            cp -v docs/deploy-tezuka.md "$STAGE/README-DEPLOY.md"
+          fi
           # Toolchain identification + git provenance for the receiver.
           {
             echo "git_sha=$(git rev-parse HEAD)"
@@ -193,14 +228,20 @@ jobs:
             echo "run_id=${GITHUB_RUN_ID:-unknown}"
             echo "toolchain=armv7-eabihf--glibc--bleeding-edge-2025.08-1"
             echo "target=arm-buildroot-linux-gnueabihf (Cortex-A9 NEON hard-float)"
+            echo "soapy_sdr_version=${SOAPY_SDR_VERSION}"
             "$TOOLCHAIN_ROOT/bin/arm-buildroot-linux-gnueabihf-gcc" --version | head -1
           } > "$STAGE/BUILD_INFO.txt"
           echo "=== artifact contents ==="
-          ls -la "$STAGE/bin" "$STAGE/lib" 2>/dev/null || true
+          ls -la "$STAGE/bin" "$STAGE/lib" "$STAGE/etc" 2>/dev/null || true
           cat "$STAGE/BUILD_INFO.txt"
           echo "=== file types (verify ARM) ==="
           for f in "$STAGE/bin"/* "$STAGE/lib"/*; do
             [ -f "$f" ] && file "$f" | head -1
+          done
+          echo "=== RPATH verification ==="
+          for f in "$STAGE/bin"/*; do
+            [ -f "$f" ] && printf '%-30s %s\n' "$(basename "$f")" \
+              "$(patchelf --print-rpath "$f" 2>/dev/null || echo '<none>')"
           done
 
       - name: Upload hardware-testable artifact
