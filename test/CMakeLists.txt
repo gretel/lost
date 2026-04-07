@@ -87,25 +87,28 @@ add_ut_test(qa_lora_tx_queue)
 add_ut_test(qa_lora_dc_blocker)
 
 # --- SoapyLoopback: hardware-free SoapySDR loopback testing ---
-# Override with -DFETCHCONTENT_SOURCE_DIR_SOAPYLOOPBACK=<path> for local development
-FetchContent_Declare(
-    SoapyLoopback
-    GIT_REPOSITORY https://github.com/gretel/SoapyLoopback.git
-    GIT_TAG        eab0395f5033da85adb5af6ccd30a5e7129a453e  # fix/tx-loopback-qa
-)
-FetchContent_MakeAvailable(SoapyLoopback)
+# Override with -DFETCHCONTENT_SOURCE_DIR_SOAPYLOOPBACK=<path> for local development.
+# Skip when cross-compiling because SoapySDR is typically not in the cross sysroot.
+if(NOT CMAKE_CROSSCOMPILING)
+    FetchContent_Declare(
+        SoapyLoopback
+        GIT_REPOSITORY https://github.com/gretel/SoapyLoopback.git
+        GIT_TAG        eab0395f5033da85adb5af6ccd30a5e7129a453e  # fix/tx-loopback-qa
+    )
+    FetchContent_MakeAvailable(SoapyLoopback)
 
-add_executable(qa_soapy_loopback qa_soapy_loopback.cpp)
-target_link_libraries(qa_soapy_loopback PRIVATE
-    gr-lora gnuradio-options gnuradio-core-group gr-sdr gr-testing ut)
-target_compile_definitions(qa_soapy_loopback PRIVATE
-    SOAPY_LOOPBACK_MODULE_PATH="$<TARGET_FILE:soapyloopback>")
-add_test(NAME qa_soapy_loopback
-         COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/qa_soapy_loopback)
-set_tests_properties(qa_soapy_loopback PROPERTIES
-    TIMEOUT 60
-    ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
-add_dependencies(qa_soapy_loopback soapyloopback)
+    add_executable(qa_soapy_loopback qa_soapy_loopback.cpp)
+    target_link_libraries(qa_soapy_loopback PRIVATE
+        gr-lora gnuradio-options gnuradio-core-group gr-sdr gr-testing ut)
+    target_compile_definitions(qa_soapy_loopback PRIVATE
+        SOAPY_LOOPBACK_MODULE_PATH="$<TARGET_FILE:soapyloopback>")
+    add_test(NAME qa_soapy_loopback
+             COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/qa_soapy_loopback)
+    set_tests_properties(qa_soapy_loopback PROPERTIES
+        TIMEOUT 60
+        ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    add_dependencies(qa_soapy_loopback soapyloopback)
+endif()
 
 # Test vector generator (not a test — run manually to regenerate vectors)
 add_executable(generate_vectors generate_vectors.cpp)
