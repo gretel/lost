@@ -502,12 +502,12 @@ def add_logging_args(parser: "argparse.ArgumentParser") -> None:
 # Search path for config.toml (first match wins):
 #   1. ./config.toml                         (CWD, e.g. when running from apps/)
 #   2. ./apps/config.toml                    (CWD = project root)
-#   3. <script-dir>/../apps/config.toml      (script-relative, works from scripts/)
+#   3. <script-dir>/../../apps/config.toml   (script-relative, works from scripts/lib/)
 #   4. ~/.config/gr4-lora/config.toml        (user config)
 _CONFIG_SEARCH = [
     Path("config.toml"),
     Path("apps/config.toml"),
-    Path(__file__).parent.parent / "apps" / "config.toml",
+    Path(__file__).parent.parent.parent / "apps" / "config.toml",
     Path.home() / ".config" / "gr4-lora" / "config.toml",
 ]
 

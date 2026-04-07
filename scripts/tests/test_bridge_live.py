@@ -28,6 +28,13 @@ import struct
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "apps"))
+sys.path.insert(
+    0, str(Path(__file__).resolve().parent.parent)
+)  # transitional — remove in Task 4
 
 from lora_common import parse_host_port
 from meshcore_crypto import (
@@ -92,7 +99,7 @@ def recv_frames(sock: socket.socket, timeout: float = 5.0) -> list[bytes]:
         sock.settimeout(remaining)
         try:
             chunk = sock.recv(4096)
-        except (socket.timeout, TimeoutError):
+        except socket.timeout, TimeoutError:
             break
         if not chunk:
             break
@@ -130,7 +137,7 @@ def recv_frames(sock: socket.socket, timeout: float = 5.0) -> list[bytes]:
                             break
                         frames.append(bytes(buf[3 : 3 + length]))
                         del buf[: 3 + length]
-            except (socket.timeout, TimeoutError):
+            except socket.timeout, TimeoutError:
                 pass
             break
 

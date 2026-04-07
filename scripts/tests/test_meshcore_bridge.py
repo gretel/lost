@@ -17,7 +17,11 @@ import time
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "apps"))
+sys.path.insert(
+    0, str(Path(__file__).resolve().parent.parent)
+)  # transitional — remove in Task 4
 import meshcore_bridge as bridge
 from meshcore_crypto import (
     load_or_create_identity,

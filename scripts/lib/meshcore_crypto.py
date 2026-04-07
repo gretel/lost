@@ -112,7 +112,7 @@ ADVERT_HAS_FEATURE2 = 0x40
 ADVERT_HAS_NAME = 0x80
 
 # Default paths — relative to the scripts/ directory so data stays in the project tree
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data" / "meshcore"
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "meshcore"
 DEFAULT_IDENTITY_FILE = DEFAULT_DATA_DIR / "identity.bin"
 DEFAULT_KEYS_DIR = DEFAULT_DATA_DIR / "keys"
 
@@ -464,8 +464,10 @@ def try_decrypt_anon_req(
 # ---- Group channel support ----
 
 
-# Seed channels bundled with the repo (scripts/channels/*.channel)
-SEED_CHANNELS_DIR = Path(__file__).resolve().parent / "data" / "meshcore" / "channels"
+# Seed channels bundled with the repo (scripts/data/meshcore/channels/*.channel)
+SEED_CHANNELS_DIR = (
+    Path(__file__).resolve().parent.parent / "data" / "meshcore" / "channels"
+)
 
 DEFAULT_CHANNELS_DIR = DEFAULT_DATA_DIR / "channels"
 

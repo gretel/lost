@@ -24,7 +24,11 @@ from pathlib import Path
 
 import cbor2
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "apps"))
+sys.path.insert(
+    0, str(Path(__file__).resolve().parent.parent)
+)  # transitional — remove in Task 4
 
 # Companion protocol constants (mirrored from meshcore_bridge.py)
 FRAME_TX = 0x3C
@@ -203,7 +207,7 @@ class BridgeFixture:
                 s = socket.create_connection(("127.0.0.1", self.tcp_port), timeout=0.1)
                 s.close()
                 return
-            except (ConnectionRefusedError, OSError):
+            except ConnectionRefusedError, OSError:
                 time.sleep(0.05)
         raise RuntimeError(
             f"Bridge did not start within {timeout}s on port {self.tcp_port}"

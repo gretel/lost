@@ -18,8 +18,13 @@ import struct
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "apps"))
+sys.path.insert(
+    0, str(Path(__file__).resolve().parent.parent)
+)  # transitional — remove in Task 4
 
 import cbor2
 
@@ -391,7 +396,7 @@ class TestCborPipeline(unittest.TestCase):
         self, cbor_data: bytes, extra_args: list[str] | None = None
     ) -> str:
         """Run lora_decode_meshcore.py with CBOR data on stdin."""
-        scripts_dir = os.path.dirname(__file__)
+        scripts_dir = os.path.dirname(os.path.dirname(__file__))  # tests/.. -> scripts/
         cmd = [
             sys.executable,
             os.path.join(scripts_dir, "lora_decode_meshcore.py"),
