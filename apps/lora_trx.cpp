@@ -62,6 +62,7 @@
 
 using namespace lora_config;
 using namespace lora_graph;
+using namespace std::string_literals;
 
 namespace {
 
