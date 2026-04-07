@@ -16,15 +16,21 @@ running `lora_trx` / `lora_scan` on a Tezuka-based PlutoSDR.
 ### Verify the target is runnable
 
 ```
-ssh root@<pluto-ip> 'strings /lib/libstdc++.so.6 | grep GLIBCXX_3.4.34'
+ssh root@<pluto-ip> 'strings /usr/lib/libstdc++.so.6 | grep GLIBCXX_3.4.34'
 ssh root@<pluto-ip> 'ls /usr/lib/libSoapySDR.so.0.8*'
-ssh root@<pluto-ip> 'ls /usr/lib/SoapySDR/modules*/libPlutoSDRSupport.so'
-ssh root@<pluto-ip> 'SoapySDRUtil --info | grep -A2 -i modules'
-ssh root@<pluto-ip> 'SoapySDRUtil --probe=driver=plutosdr | head -30'
+ssh root@<pluto-ip> 'ls /usr/lib/SoapySDR/modules0.8/libTezukaSupport.so'
+ssh root@<pluto-ip> 'ls /sys/bus/iio/devices/'
 ```
 
-If any of these fail, stop and re-flash the Tezuka rootfs before
-continuing — the gr4-lora binaries will not run.
+Expected IIO devices: `ad9361-phy`, `xadc`, `cf-ad9361-lpc`,
+`cf-ad9361-dds-core-lpc`. If any of these fail, stop and re-flash
+the Tezuka rootfs before continuing — the gr4-lora binaries will not
+run.
+
+Note: `SoapySDRUtil` is not shipped (BR2_PACKAGE_SOAPY_SDR builds the
+library only, not the CLI). The Tezuka SoapySDR module is named
+`libTezukaSupport.so` and registers itself as the `"tezuka"` driver
+(not `"plutosdr"` — see config-pluto.toml).
 
 ## Download the CI artifact
 
@@ -99,10 +105,12 @@ ssh root@<pluto-ip> '/root/gr4-lora/bin/lora_trx --config /root/gr4-lora/etc/con
 Expected startup sequence:
 
 1. Config parse log line from `lora_config`
-2. SoapySDR banner showing `driver=plutosdr` + `uri=local:`
-3. `rx_antennae = ["TX/RX"]` warning (see below)
-4. Ad9361 tune to 868.5 MHz
-5. Scheduler goes running and starts emitting frames
+2. SoapySDR banner showing `driver=tezuka` + `uri=local:`
+3. SoapyPlutoPAPR enumerates IIO devices on `local:` backend, finds
+   `ad9361-phy` + `cf-ad9361-lpc` + `cf-ad9361-dds-core-lpc`
+4. `rx_antennae = ["TX/RX"]` warning (see below)
+5. Ad9361 tune to 868.5 MHz
+6. Scheduler goes running and starts emitting frames
 
 ## Known warnings
 

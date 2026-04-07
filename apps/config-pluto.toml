@@ -23,7 +23,7 @@
 # ── Hardware ─────────────────────────────────────────────────────────────────
 
 [device]
-driver = "plutosdr"
+driver = "tezuka"               # SoapyPlutoPAPR registers as "tezuka", not "plutosdr"
 param  = "uri=local:"
 clock  = "internal"             # Pluto has no external clock input
 
