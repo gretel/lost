@@ -20,3 +20,4 @@ out/
 data/
 scripts/data
 tmp/
+.worktrees/
