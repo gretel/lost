@@ -17,16 +17,19 @@ concurrency:
 
 jobs:
   build:
-    name: "armv7-eabihf | gcc-13 | Release | cross"
+    name: "armv7-eabihf | gcc-15 | Release | cross"
     runs-on: ubuntu-24.04
     env:
       DEBIAN_FRONTEND: noninteractive
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      TOOLCHAIN_URL: "https://toolchains.bootlin.com/downloads/releases/toolchains/armv7-eabihf/tarballs/armv7-eabihf--glibc--stable-2024.05-1.tar.xz"
-      # Official sha256 from bootlin: armv7-eabihf--glibc--stable-2024.05-1.sha256
-      TOOLCHAIN_SHA256: "608263bc9dc3eadf0962ddb1165f1c2291001190f9927dee47d464e26374462c"
-      TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/armv7-bootlin/armv7-eabihf--glibc--stable-2024.05-1
-      ARMV7_TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/armv7-bootlin/armv7-eabihf--glibc--stable-2024.05-1
+      # Bleeding-edge 2025.08-1 ships gcc 15.1.0 + glibc 2.41 + binutils 2.44.
+      # gnuradio4 requires gcc 15+ for C++23 <print> and other libstdc++14+ features;
+      # the older stable-2024.05-1 (gcc 13.3, libstdc++ 13) lacks <print>.
+      TOOLCHAIN_URL: "https://toolchains.bootlin.com/downloads/releases/toolchains/armv7-eabihf/tarballs/armv7-eabihf--glibc--bleeding-edge-2025.08-1.tar.xz"
+      # Official sha256 from bootlin: armv7-eabihf--glibc--bleeding-edge-2025.08-1.sha256
+      TOOLCHAIN_SHA256: "eed0e672d305ac08d444685b48eafb291c63387ef7916c1615354ebfb3d1ebdc"
+      TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/armv7-bootlin/armv7-eabihf--glibc--bleeding-edge-2025.08-1
+      ARMV7_TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/armv7-bootlin/armv7-eabihf--glibc--bleeding-edge-2025.08-1
 
     steps:
       - uses: actions/checkout@v6
@@ -49,7 +52,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/toolchains/armv7-bootlin
-          key: bootlin-armv7-eabihf-glibc-stable-2024.05-1-xz
+          key: bootlin-armv7-eabihf-glibc-bleeding-edge-2025.08-1-xz
 
       - name: Download Bootlin toolchain
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
@@ -78,8 +81,8 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-armv7-gcc13-Release-${{ github.run_id }}
-          restore-keys: ccache-armv7-gcc13-Release
+          key: ccache-armv7-gcc15-Release-${{ github.run_id }}
+          restore-keys: ccache-armv7-gcc15-Release
 
       - name: Configure ccache
         run: |
@@ -131,12 +134,50 @@ jobs:
       # Note: test execution deferred — build-only validation is the goal of this
       # workflow. Running qa_lora_* under qemu-user would be a follow-up task.
 
+      - name: Stage hardware-testable artifact
+        if: always()
+        run: |
+          set -euo pipefail
+          STAGE="${{ github.workspace }}/artifact-stage"
+          mkdir -p "$STAGE/bin" "$STAGE/lib"
+          # Collect every qa_lora_* test binary that successfully built.
+          find build -type f -name 'qa_lora_*' -not -name '*.o' -not -name '*.cmake' \
+            -executable -print0 2>/dev/null | xargs -0 -I{} cp -v {} "$STAGE/bin/" || true
+          # Collect the gr-lora shared block library if it exists.
+          find build -type f \( -name 'libGrLoraBlocksShared.so*' -o -name 'libgnuradio-*.so*' \) \
+            -print0 2>/dev/null | xargs -0 -I{} cp -v {} "$STAGE/lib/" || true
+          # Toolchain identification + git provenance for the receiver.
+          {
+            echo "git_sha=$(git rev-parse HEAD)"
+            echo "git_ref=${GITHUB_REF:-unknown}"
+            echo "run_id=${GITHUB_RUN_ID:-unknown}"
+            echo "toolchain=armv7-eabihf--glibc--bleeding-edge-2025.08-1"
+            echo "target=arm-buildroot-linux-gnueabihf (Cortex-A9 NEON hard-float)"
+            "$TOOLCHAIN_ROOT/bin/arm-buildroot-linux-gnueabihf-gcc" --version | head -1
+          } > "$STAGE/BUILD_INFO.txt"
+          echo "=== artifact contents ==="
+          ls -la "$STAGE/bin" "$STAGE/lib" 2>/dev/null || true
+          cat "$STAGE/BUILD_INFO.txt"
+          echo "=== file types (verify ARM) ==="
+          for f in "$STAGE/bin"/* "$STAGE/lib"/*; do
+            [ -f "$f" ] && file "$f" | head -1
+          done
+
+      - name: Upload hardware-testable artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gr4-lora-armv7-eabihf-${{ github.sha }}
+          path: artifact-stage/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Save ccache
         if: always()
         uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-armv7-gcc13-Release-${{ github.run_id }}
+          key: ccache-armv7-gcc15-Release-${{ github.run_id }}
 
       - name: Show ccache stats
         if: always()
