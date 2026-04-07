@@ -17,8 +17,12 @@ import logging
 import selectors
 import signal
 import socket
+import sys
 import time
+from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import cbor2
 
@@ -484,7 +488,7 @@ def run(args: argparse.Namespace) -> None:
 
             try:
                 events = sel.select(timeout=RECV_TIMEOUT)
-            except (InterruptedError, OSError):
+            except InterruptedError, OSError:
                 continue
 
             for key, _ in events:

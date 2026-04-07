@@ -23,6 +23,9 @@ import socket
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import cbor2
 
@@ -276,7 +279,6 @@ def main() -> None:
                 f"DECODE_FRAME SF{sf} CRC={crc} SNR={snr:.1f} CR={cr} len={length}",
                 flush=True,
             )
-
 
 
 if __name__ == "__main__":

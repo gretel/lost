@@ -26,9 +26,6 @@ import cbor2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "apps"))
-sys.path.insert(
-    0, str(Path(__file__).resolve().parent.parent)
-)  # transitional — remove in Task 4
 
 # Companion protocol constants (mirrored from meshcore_bridge.py)
 FRAME_TX = 0x3C
@@ -175,9 +172,12 @@ class BridgeFixture:
         self.udp_sock.settimeout(3.0)
 
         # Start bridge subprocess
+        bridge_script = (
+            Path(__file__).resolve().parent.parent / "apps" / "meshcore_bridge.py"
+        )
         cmd = [
             sys.executable,
-            "scripts/meshcore_bridge.py",
+            str(bridge_script),
             "--port",
             str(self.tcp_port),
             "--connect",
@@ -191,7 +191,7 @@ class BridgeFixture:
             cmd.extend(extra_args)
         self.proc = subprocess.Popen(
             cmd,
-            cwd=str(Path(__file__).resolve().parent.parent),
+            cwd=str(Path(__file__).resolve().parent.parent.parent),
             stderr=subprocess.PIPE,
             stdout=subprocess.PIPE,
         )

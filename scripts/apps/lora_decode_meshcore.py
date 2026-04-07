@@ -24,7 +24,10 @@ import json
 import struct
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 from cbor_stream import read_cbor_seq
 from lora_common import PAYLOAD_NAMES, ROUTE_NAMES, format_hex, sanitize_text

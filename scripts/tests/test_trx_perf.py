@@ -17,9 +17,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "apps"))
-sys.path.insert(
-    0, str(Path(__file__).resolve().parent.parent)
-)  # transitional — remove in Task 4
 from trx_perf import FrameStats, emit_frame, emit_summary, format_bw
 
 
