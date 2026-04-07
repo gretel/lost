@@ -104,11 +104,14 @@ jobs:
             -DUSE_CCACHE=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-      - name: Build gr-lora headers (interface target)
+      - name: Build gr-lora shared block library
         run: |
-          cmake --build build -j2 --target GrLoraBlocks || true
-          # If GrLoraBlocks fails we still want downstream test targets to be attempted
-          # individually so the failure log enumerates every portability issue at once.
+          cmake --build build -j2 --target GrLoraBlocksShared || true
+          # If GrLoraBlocksShared fails we still want downstream test targets to be
+          # attempted individually so the failure log enumerates every portability
+          # issue at once. Note: gr_add_block_library(GrLoraBlocks ...) generates
+          # GrLoraBlocksObject + GrLoraBlocksShared targets — there is no plain
+          # 'GrLoraBlocks' target.
 
       - name: Build test binaries (portability validation)
         run: |
