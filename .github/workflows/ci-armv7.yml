@@ -30,6 +30,7 @@ jobs:
       TOOLCHAIN_SHA256: "eed0e672d305ac08d444685b48eafb291c63387ef7916c1615354ebfb3d1ebdc"
       TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/armv7-bootlin/armv7-eabihf--glibc--bleeding-edge-2025.08-1
       ARMV7_TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/armv7-bootlin/armv7-eabihf--glibc--bleeding-edge-2025.08-1
+      SOAPY_SDR_VERSION: "0.8.1"
 
     steps:
       - uses: actions/checkout@v6
@@ -47,12 +48,12 @@ jobs:
             cmake ninja-build ccache \
             ca-certificates curl xz-utils
 
-      - name: Cache Bootlin toolchain
+      - name: Cache Bootlin toolchain (with SoapySDR installed into sysroot)
         id: cache-toolchain
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/toolchains/armv7-bootlin
-          key: bootlin-armv7-eabihf-glibc-bleeding-edge-2025.08-1-xz
+          key: bootlin-armv7-eabihf-glibc-bleeding-edge-2025.08-1-soapy${{ env.SOAPY_SDR_VERSION }}-xz
 
       - name: Download Bootlin toolchain
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
@@ -76,13 +77,52 @@ jobs:
           "$TOOLCHAIN_ROOT/bin/arm-buildroot-linux-gnueabihf-gcc" --version
           "$TOOLCHAIN_ROOT/bin/arm-buildroot-linux-gnueabihf-g++" --version
 
+      - name: Cross-build SoapySDR into toolchain sysroot
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          SYSROOT="$TOOLCHAIN_ROOT/arm-buildroot-linux-gnueabihf/sysroot"
+          mkdir -p soapy-src
+          curl -fsSL -o soapy.tar.gz \
+            "https://github.com/pothosware/SoapySDR/archive/refs/tags/soapy-sdr-${SOAPY_SDR_VERSION}.tar.gz"
+          tar -xf soapy.tar.gz -C soapy-src --strip-components=1
+          rm soapy.tar.gz
+          cmake -S soapy-src -B soapy-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${GITHUB_WORKSPACE}/cmake/toolchain-armv7-bootlin.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${SYSROOT}/usr" \
+            -DENABLE_PYTHON=OFF \
+            -DENABLE_PYTHON3=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_DOCS=OFF \
+            -DENABLE_APPS=OFF \
+            -DENABLE_LIBRARY=ON
+          cmake --build soapy-build -j2
+          cmake --install soapy-build
+          echo "--- SoapySDR install verification ---"
+          ls -la "${SYSROOT}/usr/lib/libSoapySDR."*
+          ls -la "${SYSROOT}/usr/lib/cmake/SoapySDR/"
+          "$TOOLCHAIN_ROOT/bin/arm-buildroot-linux-gnueabihf-readelf" -h \
+            "${SYSROOT}/usr/lib/libSoapySDR.so" | head -20
+          rm -rf soapy-src soapy-build
+
+      - name: Verify SoapySDR in sysroot (after cache restore or fresh build)
+        run: |
+          set -euo pipefail
+          SYSROOT="$TOOLCHAIN_ROOT/arm-buildroot-linux-gnueabihf/sysroot"
+          test -f "${SYSROOT}/usr/lib/libSoapySDR.so" \
+            || { echo "ERROR: libSoapySDR.so missing from sysroot"; exit 1; }
+          test -f "${SYSROOT}/usr/lib/cmake/SoapySDR/SoapySDRConfig.cmake" \
+            || { echo "ERROR: SoapySDR CMake config missing"; exit 1; }
+          echo "SoapySDR ${SOAPY_SDR_VERSION} present in sysroot"
+
       - name: Restore ccache
         id: restore-ccache
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-armv7-gcc15-Release-${{ github.run_id }}
-          restore-keys: ccache-armv7-gcc15-Release
+          key: ccache-armv7-gcc15-soapy${{ env.SOAPY_SDR_VERSION }}-Release-${{ github.run_id }}
+          restore-keys: ccache-armv7-gcc15-soapy${{ env.SOAPY_SDR_VERSION }}-Release
 
       - name: Configure ccache
         run: |
@@ -177,7 +217,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-armv7-gcc15-Release-${{ github.run_id }}
+          key: ccache-armv7-gcc15-soapy${{ env.SOAPY_SDR_VERSION }}-Release-${{ github.run_id }}
 
       - name: Show ccache stats
         if: always()
