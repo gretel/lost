@@ -21,7 +21,7 @@ Note: for live monitoring, use lora_mon.py (reads UDP from lora_trx).
 This script is for offline analysis of saved CBOR streams.
 
 Usage:
-    python3 scripts/lora_decode_meshtastic.py < captured.cbor
+    python3 scripts/apps/lora_decode_meshtastic.py < captured.cbor
 """
 
 from __future__ import annotations

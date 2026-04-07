@@ -3,7 +3,7 @@
 """
 Tests for trx_perf.py pure functions.
 
-Run:  .venv/bin/python3 -m unittest scripts/test_trx_perf.py -v
+Run:  .venv/bin/python3 -m unittest scripts/tests/test_trx_perf.py -v
 """
 
 from __future__ import annotations

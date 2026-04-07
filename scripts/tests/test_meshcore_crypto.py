@@ -6,7 +6,7 @@ test_meshcore_crypto.py -- Unit tests for meshcore_crypto.py.
 Tests key store load/save, header parsing, ADVERT extraction,
 and RX decryption helpers (try_decrypt_txt_msg, try_decrypt_anon_req).
 
-Run:  python3 -m unittest scripts/test_meshcore_crypto.py -v
+Run:  python3 -m unittest scripts/tests/test_meshcore_crypto.py -v
 """
 
 import os

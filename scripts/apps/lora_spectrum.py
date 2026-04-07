@@ -4,7 +4,7 @@
 """lora_spectrum.py — real-time LoRa spectrum bar graph.
 
 Usage:
-    python3 scripts/lora_spectrum.py [--host HOST] [--port PORT] [--ema ALPHA]
+    python3 scripts/apps/lora_spectrum.py [--host HOST] [--port PORT] [--ema ALPHA]
 
 Keyboard Controls:
     Space  - Pause/resume

@@ -23,8 +23,8 @@ use ~4 GB RAM per compilation unit.
 ./build/apps/lora_trx --config apps/config.toml    # RX + TX transceiver
 ./build/apps/lora_scan --config apps/config.toml    # wideband scanner
 
-scripts/lora_mon.py                                  # display decoded frames
-scripts/meshcore_bridge.py                           # companion protocol bridge (TCP :7834)
+scripts/apps/lora_mon.py                             # display decoded frames
+scripts/apps/meshcore_bridge.py                      # companion protocol bridge (TCP :7834)
 ```
 
 ## Architecture
@@ -86,10 +86,10 @@ See `apps/config.toml` for full reference with all options.
 ctest --test-dir build -R "qa_lora|bm_lora" --output-on-failure --timeout 120
 
 # Hardware A/B test (requires companion device + lora_trx running)
-.venv/bin/python3 scripts/test_multisf_hardware.py
+.venv/bin/python3 scripts/apps/lora_test.py decode --matrix basic
 
 # Python
-.venv/bin/python3 -m unittest discover -s scripts -p 'test_*.py' -v
+.venv/bin/python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```
 
 ## License

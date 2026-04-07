@@ -7,7 +7,7 @@ Subscribes to lora_trx CBOR events via UDP and prints one line per decoded
 frame plus periodic summaries. Useful for interactive debugging.
 
 Usage:
-    python3 scripts/trx_perf.py [--host HOST] [--port PORT]
+    python3 scripts/apps/trx_perf.py [--host HOST] [--port PORT]
 
 Output lines (grep-friendly):
     FRAME seq=1 SF8 BW62.5k CRC=OK SNR=12.3 freq=869.618 cfo_int=-2

@@ -3,7 +3,7 @@
 """
 Tests for lora_mon.py and lora_decode_lorawan.py.
 
-Run:  python3 -m unittest scripts/test_lora_mon.py -v
+Run:  python3 -m unittest scripts/tests/test_lora_mon.py -v
 """
 
 from __future__ import annotations

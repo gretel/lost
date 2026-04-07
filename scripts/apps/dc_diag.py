@@ -3,7 +3,7 @@
 """DC spur diagnostic: measures center-bin power from lora_trx spectrum UDP stream.
 
 Usage:
-    python3 scripts/dc_diag.py [--host 127.0.0.1] [--port 5556] [--frames 20]
+    python3 scripts/apps/dc_diag.py [--host 127.0.0.1] [--port 5556] [--frames 20]
 
 Subscribes to lora_trx UDP, reads spectrum CBOR messages, reports:
   - DC bin power (center bin, dBFS)

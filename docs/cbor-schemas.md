@@ -752,13 +752,13 @@ deduplicates across decode chains, and re-broadcasts aggregated frames
 
 ```bash
 # Start aggregator (subscribes to lora_trx:5556, serves consumers on :5555)
-python3 scripts/lora_agg.py
+python3 scripts/apps/lora_agg.py
 
 # Monitor aggregated frames (default port 5555)
-python3 scripts/lora_mon.py
+python3 scripts/apps/lora_mon.py
 
 # Monitor raw frames directly from lora_trx
-python3 scripts/lora_mon.py --connect 127.0.0.1:5556
+python3 scripts/apps/lora_mon.py --connect 127.0.0.1:5556
 ```
 
 ## Python examples

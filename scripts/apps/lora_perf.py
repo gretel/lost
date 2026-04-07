@@ -8,7 +8,7 @@ and rolling summaries to stdout.  Works with both the streaming pipeline
 (scan_spectrum + scan_sweep_end) and legacy pipeline (additional events).
 
 Usage:
-    python3 scripts/lora_perf.py [--host HOST] [--port PORT]
+    python3 scripts/apps/lora_perf.py [--host HOST] [--port PORT]
 
 Output lines (grep-friendly):
     SWEEP sweep=1 dur=524ms hot=3 det=1 ovf=0

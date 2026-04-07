@@ -4,7 +4,7 @@
 Tests for meshcore_bridge.py — companion protocol framing, command handling,
 and RX frame conversion.
 
-Run:  python3 -m unittest scripts/test_meshcore_bridge.py -v
+Run:  python3 -m unittest scripts/tests/test_meshcore_bridge.py -v
 """
 
 from __future__ import annotations

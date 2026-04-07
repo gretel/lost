@@ -16,19 +16,19 @@ Design principles:
 
 Usage:
     # USB serial (local companion):
-    python3 scripts/lora_test.py decode --matrix full --serial /dev/cu.usbserial-0001
-    python3 scripts/lora_test.py scan --matrix basic --serial /dev/cu.usbserial-0001
+    python3 scripts/apps/lora_test.py decode --matrix full --serial /dev/cu.usbserial-0001
+    python3 scripts/apps/lora_test.py scan --matrix basic --serial /dev/cu.usbserial-0001
 
     # TCP (remote companion via WiFi serial bridge):
-    python3 scripts/lora_test.py decode --matrix full --tcp 192.168.1.42:4000
-    python3 scripts/lora_test.py scan --matrix basic --tcp 10.0.0.5:7835
+    python3 scripts/apps/lora_test.py decode --matrix full --tcp 192.168.1.42:4000
+    python3 scripts/apps/lora_test.py scan --matrix basic --tcp 10.0.0.5:7835
 
     # Attach to already-running daemons (e.g. for live demo):
     ./build/apps/lora_scan --config apps/config.toml &
-    python3 scripts/lora_spectrum.py &
-    python3 scripts/lora_test.py scan --matrix basic --serial /dev/cu.usbserial-0001 --attach
+    python3 scripts/apps/lora_spectrum.py &
+    python3 scripts/apps/lora_test.py scan --matrix basic --serial /dev/cu.usbserial-0001 --attach
 
-    python3 scripts/lora_test.py decode --matrix dc_edge --label dc-on \\
+    python3 scripts/apps/lora_test.py decode --matrix dc_edge --label dc-on \\
         --hypothesis "2kHz DC blocker does not degrade SF12" --serial ...
 """
 

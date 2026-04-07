@@ -7,7 +7,7 @@ Spawns the bridge as a subprocess, connects via raw TCP using the companion
 protocol, and verifies end-to-end behavior. A mock UDP server stands in for
 lora_trx.
 
-Run:  python3 -m unittest scripts/test_meshcore_bridge_integration.py -v
+Run:  python3 -m unittest scripts/tests/test_meshcore_bridge_integration.py -v
 """
 
 from __future__ import annotations

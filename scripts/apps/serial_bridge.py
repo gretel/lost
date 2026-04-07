@@ -8,7 +8,7 @@ then bridges bidirectionally to a TCP server. meshcore-cli connects via TCP
 instead of serial, avoiding the DTR reboot on every invocation.
 
 Usage:
-    python3 scripts/serial_bridge.py [--serial PORT] [--baud RATE] [--tcp-port PORT]
+    python3 scripts/apps/serial_bridge.py [--serial PORT] [--baud RATE] [--tcp-port PORT]
 
 Then:
     uvx meshcore-cli -t 127.0.0.1 -p 7835 advert
