@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: ISC
+name: ARMv7 Cross CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Not triggered on push:main to avoid polluting main-branch status until the
+# job has been observed green a few times. Enable main later once stable.
+
+concurrency:
+  group: ci-armv7-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: "armv7-eabihf | gcc-13 | Release | cross"
+    runs-on: ubuntu-24.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      TOOLCHAIN_URL: "https://toolchains.bootlin.com/downloads/releases/toolchains/armv7-eabihf/tarballs/armv7-eabihf--glibc--stable-2024.05-1.tar.bz2"
+      # Update this sha256 after the first CI run by copying from the failure log.
+      # Use 'sha256sum armv7-eabihf--glibc--stable-2024.05-1.tar.bz2' locally to verify.
+      TOOLCHAIN_SHA256: "0000000000000000000000000000000000000000000000000000000000000000"
+      TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/armv7-bootlin/armv7-eabihf--glibc--stable-2024.05-1
+      ARMV7_TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/armv7-bootlin/armv7-eabihf--glibc--stable-2024.05-1
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Fetch submodules
+        run: git submodule update --init --recursive
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build ccache \
+            ca-certificates curl bzip2
+
+      - name: Cache Bootlin toolchain
+        id: cache-toolchain
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/toolchains/armv7-bootlin
+          key: bootlin-armv7-eabihf-glibc-stable-2024.05-1
+
+      - name: Download Bootlin toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ github.workspace }}/toolchains/armv7-bootlin"
+          cd "${{ github.workspace }}/toolchains/armv7-bootlin"
+          curl -sSL -o toolchain.tar.bz2 "$TOOLCHAIN_URL"
+          echo "Downloaded toolchain:"
+          ls -lh toolchain.tar.bz2
+          echo "Computed sha256:"
+          sha256sum toolchain.tar.bz2
+          if [ "$TOOLCHAIN_SHA256" != "0000000000000000000000000000000000000000000000000000000000000000" ]; then
+            echo "$TOOLCHAIN_SHA256  toolchain.tar.bz2" | sha256sum -c -
+          else
+            echo "WARNING: TOOLCHAIN_SHA256 placeholder detected. First CI run will print actual hash — copy it into the workflow env."
+          fi
+          tar xf toolchain.tar.bz2
+          rm toolchain.tar.bz2
+          ls -la
+
+      - name: Verify toolchain is executable
+        run: |
+          set -euo pipefail
+          "$TOOLCHAIN_ROOT/bin/arm-buildroot-linux-gnueabihf-gcc" --version
+          "$TOOLCHAIN_ROOT/bin/arm-buildroot-linux-gnueabihf-g++" --version
+
+      - name: Restore ccache
+        id: restore-ccache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-armv7-gcc13-Release-${{ github.run_id }}
+          restore-keys: ccache-armv7-gcc13-Release
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=3G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=6
+          ccache --set-config=depend_mode=true
+          ccache --set-config=hash_dir=false
+          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
+          ccache -z
+
+      - name: Configure CMake (cross)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-armv7-bootlin.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_LORA_APPS=OFF \
+            -DENABLE_LORA_BENCHMARKS=OFF \
+            -DWARNINGS_AS_ERRORS=OFF \
+            -DUSE_CCACHE=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Build gr-lora headers (interface target)
+        run: |
+          cmake --build build -j2 --target GrLoraBlocks || true
+          # If GrLoraBlocks fails we still want downstream test targets to be attempted
+          # individually so the failure log enumerates every portability issue at once.
+
+      - name: Build test binaries (portability validation)
+        run: |
+          cmake --build build -j2 --target \
+            qa_lora_algorithms qa_lora_tx qa_lora_phase3 \
+            qa_lora_rx qa_lora_loopback qa_lora_burst \
+            qa_lora_splitter qa_lora_cad qa_lora_multisf \
+            qa_lora_cbor qa_lora_framesink qa_lora_scan \
+            qa_lora_wideband qa_lora_tx_queue qa_lora_udp \
+            qa_lora_dc_blocker qa_lora_config
+
+      # Note: qa_soapy_loopback excluded — SoapySDR is a host-arch dependency
+      # not present in the Bootlin sysroot. Would require cross-building
+      # SoapySDR to include it, which is out of scope for this CI.
+
+      # Note: test execution deferred — build-only validation is the goal of this
+      # workflow. Running qa_lora_* under qemu-user would be a follow-up task.
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-armv7-gcc13-Release-${{ github.run_id }}
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache --show-stats
