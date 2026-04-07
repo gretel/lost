@@ -101,7 +101,7 @@ jobs:
           cmake --install soapy-build
           echo "--- SoapySDR install verification ---"
           ls -la "${SYSROOT}/usr/lib/libSoapySDR."*
-          ls -la "${SYSROOT}/usr/lib/cmake/SoapySDR/"
+          ls -la "${SYSROOT}/usr/share/cmake/SoapySDR/"
           "$TOOLCHAIN_ROOT/bin/arm-buildroot-linux-gnueabihf-readelf" -h \
             "${SYSROOT}/usr/lib/libSoapySDR.so" | head -20
           rm -rf soapy-src soapy-build
@@ -112,9 +112,12 @@ jobs:
           SYSROOT="$TOOLCHAIN_ROOT/arm-buildroot-linux-gnueabihf/sysroot"
           test -f "${SYSROOT}/usr/lib/libSoapySDR.so" \
             || { echo "ERROR: libSoapySDR.so missing from sysroot"; exit 1; }
-          test -f "${SYSROOT}/usr/lib/cmake/SoapySDR/SoapySDRConfig.cmake" \
+          # SoapySDR installs CMake config to share/cmake/SoapySDR/ (not lib/cmake/)
+          # because cross-builds can't reliably autodetect CMAKE_INSTALL_LIBDIR.
+          test -f "${SYSROOT}/usr/share/cmake/SoapySDR/SoapySDRConfig.cmake" \
             || { echo "ERROR: SoapySDR CMake config missing"; exit 1; }
           echo "SoapySDR ${SOAPY_SDR_VERSION} present in sysroot"
+          ls -la "${SYSROOT}/usr/share/cmake/SoapySDR/" "${SYSROOT}/usr/lib/libSoapySDR."*
 
       - name: Restore ccache
         id: restore-ccache
