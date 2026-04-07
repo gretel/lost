@@ -168,7 +168,17 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
 
     auto sched = std::make_unique<
         gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>>();
-    sched->timeout_inactivity_count  = std::numeric_limits<gr::Size_t>::max();  // TX idles — suppress watchdog entirely
+    // TX scheduler: sleep quickly when idle (TX is long-idle between requests).
+    // timeout_inactivity_count gates BOTH the sleep trigger AND the watchdog print
+    // threshold (`nWarnings >= timeOut_count` in runWatchDog).  Setting it to
+    // UINT32_MAX (a previous workaround) prevents the worker from ever sleeping —
+    // the bug we are fixing here.  Use 10U for fast sleep, then push watchdog_timeout
+    // up to ~1 hour so the watchdog spam fires once per hour instead of once per
+    // second.  watchdog_timeout is the sleep_for interval inside runWatchDog and is
+    // independent of the worker thread's `timeout_ms` (which controls the
+    // waitUntilChanged sleep duration via _newDataReady-style notifications).
+    sched->timeout_inactivity_count  = 10U;
+    sched->watchdog_timeout          = 3'600'000U;  // 1 hour
     if (auto ret = sched->exchange(std::move(graph)); !ret) {
         gr::lora::log_ts("error", "lora_trx", "TX scheduler init failed");
         return nullptr;

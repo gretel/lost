@@ -93,7 +93,11 @@ inline std::string log_hardware_info(const char* app_name,
 
 constexpr uint32_t kSoapyChunkSize   = 512U << 4U;   // 8192 samples per poll
 constexpr uint32_t kSoapyMaxOverflow = 0U;            // disabled — upstream logs but no longer throws
-constexpr uint32_t kSoapyTimeoutUs   = 10'000U;       // readStream timeout
+// readStream timeout: must exceed chunk airtime at the LOWEST sample rate we use,
+// otherwise the IO thread busy-spins on SOAPY_SDR_TIMEOUT.  At 250 kS/s narrowband
+// decode and 8192-sample chunks, one chunk = 32.768 ms.  100 ms gives 3x safety
+// margin and is still <<100 ms at 16 MS/s scan rate (chunk = 0.512 ms there).
+constexpr uint32_t kSoapyTimeoutUs   = 100'000U;
 
 inline gr::property_map soapy_reliability_defaults() {
     return {
