@@ -1459,11 +1459,20 @@ const boost::ut::suite<"Fused NCO+FIR equivalence"> fusedNcoFirTests = [] {
             << "max error between separate and fused = " << maxErr
             << ", expected < 1e-5";
 
-        // NCO rotation state should also match after processing
+        // NCO rotation state should also match after processing.  Tolerance:
+        // both paths do 8192 complex multiplies with renormalization every
+        // 1024 samples.  Complex multiply is (ac - bd) + (ad + bc)i; GCC 14
+        // on aarch64 emits NEON FMA in one call site (Path A's tight mix
+        // loop) but not the other (Path B's interleaved mix+FIR loop), and
+        // FMA-vs-no-FMA rounding drifts by ~1 eps per operation.  Over
+        // N=8192 multiplies the RMS drift is  sqrt(N) * eps ~ 90 * 1.2e-7
+        // ~= 1e-5, and worst-case 3-4x that.  Observed on CI: 4.18e-5.
+        // 1e-4f leaves headroom while still catching a real bug (a wrong
+        // NCO step or broken renormalization would drift by O(1)).
         float rotDiff = std::abs(rotA - rotB);
-        expect(rotDiff < 1e-5f)
+        expect(rotDiff < 1e-4f)
             << "NCO rotation state divergence = " << rotDiff
-            << ", expected < 1e-5";
+            << ", expected < 1e-4";
     };
 };
 
