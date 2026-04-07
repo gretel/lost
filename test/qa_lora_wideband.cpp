@@ -1443,9 +1443,21 @@ const boost::ut::suite<"Fused NCO+FIR equivalence"> fusedNcoFirTests = [] {
         std::fprintf(stderr, "  fused NCO+FIR: %zu outputs, maxErr=%.9f\n",
                      outB.size(), static_cast<double>(maxErr));
 
-        expect(maxErr < 1e-6f)
+        // Tolerance: 1e-5f accommodates rounding-order divergence between the
+        // two FIR implementations.  Path A runs the FIR via the circular
+        // delay-line HalfBandStage::process() on a pre-mixed contiguous buffer;
+        // Path B runs the FIR via the linear-buffer processNcoFirFused() on
+        // the raw input.  GCC 14 on aarch64 auto-vectorises the two call sites
+        // differently and emits NEON FMA in one but not the other, so the
+        // observed rounding diverges by up to ~3.4e-6 on arm64 Linux CI.
+        // Apple Clang happens to produce bit-identical output on macOS/arm64.
+        // A 12-tap half-band FIR on unit-variance Gaussian input has an
+        // analytical per-output eps budget of ~1.4e-6 (12 * 2^-23); 1e-5f
+        // leaves ~7x headroom while still catching any real logic bug (those
+        // would manifest as O(1) differences, not sub-microvolt rounding).
+        expect(maxErr < 1e-5f)
             << "max error between separate and fused = " << maxErr
-            << ", expected < 1e-6";
+            << ", expected < 1e-5";
 
         // NCO rotation state should also match after processing
         float rotDiff = std::abs(rotA - rotB);
