@@ -1,0 +1,74 @@
+# gr4-lora configuration — ADALM-Pluto / FISH Ball PlutoSDR target
+#
+# Designed for single-board on-device operation: lora_trx runs ON the
+# Pluto Linux (armv7-eabihf), talking to the local ad9361-phy via
+# SoapyPlutoPAPR's iio local backend.
+#
+# For a remote host accessing a USB-connected Pluto, change
+# [device].param to "uri=ip:192.168.2.1" (or "usb:x.y.z").
+#
+# SoapyPlutoPAPR hardware constraints (verified against F5OEO master):
+#   antennas:    RX = "A_BALANCED"   TX = "A"   (the only options)
+#   RX gain:     0-71 dB manual PGA (no AGC unless gain_mode = true)
+#   TX gain:     0-89 dB (0 = -89 dBFS, 89 = 0 dBFS)
+#   sample rate: 65 kHz min (with libad9361 FIR) to 61.44 MS/s max
+#   bandwidth:   0-56 MHz analog LPF (set independently of sample rate)
+#   DC offset mode: not supported (hasDCOffsetMode() returns false)
+#
+# The apps' kChannelMap hardcodes B210 antenna labels ("TX/RX", "RX2").
+# For Pluto, only rx_channel=[0] and tx_channel=0 are valid — the
+# SoapyPluto driver will silently ignore the B210 antenna string and
+# keep the hardware default (A_BALANCED / A).
+
+# ── Hardware ─────────────────────────────────────────────────────────────────
+
+[device]
+driver = "tezuka"               # SoapyPlutoPAPR registers as "tezuka", not "plutosdr"
+param  = "uri=local:"
+clock  = "internal"             # Pluto has no external clock input
+
+[logging]
+level = "INFO"
+
+# ── Radio frontend ───────────────────────────────────────────────────────────
+
+[radio_868]
+freq              = 868500000    # EU ISM centre (Hz)
+rx_channel        = [0]          # Pluto has a single RX channel
+tx_channel        = 0            # Pluto has a single TX channel
+rx_gain           = 40           # 0-71 dB manual PGA
+tx_gain           = 0            # 0-89 dB (0 = min power, safe default)
+lo_offset         = 62500        # shift DC spur out of 62.5 kHz passband
+dc_offset_auto    = false        # Pluto does not support HW DC correction
+dc_blocker        = true         # DSP DC blocker is always safe
+dc_blocker_cutoff = 2000         # Hz
+
+# ── PHY codec ────────────────────────────────────────────────────────────────
+
+[codec_meshcore_868]
+sf           = 8
+bw           = 62500
+cr           = 8                 # CR 4/8
+sync_word    = 0x12
+preamble_len = 8
+
+# ── Transceiver ──────────────────────────────────────────────────────────────
+
+[trx]
+name       = "Pluto MeshCore 868 MHz"
+radio      = "radio_868"
+codec      = "codec_meshcore_868"
+rate       = 500000              # 500 kS/s — comfortable above Pluto min rate
+decode_bws = [62500, 125000, 250000]
+
+[trx.network]
+udp_listen      = "127.0.0.1"
+udp_port        = 5556
+status_interval = 10
+lbt             = true
+lbt_timeout_ms  = 2000
+tx_queue_depth  = 8
+
+[[trx.decode]]
+label     = "meshcore"
+sync_word = 0x12

@@ -44,6 +44,7 @@
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/Tensor.hpp>
+#include <gnuradio-4.0/testing/NullSources.hpp>
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
 #include <gnuradio-4.0/lora/algorithm/tx_chain.hpp>
@@ -62,6 +63,7 @@
 
 using namespace lora_config;
 using namespace lora_graph;
+using namespace std::string_literals;
 
 namespace {
 
@@ -88,20 +90,23 @@ std::vector<cf32> generate_iq(
 
 // Persistent TX graph: stays alive for the process lifetime.
 //
-// Architecture (MIMO / 2-ch RX mode):
-//   TxQueueSource(port0=IQ, port1=zeros) -> SoapySink<cf32,2>
+// Architecture (dual-channel device, e.g. B210 via UHD SoapySDR module):
+//   TxQueueSource(out0=IQ, out1=zeros) -> SoapyDualSink<cf32>(in#0, in#1)
 //
-// Architecture (single-ch RX mode):
-//   TxQueueSource(port0=IQ, port1=zeros) -> SoapySink<cf32,2>
+// Architecture (single-channel device, e.g. SoapyPlutoPAPR "tezuka"):
+//   TxQueueSource(out0=IQ)    -> SoapySimpleSink<cf32>(in)
+//   TxQueueSource(out1=zeros) -> NullSink<cf32>(in)
 //
-// The same SoapySink<cf32,2> is used in both modes.  In single-ch mode
-// the second TX channel (ch1) is driven with zeros; in MIMO mode ch0 or ch1
-// is selected based on cfg.tx_channel and the other receives zeros.
-// The key property: the scheduler and device handle are created ONCE at
-// startup (before RX starts) so reinitDevice() never races the RX stream.
+// build_tx_graph probes the SoapySDR device's TX channel count at startup and
+// picks the matching SoapySink template instantiation.  TxQueueSource always
+// emits IQ on out0 and zeros on out1 in lockstep; in the single-channel case
+// out1 is drained into a NullSink so the scheduler has a valid consumer for
+// every port.
 //
-// TX requests push IQ into TxQueueSource::push() and call notifyProgress()
-// to wake the singleThreadedBlocking scheduler.
+// The scheduler and device handle are created once at startup (before RX
+// starts) so reinitDevice() never races the RX stream.  TX requests push IQ
+// into TxQueueSource::push() and call notifyProgress() to wake the
+// singleThreadedBlocking scheduler.
 struct TxGraph {
     gr::lora::TxQueueSource*                         source{nullptr};
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>* sched{nullptr};
@@ -112,58 +117,131 @@ std::unique_ptr<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThre
 build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
     const auto& tx_map = kChannelMap[cfg.tx_channel];
 
-    // Both TX SoapySDR channels open (balanced UHD 2RX+2TX mode).
-    // ch0 = TRX_A, ch1 = TRX_B.  IQ goes to cfg.tx_channel's soapy_channel;
-    // the other channel carries zeros from TxQueueSource::out1.
-    // TxQueueSource always puts IQ on out0.  If cfg.tx_channel maps to soapy
-    // ch1, we swap port connections: sink.in#0 <- zeros (out1), sink.in#1 <- IQ (out0).
-    const bool tx_on_ch1 = (tx_map.soapy_channel == 1);
-
-    gr::Graph graph;
-
-    graph.emplaceBlock<gr::lora::TxQueueSource>();
-
-    auto& sink = graph.emplaceBlock<gr::blocks::sdr::SoapySink<cf32, 2UZ>>({
-        {"device",              cfg.device},
-        {"device_parameter",    cfg.device_param},
-        {"sample_rate",         cfg.rate},
-        {"frequency",           std::vector<double>{cfg.freq, cfg.freq}},
-        {"tx_gains",            std::vector<double>{cfg.gain_tx, 0.0}},
-        {"num_channels",        gr::Size_t{2}},
-        {"tx_antennae",         std::vector<std::string>{tx_map.tx_antenna, "TX/RX"}},
-        {"clock_source",        cfg.clock},
-        {"master_clock_rate",   cfg.wideband ? cfg.wideband_master_clock : 0.0},
-        {"timed_tx",            true},
-        {"wait_burst_ack",      true},
-        {"max_underflow_count", gr::Size_t{0}},
-    });
-
-    // Wire IQ port to the active TX channel; zeros to the dummy channel.
-    // We look up the TxQueueSource via the graph's block list since emplaceBlock
-    // returns a reference that becomes dangling after exchange(std::move(graph)).
-    auto tx_block_list = graph.blocks();
-    gr::lora::TxQueueSource* src_ptr = nullptr;
-    for (auto& blk : tx_block_list) {
-        if (blk->typeName().find("TxQueueSource") != std::string_view::npos) {
-            src_ptr = static_cast<gr::lora::TxQueueSource*>(blk->raw());  // BlockWrapper holds block as member
-            break;
+    // Probe the SoapySDR device for its TX channel count before building the
+    // graph.  The probe Device is scoped so it is destroyed before the scheduler
+    // opens the real handles in reinitDevice(); the DeviceRegistry's weak_ptr
+    // expires and the kMaxUsersPerDevice=2 budget resets to 0.
+    //
+    // This handles the asymmetry between hardware that is 2R2T by design and
+    // drivers that only expose one channel.  SoapyPlutoPAPR's "tezuka" driver
+    // currently reports 1 TX on the FISH Ball even though the underlying AD9361
+    // is 2R2T capable; B210 via UHD Soapy reports 2 and takes the dual path.
+    std::size_t nTxChannels = 0;
+    {
+        auto kwargs = gr::blocks::sdr::soapy::Kwargs{{"driver", cfg.device}};
+        if (!cfg.device_param.empty()) {
+            kwargs.merge(gr::blocks::sdr::soapy::parseKwargsString(cfg.device_param));
         }
+        auto probeDev = gr::blocks::sdr::soapy::Device::make(kwargs);
+        if (!probeDev) {
+            gr::lora::log_ts("error", "lora_trx",
+                "TX probe: cannot open device '%s' (%s)",
+                cfg.device.c_str(), cfg.device_param.c_str());
+            return nullptr;
+        }
+        nTxChannels = probeDev->getNumChannels(SOAPY_SDR_TX);
     }
-    if (src_ptr == nullptr) {
+
+    if (nTxChannels == 0) {
         gr::lora::log_ts("error", "lora_trx",
-            "TxQueueSource not found in TX graph");
+            "TX probe: device '%s' reports 0 TX channels", cfg.device.c_str());
         return nullptr;
     }
-    auto& src = *src_ptr;
 
-    if (!tx_on_ch1) {
-        // IQ -> sink.in#0 (ch0=TRX_A), zeros -> sink.in#1 (ch1=TRX_B)
-        std::ignore = graph.connect(src, "out0"s, sink, "in#0"s);
-        std::ignore = graph.connect(src, "out1"s, sink, "in#1"s);
+    const bool dualChannel = (nTxChannels >= 2);
+    gr::lora::log_ts("info ", "lora_trx",
+        "TX probe: %s reports %zu TX channel(s), using %s-channel sink",
+        cfg.device.c_str(), nTxChannels, dualChannel ? "dual" : "single");
+
+    if (!dualChannel && tx_map.soapy_channel != 0) {
+        gr::lora::log_ts("error", "lora_trx",
+            "tx_channel %u maps to soapy ch %u but device has only 1 TX channel",
+            cfg.tx_channel, tx_map.soapy_channel);
+        return nullptr;
+    }
+
+    gr::Graph graph;
+    graph.emplaceBlock<gr::lora::TxQueueSource>();
+
+    // Helper: locate TxQueueSource via the graph's block list.  emplaceBlock
+    // returns a reference that becomes dangling after exchange(std::move(graph))
+    // so we cannot keep it directly.  The lookup runs once per branch after all
+    // emplaceBlock calls are done (graph.blocks() returns a span that would be
+    // invalidated by subsequent emplacement).
+    auto find_tx_queue_source = [&graph]() -> gr::lora::TxQueueSource* {
+        for (auto& blk : graph.blocks()) {
+            if (blk->typeName().find("TxQueueSource") != std::string_view::npos) {
+                return static_cast<gr::lora::TxQueueSource*>(blk->raw());
+            }
+        }
+        return nullptr;
+    };
+
+    gr::lora::TxQueueSource* src_ptr = nullptr;
+
+    if (dualChannel) {
+        // Dual-channel: open both TX channels.  IQ goes to cfg.tx_channel's
+        // soapy_channel; the other channel receives zeros from out1.  When
+        // tx_channel maps to soapy ch 1 we swap sink inputs so IQ lands on in#1.
+        auto& sink = graph.emplaceBlock<gr::blocks::sdr::SoapyDualSink<cf32>>({
+            {"device",              cfg.device},
+            {"device_parameter",    cfg.device_param},
+            {"sample_rate",         cfg.rate},
+            {"frequency",           std::vector<double>{cfg.freq, cfg.freq}},
+            {"tx_gains",            std::vector<double>{cfg.gain_tx, 0.0}},
+            {"num_channels",        gr::Size_t{2}},
+            {"tx_antennae",         std::vector<std::string>{tx_map.tx_antenna, "TX/RX"}},
+            {"clock_source",        cfg.clock},
+            {"master_clock_rate",   cfg.wideband ? cfg.wideband_master_clock : 0.0},
+            {"timed_tx",            true},
+            {"wait_burst_ack",      true},
+            {"max_underflow_count", gr::Size_t{0}},
+        });
+
+        src_ptr = find_tx_queue_source();
+        if (src_ptr == nullptr) {
+            gr::lora::log_ts("error", "lora_trx", "TxQueueSource not found in TX graph");
+            return nullptr;
+        }
+        auto& src = *src_ptr;
+
+        const bool tx_on_ch1 = (tx_map.soapy_channel == 1);
+        if (!tx_on_ch1) {
+            std::ignore = graph.connect(src, "out0"s, sink, "in#0"s);
+            std::ignore = graph.connect(src, "out1"s, sink, "in#1"s);
+        } else {
+            std::ignore = graph.connect(src, "out1"s, sink, "in#0"s);
+            std::ignore = graph.connect(src, "out0"s, sink, "in#1"s);
+        }
     } else {
-        // zeros -> sink.in#0 (ch0=TRX_A), IQ -> sink.in#1 (ch1=TRX_B)
-        std::ignore = graph.connect(src, "out1"s, sink, "in#0"s);
-        std::ignore = graph.connect(src, "out0"s, sink, "in#1"s);
+        // Single-channel: one TX port.  Drain TxQueueSource::out1 into a
+        // NullSink so the scheduler has a valid consumer for every port.
+        auto& sink = graph.emplaceBlock<gr::blocks::sdr::SoapySimpleSink<cf32>>({
+            {"device",              cfg.device},
+            {"device_parameter",    cfg.device_param},
+            {"sample_rate",         cfg.rate},
+            {"frequency",           std::vector<double>{cfg.freq}},
+            {"tx_gains",            std::vector<double>{cfg.gain_tx}},
+            {"num_channels",        gr::Size_t{1}},
+            {"tx_antennae",         std::vector<std::string>{tx_map.tx_antenna}},
+            {"clock_source",        cfg.clock},
+            {"master_clock_rate",   cfg.wideband ? cfg.wideband_master_clock : 0.0},
+            {"timed_tx",            true},
+            {"wait_burst_ack",      true},
+            {"max_underflow_count", gr::Size_t{0}},
+        });
+
+        auto& nullSink = graph.emplaceBlock<gr::testing::NullSink<cf32>>();
+
+        src_ptr = find_tx_queue_source();
+        if (src_ptr == nullptr) {
+            gr::lora::log_ts("error", "lora_trx", "TxQueueSource not found in TX graph");
+            return nullptr;
+        }
+        auto& src = *src_ptr;
+
+        std::ignore = graph.connect(src, "out0"s, sink, "in"s);
+        std::ignore = graph.connect(src, "out1"s, nullSink, "in"s);
     }
 
     auto sched = std::make_unique<
@@ -190,8 +268,8 @@ build_tx_graph(gr::lora::TxQueueSource*& source_out, const TrxConfig& cfg) {
     source_out = src_ptr;
 
     gr::lora::log_ts("info ", "lora_trx",
-        "TX graph started: config ch %u -> soapy ch %u / %s",
-        cfg.tx_channel, tx_map.soapy_channel, tx_map.label);
+        "TX graph started: config ch %u -> soapy ch %u / %s (%zu-ch sink)",
+        cfg.tx_channel, tx_map.soapy_channel, tx_map.label, nTxChannels);
     return sched;
 }
 
