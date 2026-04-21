@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: ISC
+name: ARMv7 Cross CI
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+# Not triggered on push:main to avoid polluting main-branch status until the
+# job has been observed green a few times. Enable main later once stable.
+
+# Cancel any in-progress run of THIS workflow on the SAME ref when a new run
+# starts. Small project: only the most recent commit matters. ARM64 CI runs
+# in a separate group so both workflows can run concurrently on the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: "armv7-eabihf | gcc-15 | Release | cross"
+    uses: ./.github/workflows/_cross-build.yml
+    with:
+      arch_slug: armv7-eabihf
+      # Bleeding-edge 2025.08-1 ships gcc 15.1.0 + glibc 2.41 + binutils 2.44.
+      # gnuradio4 requires gcc 15+ for C++23 <print> and other libstdc++14+ features;
+      # the older stable-2024.05-1 (gcc 13.3, libstdc++ 13) lacks <print>.
+      toolchain_url: "https://toolchains.bootlin.com/downloads/releases/toolchains/armv7-eabihf/tarballs/armv7-eabihf--glibc--bleeding-edge-2025.08-1.tar.xz"
+      toolchain_sha256: "eed0e672d305ac08d444685b48eafb291c63387ef7916c1615354ebfb3d1ebdc"
+      toolchain_name: "armv7-eabihf--glibc--bleeding-edge-2025.08-1"
+      toolchain_subdir: "armv7-bootlin"
+      target_triple: "arm-buildroot-linux-gnueabihf"
+      cmake_toolchain_file: "cmake/toolchain-armv7-bootlin.cmake"
+      target_desc: "arm-buildroot-linux-gnueabihf (Cortex-A9 NEON hard-float)"
+      config_toml: "apps/config-pluto.toml"
+      artifact_name: gr4-lora-armv7-eabihf-${{ github.sha }}
+      retention_days: 14

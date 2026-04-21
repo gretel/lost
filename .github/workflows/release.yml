@@ -1,0 +1,173 @@
+# SPDX-License-Identifier: ISC
+name: Release
+
+on:
+  push:
+    tags:
+      # only prerelease semver tags (vMAJOR.MINOR.PATCH-suffix). stable tags
+      # (no '-' suffix) are matched by a separate workflow / manual cut.
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to dry-run (e.g. v0.1.0-rc.1) — creates DRAFT release, not published'
+        required: true
+
+# Never cancel an in-progress release build — we want to finish what we started.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Default: read-only. The release job opts in to contents:write below.
+permissions:
+  contents: read
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Matrix cross-build — one call into the reusable workflow per target arch.
+  # Each row uploads a staged artifact named `release-<arch_slug>` containing
+  # bin/ lib/ etc/ BUILD_INFO.txt. The `release` job below packages those.
+  # ---------------------------------------------------------------------------
+  build:
+    name: "Build ${{ matrix.arch_slug }} | gcc-15 | cross"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_slug: armv7-eabihf
+            toolchain_url: "https://toolchains.bootlin.com/downloads/releases/toolchains/armv7-eabihf/tarballs/armv7-eabihf--glibc--bleeding-edge-2025.08-1.tar.xz"
+            toolchain_sha256: "eed0e672d305ac08d444685b48eafb291c63387ef7916c1615354ebfb3d1ebdc"
+            toolchain_name: "armv7-eabihf--glibc--bleeding-edge-2025.08-1"
+            toolchain_subdir: "armv7-bootlin"
+            target_triple: "arm-buildroot-linux-gnueabihf"
+            cmake_toolchain_file: "cmake/toolchain-armv7-bootlin.cmake"
+            target_desc: "arm-buildroot-linux-gnueabihf (Cortex-A9 NEON hard-float)"
+            config_toml: "apps/config-pluto.toml"
+          - arch_slug: aarch64
+            toolchain_url: "https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/aarch64--glibc--bleeding-edge-2025.08-1.tar.xz"
+            toolchain_sha256: "54875d12829a792b8d4d1c9fb1f736afc60f514b0d260616f188eafafaac7cb5"
+            toolchain_name: "aarch64--glibc--bleeding-edge-2025.08-1"
+            toolchain_subdir: "aarch64-bootlin"
+            target_triple: "aarch64-buildroot-linux-gnu"
+            cmake_toolchain_file: "cmake/toolchain-aarch64-bootlin.cmake"
+            target_desc: "aarch64-buildroot-linux-gnu (generic ARMv8-A: Pi 4 Cortex-A72, Pi 5 Cortex-A76)"
+            config_toml: "apps/config.toml"
+    uses: ./.github/workflows/_cross-build.yml
+    with:
+      arch_slug: ${{ matrix.arch_slug }}
+      toolchain_url: ${{ matrix.toolchain_url }}
+      toolchain_sha256: ${{ matrix.toolchain_sha256 }}
+      toolchain_name: ${{ matrix.toolchain_name }}
+      toolchain_subdir: ${{ matrix.toolchain_subdir }}
+      target_triple: ${{ matrix.target_triple }}
+      cmake_toolchain_file: ${{ matrix.cmake_toolchain_file }}
+      target_desc: ${{ matrix.target_desc }}
+      config_toml: ${{ matrix.config_toml }}
+      artifact_name: release-${{ matrix.arch_slug }}
+      retention_days: 7
+      build_info_tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+  # ---------------------------------------------------------------------------
+  # Create the prerelease on GitHub — notes from git-cliff, tarballs packaged
+  # from the matrix build artifacts and attached.
+  # ---------------------------------------------------------------------------
+  release:
+    name: "Draft prerelease"
+    runs-on: ubuntu-24.04
+    needs: [build]
+    permissions:
+      contents: write    # gh release create / upload
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0     # git-cliff walks full history
+
+      - name: Resolve tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG"
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@5939f3337e40968c39aa70f5ecb1417a92fb25a0 # v2.75.15
+        with:
+          tool: git-cliff
+
+      - name: Generate release notes
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git cliff --tag "$TAG" --unreleased --strip header > NOTES.md
+          echo "=== NOTES.md ==="
+          cat NOTES.md
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: artifacts/
+
+      - name: Package per-arch tarballs
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p tarballs
+          shopt -s nullglob
+          for d in artifacts/release-*/; do
+            arch="${d#artifacts/release-}"
+            arch="${arch%/}"
+            pkg="gr4-lora-${arch}-${TAG}"
+            mv "$d" "$pkg"
+            tar -czf "tarballs/${pkg}.tar.gz" "$pkg"
+            echo "Packaged ${pkg}.tar.gz:"
+            ls -lh "tarballs/${pkg}.tar.gz"
+          done
+          echo "=== all tarballs ==="
+          ls -lh tarballs/
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # Mode selection:
+          #   workflow_dispatch     -> --draft (validation only, never published)
+          #   push tag with '-NNN'  -> --prerelease (e.g. v0.1.0-rc.1)
+          #   push tag without '-'  -> stable (no flag; trigger filter excludes
+          #                                    these today, but keep defensive)
+          flags=()
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            flags+=("--draft")
+          elif [[ "$TAG" == *-* ]]; then
+            flags+=("--prerelease")
+          fi
+          # Create the release if it doesn't exist; if it does, overwrite notes
+          # and re-upload artifacts (so re-runs / force-push updates are
+          # idempotent).
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists — updating notes and assets"
+            gh release edit "$TAG" "${flags[@]}" --notes-file NOTES.md
+            gh release upload "$TAG" tarballs/*.tar.gz --clobber
+          else
+            echo "Creating release $TAG (flags: ${flags[*]:-none})"
+            gh release create "$TAG" \
+              "${flags[@]}" \
+              --title "$TAG" \
+              --notes-file NOTES.md \
+              tarballs/*.tar.gz
+          fi

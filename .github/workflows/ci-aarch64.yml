@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: ISC
+name: aarch64 Cross CI
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+# Not triggered on push:main to avoid polluting main-branch status until the
+# job has been observed green a few times. Enable main later once stable.
+
+# Cancel any in-progress run of THIS workflow on the SAME ref when a new run
+# starts. Small project: only the most recent commit matters. Other CI
+# workflows run in separate groups so all can run concurrently on the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: "aarch64 | gcc-15 | Release | cross"
+    uses: ./.github/workflows/_cross-build.yml
+    with:
+      arch_slug: aarch64
+      # Bleeding-edge 2025.08-1 ships gcc 15.1.0 + glibc 2.41 + binutils 2.44.
+      # Matches the armv7-eabihf toolchain series (same release) so every
+      # artifact across arches ships with identical libstdc++ 15.1 ABI.
+      # Target OS: Debian Trixie (glibc 2.41) — Raspberry Pi OS Trixie, or
+      # any Trixie-derived aarch64 distro.
+      toolchain_url: "https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/aarch64--glibc--bleeding-edge-2025.08-1.tar.xz"
+      toolchain_sha256: "54875d12829a792b8d4d1c9fb1f736afc60f514b0d260616f188eafafaac7cb5"
+      toolchain_name: "aarch64--glibc--bleeding-edge-2025.08-1"
+      toolchain_subdir: "aarch64-bootlin"
+      target_triple: "aarch64-buildroot-linux-gnu"
+      cmake_toolchain_file: "cmake/toolchain-aarch64-bootlin.cmake"
+      target_desc: "aarch64-buildroot-linux-gnu (generic ARMv8-A: Pi 4 Cortex-A72, Pi 5 Cortex-A76)"
+      config_toml: "apps/config.toml"
+      artifact_name: gr4-lora-aarch64-${{ github.sha }}
+      retention_days: 14

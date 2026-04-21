@@ -1,0 +1,21 @@
+[project]
+name = "gr4-lora"
+version = "0.1.0"
+description = "LoRa PHY for GNU Radio 4"
+requires-python = ">=3.14"
+dependencies = [
+    "bottle",
+    "cbor2>=6.0.0rc1",
+    "duckdb",
+    "meshcore>=2.3",
+    "pynacl",
+    "pycryptodome",
+    "segno",
+    "paho-mqtt",
+    "sounddevice",
+    "numpy>=2.4.2",
+    "pyserial>=3.5",
+]
+
+[tool.uv]
+prerelease = "if-necessary-or-explicit"

@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: ISC
+#
+# git-cliff config for conventional-commits → categorized changelog.
+# Used by .github/workflows/release.yml on semver tag push.
+#
+# Local preview:
+#   git cliff --tag vX.Y.Z --unreleased
+#   git cliff --tag vX.Y.Z --unreleased --strip header
+
+[changelog]
+# Emitted verbatim before the generated body (none here — release.yml adds
+# its own header if needed).
+header = ""
+
+# Body template. One section per commit group, one line per commit, with
+# short SHA and author name. Contributor roll-up at the end.
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | trim }} ({{ commit.id | truncate(length=7, end="") }}) — {{ commit.author.name }}
+{%- endfor %}
+{% endfor %}
+{% set contributors = commits | map(attribute="author.name") | unique | sort %}
+{% if contributors | length > 0 %}
+**Contributors:** {{ contributors | join(sep=", ") }}
+{% endif %}
+"""
+
+footer = ""
+trim = true
+
+[git]
+# Parse conventional commits (type(scope): subject) when they exist,
+# but keep non-conventional commits too — gr4-lora has both styles.
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+
+# Map commit subject prefixes → display groups. First match wins.
+commit_parsers = [
+  { message = "^feat",             group = "Features" },
+  { message = "^fix",              group = "Bug Fixes" },
+  { message = "^perf",             group = "Performance" },
+  { message = "^refactor",         group = "Refactoring" },
+  { message = "^docs?",            group = "Documentation" },
+  { message = "^test",             group = "Tests" },
+  { message = "^build|^ci",        group = "Build / CI" },
+  { message = "^chore",            group = "Maintenance" },
+  { message = "^remove|^delete",   group = "Removals" },
+  { message = "^update",           group = "Updates" },
+  { message = "^submodule",        group = "Submodule Updates" },
+  { message = ".*",                group = "Other" },
+]
+
+# Drop commits that match these patterns entirely.
+commit_preprocessors = []
+
+# Tag filter — strict SemVer 2.0:  vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]
+# Anchored end-of-string to reject suffixes like "v1.2.3banana".
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+
+# Sort newest first within each group.
+sort_commits = "newest"
+
+# Skip tags matching this (none).
+skip_tags = ""
+ignore_tags = ""

@@ -1,0 +1,324 @@
+# SPDX-License-Identifier: ISC
+#
+# Reusable cross-build workflow for gr4-lora.
+#
+# One canonical Bootlin-toolchain + SoapySDR + ccache + CMake + RPATH-normalize
+# pipeline, parameterized by target arch. Invoked by release.yml (matrix) and
+# ci-armv7.yml / ci-aarch64.yml (single call). Do not run directly.
+#
+# Output: a staged directory (bin/, lib/, etc/, BUILD_INFO.txt) uploaded as
+# an artifact under `artifact_name`. Callers decide packaging (tarball, raw).
+
+name: _cross-build (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      arch_slug:
+        description: 'Short arch id used in logs / file names (armv7-eabihf | aarch64)'
+        required: true
+        type: string
+      toolchain_url:
+        description: 'Bootlin toolchain tarball URL (.tar.xz)'
+        required: true
+        type: string
+      toolchain_sha256:
+        description: 'sha256 of toolchain tarball'
+        required: true
+        type: string
+      toolchain_name:
+        description: 'Top-level dir inside tarball, e.g. aarch64--glibc--bleeding-edge-2025.08-1'
+        required: true
+        type: string
+      toolchain_subdir:
+        description: 'Parent dir under toolchains/, e.g. aarch64-bootlin'
+        required: true
+        type: string
+      target_triple:
+        description: 'Buildroot target triple, e.g. aarch64-buildroot-linux-gnu'
+        required: true
+        type: string
+      cmake_toolchain_file:
+        description: 'Repo-relative CMake toolchain file, e.g. cmake/toolchain-aarch64-bootlin.cmake'
+        required: true
+        type: string
+      target_desc:
+        description: 'Human-readable target description for BUILD_INFO.txt'
+        required: true
+        type: string
+      config_toml:
+        description: 'Repo-relative config file to bundle under etc/ (e.g. apps/config.toml)'
+        required: false
+        type: string
+        default: 'apps/config.toml'
+      soapy_sdr_version:
+        description: 'SoapySDR release tag'
+        required: false
+        type: string
+        default: '0.8.1'
+      artifact_name:
+        description: 'Name for the uploaded artifact (must be unique per caller run)'
+        required: true
+        type: string
+      retention_days:
+        description: 'Artifact retention in days'
+        required: false
+        type: number
+        default: 7
+      build_info_tag:
+        description: 'Optional tag string to record in BUILD_INFO.txt (release path). Empty for CI.'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  # The GHA UI renders this as "<caller-job-name> / build". Callers set their
+  # own job-level `name:` — that's the prominent label in the matrix list.
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      TOOLCHAIN_URL: ${{ inputs.toolchain_url }}
+      TOOLCHAIN_SHA256: ${{ inputs.toolchain_sha256 }}
+      TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/${{ inputs.toolchain_subdir }}/${{ inputs.toolchain_name }}
+      TOOLCHAIN_PARENT: ${{ github.workspace }}/toolchains/${{ inputs.toolchain_subdir }}
+      # The repo's cmake/toolchain-<arch>-bootlin.cmake files each read a
+      # dedicated env var (AARCH64_TOOLCHAIN_ROOT / ARMV7_TOOLCHAIN_ROOT). We
+      # set both to the same TOOLCHAIN_ROOT: only the matching cmake picks its
+      # own, the other is ignored. Cheaper than plumbing another input.
+      AARCH64_TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/${{ inputs.toolchain_subdir }}/${{ inputs.toolchain_name }}
+      ARMV7_TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchains/${{ inputs.toolchain_subdir }}/${{ inputs.toolchain_name }}
+      TARGET_TRIPLE: ${{ inputs.target_triple }}
+      CMAKE_TOOLCHAIN_FILE_REL: ${{ inputs.cmake_toolchain_file }}
+      SOAPY_SDR_VERSION: ${{ inputs.soapy_sdr_version }}
+      ARCH_SLUG: ${{ inputs.arch_slug }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Fetch submodules
+        run: git submodule update --init --recursive
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build ccache patchelf file \
+            ca-certificates curl xz-utils
+
+      - name: Cache Bootlin toolchain (with SoapySDR installed into sysroot)
+        id: cache-toolchain
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.TOOLCHAIN_PARENT }}
+          key: bootlin-${{ inputs.arch_slug }}-${{ inputs.toolchain_name }}-soapy${{ inputs.soapy_sdr_version }}-xz
+
+      - name: Download Bootlin toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$TOOLCHAIN_PARENT"
+          cd "$TOOLCHAIN_PARENT"
+          curl -fsSL -o toolchain.tar.xz "$TOOLCHAIN_URL"
+          ls -lh toolchain.tar.xz
+          sha256sum toolchain.tar.xz
+          echo "$TOOLCHAIN_SHA256  toolchain.tar.xz" | sha256sum -c -
+          tar xf toolchain.tar.xz
+          rm toolchain.tar.xz
+
+      - name: Verify toolchain is executable
+        run: |
+          set -euo pipefail
+          "$TOOLCHAIN_ROOT/bin/${TARGET_TRIPLE}-gcc" --version
+          "$TOOLCHAIN_ROOT/bin/${TARGET_TRIPLE}-g++" --version
+
+      - name: Cross-build SoapySDR into toolchain sysroot
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          SYSROOT="$TOOLCHAIN_ROOT/${TARGET_TRIPLE}/sysroot"
+          mkdir -p soapy-src
+          curl -fsSL -o soapy.tar.gz \
+            "https://github.com/pothosware/SoapySDR/archive/refs/tags/soapy-sdr-${SOAPY_SDR_VERSION}.tar.gz"
+          tar -xf soapy.tar.gz -C soapy-src --strip-components=1
+          rm soapy.tar.gz
+          cmake -S soapy-src -B soapy-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${GITHUB_WORKSPACE}/${CMAKE_TOOLCHAIN_FILE_REL}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${SYSROOT}/usr" \
+            -DENABLE_PYTHON=OFF -DENABLE_PYTHON3=OFF \
+            -DENABLE_TESTS=OFF -DENABLE_DOCS=OFF -DENABLE_APPS=OFF \
+            -DENABLE_LIBRARY=ON
+          cmake --build soapy-build -j2
+          cmake --install soapy-build
+          echo "--- SoapySDR install verification ---"
+          ls -la "${SYSROOT}/usr/lib/libSoapySDR."*
+          ls -la "${SYSROOT}/usr/share/cmake/SoapySDR/"
+          "$TOOLCHAIN_ROOT/bin/${TARGET_TRIPLE}-readelf" -h \
+            "${SYSROOT}/usr/lib/libSoapySDR.so" | head -20
+          rm -rf soapy-src soapy-build
+
+      - name: Verify SoapySDR in sysroot
+        run: |
+          set -euo pipefail
+          SYSROOT="$TOOLCHAIN_ROOT/${TARGET_TRIPLE}/sysroot"
+          test -f "${SYSROOT}/usr/lib/libSoapySDR.so" \
+            || { echo "ERROR: libSoapySDR.so missing from sysroot"; exit 1; }
+          # SoapySDR installs CMake config to share/cmake/SoapySDR/ (not lib/cmake/)
+          # because cross-builds can't reliably autodetect CMAKE_INSTALL_LIBDIR.
+          test -f "${SYSROOT}/usr/share/cmake/SoapySDR/SoapySDRConfig.cmake" \
+            || { echo "ERROR: SoapySDR CMake config missing"; exit 1; }
+          echo "SoapySDR ${SOAPY_SDR_VERSION} present in sysroot"
+
+      - name: Restore ccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ inputs.arch_slug }}-gcc15-soapy${{ inputs.soapy_sdr_version }}-Release-${{ github.run_id }}
+          restore-keys: ccache-${{ inputs.arch_slug }}-gcc15-soapy${{ inputs.soapy_sdr_version }}-Release
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=3G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=6
+          ccache --set-config=depend_mode=true
+          ccache --set-config=hash_dir=false
+          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
+          ccache -z
+
+      - name: Configure CMake (cross)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${CMAKE_TOOLCHAIN_FILE_REL}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_LORA_APPS=ON \
+            -DENABLE_LORA_BENCHMARKS=OFF \
+            -DWARNINGS_AS_ERRORS=OFF \
+            -DUSE_CCACHE=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DGR_ENABLE_BLOCK_REGISTRY=OFF \
+            -DINTERNAL_ENABLE_BLOCK_PLUGINS=OFF \
+            -DGR_ENABLE_HTTP=OFF \
+            '-DCMAKE_CXX_FLAGS=-DGR_CACHE_LINE_SIZE=64'
+
+      - name: Build gr-lora shared block library
+        run: |
+          # If GrLoraBlocksShared fails we still want downstream test targets to be
+          # attempted individually so the failure log enumerates every portability
+          # issue at once. Note: gr_add_block_library(GrLoraBlocks ...) generates
+          # GrLoraBlocksObject + GrLoraBlocksShared targets — there is no plain
+          # 'GrLoraBlocks' target.
+          cmake --build build -j2 --target GrLoraBlocksShared || true
+
+      - name: Build test binaries (portability validation)
+        run: |
+          cmake --build build -j2 --target \
+            qa_lora_tx qa_lora_rx qa_lora_splitter qa_lora_udp qa_lora_config \
+            qa_lora_framesink qa_lora_scan qa_lora_cbor qa_lora_tx_queue \
+            qa_lora_l1_detector qa_lora_primitives qa_lora_vangelista \
+            qa_lora_decode_chain qa_lora_css_demod qa_lora_preamble_sync \
+            qa_lora_preamble_id qa_lora_half_band_decimator qa_lora_cad \
+            qa_lora_sinks qa_lora_antenna_combiner qa_lora_multisf \
+            qa_lora_lib_pipeline
+
+      - name: Build hardware applications (lora_trx, lora_scan)
+        run: |
+          set -euo pipefail
+          cmake --build build -j2 --target lora_trx lora_scan
+          ls -la build/apps/lora_trx build/apps/lora_scan
+          file build/apps/lora_trx build/apps/lora_scan
+
+      - name: Normalize RPATH on staged binaries
+        run: |
+          set -euo pipefail
+          binaries=$(find build -type f \
+            \( -name 'qa_lora_*' -o -name 'lora_trx' -o -name 'lora_scan' \) \
+            -executable 2>/dev/null | sort -u || true)
+          for f in $binaries; do
+            [ -f "$f" ] || continue
+            old=$(patchelf --print-rpath "$f" 2>/dev/null || echo '<none>')
+            patchelf --remove-rpath "$f" || true
+            # $ORIGIN is an ELF rpath token resolved by the dynamic linker at
+            # load time — it must reach patchelf literally, not be expanded by
+            # the shell. Single quotes are intentional.
+            # shellcheck disable=SC2016
+            patchelf --set-rpath '$ORIGIN/../lib' "$f"
+            new=$(patchelf --print-rpath "$f")
+            printf 'rpath: %-30s %s -> %s\n' "$(basename "$f")" "$old" "$new"
+          done
+
+      - name: Stage artifact
+        if: always()
+        env:
+          INPUT_CONFIG_TOML: ${{ inputs.config_toml }}
+          INPUT_TARGET_DESC: ${{ inputs.target_desc }}
+          INPUT_TOOLCHAIN_NAME: ${{ inputs.toolchain_name }}
+          INPUT_BUILD_INFO_TAG: ${{ inputs.build_info_tag }}
+        run: |
+          set -euo pipefail
+          STAGE="${{ github.workspace }}/artifact-stage"
+          mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/etc"
+          # Every qa_lora_* test binary that successfully built.
+          find build -type f -name 'qa_lora_*' -not -name '*.o' -not -name '*.cmake' \
+            -executable -print0 2>/dev/null | xargs -0 -I{} cp -v {} "$STAGE/bin/" || true
+          # Hardware apps.
+          for app in lora_trx lora_scan; do
+            if [ -x "build/apps/$app" ]; then
+              cp -v "build/apps/$app" "$STAGE/bin/"
+            fi
+          done
+          # gr-lora shared block library + any gnuradio-*.so alongside.
+          find build -type f \( -name 'libGrLoraBlocksShared.so*' -o -name 'libgnuradio-*.so*' \) \
+            -print0 2>/dev/null | xargs -0 -I{} cp -v {} "$STAGE/lib/" || true
+          # Config template for target.
+          if [ -n "${INPUT_CONFIG_TOML}" ] && [ -f "${INPUT_CONFIG_TOML}" ]; then
+            cp -v "${INPUT_CONFIG_TOML}" "$STAGE/etc/"
+          fi
+          # Toolchain identification + git provenance.
+          {
+            echo "git_sha=$(git rev-parse HEAD)"
+            echo "git_ref=${GITHUB_REF:-unknown}"
+            echo "run_id=${GITHUB_RUN_ID:-unknown}"
+            [ -n "${INPUT_BUILD_INFO_TAG}" ] && echo "git_tag=${INPUT_BUILD_INFO_TAG}"
+            echo "toolchain=${INPUT_TOOLCHAIN_NAME}"
+            echo "target=${INPUT_TARGET_DESC}"
+            echo "soapy_sdr_version=${SOAPY_SDR_VERSION}"
+            "$TOOLCHAIN_ROOT/bin/${TARGET_TRIPLE}-gcc" --version | head -1
+          } > "$STAGE/BUILD_INFO.txt"
+          echo "=== artifact contents ==="
+          ls -la "$STAGE/bin" "$STAGE/lib" "$STAGE/etc" 2>/dev/null || true
+          cat "$STAGE/BUILD_INFO.txt"
+          echo "=== file types (verify ${ARCH_SLUG}) ==="
+          for f in "$STAGE/bin"/* "$STAGE/lib"/*; do
+            [ -f "$f" ] && file "$f" | head -1
+          done
+          echo "=== RPATH verification ==="
+          for f in "$STAGE/bin"/*; do
+            [ -f "$f" ] && printf '%-30s %s\n' "$(basename "$f")" \
+              "$(patchelf --print-rpath "$f" 2>/dev/null || echo '<none>')"
+          done
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: artifact-stage/
+          if-no-files-found: warn
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ inputs.arch_slug }}-gcc15-soapy${{ inputs.soapy_sdr_version }}-Release-${{ github.run_id }}
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache --show-stats

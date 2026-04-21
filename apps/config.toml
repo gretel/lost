@@ -1,0 +1,115 @@
+# ── Hardware ─────────────────────────────────────────────────────────────────
+
+[device]
+# driver = "uhd"
+driver = "uhd"                # SoapySDR driver name (required)
+# param  = ""
+param  = "type=b200,num_recv_frames=512,recv_frame_size=16360"
+# clock  = "internal"         # options: internal | external | gpsdo
+clock  = "external"
+
+[logging]
+# level = "INFO"              # options: DEBUG | INFO | WARN | ERROR
+level = "INFO"
+# color = true
+
+# ── Radio frontends ──────────────────────────────────────────────────────────
+
+[radio_868]
+freq       = 869618000        # center frequency (Hz)
+rx_channel = [0, 1]           # SoapySDR channel indices (B210: 2 independent RX)
+rx_antenna = ["RX2", "RX2"]   # stock B210 FPGA labels (B220 Mini bitstream uses "RXA"/"RXB")
+tx_channel = 0                # SoapySDR TX channel index
+tx_antenna = "TX/RX"          # stock B210 FPGA label (B220 Mini bitstream uses "TRXA")
+rx_gain    = 40
+tx_gain    = 73.5             # 97 mW
+# lo_offset      = 0          # Hz, 0 = disabled
+lo_offset        = 62500      # shift DC spur out of passband
+# dc_offset_auto = true       # hardware DC offset correction
+
+# ── Transceiver mode (lora_trx) ──────────────────────────────────────────────
+
+[trx]
+name  = "MeshCore 868 MHz"
+radio = "radio_868"
+# rate       = 250000         # S/s (baseband sample rate)
+# enable_tx  = true           # false = RX-only mode
+
+# TX modulation preset. Used only when transmitting.
+[trx.transmit]
+sf           = 8
+bw           = 62500
+cr           = 8              # CR 4/8 (denominator; valid 5..8)
+sync_word    = 0x12
+# preamble_len = 16           # MeshCore RadioLib SX1262::begin() default; also RX detection threshold
+preamble_len   = 16
+
+# RX pipeline. One MultiSfDecoder per bandwidth per radio channel.
+[trx.receive]
+bandwidths = [62500]   # single BW matching MeshCore EU; multi-BW [62500,125000,250000] causes cross-BW false locks
+
+# Promiscuous chain: decode any LoRa frame regardless of sync word and
+# tag each frame with the observed value.  Agnostic default — captures
+# MeshCore, LoRaWAN, and private-net traffic out of the box.  Add a
+# `sync_word = 0xXX` line to turn this into a strict filter, or add
+# additional [[trx.receive.chain]] entries (e.g. one strict + one
+# promiscuous) to run several decoders concurrently.
+#
+# `label` names the chain for downstream consumers (shown as "chain=…"
+# in logs / CBOR `decode_label` field).  Convention: use protocol names
+# ("meshcore", "lorawan") for strict-filter chains and a mode name
+# ("promisc", "all") for promiscuous chains.
+[[trx.receive.chain]]
+label = "promisc"
+# sync_word = 0x12            # uncomment for strict MeshCore-only filter
+# sf        = []              # empty / unset = sweep SF7-12
+# sf        = [8]             # pin single SF (lower CPU / latency)
+# sf        = [8, 11]         # explicit non-contiguous subset
+
+[trx.network]
+# udp_listen      = "127.0.0.1"
+# udp_port        = 5556
+# status_interval = 10        # seconds between heartbeats (0 = off)
+# lbt             = true
+# lbt_timeout_ms  = 2000
+# tx_queue_depth  = 8
+
+# ── MeshCore node identity (meshcore_bridge.py) ─────────────────────────────
+
+[meshcore]
+name        = "DO2THX 📡"
+lat         = 53.54513
+lon         = 9.94896
+flood_scope = "de-hh"
+
+# ── Aggregator (lora_agg.py) ─────────────────────────────────────────────────
+# Section must contain at least one key for Python to treat the aggregator as
+# enabled (C++ falls back to the same defaults either way). Populating the
+# defaults explicitly resolves the empty-section ambiguity between the two
+# consumers.
+
+[aggregator]
+upstream  = "127.0.0.1:5556"
+listen    = "127.0.0.1:5555"
+window_ms = 200
+
+# ── Scanner mode (lora_scan) ─────────────────────────────────────────────────
+
+[scan]
+radio        = "radio_868"
+freq_start   = 867000000
+freq_stop    = 870000000
+bws          = [62500, 125000, 250000]   # multi-BW probe for SF classification via chirp-slope
+l1_rate      = 4000000           # 4 MS/s — parity with Pluto; fewer channels = faster sweep
+master_clock = 8000000           # 2x L1 rate
+# os_factor    = 4
+# min_ratio    = 5.0
+# settle_ms    = 5
+# sweeps       = 0            # 0 = infinite
+# buffer_ms    = 512.0
+# l1_fft_size  = 4096
+# channel_bw   = 62500
+
+[scan.network]
+# udp_listen = "127.0.0.1"
+# udp_port   = 5557
