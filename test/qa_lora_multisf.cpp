@@ -34,7 +34,7 @@ struct LoopbackResult {
     bool                 ok = false;
 };
 
-[[nodiscard]] LoopbackResult run_loopback(const std::vector<uint8_t>& payload, uint8_t test_sf, uint8_t test_cr, uint32_t test_bw, uint8_t test_os, uint16_t sync_word = 0x12, uint16_t preamble_len = 8, uint8_t sf_min = 7, uint8_t sf_max = 12, double freq_offset_hz = 0.0) {
+[[nodiscard]] LoopbackResult run_loopback(const std::vector<uint8_t>& payload, uint8_t test_sf, uint8_t test_cr, uint32_t test_bw, uint8_t test_os, uint16_t sync_word = 0x12, uint16_t preamble_len = 8, uint8_t sf_min = 7, uint8_t sf_max = 12, double freq_offset_hz = 0.0, bool debug = false) {
     using namespace gr;
     using namespace gr::lora;
 
@@ -71,6 +71,7 @@ struct LoopbackResult {
     decoder.sync_word    = sync_word;
     decoder.os_factor    = test_os;
     decoder.preamble_len = preamble_len;
+    decoder.debug        = debug;
     // Build sf_set from the legacy sf_min/sf_max range.
     decoder.sf_set.clear();
     for (uint8_t s = sf_min; s <= sf_max; ++s) {
@@ -266,6 +267,14 @@ suite<"MultiSfDecoder loopback"> _loopback = [] {
     "SF7 CR4 BW62.5k os64 (4 MS/s IIO)"_test = [] {
         const std::vector<uint8_t> payload{'H', 'E', 'L', 'L', 'O'};
         auto                       r = run_loopback(payload, 7, 4, 62500, 64, 0x12, 16, 7, 12);
+        expect(r.ok) << "decoder did not emit a frame";
+        expect(payload_matches(payload, r.decoded)) << "decoded payload mismatch";
+        expect(tag_crc_valid(r.tags)) << "CRC failed";
+    };
+
+    "SF9 CR3 multi-SF loopback (CR3 4/7)"_test = [] {
+        const std::vector<uint8_t> payload{'H', 'E', 'L', 'L', 'O'};
+        auto                       r = run_loopback(payload, 9, 3, 125000, 4, 0x12, 8, 7, 12);
         expect(r.ok) << "decoder did not emit a frame";
         expect(payload_matches(payload, r.decoded)) << "decoded payload mismatch";
         expect(tag_crc_valid(r.tags)) << "CRC failed";

@@ -425,14 +425,18 @@ private:
                     lane.resetLane();
                     return lane.sps;
                 }
-                // CFO correction: use zero for hardware (PlutoSDR calibration
-                // reduces actual CFO to near zero). When AA filter is active,
-                // add filter group-delay offset (6-stage cascade shifts
-                // dechirped peak by 12 bins — verified in Python simulation).
-                float       cfo_frac_corr = 0.f;
-                int32_t     cfo_int_corr  = 0;
+                // CFO correction: apply PreambleSync estimate (cfo_int, cfo_frac)
+                // to the downchirp reference so subsequent dechirp+FFT resolves
+                // bins at the correct position. Without this, any carrier
+                // frequency offset shifts the FFT argmax and corrupts both
+                // header and payload decode.
+                //
+                // When AA filter is active, add filter group-delay offset
+                // (6-stage cascade shifts dechirped peak by 12 bins — verified
+                // in Python simulation).
+                float       cfo_frac_corr = r.cfo_frac;
+                int32_t     cfo_int_corr  = r.cfo_int;
                 if (lane.aa_enabled) {
-                    // Filter delay in bins: 6 stages → 12 bins
                     const int32_t filter_delay_bins = 12;
                     cfo_int_corr += filter_delay_bins;
                 }

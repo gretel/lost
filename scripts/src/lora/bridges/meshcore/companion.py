@@ -828,7 +828,7 @@ def _handle_send_txt_msg(
 
     h = hash_payload(packet)
     state.recent_tx[h] = time.monotonic()
-    cbor_msg = make_cbor_tx_request(packet)
+    cbor_msg = make_cbor_tx_request(packet, cr=state.cr - 4)
     udp_sock.sendto(cbor_msg, udp_addr)
     state.pkt_sent += 1
     if use_flood:
@@ -871,11 +871,11 @@ def _handle_send_advert(
         )
     h = hash_payload(packet)
     state.recent_tx[h] = time.monotonic()
-    cbor_msg = make_cbor_tx_request(packet)
+    cbor_msg = make_cbor_tx_request(packet, cr=state.cr - 4)
     udp_sock.sendto(cbor_msg, udp_addr)
     state.pkt_sent += 1
     state.pkt_flood_tx += 1
-    log.info("TX: ADVERT '%s' %dB", state.name, len(packet))
+    log.info("TX: ADVERT '%s' %dB cr=%d", state.name, len(packet), state.cr)
     return [state.build_ok()]
 
 
@@ -919,11 +919,11 @@ def _handle_send_chan_txt_msg(
         packet = build_wire_packet(header, grp_payload)
     h = hash_payload(packet)
     state.recent_tx[h] = time.monotonic()
-    cbor_msg = make_cbor_tx_request(packet)
+    cbor_msg = make_cbor_tx_request(packet, cr=state.cr - 4)
     udp_sock.sendto(cbor_msg, udp_addr)
     state.pkt_sent += 1
     state.pkt_flood_tx += 1
-    log.info("TX: %dB GRP_TXT to #%s", len(packet), channel.name)
+    log.info("TX: %dB GRP_TXT to #%s cr=%d", len(packet), channel.name, state.cr)
     return [state.build_ok()]
 
 
@@ -947,11 +947,11 @@ def _handle_send_control_data(
         packet = build_wire_packet(header, data)
     h = hash_payload(packet)
     state.recent_tx[h] = time.monotonic()
-    cbor_msg = make_cbor_tx_request(packet)
+    cbor_msg = make_cbor_tx_request(packet, cr=state.cr - 4)
     udp_sock.sendto(cbor_msg, udp_addr)
     state.pkt_sent += 1
     state.pkt_flood_tx += 1
-    log.info("TX: %dB CTRL type=0x%02x", len(packet), data[0])
+    log.info("TX: %dB CTRL type=0x%02x cr=%d", len(packet), data[0], state.cr)
     return [state.build_ok()]
 
 
@@ -1141,7 +1141,7 @@ def handle_command(
             state.freq_mhz = freq_hz / 1_000_000.0
             state.bw_khz = bw_hz / 1_000.0
             state.sf = sf_new
-            state.cr = cr_new
+            state.cr = max(5, min(8, cr_new))  # clamp to valid companion CR range
             log.warning(
                 "SET_RADIO_PARAMS freq=%.3f MHz bw=%.1f kHz sf=%d cr=%d repeat=%d",
                 state.freq_mhz,
@@ -1378,9 +1378,9 @@ def handle_command(
         state.recent_tx[h] = time.monotonic()
         state.pkt_sent += 1
         state.pkt_direct_tx += 1
-        cbor_msg = make_cbor_tx_request(packet)
+        cbor_msg = make_cbor_tx_request(packet, cr=state.cr - 4)
         udp_sock.sendto(cbor_msg, udp_addr)
-        log.info("TRACE tag=%s flags=0x%02x", tag_bytes.hex(), data[8])
+        log.info("TRACE tag=%s flags=0x%02x cr=%d", tag_bytes.hex(), data[8], state.cr)
         return [state.build_msg_sent(flood=False, ack_hash=tag_bytes)]
 
     if cmd == CMD_PATH_DISCOVERY:
@@ -1436,7 +1436,7 @@ def handle_command(
         state.recent_tx[h] = time.monotonic()
         state.pkt_sent += 1
         state.pkt_direct_tx += 1
-        cbor_msg = make_cbor_tx_request(pkt)
+        cbor_msg = make_cbor_tx_request(pkt, cr=state.cr - 4)
         udp_sock.sendto(cbor_msg, udp_addr)
         expected_ack = compute_ack_hash(
             struct.pack("<I", ts) + bytes([req_type]), state.pub_key

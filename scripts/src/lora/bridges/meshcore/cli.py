@@ -200,15 +200,15 @@ def run_bridge(
                             state.freq_mhz = phy.get("freq", state.freq_mhz * 1e6) / 1e6
                             state.bw_khz = phy.get("bw", state.bw_khz * 1e3) / 1e3
                             state.sf = int(phy.get("sf", state.sf))
-                            state.cr = int(phy.get("cr", state.cr + 4)) - 4
+                            state.cr = int(phy.get("cr", state.cr - 4)) + 4
                             state.tx_power = int(phy.get("tx_gain", state.tx_power))
                         if not config_shown:
                             log.debug(
-                                "config: %.3f MHz SF%d BW %.1fk CR 4/%d",
+                                "config: %.3f MHz SF%d BW %.1fk CR %d",
                                 state.freq_mhz,
                                 state.sf,
                                 state.bw_khz,
-                                state.cr + 4,
+                                state.cr,
                             )
                             config_shown = True
                         continue
@@ -240,16 +240,23 @@ def run_bridge(
 
                     if ack_packets:
                         for ack_pkt in ack_packets:
-                            cbor_msg = make_cbor_tx_request(ack_pkt)
+                            cbor_msg = make_cbor_tx_request(ack_pkt, cr=state.cr - 4)
                             udp_sock.sendto(cbor_msg, udp_addr)
-                            log.info("TX ACK: %s (%dB)", ack_pkt.hex(), len(ack_pkt))
+                            log.info(
+                                "TX ACK: %s (%dB) cr=%d",
+                                ack_pkt.hex(),
+                                len(ack_pkt),
+                                state.cr,
+                            )
 
                     if state.client_repeat and rx_payload:
                         fwd_pkt = prepare_repeat_packet(rx_payload, msg, state.pub_key)
                         if fwd_pkt is not None:
-                            fwd_cbor = make_cbor_tx_request(fwd_pkt)
+                            fwd_cbor = make_cbor_tx_request(fwd_pkt, cr=state.cr - 4)
                             udp_sock.sendto(fwd_cbor, udp_addr)
-                            log.info("repeat: forwarded %dB", len(fwd_pkt))
+                            log.info(
+                                "repeat: forwarded %dB cr=%d", len(fwd_pkt), state.cr
+                            )
 
                     for companion_msg in companion_msgs:
                         if companion_msg[0] == PUSH_ACK:
@@ -401,14 +408,16 @@ def main(argv: list[str] | None = None) -> int:
     freq_mhz = phy.get("freq", 869_618_000.0) / 1e6
     bw_khz = phy.get("bw", 62_500) / 1e3
     sf = int(phy.get("sf", 8))
-    cr = int(phy.get("cr", 8)) - 4
+    cr = (
+        int(phy.get("cr", 4)) + 4
+    )  # lora_trx sends internal 1-4, bridge stores external 5-8
     tx_power = int(phy.get("tx_gain", 14))
     log.info(
-        "PHY: %.3f MHz SF%d BW %.1fk CR 4/%d TX %d",
+        "PHY: %.3f MHz SF%d BW %.1fk CR %d TX %d",
         freq_mhz,
         sf,
         bw_khz,
-        cr + 4,
+        cr,
         tx_power,
     )
 

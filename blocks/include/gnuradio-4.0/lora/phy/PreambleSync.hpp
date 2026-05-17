@@ -313,11 +313,23 @@ private:
                 acc += Yl[kkz] * std::conj(Ylm1[kkz]);
             }
         }
-        const float cfo_frac = (std::abs(acc) > 0.f) ? std::arg(acc) / (2.f * std::numbers::pi_v<float>) : 0.f;
+        float cfo_frac = (std::abs(acc) > 0.f) ? std::arg(acc) / (2.f * std::numbers::pi_v<float>) : 0.f;
 
-        if (std::abs(cfo_frac) >= 0.5f) {
-            failWith();
-            return;
+        // Wrap fractional CFO to [-0.5, 0.5). When |cfo_frac| >= 0.5 the
+        // integer bin estimate (i_peak) is off by 1 — correct by adjusting
+        // i_peak and wrapping cfo_frac. This handles fractional-only CFO
+        // cases (e.g. +3.5 bins at SF8) where the cross-correlation phase
+        // wraps around π.
+        if (cfo_frac >= 0.5f) {
+            cfo_frac -= 1.0f;
+            if (i_peak > 0) {
+                --i_peak;
+            }
+        } else if (cfo_frac < -0.5f) {
+            cfo_frac += 1.0f;
+            if (i_peak < _N - 1) {
+                ++i_peak;
+            }
         }
         _cfo_frac_est = cfo_frac;
 
