@@ -23,9 +23,9 @@ dc_offset_auto    = false        # Pluto has no HW DC correction
 [trx]
 name      = "Tezuka IIO MeshCore 868 MHz"
 radio     = "radio_868"
-rate      = 1000000              # 1 MS/s — matches Pluto IIO constraints
+rate      = 2500000              # 2.5 MS/s — 40 MHz / 16 = 2.5M valid Pluto rate
 enable_tx = false                # RX-only on-device (no TX path yet)
-use_aa_filter = true             # half-band FIR anti-alias on narrowband decimate
+use_aa_filter = false            # OS=40 not power-of-2; AA filter asserts in debug
 
 [trx.transmit]
 sf           = 8
