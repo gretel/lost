@@ -71,12 +71,21 @@ namespace gr::lora {
     return result;
 }
 
-/// Append CRC-16/XMODEM as 4 nibbles (LoRa CRC uses the last-2-byte XOR
-/// variant per Tapparel & Burg Section III-E).
+/// Append CRC-16/XMODEM as 4 whitened nibbles.
+/// CRC nibbles are whitened with the same continuous LFSR sequence used
+/// for payload bytes, making TX compatible with SX1262 receivers which
+/// whiten the entire data stream including CRC.
 [[nodiscard]] inline std::vector<uint8_t> add_crc(std::span<const uint8_t> with_header, std::span<const uint8_t> payload, bool has_crc) {
     std::vector<uint8_t> result(with_header.begin(), with_header.end());
     if (has_crc && payload.size() >= 2) {
         auto nibs = crc_to_nibbles(lora_payload_crc(payload));
+        // Whitening sequence continues from payload: CRC bytes at index
+        // pay_len and pay_len+1 use whitening_seq[pay_len..pay_len+1].
+        for (std::size_t byte_idx = 0u; byte_idx < 2u; ++byte_idx) {
+            const uint8_t ws = whitening_seq[(payload.size() + byte_idx) % whitening_seq.size()];
+            nibs[byte_idx * 2u] ^= (ws & 0x0F);
+            nibs[byte_idx * 2u + 1u] ^= ((ws >> 4u) & 0x0F);
+        }
         result.insert(result.end(), nibs.begin(), nibs.end());
     }
     return result;
@@ -189,11 +198,11 @@ namespace gr::lora {
 ///
 /// When inverted_iq is true, the frame uses downchirp preamble (inverted
 /// IQ). The RX side detects this by correlating with conjugated input.
-[[nodiscard]] inline std::vector<std::complex<float>> generate_frame_iq(std::span<const uint8_t> payload, uint8_t sf, uint8_t cr, uint8_t os_factor, uint16_t sync_word, uint16_t preamble_len, bool has_crc = true, uint32_t zero_pad = 0, uint8_t ldro_mode = 2, uint32_t bandwidth = 62500, bool inverted_iq = false) {
+[[nodiscard]] inline std::vector<std::complex<float>> generate_frame_iq(std::span<const uint8_t> payload, uint8_t sf, uint8_t cr, uint8_t os_factor, uint16_t sync_word, uint16_t preamble_len, bool has_crc = true, uint32_t zero_pad = 0, uint8_t ldro_mode = 2, uint32_t bandwidth = 62500, bool inverted_iq = false, bool implicit_header = false) {
     bool ldro = (ldro_mode == 2) ? needs_ldro(sf, bandwidth) : (ldro_mode != 0);
 
     auto whitened    = whiten(payload);
-    auto with_header = insert_header(whitened, static_cast<uint8_t>(payload.size()), cr, has_crc);
+    auto with_header = implicit_header ? whitened : insert_header(whitened, static_cast<uint8_t>(payload.size()), cr, has_crc);
     auto with_crc    = add_crc(with_header, payload, has_crc);
     auto encoded     = hamming_encode_frame(with_crc, sf, cr);
     auto interleaved = interleave_frame(encoded, sf, cr, ldro);

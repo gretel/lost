@@ -48,7 +48,7 @@ struct DecodeConfig {
 
 // Passthrough config sections for Python scripts.
 // Mirrors the TOML section structure so Python gets the same nested dict
-// it would have gotten from parsing config.toml directly.
+// it would have gotten from parsing a TOML config directly.
 struct RawConfig {
     // [network] — UDP addressing (scripts resolve listen addresses from here)
     struct Network {
@@ -97,6 +97,7 @@ struct TrxConfig {
     std::string name{};
     std::string device{};
     std::string device_param{};
+    std::string uri{};   ///< IIO context URI (e.g. "local:"); non-empty → IIO source
     double      freq{869'618'000.0};
     double      gain_rx{35.0};
     double      gain_tx{70.0};
@@ -135,6 +136,9 @@ struct TrxConfig {
     // Decode options
     bool soft_decode{false};   ///< soft-decision (LLR) Hamming decode (experimental)
     bool use_aa_filter{false}; ///< half-band FIR anti-alias in narrowband decimate
+
+    // IIOSink-only
+    bool tx_lo_powerdown{true}; ///< power down TX LO after DMA cancel (Phase 6)
 };
 
 /// Scan-specific configuration (parsed from [scan] section).
@@ -143,6 +147,7 @@ struct ScanSetConfig {
     // From [device]
     std::string device{};
     std::string device_param{};
+    std::string uri{};   ///< IIO context URI (e.g. "local:"); non-empty → IIO source
     double      l1_rate{16.0e6};      ///< L1 wideband sample rate
     double      master_clock{24.0e6}; ///< FPGA master clock rate (24 MHz fits under stock-UHD 2T2R ceiling of 30.72 MHz)
     std::string clock{};
@@ -238,7 +243,9 @@ std::vector<uint8_t> build_config_cbor(const TrxConfig& cfg, const std::string& 
 std::vector<uint8_t> build_status_cbor(const TrxConfig& cfg, SharedStatus& status, const char* git_rev = "", const std::string& device_serial = "");
 
 /// Build a CBOR spectrum message from a SpectrumState result buffer.
-std::vector<uint8_t> build_spectrum_cbor(gr::lora::SpectrumState& spec, const char* type_name = "spectrum");
+/// `device_serial` (when non-empty) is emitted under the "device" key so
+/// multi-source consumers can attribute spectrum frames to a radio.
+std::vector<uint8_t> build_spectrum_cbor(gr::lora::SpectrumState& spec, const char* type_name = "spectrum", const std::string& device_serial = "");
 
 } // namespace lora_config
 

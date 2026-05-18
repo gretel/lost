@@ -152,9 +152,16 @@ struct DechirpSoftResult {
 /// for soft-decision decoding (LLR extraction via GrayPartition).
 /// Allocating version (tests only). Real-time paths use the
 /// buffer-taking overload below.
-[[nodiscard]] inline DechirpSoftResult dechirp_soft(const std::complex<float>* samples, const std::complex<float>* ref_chirp, std::complex<float>* scratch, uint32_t N, gr::algorithm::FFT<std::complex<float>>& fft) {
-    for (uint32_t i = 0; i < N; i++) {
-        scratch[i] = samples[i] * ref_chirp[i];
+[[nodiscard]] inline DechirpSoftResult dechirp_soft(const std::complex<float>* samples, const std::complex<float>* ref_chirp, std::complex<float>* scratch, uint32_t N, gr::algorithm::FFT<std::complex<float>>& fft, bool remove_dc = false) {
+    if (remove_dc) {
+        std::complex<float> mean{0.f, 0.f};
+        for (uint32_t i = 0; i < N; i++) { mean += samples[i]; }
+        mean /= static_cast<float>(N);
+        for (uint32_t i = 0; i < N; i++) { scratch[i] = (samples[i] - mean) * ref_chirp[i]; }
+    } else {
+        for (uint32_t i = 0; i < N; i++) {
+            scratch[i] = samples[i] * ref_chirp[i];
+        }
     }
     auto fft_out = fft.compute(std::span<const std::complex<float>>(scratch, N));
 
@@ -180,9 +187,16 @@ struct DechirpSoftResult {
 
 /// Dechirp + FFT into pre-allocated buffer. No heap allocation.
 /// mag_sq_out must point to N writable floats (caller-provided).
-[[nodiscard]] inline DechirpResult dechirp_soft(const std::complex<float>* samples, const std::complex<float>* ref_chirp, std::complex<float>* scratch, uint32_t N, gr::algorithm::FFT<std::complex<float>>& fft, float* mag_sq_out) {
-    for (uint32_t i = 0; i < N; i++) {
-        scratch[i] = samples[i] * ref_chirp[i];
+[[nodiscard]] inline DechirpResult dechirp_soft(const std::complex<float>* samples, const std::complex<float>* ref_chirp, std::complex<float>* scratch, uint32_t N, gr::algorithm::FFT<std::complex<float>>& fft, float* mag_sq_out, bool remove_dc = false) {
+    if (remove_dc) {
+        std::complex<float> mean{0.f, 0.f};
+        for (uint32_t i = 0; i < N; i++) { mean += samples[i]; }
+        mean /= static_cast<float>(N);
+        for (uint32_t i = 0; i < N; i++) { scratch[i] = (samples[i] - mean) * ref_chirp[i]; }
+    } else {
+        for (uint32_t i = 0; i < N; i++) {
+            scratch[i] = samples[i] * ref_chirp[i];
+        }
     }
     auto fft_out = fft.compute(std::span<const std::complex<float>>(scratch, N));
 

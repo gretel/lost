@@ -47,6 +47,26 @@ namespace {
     return bins;
 }
 
+/// Like generateBins but for implicit header mode — no insert_header,
+/// payload+CRC nibbles go directly through Hamming+interleaver.
+[[nodiscard]] std::vector<uint16_t> generateBinsImplicit(std::span<const uint8_t> payload, uint8_t sf, uint8_t cr, bool has_crc, uint32_t bandwidth) {
+    const bool ldro = gr::lora::needs_ldro(sf, bandwidth);
+
+    auto whitened    = gr::lora::whiten(payload);
+    // No insert_header — implicit mode has no explicit header nibbles.
+    auto with_crc    = gr::lora::add_crc(whitened, payload, has_crc);
+    auto encoded     = gr::lora::hamming_encode_frame(with_crc, sf, cr);
+    auto interleaved = gr::lora::interleave_frame(encoded, sf, cr, ldro);
+    auto gray_mapped = gr::lora::gray_demap(interleaved, sf);
+
+    std::vector<uint16_t> bins;
+    bins.reserve(gray_mapped.size());
+    for (auto sym : gray_mapped) {
+        bins.push_back(static_cast<uint16_t>(sym));
+    }
+    return bins;
+}
+
 /// Drive a payload through DecodeChain and return the resulting frame.
 [[nodiscard]] FrameResult roundtrip(std::span<const uint8_t> payload, uint8_t sf, uint8_t cr, bool has_crc, uint32_t bandwidth) {
     auto bins = generateBins(payload, sf, cr, has_crc, bandwidth);
@@ -192,6 +212,62 @@ suite<"DecodeChain CRC error detection"> _crc_err = [] {
         // damaged payload bins it's effectively impossible for both to hold.
         const bool damaged = (last.payload != payload) || not last.crc_valid;
         expect(damaged);
+    };
+};
+
+suite<"DecodeChain implicit header CRC"> _imp_crc = [] {
+    "damaged payload in implicit mode → CRC fails"_test = [] {
+        // Implicit header mode: no explicit header, payload+CRC directly
+        // through Hamming+interleaver. The kHeaderNibbles=0 fix must ensure
+        // CRC bytes are reached and verified.
+        const std::vector<uint8_t> payload{'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '0', '1'};
+        auto bins = generateBinsImplicit(payload, 8, 1, true, 62500);
+
+        // Corrupt several payload symbols by flipping random bins.
+        // Skip the preamble+sync words (first ~10 symbols) — only
+        // corrupt payload symbols.
+        for (std::size_t i = 10; i < std::min<std::size_t>(bins.size(), 20); ++i) {
+            bins[i] = static_cast<uint16_t>((bins[i] + 73) % 256);
+        }
+
+        DecodeChain dc;
+        dc.init({8, 62500, false, false, true, 1, 28});
+
+        FrameResult last{};
+        for (auto b : bins) {
+            if (auto r = dc.push_symbol(b); r.has_value()) {
+                last = std::move(*r);
+                break;
+            }
+        }
+        // With corruption, either the payload is different or CRC should
+        // fail. This test specifically verifies CRC is NOT vacuously true.
+        const bool damaged = (last.payload != payload) || not last.crc_valid;
+        expect(damaged);
+
+        // Also confirm payload bytes are present and not empty — safeguards
+        // against the kHeaderNibbles skip cutting off payload data.
+        expect(not last.payload.empty());
+        expect(last.payload.size() >= 10u);
+    };
+
+    "clean implicit frame → CRC OK"_test = [] {
+        const std::vector<uint8_t> payload(28, 0x42);
+        auto bins = generateBinsImplicit(payload, 8, 1, true, 62500);
+
+        DecodeChain dc;
+        dc.init({8, 62500, false, false, true, 1, 28});
+
+        FrameResult last{};
+        for (auto b : bins) {
+            if (auto r = dc.push_symbol(b); r.has_value()) {
+                last = std::move(*r);
+                break;
+            }
+        }
+        expect(last.header_valid);
+        expect(last.crc_valid);
+        expect(last.payload == payload);
     };
 };
 

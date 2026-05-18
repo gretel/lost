@@ -63,9 +63,9 @@ void print_usage() {
     std::fprintf(stderr, "Usage: lora_trx [options]\n\n"
                          "Full-duplex LoRa transceiver with CBOR-over-UDP I/O.\n\n"
                          "Options:\n"
-                         "  --config <file>       TOML configuration file (default: config.toml)\n"
+                         "  --config <file>       TOML configuration file (default: config-uhd.toml)\n"
                          "  --log-level <level>   Log level: DEBUG, INFO, WARNING, ERROR\n"
-                         "                        Overrides [logging] level in config.toml.\n"
+                         "                        Overrides [logging] level in config-uhd.toml.\n"
                          "                        DEBUG also enables verbose decoder traces.\n"
                          "  --version             Show version and exit\n"
                          "  -h, --help            Show this help\n");
@@ -99,7 +99,7 @@ int parse_args(int argc, char* argv[], std::string& config_path, std::string& lo
         return 1;
     }
     if (config_path.empty()) {
-        config_path = "config.toml";
+        config_path = "config-uhd.toml";
     }
     return 0;
 }
@@ -110,6 +110,7 @@ struct ParsedDevice {
     std::string device{};
     std::string param{};
     std::string clock{};
+    std::string uri{};
 };
 
 static ParsedDevice parse_device(const toml::table& tbl) {
@@ -126,8 +127,9 @@ static ParsedDevice parse_device(const toml::table& tbl) {
     };
     d.device = dev_or_s("driver", dev_or_s("device", ""));
     d.param  = dev_or_s("param", "");
+    d.uri    = dev_or_s("uri", "");
     if (d.device.empty()) {
-        throw std::runtime_error("[device].driver is required (e.g. \"uhd\", \"lime\", \"loopback\")");
+        throw std::runtime_error("[device].driver is required (e.g. \"uhd\", \"iio\", \"lime\", \"loopback\")");
     }
     d.clock = dev_or_s("clock", "");
     return d;
@@ -249,6 +251,7 @@ std::vector<TrxConfig> load_config(const std::string& path, const std::string& c
     TrxConfig cfg;
     cfg.device       = dev.device;
     cfg.device_param = dev.param;
+    cfg.uri          = dev.uri;
     cfg.clock        = dev.clock;
     cfg.debug        = g_debug;
 
@@ -365,6 +368,7 @@ std::vector<TrxConfig> load_config(const std::string& path, const std::string& c
     // [[trx.receive.chain]] entries
     static constexpr std::array kChainIdentityKeys = {
         std::string_view{"sf"},
+        std::string_view{"sf_set"},
         std::string_view{"sync_word"},
         std::string_view{"label"},
     };
@@ -394,8 +398,12 @@ std::vector<TrxConfig> load_config(const std::string& path, const std::string& c
             }
             dc.label = *lbl_opt;
 
-            // sf: optional list. Empty/unset = sweep SF7-12. Each entry ∈ [7..12].
-            if (auto* sf_arr = dtbl["sf"].as_array()) {
+            // sf / sf_set: optional list. Empty/unset = sweep SF7-12. Each entry ∈ [7..12].
+            auto* sf_arr = dtbl["sf"].as_array();
+            if (!sf_arr) {
+                sf_arr = dtbl["sf_set"].as_array();
+            }
+            if (sf_arr) {
                 for (auto& sf_elem : *sf_arr) {
                     auto sf_val = sf_elem.value<int64_t>();
                     if (!sf_val) {
@@ -482,6 +490,10 @@ std::vector<TrxConfig> load_config(const std::string& path, const std::string& c
         cfg.enable_tx = *v;
     }
 
+    if (auto v = trx_tbl->at_path("tx_lo_powerdown").value<bool>()) {
+        cfg.tx_lo_powerdown = *v;
+    }
+
     // Validate: rx_channel values are SoapySDR channel indices (0-based)
     if (cfg.rx_channels.empty()) {
         gr::lora::log_ts("error", "config", "rx_channel must have at least one entry");
@@ -534,6 +546,7 @@ std::vector<ScanSetConfig> load_scan_config(const std::string& path, const std::
     ScanSetConfig cfg;
     cfg.device         = dev.device;
     cfg.device_param   = dev.param;
+    cfg.uri            = dev.uri;
     cfg.clock          = dev.clock;
     cfg.l1_rate        = scan_tbl->at_path("l1_rate").value_or(16.0e6);
     cfg.master_clock   = scan_tbl->at_path("master_clock").value_or(24.0e6);
@@ -825,11 +838,12 @@ std::vector<uint8_t> build_status_cbor(const TrxConfig& cfg, SharedStatus& statu
     return buf;
 }
 
-std::vector<uint8_t> build_spectrum_cbor(gr::lora::SpectrumState& spec, const char* type_name) {
+std::vector<uint8_t> build_spectrum_cbor(gr::lora::SpectrumState& spec, const char* type_name, const std::string& device_serial) {
     namespace cbor = gr::lora::cbor;
     std::vector<uint8_t> buf;
     buf.reserve(64 + spec.fft_size * sizeof(float));
-    cbor::encode_map_begin(buf, 5);
+    const uint32_t n_fields = device_serial.empty() ? 5U : 6U;
+    cbor::encode_map_begin(buf, n_fields);
     cbor::kv_text(buf, "type", type_name);
     {
         std::lock_guard lock(spec.result_mutex);
@@ -839,6 +853,9 @@ std::vector<uint8_t> build_spectrum_cbor(gr::lora::SpectrumState& spec, const ch
     cbor::kv_uint(buf, "fft_size", spec.fft_size);
     cbor::kv_float64(buf, "center_freq", spec.center_freq);
     cbor::kv_float64(buf, "sample_rate", static_cast<double>(spec.sample_rate));
+    if (!device_serial.empty()) {
+        cbor::kv_text(buf, "device", device_serial);
+    }
     return buf;
 }
 

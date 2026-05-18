@@ -437,6 +437,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="override bandwidth (Hz)",
     )
     shared.add_argument(
+        "--cr",
+        type=int,
+        default=None,
+        choices=[5, 6, 7, 8],
+        help="override coding rate denominator (5-8, default: lora_trx config)",
+    )
+    shared.add_argument(
         "--connect",
         metavar="HOST:PORT",
         default=None,
@@ -566,6 +573,8 @@ def main(argv: list[str] | None = None) -> int:
         phy["sf"] = args.sf
     if args.bw is not None:
         phy["bw"] = args.bw
+    if args.cr is not None:
+        phy["cr"] = args.cr - 4  # convert external 5-8 to internal 1-4
     if args.dry_run:
         phy["dry_run"] = True
 
